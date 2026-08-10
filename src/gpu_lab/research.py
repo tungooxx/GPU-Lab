@@ -231,11 +231,12 @@ class ResearchStore:
             )
             self._event(cur, model["project_id"], child_event, child_id, child_data)
             current_version = int(model["data"].get("version", 0))
+            change_key = "nodes_added" if list_field == "node_ids" else "edges_added"
             version_data = {
                 "world_model_id": world_model_id,
                 "version": current_version + 1,
                 "parent_version_id": model["data"].get("current_version_id"),
-                "changes": changes,
+                "changes": {**changes, change_key: [str(child_id)]},
                 "evidence_ids": evidence_ids or [],
                 "decision_id": decision_id,
                 "timestamp": now.isoformat(),
@@ -958,9 +959,11 @@ class ResearchStore:
                 "active_hypotheses": by_kind("Hypothesis", {"ACTIVE", "SURVIVES_INITIAL_TEST"}),
                 "refuted_lineages": by_kind("Hypothesis", {"REFUTED"}),
                 "completed_experiments": by_kind("ExperimentRun", {"completed"}),
-                "active_experiments": by_kind("ExperimentRun", {"ACTIVE", "running"}),
+                "active_experiments": by_kind(
+                    "ExperimentRun", {"ACTIVE", "RESERVED", "running", "unknown"}
+                ),
                 "terminal_non_success_experiments": by_kind(
-                    "ExperimentRun", {"failed", "cancelled", "unknown"}
+                    "ExperimentRun", {"failed", "cancelled"}
                 ),
                 "open_experiments": by_kind("Experiment", {"ACTIVE"}),
                 "reproduction_status": by_kind("Reproduction"),
