@@ -10,3 +10,4 @@ def test_every_mcp_tool_has_chatgpt_metadata():
         assert tool.annotations.destructiveHint is not None
         assert tool.annotations.openWorldHint is not None
         assert tool.output_schema is not None
+        assert tool.fn_metadata.output_model is not None

@@ -3,9 +3,11 @@ import inspect
 import logging
 import re
 import time
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
+from pydantic import BaseModel
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 
@@ -88,13 +90,15 @@ _OPEN_WORLD_TOOLS = {
     "local_env_prepare",
 }
 _ACRONYMS = {"api": "API", "gpu": "GPU", "id": "ID", "ssh": "SSH", "url": "URL", "vlm": "VLM"}
-_GENERIC_RESULT_SCHEMA = {
-    "anyOf": [
-        {"type": "object", "additionalProperties": True},
-        {"type": "array", "items": {}},
-    ],
-    "description": "A structured GPU Lab result or error object.",
-}
+
+
+class GenericToolResult(BaseModel):
+    """Stable structured envelope for dynamically shaped GPU Lab results."""
+
+    result: Any
+
+
+_GENERIC_RESULT_SCHEMA = GenericToolResult.model_json_schema()
 
 
 def _tool_title(name: str) -> str:
@@ -112,6 +116,8 @@ def _apply_tool_metadata() -> None:
             openWorldHint=name in _OPEN_WORLD_TOOLS,
         )
         tool.fn_metadata.output_schema = _GENERIC_RESULT_SCHEMA
+        tool.fn_metadata.output_model = GenericToolResult
+        tool.fn_metadata.wrap_output = True
         tool.__dict__.pop("output_schema", None)
 
 
