@@ -1,0 +1,6 @@
+services:
+  gpu-lab:
+    build: .
+    env_file: .env
+    ports: ["8000:8000"]
+    volumes: ["./data:/data", "${GPU_LAB_SSH_PRIVATE_KEY_PATH:-/dev/null}:/run/ssh-key:ro"]
