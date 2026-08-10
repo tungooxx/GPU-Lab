@@ -1,5 +1,7 @@
 import argparse
+import hashlib
 import inspect
+import json
 import logging
 import re
 import time
@@ -848,10 +850,41 @@ async def research_experiment_execute(
     working_directory: str = ".",
     env: dict[str, str] | None = None,
     python_env: str | None = None,
+    execution_attempt_uuid: str | None = None,
 ):
-    """Run a preregistered experiment through the local GPU-Lab executor."""
+    """Idempotently run a preregistered experiment and return canonical run/job IDs."""
     if not settings.gpu_lab_enable_local_runner:
         return {"error": {"type": "LOCAL_RUNNER_DISABLED"}}
+    request = {
+        "experiment_id": experiment_id,
+        "command": command,
+        "working_directory": working_directory,
+        "env": env or {},
+        "python_env": python_env,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(request, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    idempotency_key = execution_attempt_uuid or f"auto:{fingerprint}"
+    job_id = "local_" + hashlib.sha256(
+        f"{experiment_id}:{idempotency_key}".encode()
+    ).hexdigest()[:24]
+    reservation = await call(
+        research().run_reserve,
+        experiment_id,
+        idempotency_key,
+        job_id,
+        fingerprint,
+        {
+            "executor": "local",
+            "command": command,
+            "working_directory": working_directory,
+            "environment": env or {},
+            "python_env": python_env,
+        },
+    )
+    if "error" in reservation:
+        return reservation
     job = await call(
         local.submit,
         command,
@@ -859,36 +892,56 @@ async def research_experiment_execute(
         "research-" + experiment_id[:8],
         env,
         python_env,
+        reservation["job_id"],
     )
     if "error" in job:
-        return job
-    return await call(
-        research().run_create,
-        experiment_id,
-        {
-            "executor": "local",
-            "job_id": job["job_id"],
-            "command": command,
-            "working_directory": working_directory,
-            "environment": env or {},
-            "python_env": python_env,
-        },
-    )
+        return {
+            "experiment_id": reservation["experiment_id"],
+            "run_id": reservation["run_id"],
+            "job_id": reservation["job_id"],
+            "idempotency_key": reservation["idempotency_key"],
+            "status": "RESERVED",
+            "submission_error": job["error"],
+            "retry_safe": True,
+        }
+    mapping = await call(research().run_mark_submitted, reservation["run_id"])
+    if "error" in mapping:
+        return {
+            "experiment_id": reservation["experiment_id"],
+            "run_id": reservation["run_id"],
+            "job_id": reservation["job_id"],
+            "idempotency_key": reservation["idempotency_key"],
+            "status": job["status"],
+            "mapping_error": mapping["error"],
+            "retry_safe": True,
+        }
+    return {**mapping, "job": job, "retry_safe": True}
 
 
 @mcp.tool()
-async def research_experiment_sync(run_id: str):
-    """Retrieve a real job's logs/artifacts and append immutable execution evidence."""
-    run = research().object_get(run_id)
-    job_id = run["data"].get("job_id")
-    if not job_id:
-        return {"error": {"type": "RUN_MISSING_JOB"}}
-    outcome, artifacts, runtime = local.job_status(job_id), local.artifacts(job_id), await local.status()
+async def research_experiment_sync(run_id: str | None = None, job_id: str | None = None):
+    """Sync by run ID or job ID and always return the canonical execution mapping."""
+    identifier = run_id or job_id
+    if not identifier:
+        return {"error": {"type": "EXECUTION_IDENTIFIER_REQUIRED"}}
+    mapping = await call(research().run_resolve, identifier)
+    if "error" in mapping:
+        return mapping
+    if run_id and job_id:
+        job_mapping = await call(research().run_resolve, job_id)
+        if "error" in job_mapping:
+            return job_mapping
+        if job_mapping["run_id"] != mapping["run_id"]:
+            return {"error": {"type": "EXECUTION_IDENTIFIER_MISMATCH"}}
+    canonical_run_id, canonical_job_id = mapping["run_id"], mapping["job_id"]
+    run = mapping["run"]
+    outcome = local.job_status(canonical_job_id)
+    artifacts, runtime = local.artifacts(canonical_job_id), await local.status()
     runner_status = outcome["status"]
     research_status = "failed" if runner_status == "unknown" else runner_status
     updated = await call(
         research().run_update,
-        run_id,
+        canonical_run_id,
         {
             "status": research_status,
             "runner_status": runner_status,
@@ -898,19 +951,27 @@ async def research_experiment_sync(run_id: str):
             "runtime": runtime,
         },
     )
+    response = {
+        "experiment_id": mapping["experiment_id"],
+        "run_id": canonical_run_id,
+        "job_id": canonical_job_id,
+        "idempotency_key": mapping.get("idempotency_key"),
+        "status": updated.get("status", research_status),
+        "run": updated,
+    }
     if "error" in updated or updated.get("already_final") or research_status not in {"completed", "failed"}:
-        return updated
+        return response
     for artifact in artifacts:
         recorded = await call(
             research().object_create,
             str(run["project_id"]),
             "Artifact",
-            {"run_id": run_id, "job_id": job_id, **artifact},
+            {"run_id": canonical_run_id, "job_id": canonical_job_id, **artifact},
             "ARTIFACT_RECORDED",
         )
         if "error" not in recorded:
-            await call(research().edge_create, run_id, recorded["id"], "PRODUCED")
-    return updated
+            await call(research().edge_create, canonical_run_id, recorded["id"], "PRODUCED")
+    return response
 
 
 @mcp.tool()
@@ -923,56 +984,66 @@ async def artifact_read(job_id: str, path: str, max_bytes: int | None = None):
     return await call(svc().artifact_read, job_id, path, max_bytes)
 
 
-if settings.gpu_lab_enable_remote_exec:
-
-    @mcp.tool()
-    async def remote_exec(instance_id: str, command: str, timeout_seconds: int = 60):
-        """Dangerous, bounded non-interactive debug command."""
-        return await call(svc().remote_exec, instance_id, command, timeout_seconds)
+@mcp.tool()
+async def remote_exec(instance_id: str, command: str, timeout_seconds: int = 60):
+    """Dangerous, bounded non-interactive debug command."""
+    return await call(svc().remote_exec, instance_id, command, timeout_seconds)
 
 
-if settings.gpu_lab_enable_local_runner:
-    local = LocalRunner(settings, svc().repo)
+local = LocalRunner(settings, svc().repo)
 
-    @mcp.tool()
-    async def local_status():
-        """Show the mounted local research workspace and container-visible GPU."""
-        return await call(local.status)
 
-    @mcp.tool()
-    async def local_experiment_submit(
-        command: str,
-        working_directory: str = ".",
-        name: str | None = None,
-        env: dict[str, str] | None = None,
-        python_env: str | None = None,
-    ):
-        """Start a detached Linux experiment confined to the local research workspace."""
-        return await call(local.submit, command, working_directory, name, env, python_env)
+@mcp.tool()
+async def local_status():
+    """Show the mounted local research workspace and container-visible GPU."""
+    return await call(local.status)
 
-    @mcp.tool()
-    async def local_env_prepare(name: str, requirements_path: str | None = None):
-        return await call(local.env_prepare, name, requirements_path)
 
-    @mcp.tool()
-    async def local_experiment_status(job_id: str):
-        return await call(local.job_status, job_id)
+@mcp.tool()
+async def local_experiment_submit(
+    command: str,
+    working_directory: str = ".",
+    name: str | None = None,
+    env: dict[str, str] | None = None,
+    python_env: str | None = None,
+):
+    """Start a detached Linux experiment confined to the local research workspace."""
+    return await call(local.submit, command, working_directory, name, env, python_env)
 
-    @mcp.tool()
-    async def local_experiment_logs(job_id: str, tail: int = 200):
-        return await call(local.logs, job_id, tail)
 
-    @mcp.tool()
-    async def local_artifact_list(job_id: str):
-        return await call(local.artifacts, job_id)
+@mcp.tool()
+async def local_env_prepare(
+    name: str,
+    requirements_path: str | None = None,
+    python_executable: str = "python3",
+):
+    """Create a persistent local environment from a requirements file or directory."""
+    return await call(local.env_prepare, name, requirements_path, python_executable)
 
-    @mcp.tool()
-    async def local_artifact_read(job_id: str, path: str, max_bytes: int = 65536):
-        return await call(local.artifact_read, job_id, path, max_bytes)
 
-    @mcp.tool()
-    async def local_experiment_cancel(job_id: str):
-        return await call(local.cancel, job_id)
+@mcp.tool()
+async def local_experiment_status(job_id: str):
+    return await call(local.job_status, job_id)
+
+
+@mcp.tool()
+async def local_experiment_logs(job_id: str, tail: int = 200):
+    return await call(local.logs, job_id, tail)
+
+
+@mcp.tool()
+async def local_artifact_list(job_id: str):
+    return await call(local.artifacts, job_id)
+
+
+@mcp.tool()
+async def local_artifact_read(job_id: str, path: str, max_bytes: int = 65536):
+    return await call(local.artifact_read, job_id, path, max_bytes)
+
+
+@mcp.tool()
+async def local_experiment_cancel(job_id: str):
+    return await call(local.cancel, job_id)
 
 
 _apply_tool_metadata()
