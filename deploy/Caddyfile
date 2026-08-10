@@ -1,0 +1,4 @@
+chucky-lab.com {
+	# The MCP server uses long-lived streaming responses.
+	reverse_proxy 127.0.0.1:8000
+}

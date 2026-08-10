@@ -16,6 +16,7 @@ class Repository:
         CREATE TABLE IF NOT EXISTS jobs (job_id TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS artifacts (id INTEGER PRIMARY KEY, job_id TEXT NOT NULL, path TEXT NOT NULL, size INTEGER NOT NULL, checksum TEXT NOT NULL, mime_type TEXT, created_at TEXT NOT NULL, UNIQUE(job_id,path));
         CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, job_id TEXT, event_type TEXT NOT NULL, message TEXT NOT NULL, metadata_json TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY, tool_name TEXT NOT NULL, arguments_json TEXT NOT NULL, outcome TEXT NOT NULL, error_message TEXT, duration_ms INTEGER NOT NULL, created_at TEXT NOT NULL);
         """)
         self.conn.commit()
 
@@ -72,3 +73,37 @@ class Repository:
             (job_id, event_type, message, json.dumps(metadata or {}), self._now()),
         )
         self.conn.commit()
+
+    def audit(
+        self,
+        tool_name: str,
+        arguments: dict,
+        outcome: str,
+        duration_ms: int,
+        error_message: str | None = None,
+    ) -> None:
+        try:
+            self.conn.execute(
+                "INSERT INTO audit_log(tool_name,arguments_json,outcome,error_message,duration_ms,created_at) VALUES(?,?,?,?,?,?)",
+                (tool_name, json.dumps(arguments, default=str), outcome, error_message, duration_ms, self._now()),
+            )
+            self.conn.commit()
+        except sqlite3.Error:
+            self.conn.rollback()
+
+    def list_audit(self, limit: int = 50) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT tool_name,arguments_json,outcome,error_message,duration_ms,created_at FROM audit_log ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+        return [
+            {
+                "tool": row["tool_name"],
+                "arguments": json.loads(row["arguments_json"]),
+                "outcome": row["outcome"],
+                "error": row["error_message"],
+                "duration_ms": row["duration_ms"],
+                "at": row["created_at"],
+            }
+            for row in rows
+        ]
