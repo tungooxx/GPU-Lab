@@ -500,13 +500,85 @@ async def paper_ask(project_id: str, question: str, limit: int = 8):
 
 
 @mcp.tool()
-async def anomaly_create(project_id: str, expected: str, observed: str, scope: str, priority: str = "medium"):
-    return await call(research().object_create, project_id, "Anomaly", {"expected": expected, "observed": observed, "scope": scope, "priority": priority}, "ANOMALY_CREATED")
+async def anomaly_create(
+    project_id: str,
+    expected: str,
+    observed: str,
+    scope: str,
+    priority: str = "medium",
+    model: str | None = None,
+    dataset: str | None = None,
+    experiment_id: str | None = None,
+    affected_claim_ids: list[str] | None = None,
+    possible_explanations: list[str] | None = None,
+):
+    """Persist an unexpected observation with its scope, affected claims, and candidate explanations."""
+    claims = affected_claim_ids or []
+    for claim_id in claims:
+        claim = research().object_get(claim_id)
+        if str(claim["project_id"]) != project_id or claim["kind"] != "Claim":
+            return {"error": {"type": "INVALID_ANOMALY_CLAIM", "message": claim_id}}
+    result = await call(
+        research().object_create,
+        project_id,
+        "Anomaly",
+        {
+            "expected": expected,
+            "observed": observed,
+            "scope": scope,
+            "priority": priority,
+            "model": model,
+            "dataset": dataset,
+            "experiment_id": experiment_id,
+            "affected_claim_ids": claims,
+            "possible_explanations": possible_explanations or [],
+        },
+        "ANOMALY_CREATED",
+    )
+    if "error" not in result:
+        for claim_id in claims:
+            await call(research().edge_create, result["id"], claim_id, "AFFECTS")
+    return result
 
 
 @mcp.tool()
-async def negative_result_create(project_id: str, proposal: str, prediction: str, result: str, failed_assumption: str, revisit_condition: str):
-    return await call(research().object_create, project_id, "NegativeResult", {"proposal": proposal, "prediction": prediction, "result": result, "failed_assumption": failed_assumption, "revisit_condition": revisit_condition}, "NEGATIVE_RESULT_CREATED")
+async def negative_result_create(
+    project_id: str,
+    proposal: str,
+    prediction: str,
+    result: str,
+    failed_assumption: str,
+    revisit_condition: str,
+    why_plausible: str | None = None,
+    experiment_id: str | None = None,
+    weakened_descendant_ids: list[str] | None = None,
+):
+    """Store a failed proposal and the evidence needed to avoid resurrecting it without change."""
+    descendants = weakened_descendant_ids or []
+    for hypothesis_id in descendants:
+        hypothesis = research().object_get(hypothesis_id)
+        if str(hypothesis["project_id"]) != project_id or hypothesis["kind"] != "Hypothesis":
+            return {"error": {"type": "INVALID_NEGATIVE_RESULT_DESCENDANT", "message": hypothesis_id}}
+    result_object = await call(
+        research().object_create,
+        project_id,
+        "NegativeResult",
+        {
+            "proposal": proposal,
+            "why_plausible": why_plausible,
+            "prediction": prediction,
+            "experiment_id": experiment_id,
+            "result": result,
+            "failed_assumption": failed_assumption,
+            "weakened_descendant_ids": descendants,
+            "revisit_condition": revisit_condition,
+        },
+        "NEGATIVE_RESULT_CREATED",
+    )
+    if "error" not in result_object:
+        for hypothesis_id in descendants:
+            await call(research().edge_create, result_object["id"], hypothesis_id, "WEAKENS")
+    return result_object
 
 
 @mcp.tool()
