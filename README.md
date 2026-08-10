@@ -125,5 +125,6 @@ remain on the worker. Vast endpoint shapes are normalized defensively and still 
 provider integration checks before production use. Brain v1 has a native versioned WorldModel,
 ResearchAgenda, hypothesis portfolio, decision ledger, deterministic information-per-cost policy,
 unfinished-work recovery, and explicit result assessment. Its real smoke has exercised the vertical
-slice on PostgreSQL and a local GTX 1650. PaperQA, Paper2Agent, quality-diversity operators,
+slice on PostgreSQL and a local GTX 1650. PaperQA is integrated as an optional isolated provider;
+its real model-backed answer quality is not yet verified. Paper2Agent, quality-diversity operators,
 experiment branching, and campaign automation remain later milestones.

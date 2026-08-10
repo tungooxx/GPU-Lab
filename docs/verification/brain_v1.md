@@ -21,11 +21,19 @@ evidence. A successful tool call or unit test is not treated as proof of a mecha
 ## Real MCP, database, GPU, and learning tests
 
 `uv run python scripts/brain_e2e_smoke.py` passed against the Docker MCP endpoint and PostgreSQL.
-The run reproduced the baseline, found a related negative mechanism through pgvector-backed search,
+The run reloaded an actual saved VRCNet prediction with exact equality, found a related negative
+mechanism through pgvector-backed search,
 selected `CAUSAL_INTERVENTION`, submitted a retry-safe canonical run/job mapping, executed CUDA on
-an NVIDIA GeForce GTX 1650, recovered the completed result as `INSPECT_RESULT`, and explicitly
+an NVIDIA GeForce GTX 1650, ran the frozen HASI hierarchical-state intervention, parsed the
+persisted result artifact, recovered the completed result as `INSPECT_RESULT`, and explicitly
 inspected the evidence. The edge changed from `HYPOTHESIZED_CAUSAL` to
 `INTERVENTION_SUPPORTED`; the following `brain_step()` changed to `GENERALIZATION`.
+The smoke also proved that the exact execution attempt remained `RESERVED` before explicit human
+approval, then reused the same canonical run/job mapping after approval without submitting twice.
+
+Candidate/decision persistence, result assessment, causal-edge/version updates, agenda appends, and
+ResearchState fact appends now use locked PostgreSQL transactions so a failed request cannot leave a
+partially promoted scientific result.
 
 After `docker compose restart postgres gpu-lab`, the same project recovered three decisions, one
 inspected run, five WorldModel versions, and continued with `GENERALIZATION`.
@@ -40,15 +48,16 @@ inspected run, five WorldModel versions, and continued with `GENERALIZATION`.
   reproduction-before-intervention gate, and unavailable-provider alternative action.
 - **VERIFIED_INTEGRATION:** PaperQA 2026.3.18 import/API compatibility, isolated worker health,
   authenticated gateway-to-worker connectivity, provenance normalization, canonical candidate
-  import, unavailable-provider behavior, and absence of Vast/SSH/PostgreSQL credentials in the
-  worker environment.
+  import, unavailable-provider behavior, a non-root/capability-dropped worker with writable paper
+  storage, and absence of Vast/SSH/PostgreSQL credentials in the worker environment.
 - **UNVERIFIED:** scientific generality of HASI, real model-backed PaperQA answer quality,
   Paper2Agent, quality-diversity operators, branch search, meta-review, and autonomous campaigns.
 
 ## Known risks and next highest-value build step
 
-Brain v1 uses deterministic heuristics and caller-authored candidate experiments. Its real smoke
-proves the scientific state machine learns from inspected evidence; it does not establish that one
-intervention generalizes across models or datasets. The next build step is an optional,
-provenance-preserving `LiteratureProvider` adapter, followed by executable-paper isolation only after
+Brain v1 uses deterministic heuristics and caller-authored candidate experiments. PaperQA is now
+integrated as an isolated optional provider, so the next literature task is a credentialed
+model-backed quality evaluation rather than another adapter. Its real smoke proves the scientific
+state machine learns from inspected evidence; it does not establish that one intervention
+generalizes across models or datasets. The next build step is executable-paper isolation only after
 license and dependency verification.

@@ -153,8 +153,12 @@ class FakeStore:
         self.created = []
         self.edges = []
 
-    def search(self, _project_id, _query, kind, _limit):
-        return [item for item in self.created if item["kind"] == kind]
+    def search(self, _project_id, query, kind, _limit):
+        return [
+            item
+            for item in self.created
+            if item["kind"] == kind and query.lower() in json.dumps(item["data"]).lower()
+        ]
 
     def object_create(self, project_id, kind, data, event_type, status="ACTIVE"):
         item = {
@@ -276,6 +280,31 @@ async def test_http_literature_worker_preserves_structured_errors():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response", "expected_message"),
+    [
+        (httpx.Response(200, text="not-json"), "non-JSON"),
+        (httpx.Response(200, json=[]), "non-object"),
+        (httpx.Response(200, json={}), "missing the result"),
+    ],
+)
+async def test_http_literature_worker_rejects_malformed_responses(
+    response, expected_message
+):
+    provider = HttpLiteratureProvider(
+        "http://literature:8010",
+        "scoped-token",
+        transport=httpx.MockTransport(lambda _request: response),
+    )
+
+    with pytest.raises(GPUError) as error:
+        await provider.health()
+
+    assert error.value.error_type == "LITERATURE_PROVIDER_INVALID_RESPONSE"
+    assert expected_message in error.value.message
+
+
+@pytest.mark.asyncio
 async def test_worker_health_is_secret_free_and_other_routes_require_auth(monkeypatch):
     from gpu_lab import literature_worker
 
@@ -284,10 +313,16 @@ async def test_worker_health_is_secret_free_and_other_routes_require_auth(monkey
     async with httpx.AsyncClient(transport=transport, base_url="http://worker") as client:
         health = await client.post("/health", json={})
         unauthorized = await client.post("/ask", json={"question": "q"})
+        non_ascii = await client.post(
+            "/ask",
+            json={"question": "q"},
+            headers={b"Authorization": b"Bearer t\xc3\xa9st"},
+        )
 
     assert health.json() == {"result": {"provider": "paperqa", "status": "ready"}}
     assert unauthorized.status_code == 401
     assert unauthorized.json()["error"]["type"] == "UNAUTHORIZED"
+    assert non_ascii.status_code == 401
 
 
 @pytest.mark.asyncio

@@ -140,7 +140,7 @@ class PaperQALiteratureProvider:
     def _normalize(self, question: str, answer: Any) -> LiteratureResult:
         raw = self._dump(answer)
         answer_text = self._first(raw, "formatted_answer", "answer")
-        contexts = raw.get("contexts") or raw.get("context", []) if isinstance(raw, dict) else []
+        contexts = (raw.get("contexts") or raw.get("context", [])) if isinstance(raw, dict) else []
         if isinstance(contexts, dict):
             contexts = list(contexts.values())
         elif not isinstance(contexts, (list, tuple)):
@@ -297,6 +297,12 @@ class HttpLiteratureProvider:
                 f"The isolated worker returned non-JSON status {response.status_code}",
                 retryable=response.status_code >= 500,
             ) from exc
+        if not isinstance(data, dict):
+            raise GPUError(
+                "LITERATURE_PROVIDER_INVALID_RESPONSE",
+                f"The isolated worker returned a non-object body with status {response.status_code}",
+                retryable=response.status_code >= 500,
+            )
         if data.get("error"):
             error = data["error"]
             raise GPUError(
@@ -309,6 +315,12 @@ class HttpLiteratureProvider:
                 "LITERATURE_PROVIDER_ERROR",
                 f"The isolated worker returned HTTP {response.status_code}",
                 retryable=response.status_code >= 500,
+            )
+        if "result" not in data:
+            raise GPUError(
+                "LITERATURE_PROVIDER_INVALID_RESPONSE",
+                "The isolated worker response is missing the result field",
+                retryable=False,
             )
         return data["result"]
 
@@ -383,7 +395,9 @@ class LiteratureService:
                 ).encode()
             ).hexdigest()
             existing_claims = self.store.search(project_id, claim_fingerprint, "Claim", 1)
-            if existing_claims:
+            if existing_claims and (
+                existing_claims[0]["data"].get("candidate_fingerprint") == claim_fingerprint
+            ):
                 claim = existing_claims[0]
             else:
                 claim = self.store.object_create(
@@ -514,7 +528,7 @@ class LiteratureService:
             ).encode()
         ).hexdigest()
         existing = self.store.search(project_id, fingerprint, "EvidenceUnit", 1)
-        if existing:
+        if existing and existing[0]["data"].get("candidate_fingerprint") == fingerprint:
             return existing[0]
         evidence = self.store.object_create(
             project_id,

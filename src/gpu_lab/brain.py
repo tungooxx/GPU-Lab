@@ -3,7 +3,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from .errors import GPUError
 from .research import ResearchStore
@@ -26,6 +26,15 @@ EDGE_STATUSES = {
     "REFUTED",
     "UNKNOWN",
 }
+CAUSAL_RELATIONS = {
+    "CAUSES",
+    "INFLUENCES",
+    "MEDIATES",
+    "ENABLES",
+    "INHIBITS",
+    "ASSOCIATED_WITH",
+    "TRANSMITS_INFORMATION_TO",
+}
 AGENDA_STATUSES = {"OPEN", "ACTIVE", "RESOLVED", "DEFERRED", "BLOCKED"}
 ACTION_TYPES = {
     "LITERATURE_SEARCH",
@@ -41,6 +50,7 @@ ACTION_TYPES = {
     "NOVELTY_CHECK",
     "CODE_INSPECTION",
 }
+APPROVAL_REQUIRED_ACTIONS = {"TRAINING_RUN", "CAUSAL_INTERVENTION", "ABLATION"}
 
 
 class ActionScore(BaseModel):
@@ -72,6 +82,8 @@ class ActionCandidate(BaseModel):
     required_resources: list[str] = Field(default_factory=list)
     score: ActionScore
     payload: dict[str, Any] = Field(default_factory=dict)
+    available: bool = True
+    blocked_reason: str | None = None
 
     def checked(self) -> "ActionCandidate":
         if self.action_type not in ACTION_TYPES:
@@ -80,7 +92,7 @@ class ActionCandidate(BaseModel):
 
     def persisted_data(self) -> dict[str, Any]:
         data = self.model_dump()
-        data["priority"] = self.score.priority
+        data["priority"] = self.score.priority if self.available else 0.0
         return data
 
 
@@ -130,10 +142,12 @@ class ResearchBrain:
         model = self._expect(world_model_id, "WorldModel")
         nodes = [self.store.object_get(item) for item in model["data"].get("node_ids", [])]
         edges = [self.store.object_get(item) for item in model["data"].get("edge_ids", [])]
-        versions = self.store.objects_list(model["project_id"], "WorldModelVersion")
-        versions = [
-            item for item in versions if item["data"].get("world_model_id") == world_model_id
-        ]
+        versions = self.store.objects_list(
+            model["project_id"],
+            "WorldModelVersion",
+            limit=None,
+            data_filters={"world_model_id": world_model_id},
+        )
         return {"world_model": model, "nodes": nodes, "edges": edges, "versions": versions}
 
     def world_entity_create(
@@ -157,9 +171,9 @@ class ResearchBrain:
         }
         if kind not in allowed:
             raise GPUError("INVALID_WORLD_ENTITY_KIND", kind)
-        model = self._expect(world_model_id, "WorldModel")
-        entity = self.store.object_create(
-            model["project_id"],
+        self._expect(world_model_id, "WorldModel")
+        created = self.store.world_model_child_create(
+            world_model_id,
             kind,
             {
                 "world_model_id": world_model_id,
@@ -168,22 +182,10 @@ class ResearchBrain:
                 "attributes": attributes or {},
             },
             f"{kind.upper()}_CREATED",
-            "IMPLEMENTED_UNVERIFIED",
+            "node_ids",
+            {"nodes_added": [name]},
         )
-        node_ids = [*model["data"].get("node_ids", []), entity["id"]]
-        updated = self.store.object_update(
-            world_model_id,
-            {"node_ids": node_ids},
-            model["status"],
-            "WORLD_MODEL_NODE_ADDED",
-        )
-        version = self._version_world_model(
-            {**model, "data": updated["data"]},
-            {"nodes_added": [entity["id"]]},
-            evidence_ids=[],
-            decision_id=None,
-        )
-        return {"entity": entity, "version": version}
+        return {"entity": created["child"], "version": created["version"]}
 
     def causal_edge_create(
         self,
@@ -199,6 +201,8 @@ class ResearchBrain:
     ) -> dict:
         if status not in EDGE_STATUSES:
             raise GPUError("INVALID_CAUSAL_EDGE_STATUS", status)
+        if relation not in CAUSAL_RELATIONS:
+            raise GPUError("INVALID_CAUSAL_RELATION", relation)
         model = self._expect(world_model_id, "WorldModel")
         source, target = self.store.object_get(source_id), self.store.object_get(target_id)
         if (
@@ -216,47 +220,40 @@ class ResearchBrain:
         predictions = list(dict.fromkeys(unresolved_prediction_ids or []))
         references = [*evidence, *predictions, *([decision_id] if decision_id else [])]
         self._validate_references(model["project_id"], references)
+        if decision_id:
+            self._expect(decision_id, "ResearchDecision")
         if (
             status in {"OBSERVED_ASSOCIATION", "INTERVENTION_SUPPORTED", "WEAKENED", "REFUTED"}
             and not evidence
         ):
             raise GPUError("CAUSAL_EDGE_EVIDENCE_REQUIRED", status)
-        if status == "HYPOTHESIZED_CAUSAL" and not (evidence or predictions):
+        if status in {"HYPOTHESIZED_CAUSAL", "UNKNOWN"} and not (evidence or predictions):
             raise GPUError(
                 "CAUSAL_EDGE_PROVENANCE_REQUIRED",
                 "Hypothesized edges need evidence or an unresolved prediction",
             )
-        edge = self.store.object_create(
-            model["project_id"],
-            "CausalEdge",
-            {
-                "world_model_id": world_model_id,
-                "source_id": source_id,
-                "target_id": target_id,
-                "relation": relation,
-                "edge_status": status,
-                "supporting_ids": supporting_ids or [],
-                "against_ids": against_ids or [],
-                "unresolved_prediction_ids": predictions,
-                "decision_id": decision_id,
-            },
-            "CAUSAL_EDGE_CREATED",
-            "IMPLEMENTED_UNVERIFIED",
-        )
-        edge_ids = [*model["data"].get("edge_ids", []), edge["id"]]
-        updated = self.store.object_update(
+        edge_data = {
+            "world_model_id": world_model_id,
+            "source_id": source_id,
+            "target_id": target_id,
+            "relation": relation,
+            "edge_status": status,
+            "supporting_ids": supporting_ids or [],
+            "against_ids": against_ids or [],
+            "unresolved_prediction_ids": predictions,
+            "decision_id": decision_id,
+        }
+        created = self.store.world_model_child_create(
             world_model_id,
-            {"edge_ids": edge_ids},
-            model["status"],
-            "WORLD_MODEL_EDGE_ADDED",
+            "CausalEdge",
+            edge_data,
+            "CAUSAL_EDGE_CREATED",
+            "edge_ids",
+            {"edges_added": [{"source_id": source_id, "target_id": target_id}]},
+            evidence,
+            decision_id,
         )
-        version = self._version_world_model(
-            {**model, "data": updated["data"]},
-            {"edges_added": [edge["id"]]},
-            evidence_ids=evidence,
-            decision_id=decision_id,
-        )
-        return {"edge": edge, "version": version}
+        return {"edge": created["child"], "version": created["version"]}
 
     def causal_edge_update(
         self,
@@ -278,9 +275,15 @@ class ResearchBrain:
         evidence = [*supporting, *against]
         references = [*evidence, *([decision_id] if decision_id else [])]
         self._validate_references(model["project_id"], references)
-        if status in {"INTERVENTION_SUPPORTED", "WEAKENED", "REFUTED"} and not evidence:
+        if decision_id:
+            self._expect(decision_id, "ResearchDecision")
+        if (
+            status
+            in {"OBSERVED_ASSOCIATION", "INTERVENTION_SUPPORTED", "WEAKENED", "REFUTED"}
+            and not evidence
+        ):
             raise GPUError("CAUSAL_EDGE_EVIDENCE_REQUIRED", status)
-        updated = self.store.object_update(
+        return self.store.causal_edge_update_atomic(
             edge_id,
             {
                 "edge_status": status,
@@ -290,30 +293,17 @@ class ResearchBrain:
                 "last_update_rationale": rationale,
             },
             "VERIFIED_REAL" if status == "INTERVENTION_SUPPORTED" else "RESULT_INSPECTED",
-            "CAUSAL_EDGE_STATUS_CHANGED",
-        )
-        version = self._version_world_model(
-            model,
             {
                 "edges_status_changed": [
                     {"edge_id": edge_id, "from": edge["data"]["edge_status"], "to": status}
                 ]
             },
-            evidence_ids=evidence,
-            decision_id=decision_id,
+            evidence,
+            decision_id,
         )
-        return {"edge": updated, "version": version}
 
     def agenda_create(self, project_id: str, name: str) -> dict:
-        existing = self.store.objects_list(project_id, "ResearchAgenda", {"ACTIVE"}, 1)
-        if existing:
-            return {**existing[0], "idempotent_replay": True}
-        return self.store.object_create(
-            project_id,
-            "ResearchAgenda",
-            {"name": name, "item_ids": []},
-            "RESEARCH_AGENDA_CREATED",
-        )
+        return self._json_safe(self.store.agenda_create_once(project_id, name))
 
     def agenda_item_create(
         self,
@@ -340,9 +330,8 @@ class ResearchBrain:
             if "action_type" not in candidate:
                 raise GPUError("INVALID_RESEARCH_ACTION_TYPE", "Candidate action_type is required")
             self._configured_candidate(candidate, question, blocking_hypothesis_ids or [])
-        item = self.store.object_create(
-            agenda["project_id"],
-            "AgendaItem",
+        return self.store.agenda_item_create_atomic(
+            agenda_id,
             {
                 "agenda_id": agenda_id,
                 "question": question,
@@ -355,20 +344,12 @@ class ResearchBrain:
                 "candidate_experiments": experiments,
                 "reproduction_required": reproduction_required,
             },
-            "AGENDA_ITEM_CREATED",
-            "OPEN",
         )
-        self.store.object_update(
-            agenda_id,
-            {"item_ids": [*agenda["data"].get("item_ids", []), item["id"]]},
-            "ACTIVE",
-            "RESEARCH_AGENDA_UPDATED",
-        )
-        return item
 
     def agenda_item_update(self, agenda_item_id: str, status: str, rationale: str) -> dict:
         if status not in AGENDA_STATUSES:
             raise GPUError("INVALID_AGENDA_STATUS", status)
+        self._expect(agenda_item_id, "AgendaItem")
         return self.store.object_update(
             agenda_item_id,
             {"status_rationale": rationale},
@@ -377,8 +358,8 @@ class ResearchBrain:
         )
 
     def _portfolio_data(self, project_id: str) -> dict:
-        hypotheses = self.store.objects_list(project_id, "Hypothesis")
-        negative = self.store.objects_list(project_id, "NegativeResult")
+        hypotheses = self.store.objects_list(project_id, "Hypothesis", limit=None)
+        negative = self.store.objects_list(project_id, "NegativeResult", limit=None)
         return {
             "active_hypothesis_ids": [
                 str(item["id"])
@@ -435,12 +416,13 @@ class ResearchBrain:
             ]
             raise GPUError("BRAIN_STATE_INCOMPLETE", "Missing: " + ", ".join(missing))
         model, agenda = models[0], agendas[0]
-        items = [
-            item
-            for item in self.store.objects_list(project_id, "AgendaItem")
-            if item["data"].get("agenda_id") == str(agenda["id"])
-            and item["status"] in {"OPEN", "ACTIVE", "BLOCKED"}
-        ]
+        items = self.store.objects_list(
+            project_id,
+            "AgendaItem",
+            {"OPEN", "ACTIVE", "BLOCKED"},
+            limit=None,
+            data_filters={"agenda_id": str(agenda["id"])},
+        )
         if not items:
             raise GPUError("RESEARCH_AGENDA_EMPTY", str(agenda["id"]))
         agenda_item = max(
@@ -453,21 +435,16 @@ class ResearchBrain:
         )
         related_dead = self._related_dead_ideas(project_id, hypotheses)
         candidates = self._candidate_actions(project_id, agenda_item, hypotheses)
-        persisted = []
-        for candidate in candidates:
-            action = self.store.object_create(
-                project_id,
-                "ResearchActionCandidate",
-                {
-                    **candidate.persisted_data(),
-                    "brain_step_id": brain_step_id,
-                    "agenda_item_id": str(agenda_item["id"]),
-                },
-                "RESEARCH_ACTION_CANDIDATE_CREATED",
-                "PROPOSED",
-            )
-            persisted.append({**candidate.persisted_data(), "id": action["id"]})
-        selected = max(persisted, key=lambda item: item["priority"])
+        candidate_data = [
+            {
+                **candidate.persisted_data(),
+                "brain_step_id": brain_step_id,
+                "agenda_item_id": str(agenda_item["id"]),
+            }
+            for candidate in candidates
+        ]
+        selected_index = max(range(len(candidate_data)), key=lambda index: candidate_data[index]["priority"])
+        selected = candidate_data[selected_index]
         decision_data = {
             "request_id": request_id,
             "brain_step_id": brain_step_id,
@@ -483,9 +460,6 @@ class ResearchBrain:
             "evidence_considered": self._evidence_ids(state),
             "hypotheses_affected": [str(item["id"]) for item in hypotheses],
             "dead_ideas_retrieved": related_dead,
-            "candidate_action_ids": [item["id"] for item in persisted],
-            "candidate_actions": persisted,
-            "selected_action": selected,
             "rationale": self._decision_rationale(selected, related_dead),
             "expected_information_gain": self._information_gain_label(
                 selected["score"]["expected_information_gain"]
@@ -503,13 +477,15 @@ class ResearchBrain:
             "duration_ms": 0,
         }
         decision_data["duration_ms"] = int((datetime.now(UTC) - started).total_seconds() * 1000)
-        decision = self.store.object_create(
+        persisted_step = self.store.brain_decision_create(
             project_id,
-            "ResearchDecision",
+            candidate_data,
+            selected_index,
             decision_data,
-            "RESEARCH_DECISION_SELECTED",
-            "SELECTED",
         )
+        decision = persisted_step["decision"]
+        persisted = persisted_step["candidates"]
+        selected = persisted_step["selected"]
         return {
             "brain_step_id": brain_step_id,
             "decision_id": decision["id"],
@@ -525,8 +501,59 @@ class ResearchBrain:
             "expected_information_gain": decision_data["expected_information_gain"],
             "estimated_cost": decision_data["estimated_cost"],
             "requires_human_approval": selected["action_type"]
-            in {"TRAINING_RUN", "CAUSAL_INTERVENTION", "ABLATION"},
+            in APPROVAL_REQUIRED_ACTIONS,
             "verification_status": "IMPLEMENTED_UNVERIFIED",
+        }
+
+    def decision_approve(self, decision_id: str, approver: str, rationale: str) -> dict:
+        """Record explicit human approval for the selected bounded research action."""
+        decision = self._expect(decision_id, "ResearchDecision")
+        if decision["status"] not in {"SELECTED", "APPROVED"}:
+            raise GPUError("RESEARCH_DECISION_NOT_APPROVABLE", decision["status"])
+        if not approver.strip() or not rationale.strip():
+            raise GPUError("RESEARCH_APPROVAL_INCOMPLETE", "Approver and rationale are required")
+        if decision["status"] == "APPROVED":
+            return {**decision, "idempotent_replay": True}
+        return self.store.object_update(
+            decision_id,
+            {
+                "approval": {
+                    "approver": approver.strip(),
+                    "rationale": rationale.strip(),
+                    "approved_at": datetime.now(UTC).isoformat(),
+                    "selected_action_id": decision["data"]["selected_action"]["id"],
+                }
+            },
+            "APPROVED",
+            "RESEARCH_DECISION_APPROVED",
+        )
+
+    def authorize_execution(self, experiment_id: str, decision_id: str) -> dict:
+        """Verify that an execution matches its decision and has required human approval."""
+        experiment = self._expect(experiment_id, "Experiment")
+        decision = self._expect(decision_id, "ResearchDecision")
+        if str(experiment["project_id"]) != str(decision["project_id"]):
+            raise GPUError("RESEARCH_PROJECT_MISMATCH", "Experiment and decision differ")
+        hypothesis_id = str(experiment["data"].get("hypothesis_id"))
+        if hypothesis_id not in {str(item) for item in decision["data"].get("hypotheses_affected", [])}:
+            raise GPUError("RESEARCH_DECISION_MISMATCH", "Decision does not cover the hypothesis")
+        selected = decision["data"].get("selected_action", {})
+        plan = experiment["data"].get("plan", {})
+        if selected.get("question_addressed") != plan.get("research_question"):
+            raise GPUError("RESEARCH_DECISION_MISMATCH", "Decision question differs from the plan")
+        requires_approval = selected.get("action_type") in APPROVAL_REQUIRED_ACTIONS
+        approval = decision["data"].get("approval")
+        if requires_approval and (
+            decision["status"] != "APPROVED"
+            or not approval
+            or approval.get("selected_action_id") != selected.get("id")
+        ):
+            raise GPUError("RESEARCH_APPROVAL_REQUIRED", selected.get("action_type", "UNKNOWN"))
+        return {
+            "decision_id": decision_id,
+            "action_type": selected.get("action_type"),
+            "requires_human_approval": requires_approval,
+            "approved": decision["status"] == "APPROVED",
         }
 
     def result_assess(
@@ -537,6 +564,7 @@ class ResearchBrain:
         agenda_item_id: str,
         prediction_outcome: str,
         guard_condition_outcome: str,
+        condition_evaluations: dict[str, bool],
         evidence_supporting: list[str],
         evidence_against: list[str],
         unexpected_observations: list[str],
@@ -557,8 +585,45 @@ class ResearchBrain:
             str(item["project_id"]) != project_id for item in (decision, hypothesis, agenda_item)
         ):
             raise GPUError("RESEARCH_PROJECT_MISMATCH", "Assessment inputs must share a project")
-        if run["status"] not in {"completed", "RESULT_NOT_INSPECTED"}:
+        if run["status"] not in {
+            "completed",
+            "RESULT_NOT_INSPECTED",
+            "failed",
+            "cancelled",
+            "unknown",
+            "RESULT_INSPECTED",
+        }:
             raise GPUError("EXPERIMENT_RESULT_NOT_READY", run["status"])
+        if str(decision["data"].get("agenda_item_id")) != agenda_item_id:
+            raise GPUError("RESEARCH_DECISION_MISMATCH", "Agenda item differs from decision")
+        if hypothesis_id not in {
+            str(item) for item in decision["data"].get("hypotheses_affected", [])
+        }:
+            raise GPUError("RESEARCH_DECISION_MISMATCH", "Hypothesis differs from decision")
+        if str(run["data"].get("decision_id")) != decision_id:
+            raise GPUError("RESEARCH_DECISION_MISMATCH", "Run was not authorized by this decision")
+        experiment_id = str(run["data"].get("experiment_id"))
+        experiment = self._expect(experiment_id, "Experiment")
+        if str(experiment["data"].get("hypothesis_id")) != hypothesis_id:
+            raise GPUError("EXPERIMENT_HYPOTHESIS_MISMATCH", hypothesis_id)
+        pass_condition = experiment["data"].get("plan", {}).get("pass_condition")
+        predictions = self.store.objects_list(
+            project_id,
+            "Prediction",
+            limit=None,
+            data_filters={"experiment_id": experiment_id, "frozen": True},
+        )
+        if not pass_condition or not predictions:
+            raise GPUError("EXPERIMENT_GUARD_NOT_PREREGISTERED", experiment_id)
+        if any(item["data"].get("pass_condition") != pass_condition for item in predictions):
+            raise GPUError("EXPERIMENT_GUARD_MISMATCH", experiment_id)
+        if set(condition_evaluations) != {pass_condition} or not all(
+            isinstance(value, bool) for value in condition_evaluations.values()
+        ):
+            raise GPUError(
+                "EXPERIMENT_GUARD_EVALUATION_INVALID",
+                "Evaluate the exact frozen pass_condition once with a boolean result",
+            )
         allowed_transitions = {
             "SUPPORTED",
             "WEAKENED",
@@ -569,127 +634,96 @@ class ResearchBrain:
         }
         if hypothesis_transition not in allowed_transitions:
             raise GPUError("INVALID_SCIENTIFIC_STATUS", hypothesis_transition)
-        guard_passed = guard_condition_outcome.strip().upper() in {
-            "PASS",
-            "PASSED",
-            "SATISFIED",
-        } or guard_condition_outcome.strip().upper().startswith(("PASS:", "PASSED:"))
+        if actual_information_gain not in {"HIGH", "MEDIUM", "LOW"}:
+            raise GPUError("INVALID_INFORMATION_GAIN", actual_information_gain)
+        guard_passed = condition_evaluations[pass_condition]
+        successful_run = run["status"] in {"completed", "RESULT_NOT_INSPECTED"}
         if hypothesis_transition in {"SUPPORTED", "SURVIVES_INITIAL_TEST"} and not guard_passed:
             raise GPUError(
                 "EXPERIMENT_GUARD_NOT_PASSED",
-                "Positive scientific transitions require an explicitly passed guard condition",
+                "Positive transitions require the frozen pass condition to evaluate true",
             )
-        evidence = self.store.object_create(
-            project_id,
-            "EvidenceUnit",
-            {
-                "source_type": "ExperimentRun",
-                "run_id": run_id,
-                "experiment_id": run["data"].get("experiment_id"),
-                "job_id": run["data"].get("job_id"),
-                "prediction_outcome": prediction_outcome,
-                "guard_condition_outcome": guard_condition_outcome,
-                "supporting_observations": evidence_supporting,
-                "against_observations": evidence_against,
-                "unexpected_observations": unexpected_observations,
-                "alternative_explanations": alternative_explanations,
-                "scope": scope,
-                "artifacts": run["data"].get("artifacts", []),
-                "exit_code": run["data"].get("exit_code"),
-                "extraction_method": "explicit_result_assessment",
-                "extracted_at": datetime.now(UTC).isoformat(),
-            },
-            "EXPERIMENT_EVIDENCE_INSPECTED",
-            "VERIFIED_REAL",
-        )
-        assessed_hypothesis = self.store.assess(hypothesis_id, hypothesis_transition, rationale)
-        inspected_run = self.store.object_update(
-            run_id,
-            {
-                "inspection": {
-                    "evidence_id": evidence["id"],
-                    "decision_id": decision_id,
-                    "prediction_outcome": prediction_outcome,
-                    "guard_condition_outcome": guard_condition_outcome,
-                    "scope": scope,
-                }
-            },
-            "RESULT_INSPECTED",
-            "EXPERIMENT_RESULT_INSPECTED",
-        )
-        agenda = self.agenda_item_update(
-            agenda_item_id,
-            "RESOLVED" if hypothesis_transition != "INCONCLUSIVE" else "ACTIVE",
-            rationale,
-        )
-        edge_update = None
+        if hypothesis_transition in {"SUPPORTED", "SURVIVES_INITIAL_TEST"} and not successful_run:
+            raise GPUError(
+                "FAILED_RUN_CANNOT_SUPPORT_HYPOTHESIS",
+                "Failed, cancelled, and unknown runs may only weaken, refute, block, or remain inconclusive",
+            )
         if causal_edge_id or causal_edge_status:
             if not causal_edge_id or not causal_edge_status:
                 raise GPUError(
                     "CAUSAL_EDGE_UPDATE_INCOMPLETE", "Both causal_edge_id and status are required"
                 )
-            supporting = [evidence["id"]] if causal_edge_status == "INTERVENTION_SUPPORTED" else []
-            against = [evidence["id"]] if causal_edge_status in {"WEAKENED", "REFUTED"} else []
-            edge_update = self.causal_edge_update(
-                causal_edge_id,
-                causal_edge_status,
-                rationale,
-                supporting,
-                against,
-                decision_id,
-            )
-        updated_decision = self.store.object_update(
-            decision_id,
-            {
-                "actual_information_gain": actual_information_gain,
-                "outcome": {
-                    "run_id": run_id,
-                    "evidence_id": evidence["id"],
-                    "hypothesis_transition": hypothesis_transition,
-                    "prediction_outcome": prediction_outcome,
-                },
-                "hindsight_assessment": rationale,
-            },
-            "COMPLETED",
-            "RESEARCH_DECISION_OUTCOME_RECORDED",
-        )
-        self.store.project_state_update(
-            project_id,
-            {
-                "highest_value_unknown": None,
-                "established_facts": [
-                    *self.store.state_get(project_id)["state"].get("established_facts", []),
-                    {
-                        "evidence_id": evidence["id"],
-                        "statement": prediction_outcome,
-                        "scope": scope,
-                        "verification_status": "VERIFIED_REAL",
-                    },
-                ],
-            },
-        )
-        return {
-            "run": inspected_run,
-            "evidence": evidence,
-            "hypothesis": assessed_hypothesis,
-            "agenda_item": agenda,
-            "world_model_update": edge_update,
-            "decision": updated_decision,
-            "verification_status": "RESULT_INSPECTED",
+            if causal_edge_status == "INTERVENTION_SUPPORTED" and not successful_run:
+                raise GPUError("FAILED_RUN_CANNOT_SUPPORT_CAUSAL_EDGE", run["status"])
+            if causal_edge_status not in EDGE_STATUSES:
+                raise GPUError("INVALID_CAUSAL_EDGE_STATUS", causal_edge_status)
+            edge = self._expect(causal_edge_id, "CausalEdge")
+            if str(edge["project_id"]) != project_id:
+                raise GPUError("RESEARCH_PROJECT_MISMATCH", causal_edge_id)
+        evidence_data = {
+            "source_type": "ExperimentRun",
+            "run_id": run_id,
+            "experiment_id": experiment_id,
+            "job_id": run["data"].get("job_id"),
+            "prediction_outcome": prediction_outcome,
+            "guard_condition_outcome": guard_condition_outcome,
+            "frozen_pass_condition": pass_condition,
+            "condition_evaluations": condition_evaluations,
+            "guard_passed": guard_passed,
+            "supporting_observations": evidence_supporting,
+            "against_observations": evidence_against,
+            "unexpected_observations": unexpected_observations,
+            "alternative_explanations": alternative_explanations,
+            "scope": scope,
+            "artifacts": run["data"].get("artifacts", []),
+            "exit_code": run["data"].get("exit_code"),
+            "extraction_method": "explicit_result_assessment",
+            "extracted_at": datetime.now(UTC).isoformat(),
         }
+        result = self.store.result_assessment_apply(
+            run_id=run_id,
+            decision_id=decision_id,
+            hypothesis_id=hypothesis_id,
+            agenda_item_id=agenda_item_id,
+            evidence_data=evidence_data,
+            hypothesis_transition=hypothesis_transition,
+            rationale=rationale,
+            inspection={
+                "decision_id": decision_id,
+                "prediction_outcome": prediction_outcome,
+                "guard_condition_outcome": guard_condition_outcome,
+                "frozen_pass_condition": pass_condition,
+                "condition_evaluations": condition_evaluations,
+                "guard_passed": guard_passed,
+                "scope": scope,
+            },
+            agenda_status="RESOLVED" if hypothesis_transition != "INCONCLUSIVE" else "ACTIVE",
+            actual_information_gain=actual_information_gain,
+            causal_edge_id=causal_edge_id,
+            causal_edge_status=causal_edge_status,
+        )
+        return {**result, "verification_status": "RESULT_INSPECTED"}
 
     def _candidate_actions(
         self, project_id: str, agenda_item: dict, hypotheses: list[dict]
     ) -> list[ActionCandidate]:
-        runs = self.store.objects_list(project_id, "ExperimentRun")
+        runs = self.store.objects_list(
+            project_id,
+            "ExperimentRun",
+            {"completed", "RESULT_NOT_INSPECTED", "RESERVED", "running", "unknown", "failed", "cancelled"},
+            limit=None,
+        )
         uninspected = [
             run
             for run in runs
             if run["status"] in {"completed", "RESULT_NOT_INSPECTED"}
             and not run["data"].get("inspection")
         ]
-        unfinished = [
-            run for run in runs if run["status"] in {"RESERVED", "SUBMITTED", "running", "unknown"}
+        unfinished = [run for run in runs if run["status"] in {"RESERVED", "running", "unknown"}]
+        failed_uninspected = [
+            run
+            for run in runs
+            if run["status"] in {"failed", "cancelled"} and not run["data"].get("inspection")
         ]
         question = agenda_item["data"]["question"]
         hypothesis_ids = [str(item["id"]) for item in hypotheses]
@@ -706,6 +740,29 @@ class ResearchBrain:
                         scientific_importance=5,
                         expected_discrimination=5,
                         expected_information_gain=5,
+                        feasibility=5,
+                        compute_cost=0.1,
+                        engineering_cost=0.2,
+                        execution_risk=0.1,
+                    ),
+                ).checked()
+            ]
+        if failed_uninspected:
+            return [
+                ActionCandidate(
+                    action_type="ARTIFACT_ANALYSIS",
+                    question_addressed=question,
+                    hypotheses_discriminated=hypothesis_ids,
+                    predicted_outcomes=["Inspect failure evidence and preserve negative knowledge"],
+                    required_resources=["experiment logs", "failure artifacts"],
+                    payload={
+                        "run_id": str(failed_uninspected[0]["id"]),
+                        "mode": "INSPECT_FAILURE",
+                    },
+                    score=ActionScore(
+                        scientific_importance=5,
+                        expected_discrimination=4,
+                        expected_information_gain=4,
                         feasibility=5,
                         compute_cost=0.1,
                         engineering_cost=0.2,
@@ -788,12 +845,8 @@ class ResearchBrain:
                     ),
                 ).checked()
             ]
-        candidates = [
-            self._configured_candidate(item, question, hypothesis_ids)
-            for item in configured
-            if item.get("available", True)
-        ]
-        if candidates:
+        candidates = [self._configured_candidate(item, question, hypothesis_ids) for item in configured]
+        if any(candidate.available for candidate in candidates):
             return candidates
         if configured:
             return [
@@ -826,7 +879,8 @@ class ResearchBrain:
                         engineering_cost=0.5,
                         execution_risk=0.2,
                     ),
-                ).checked()
+                ).checked(),
+                *candidates,
             ]
         return [
             ActionCandidate(
@@ -868,29 +922,58 @@ class ResearchBrain:
         item: dict[str, Any], question: str, hypothesis_ids: list[str]
     ) -> ActionCandidate:
         score = item.get("score", {})
-        return ActionCandidate(
-            action_type=item["action_type"],
-            question_addressed=item.get("question_addressed", question),
-            hypotheses_discriminated=item.get("hypotheses_discriminated", hypothesis_ids),
-            predicted_outcomes=item.get("predicted_outcomes", []),
-            required_resources=item.get("required_resources", []),
-            payload=item.get("payload", {}),
-            score=ActionScore(
-                scientific_importance=score.get("scientific_importance", 3),
-                expected_discrimination=score.get("expected_discrimination", 3),
-                expected_information_gain=score.get("expected_information_gain", 3),
-                feasibility=score.get("feasibility", 3),
-                compute_cost=score.get("compute_cost", 1),
-                engineering_cost=score.get("engineering_cost", 1),
-                execution_risk=score.get("execution_risk", 1),
-            ),
-        ).checked()
+        try:
+            return ActionCandidate(
+                action_type=item["action_type"],
+                question_addressed=item.get("question_addressed", question),
+                hypotheses_discriminated=item.get("hypotheses_discriminated", hypothesis_ids),
+                predicted_outcomes=item.get("predicted_outcomes", []),
+                required_resources=item.get("required_resources", []),
+                payload=item.get("payload", {}),
+                available=item.get("available", True),
+                blocked_reason=item.get("blocked_reason"),
+                score=ActionScore(
+                    scientific_importance=score.get("scientific_importance", 3),
+                    expected_discrimination=score.get("expected_discrimination", 3),
+                    expected_information_gain=score.get("expected_information_gain", 3),
+                    feasibility=score.get("feasibility", 3),
+                    compute_cost=score.get("compute_cost", 1),
+                    engineering_cost=score.get("engineering_cost", 1),
+                    execution_risk=score.get("execution_risk", 1),
+                ),
+            ).checked()
+        except (KeyError, ValidationError) as exc:
+            raise GPUError("INVALID_RESEARCH_ACTION", str(exc)) from exc
 
     def _related_dead_ideas(self, project_id: str, hypotheses: list[dict]) -> list[dict]:
         found: dict[str, dict] = {}
+        candidates = [
+            *self.store.objects_list(project_id, "Hypothesis", limit=None),
+            *self.store.objects_list(project_id, "NegativeResult", limit=None),
+        ]
         for hypothesis in hypotheses:
             mechanism = hypothesis["data"].get("mechanism", "")
-            for related in self.store.related_hypotheses(project_id, mechanism, 20):
+            query_terms = self.store._terms(mechanism)
+            scored = []
+            for related in candidates:
+                text = related["data"].get("mechanism") or related["data"].get("proposal", "")
+                terms = self.store._terms(text)
+                union = query_terms | terms
+                overlap = len(query_terms & terms) / len(union) if union else 0.0
+                if overlap:
+                    scored.append(
+                        {
+                            **related,
+                            "lexical_similarity": round(overlap, 3),
+                            "containment_similarity": round(
+                                len(query_terms & terms) / len(query_terms) if query_terms else 0.0,
+                                3,
+                            ),
+                        }
+                    )
+            for related in sorted(
+                scored, key=lambda item: item["lexical_similarity"], reverse=True
+            )[:20]:
                 if related["kind"] == "NegativeResult" or related["status"] == "REFUTED":
                     found[str(related["id"])] = {
                         "id": str(related["id"]),
@@ -935,8 +1018,12 @@ class ResearchBrain:
         return version
 
     def _validate_references(self, project_id: str, identifiers: list[str]) -> None:
-        for identifier in identifiers:
-            item = self.store.object_get(identifier)
+        unique = list(dict.fromkeys(identifiers))
+        records = self.store.references_get(unique)
+        for identifier in unique:
+            item = records.get(str(identifier))
+            if not item:
+                raise GPUError("RESEARCH_OBJECT_NOT_FOUND", identifier)
             if str(item["project_id"]) != str(project_id):
                 raise GPUError("RESEARCH_PROJECT_MISMATCH", identifier)
 

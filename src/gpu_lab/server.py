@@ -4,6 +4,7 @@ import inspect
 import json
 import logging
 import re
+import threading
 import time
 from typing import Any
 
@@ -34,6 +35,7 @@ settings, service, research_store, research_brain, literature_service = (
     None,
     None,
 )
+_singleton_lock = threading.RLock()
 instructions = (
     "Safe, structured remote GPU experiment control plane. Credentials are never returned."
 )
@@ -190,14 +192,18 @@ def research() -> ResearchStore:
     if not settings.gpu_lab_research_database_url:
         raise GPUError("RESEARCH_DATABASE_NOT_CONFIGURED", "Set GPU_LAB_RESEARCH_DATABASE_URL")
     if research_store is None:
-        research_store = ResearchStore(settings.gpu_lab_research_database_url)
+        with _singleton_lock:
+            if research_store is None:
+                research_store = ResearchStore(settings.gpu_lab_research_database_url)
     return research_store
 
 
 def brain() -> ResearchBrain:
     global research_brain
     if research_brain is None:
-        research_brain = ResearchBrain(research())
+        with _singleton_lock:
+            if research_brain is None:
+                research_brain = ResearchBrain(research())
     return research_brain
 
 
@@ -209,13 +215,15 @@ def literature() -> LiteratureService:
             "Start the isolated literature profile and set provider=paperqa-http.",
         )
     if literature_service is None:
-        literature_service = LiteratureService(
-            research(),
-            HttpLiteratureProvider(
-                settings.gpu_lab_literature_worker_url,
-                settings.gpu_lab_literature_worker_token or "",
-            ),
-        )
+        with _singleton_lock:
+            if literature_service is None:
+                literature_service = LiteratureService(
+                    research(),
+                    HttpLiteratureProvider(
+                        settings.gpu_lab_literature_worker_url,
+                        settings.gpu_lab_literature_worker_token or "",
+                    ),
+                )
     return literature_service
 
 
@@ -270,8 +278,8 @@ def scrub(value):
         return [scrub(item) for item in value]
     if isinstance(value, str):
         return re.sub(
-            r"(?i)(bearer|token|api[_-]?key|password)\\s*[=:]\\s*[^\\s'\\\"]+",
-            r"\\1=[REDACTED]",
+            r"(?i)(bearer\s+|token\s*[=:]\s*|api[_-]?key\s*[=:]\s*|password\s*[=:]\s*)[^\s'\"]+",
+            r"\1[REDACTED]",
             value,
         )[:4096]
     return value
@@ -538,6 +546,12 @@ async def brain_step(project_id: str):
 
 
 @mcp.tool()
+async def brain_decision_approve(decision_id: str, approver: str, rationale: str):
+    """Record explicit human approval for the exact selected Brain action."""
+    return await call(brain().decision_approve, decision_id, approver, rationale)
+
+
+@mcp.tool()
 async def brain_result_assess(
     run_id: str,
     decision_id: str,
@@ -545,6 +559,7 @@ async def brain_result_assess(
     agenda_item_id: str,
     prediction_outcome: str,
     guard_condition_outcome: str,
+    condition_evaluations: dict[str, bool],
     evidence_supporting: list[str],
     evidence_against: list[str],
     unexpected_observations: list[str],
@@ -559,22 +574,23 @@ async def brain_result_assess(
     """Inspect a real result and explicitly update evidence, belief, agenda, and WorldModel."""
     return await call(
         brain().result_assess,
-        run_id,
-        decision_id,
-        hypothesis_id,
-        agenda_item_id,
-        prediction_outcome,
-        guard_condition_outcome,
-        evidence_supporting,
-        evidence_against,
-        unexpected_observations,
-        alternative_explanations,
-        scope,
-        hypothesis_transition,
-        rationale,
-        causal_edge_id,
-        causal_edge_status,
-        actual_information_gain,
+        run_id=run_id,
+        decision_id=decision_id,
+        hypothesis_id=hypothesis_id,
+        agenda_item_id=agenda_item_id,
+        prediction_outcome=prediction_outcome,
+        guard_condition_outcome=guard_condition_outcome,
+        condition_evaluations=condition_evaluations,
+        evidence_supporting=evidence_supporting,
+        evidence_against=evidence_against,
+        unexpected_observations=unexpected_observations,
+        alternative_explanations=alternative_explanations,
+        scope=scope,
+        hypothesis_transition=hypothesis_transition,
+        rationale=rationale,
+        causal_edge_id=causal_edge_id,
+        causal_edge_status=causal_edge_status,
+        actual_information_gain=actual_information_gain,
     )
 
 
@@ -936,12 +952,13 @@ async def literature_provider_status():
     }
     if settings.gpu_lab_literature_provider != "paperqa-http":
         return {**result, "status": "disabled"}
-    try:
-        result["worker"] = await literature().provider.health()
+    worker = await call(literature().provider.health)
+    if "error" not in worker:
+        result["worker"] = worker
         result["status"] = "ready"
-    except GPUError as exc:
+    else:
         result["status"] = "unavailable"
-        result["error"] = exc.response()["error"]
+        result["error"] = worker["error"]
     return result
 
 
@@ -1302,6 +1319,7 @@ async def reproduction_compare(
 @mcp.tool()
 async def research_experiment_execute(
     experiment_id: str,
+    decision_id: str,
     command: str,
     working_directory: str = ".",
     env: dict[str, str] | None = None,
@@ -1313,6 +1331,7 @@ async def research_experiment_execute(
         return {"error": {"type": "LOCAL_RUNNER_DISABLED"}}
     request = {
         "experiment_id": experiment_id,
+        "decision_id": decision_id,
         "command": command,
         "working_directory": working_directory,
         "env": env or {},
@@ -1333,6 +1352,7 @@ async def research_experiment_execute(
         fingerprint,
         {
             "executor": "local",
+            "decision_id": decision_id,
             "command": command,
             "working_directory": working_directory,
             "environment": env or {},
@@ -1341,6 +1361,17 @@ async def research_experiment_execute(
     )
     if "error" in reservation:
         return reservation
+    authorization = await call(brain().authorize_execution, experiment_id, decision_id)
+    if "error" in authorization:
+        return {
+            "experiment_id": reservation["experiment_id"],
+            "run_id": reservation["run_id"],
+            "job_id": reservation["job_id"],
+            "idempotency_key": reservation["idempotency_key"],
+            "status": "RESERVED",
+            "authorization_error": authorization["error"],
+            "retry_safe": True,
+        }
     job = await call(
         local.submit,
         command,

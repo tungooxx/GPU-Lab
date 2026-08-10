@@ -5,7 +5,7 @@ import pytest
 from gpu_lab.config import Settings
 from gpu_lab.db import Repository
 from gpu_lab.local_runner import LocalRunner
-from gpu_lab.server import _normalise_mcp_accept_header
+from gpu_lab.server import _normalise_mcp_accept_header, scrub
 
 
 class _Process:
@@ -46,6 +46,17 @@ def test_mcp_wildcard_accept_header_allows_json_response():
         (b"accept", b"application/json"),
         (b"content-type", b"application/json"),
     ]
+
+
+def test_audit_scrub_redacts_bearer_and_assignment_credentials():
+    value = "Authorization: Bearer top-secret api_key=abc password:xyz token=qwerty"
+
+    scrubbed = scrub(value)
+
+    assert "top-secret" not in scrubbed
+    assert "abc" not in scrubbed
+    assert "xyz" not in scrubbed
+    assert "qwerty" not in scrubbed
 
 
 @pytest.mark.asyncio

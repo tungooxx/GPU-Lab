@@ -72,6 +72,13 @@ def wait_for_experiment(job_id: str) -> dict:
     raise TimeoutError("Experiment did not reach a terminal execution state")
 
 
+def read_json_artifact(job_id: str, path: str) -> dict:
+    artifact = call_tool("local_artifact_read", {"job_id": job_id, "path": path})
+    if artifact.get("truncated"):
+        raise AssertionError(f"Artifact was truncated: {path}")
+    return json.loads(artifact["content"])
+
+
 def main() -> None:
     wait_for_server()
     nonce = uuid.uuid4().hex[:10]
@@ -103,8 +110,8 @@ def main() -> None:
             "commit": "smoke-fixture",
             "dataset": "saved prediction fixture",
             "checkpoint": "canonical VRC runtime",
-            "evaluation_command": "CUDA availability and deterministic metric smoke",
-            "reported_metric": {"name": "baseline_metric", "value": 1.0},
+            "evaluation_command": "Reload one saved VRCNet prediction and verify exact equality",
+            "reported_metric": {"name": "native_reconstruction_maxabs", "value": 0.0},
             "tolerance": 0.0,
         },
     )
@@ -113,18 +120,42 @@ def main() -> None:
         {
             "reproduction_id": reproduction["id"],
             "python_env": "vrc-py313-torch260-cu124",
+            "working_directory": "/workspace/local-vlm",
+            "env": {"PYTHONPATH": "/opt/gpu-lab/envs/vrc-analysis-deps"},
             "command": (
-                "python -c \"import torch; assert torch.cuda.is_available(); "
-                "x=torch.ones(1, device='cuda'); print('baseline_metric=', float(x.item()))\""
+                "mkdir -p \"$GPU_LAB_JOB_DIR/artifacts\"\n"
+                "python - <<'PY'\n"
+                "import json, os, sys, numpy as np, torch\n"
+                "sys.path.insert(0, 'scripts')\n"
+                "from run_hasi1_hierarchical_splices import state, out\n"
+                "from run_stage6k_decoder_entry_mediation import ARRAYS, load_model\n"
+                "assert torch.cuda.is_available()\n"
+                "model=load_model(); uid='novel_0148'; view=5; root=ARRAYS/uid\n"
+                "inp=np.load(root/f'view_{view:02d}_input.npy').astype('float32')\n"
+                "saved=np.load(root/f'view_{view:02d}_pred.npy').astype('float32')\n"
+                "current=out(state(model, inp)[0].fine).astype('float32')\n"
+                "result={'native_reconstruction_maxabs': float(np.abs(current-saved).max()), "
+                "'gpu': torch.cuda.get_device_name(0), 'torch': torch.__version__}\n"
+                "with open(os.path.join(os.environ['GPU_LAB_JOB_DIR'],'artifacts','baseline.json'),'w') as h: json.dump(result,h)\n"
+                "print(json.dumps(result))\n"
+                "PY"
             ),
         },
     )
     reproduction_run = wait_for_reproduction(reproduction["id"])
     if reproduction_run["status"] != "PARTIAL":
         raise AssertionError(reproduction_run)
+    baseline = read_json_artifact(
+        reproduction_run["data"]["job_id"], "artifacts/baseline.json"
+    )
+    if baseline["gpu"] != "NVIDIA GeForce GTX 1650":
+        raise AssertionError(baseline)
     reproduced = call_tool(
         "reproduction_compare",
-        {"reproduction_id": reproduction["id"], "observed_metric": 1.0},
+        {
+            "reproduction_id": reproduction["id"],
+            "observed_metric": baseline["native_reconstruction_maxabs"],
+        },
     )
     if reproduced["status"] != "REPRODUCED":
         raise AssertionError(reproduced)
@@ -317,15 +348,15 @@ def main() -> None:
             "hypothesis_id": hypothesis["id"],
             "plan": {
                 "research_question": causal_item["data"]["question"],
-                "prediction": "CUDA state substitution fixture produces the preregistered effect",
+                "prediction": "Frozen VRCNet hierarchical state substitution changes the recipient output",
                 "alternative_hypotheses": [alternative["id"]],
-                "intervention": "Run the frozen CUDA substitution fixture",
-                "control": "Unmodified CUDA tensor",
-                "primary_metric": "effect",
-                "secondary_metrics": ["CUDA availability", "runtime identity"],
+                "intervention": "Run the frozen HASI hierarchical-state splices",
+                "control": "Native saved VRCNet predictions for the same fixture views",
+                "primary_metric": "max_recipient_effect_R",
+                "secondary_metrics": ["native_reconstruction_maxabs", "GPU identity"],
                 "expected_direction": "positive",
-                "pass_condition": "effect == 1.0 and CUDA is available",
-                "fail_condition": "effect != 1.0 or CUDA is unavailable",
+                "pass_condition": "native_reconstruction_maxabs == 0 and max_recipient_effect_R > 0 on NVIDIA GeForce GTX 1650",
+                "fail_condition": "native reconstruction differs, no recipient effect is measured, or GPU identity differs",
                 "interpretation_if_pass": "Supports the scoped causal edge in this fixture only",
                 "interpretation_if_fail": "Weakens the scoped causal edge",
                 "estimated_runtime_minutes": 1,
@@ -334,49 +365,50 @@ def main() -> None:
         },
     )
     attempt = str(uuid.uuid4())
+    experiment_command = (
+        "set -e\n"
+        "mkdir -p \"$GPU_LAB_JOB_DIR/artifacts\"\n"
+        "python - <<'PY'\n"
+        "import json, os, sys, torch\n"
+        "sys.path.insert(0, 'scripts')\n"
+        "from run_hasi1_hierarchical_splices import load_model, runpair\n"
+        "assert torch.cuda.is_available()\n"
+        "rows, states, _ = runpair(load_model(), 'novel_0148', 5, 18, 'strict_residual')\n"
+        "result={'status':'completed','fixture':'novel_0148:5->18',"
+        "'native_reconstruction_maxabs':max(float(row['native_reconstruction_maxabs']) for row in rows),"
+        "'max_recipient_effect_R':max(float(row['R']) for row in rows),"
+        "'rows':len(rows),'state_rows':len(states),'gpu':torch.cuda.get_device_name(0)}\n"
+        "with open(os.path.join(os.environ['GPU_LAB_JOB_DIR'],'artifacts','result.json'),'w') as h: json.dump(result,h)\n"
+        "print(json.dumps(result))\n"
+        "PY"
+    )
+    execution_arguments = {
+        "experiment_id": plan["id"],
+        "decision_id": before["decision_id"],
+        "execution_attempt_uuid": attempt,
+        "python_env": "vrc-py313-torch260-cu124",
+        "working_directory": "/workspace/local-vlm",
+        "env": {"PYTHONPATH": "/opt/gpu-lab/envs/vrc-analysis-deps"},
+        "command": experiment_command,
+    }
+    rejected = call_tool("research_experiment_execute", execution_arguments)
+    if rejected.get("authorization_error", {}).get("type") != "RESEARCH_APPROVAL_REQUIRED":
+        raise AssertionError("High-impact execution was not blocked before human approval")
+    call_tool(
+        "brain_decision_approve",
+        {
+            "decision_id": before["decision_id"],
+            "approver": "brain-e2e-smoke",
+            "rationale": "Authorize the preregistered low-cost frozen VRCNet intervention.",
+        },
+    )
     execution = call_tool(
         "research_experiment_execute",
-        {
-            "experiment_id": plan["id"],
-            "execution_attempt_uuid": attempt,
-            "python_env": "vrc-py313-torch260-cu124",
-            "command": (
-                "mkdir -p \"$GPU_LAB_JOB_DIR/artifacts\"\n"
-                "python - <<'PY'\n"
-                "import json, os, torch\n"
-                "assert torch.cuda.is_available()\n"
-                "control = torch.zeros(1, device='cuda')\n"
-                "intervention = torch.ones(1, device='cuda')\n"
-                "effect = float((intervention - control).item())\n"
-                "result = {'effect': effect, 'gpu': torch.cuda.get_device_name(0)}\n"
-                "path = os.path.join(os.environ['GPU_LAB_JOB_DIR'], 'artifacts', 'result.json')\n"
-                "with open(path, 'w', encoding='utf-8') as handle: json.dump(result, handle)\n"
-                "print(json.dumps(result))\n"
-                "PY"
-            ),
-        },
+        execution_arguments,
     )
     repeated = call_tool(
         "research_experiment_execute",
-        {
-            "experiment_id": plan["id"],
-            "execution_attempt_uuid": attempt,
-            "python_env": "vrc-py313-torch260-cu124",
-            "command": (
-                "mkdir -p \"$GPU_LAB_JOB_DIR/artifacts\"\n"
-                "python - <<'PY'\n"
-                "import json, os, torch\n"
-                "assert torch.cuda.is_available()\n"
-                "control = torch.zeros(1, device='cuda')\n"
-                "intervention = torch.ones(1, device='cuda')\n"
-                "effect = float((intervention - control).item())\n"
-                "result = {'effect': effect, 'gpu': torch.cuda.get_device_name(0)}\n"
-                "path = os.path.join(os.environ['GPU_LAB_JOB_DIR'], 'artifacts', 'result.json')\n"
-                "with open(path, 'w', encoding='utf-8') as handle: json.dump(result, handle)\n"
-                "print(json.dumps(result))\n"
-                "PY"
-            ),
-        },
+        execution_arguments,
     )
     if (execution["run_id"], execution["job_id"]) != (
         repeated["run_id"],
@@ -386,6 +418,13 @@ def main() -> None:
     finished = wait_for_experiment(execution["job_id"])
     if finished["status"] != "completed":
         raise AssertionError(finished)
+    experiment_result = read_json_artifact(execution["job_id"], "artifacts/result.json")
+    if experiment_result["gpu"] != "NVIDIA GeForce GTX 1650":
+        raise AssertionError(experiment_result)
+    if experiment_result["native_reconstruction_maxabs"] != 0.0:
+        raise AssertionError(experiment_result)
+    if experiment_result["max_recipient_effect_R"] <= 0:
+        raise AssertionError(experiment_result)
 
     inspect_decision = call_tool("brain_step", {"project_id": project_id})
     if inspect_decision["selected_action"]["payload"].get("mode") != "INSPECT_RESULT":
@@ -397,9 +436,14 @@ def main() -> None:
             "decision_id": before["decision_id"],
             "hypothesis_id": hypothesis["id"],
             "agenda_item_id": causal_item["id"],
-            "prediction_outcome": "effect == 1.0 on the preregistered CUDA fixture",
-            "guard_condition_outcome": "PASSED: CUDA available; canonical runtime used",
-            "evidence_supporting": ["result.json effect equals 1.0"],
+            "prediction_outcome": "Frozen HASI state substitution changed the recipient output",
+            "guard_condition_outcome": "Measured from the persisted result.json artifact",
+            "condition_evaluations": {
+                "native_reconstruction_maxabs == 0 and max_recipient_effect_R > 0 on NVIDIA GeForce GTX 1650": True
+            },
+            "evidence_supporting": [
+                f"result.json max_recipient_effect_R={experiment_result['max_recipient_effect_R']}"
+            ],
             "evidence_against": [],
             "unexpected_observations": [],
             "alternative_explanations": ["The fixture does not prove dataset generalization"],
@@ -441,6 +485,7 @@ def main() -> None:
                 "negative_memory_id": dead["id"],
                 "semantic_negative_memory_retrieved": True,
                 "decision_before": before["selected_action"]["action_type"],
+                "approval_gate_verified": True,
                 "uninspected_result_recovered": True,
                 "run_id": execution["run_id"],
                 "job_id": execution["job_id"],

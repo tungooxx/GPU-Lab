@@ -22,6 +22,9 @@ services:
       GPU_LAB_SSH_PRIVATE_KEY_PATH: /run/ssh-key
       GPU_LAB_LOCAL_WORKSPACE: /workspace/local-vlm
       GPU_LAB_RESEARCH_DATABASE_URL: postgresql://research:research@postgres:5432/research_os
+      GPU_LAB_LITERATURE_PROVIDER: ${GPU_LAB_LITERATURE_PROVIDER:-disabled}
+      GPU_LAB_LITERATURE_WORKER_URL: http://literature:8010
+      GPU_LAB_LITERATURE_WORKER_TOKEN: ${GPU_LAB_LITERATURE_WORKER_TOKEN:-}
     ports: ["127.0.0.1:8000:8000"]
     volumes: ["./data:/data", "gpu-lab-envs:/opt/gpu-lab/envs", "${GPU_LAB_SSH_PRIVATE_KEY_PATH:-/dev/null}:/run/ssh-key:ro", "${GPU_LAB_LOCAL_WORKSPACE_HOST:-F:/Newgeneration/VLM}:/workspace/local-vlm"]
     gpus: all
@@ -42,6 +45,9 @@ services:
       CROSSREF_API_KEY: ${CROSSREF_API_KEY:-}
       SEMANTIC_SCHOLAR_API_KEY: ${SEMANTIC_SCHOLAR_API_KEY:-}
     volumes: ["literature-papers:/papers"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 4g
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8010/health', data=b'{}')).read()"]
       interval: 5s

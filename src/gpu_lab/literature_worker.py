@@ -38,8 +38,8 @@ async def dispatch(request: Request) -> JSONResponse:
     if operation == "health":
         return JSONResponse({"result": {"provider": "paperqa", "status": "ready"}})
     authorization = request.headers.get("authorization", "")
-    supplied = authorization.removeprefix("Bearer ")
-    if not WORKER_TOKEN or not hmac.compare_digest(supplied, WORKER_TOKEN):
+    supplied = authorization.removeprefix("Bearer ").encode("utf-8", "replace")
+    if not WORKER_TOKEN or not hmac.compare_digest(supplied, WORKER_TOKEN.encode()):
         return JSONResponse({"error": {"type": "UNAUTHORIZED", "message": "Unauthorized"}}, 401)
     try:
         body = WorkerRequest.model_validate(await request.json())
@@ -85,6 +85,7 @@ app = Starlette(routes=[Route("/{operation}", dispatch, methods=["POST"])])
 def main() -> None:
     if not WORKER_TOKEN:
         raise RuntimeError("GPU_LAB_LITERATURE_WORKER_TOKEN is required")
+    # Container-internal bind; Compose does not publish port 8010 to the host.
     uvicorn.run(app, host="0.0.0.0", port=8010, access_log=False)
 
 
