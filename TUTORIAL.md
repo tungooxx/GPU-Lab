@@ -108,11 +108,14 @@ ChatGPT needs a remote MCP server; a local or raw public HTTP endpoint is not ap
 - Recommended for a private/testing deployment: use Secure MCP Tunnel.
 - Production: use an HTTPS reverse proxy with a real domain and TLS certificate.
 
-The public endpoint must end in `/mcp`, for example:
+For Streamable HTTP clients, the public endpoint must end in `/mcp`, for example:
 
 ```text
 https://gpu-lab.example.com/mcp
 ```
+
+Older ChatGPT connector screens may require the legacy SSE transport instead. Run
+`uv run gpu-lab-mcp --transport sse` and use `https://gpu-lab.example.com/sse`.
 
 Do not expose the gateway without authentication and HTTPS. The current MVP does not include its own user authentication, so a private tunnel or an authenticated reverse proxy is strongly recommended.
 
