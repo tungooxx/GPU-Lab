@@ -10,8 +10,10 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
+from starlette.types import ASGIApp
 
 from .config import Settings
 from .dashboard import DASHBOARD_HTML
@@ -101,6 +103,36 @@ class GenericToolResult(BaseModel):
 
 
 _GENERIC_RESULT_SCHEMA = GenericToolResult.model_json_schema()
+
+
+def _normalise_mcp_accept_header(headers: list[tuple[bytes, bytes]]) -> list[tuple[bytes, bytes]]:
+    """Treat an HTTP wildcard Accept header as accepting the JSON MCP response.
+
+    Some connector preflight clients send ``Accept: */*`` rather than naming
+    ``application/json``.  That is valid HTTP content negotiation, but the
+    current Python MCP transport checks only explicit media-type prefixes.
+    Keep the normal MCP JSON body validation unchanged; this only expands a
+    wildcard response preference for the ``/mcp`` route.
+    """
+    accept = next((value.decode("latin-1") for name, value in headers if name.lower() == b"accept"), "")
+    if "application/json" in accept.lower() or "*/*" not in accept:
+        return headers
+    return [
+        (name, b"application/json" if name.lower() == b"accept" else value)
+        for name, value in headers
+    ]
+
+
+class McpAcceptCompatibilityMiddleware(BaseHTTPMiddleware):
+    """Allow standards-compliant wildcard Accept headers on the MCP endpoint."""
+
+    def __init__(self, app: ASGIApp):
+        super().__init__(app)
+
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path == "/mcp":
+            request.scope["headers"] = _normalise_mcp_accept_header(request.scope["headers"])
+        return await call_next(request)
 
 
 def _tool_title(name: str) -> str:
@@ -1108,8 +1140,20 @@ async def dashboard(_: Request):
     return HTMLResponse(DASHBOARD_HTML)
 
 
+def http_app():
+    """Build the streamable HTTP app with connector header compatibility."""
+    app = mcp.streamable_http_app()
+    app.add_middleware(McpAcceptCompatibilityMiddleware)
+    return app
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--transport", choices=["stdio", "sse", "streamable-http"], default="stdio")
     args = parser.parse_args()
+    if args.transport == "streamable-http":
+        import uvicorn
+
+        uvicorn.run(http_app(), host=settings.fastmcp_host, port=settings.fastmcp_port)
+        return
     mcp.run(transport=args.transport)

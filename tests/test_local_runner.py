@@ -5,6 +5,7 @@ import pytest
 from gpu_lab.config import Settings
 from gpu_lab.db import Repository
 from gpu_lab.local_runner import LocalRunner
+from gpu_lab.server import _normalise_mcp_accept_header
 
 
 class _Process:
@@ -36,6 +37,15 @@ def test_requirements_path_accepts_file_or_directory(tmp_path):
 
     assert runner._requirements_path("project") == requirements
     assert runner._requirements_path("project/requirements.txt") == requirements
+
+
+def test_mcp_wildcard_accept_header_allows_json_response():
+    headers = [(b"accept", b"text/html, */*"), (b"content-type", b"application/json")]
+
+    assert _normalise_mcp_accept_header(headers) == [
+        (b"accept", b"application/json"),
+        (b"content-type", b"application/json"),
+    ]
 
 
 @pytest.mark.asyncio
