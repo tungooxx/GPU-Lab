@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,6 +17,11 @@ class Settings(BaseSettings):
     gpu_lab_ssh_timeout: int = 20
     gpu_lab_ssh_known_hosts: Path | None = None
     gpu_lab_ssh_allow_unverified_hosts: bool = False
+
+    @field_validator("gpu_lab_ssh_private_key_path", "gpu_lab_ssh_known_hosts", mode="before")
+    @classmethod
+    def blank_paths_are_none(cls, value):
+        return None if value is None or (isinstance(value, str) and not value.strip()) else value
 
     @property
     def db_path(self) -> Path:
