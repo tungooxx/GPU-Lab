@@ -657,6 +657,18 @@ async def reproduction_status(reproduction_id: str):
 
 
 @mcp.tool()
+async def reproduction_plan(paper_id: str):
+    """Retrieve the prepared executable provenance and outstanding reproduction plans for a paper."""
+    paper = research().object_get(paper_id)
+    if paper["kind"] != "Paper":
+        return {"error": {"type": "NOT_A_PAPER", "message": paper_id}}
+    plans = await call(research().search, str(paper["project_id"]), paper_id, "Reproduction", 100)
+    if isinstance(plans, dict) and "error" in plans:
+        return plans
+    return {"paper": paper, "plans": plans}
+
+
+@mcp.tool()
 async def reproduction_run(
     reproduction_id: str,
     command: str,
