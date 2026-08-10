@@ -15,6 +15,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 from starlette.types import ASGIApp
 
+from .brain import ResearchBrain
 from .config import Settings
 from .dashboard import DASHBOARD_HTML
 from .errors import GPUError
@@ -25,7 +26,7 @@ from .terminal import TERMINAL_HTML
 
 logger = logging.getLogger(__name__)
 
-settings, service, research_store = Settings(), None, None
+settings, service, research_store, research_brain = Settings(), None, None, None
 instructions = "Safe, structured remote GPU experiment control plane. Credentials are never returned."
 if settings.gpu_lab_enable_local_runner:
     instructions += (
@@ -51,6 +52,8 @@ _READ_ONLY_TOOLS = {
     "experiment_list",
     "activity_recent",
     "research_state_get",
+    "world_model_get",
+    "hypothesis_portfolio_get",
     "claim_search",
     "claim_get_evidence",
     "claim_compare",
@@ -169,6 +172,13 @@ def research() -> ResearchStore:
     if research_store is None:
         research_store = ResearchStore(settings.gpu_lab_research_database_url)
     return research_store
+
+
+def brain() -> ResearchBrain:
+    global research_brain
+    if research_brain is None:
+        research_brain = ResearchBrain(research())
+    return research_brain
 
 
 async def call(fn, *args, **kwargs):
@@ -337,6 +347,179 @@ async def research_state_get(project_id: str):
 async def research_state_update(project_id: str, update: dict):
     """Persist the evidence-backed research focus that guides the next discriminating test."""
     return await call(research().project_state_update, project_id, update)
+
+
+@mcp.tool()
+async def world_model_create(project_id: str, name: str, scope: str):
+    """Create the native versioned mechanistic model owned by Research OS."""
+    return await call(brain().world_model_create, project_id, name, scope)
+
+
+@mcp.tool()
+async def world_model_get(world_model_id: str):
+    """Retrieve a WorldModel with its typed nodes, causal edges, and version history."""
+    return await call(brain().world_model_get, world_model_id)
+
+
+@mcp.tool()
+async def world_entity_create(
+    world_model_id: str,
+    kind: str,
+    name: str,
+    description: str,
+    attributes: dict | None = None,
+):
+    """Add a typed scientific entity to a WorldModel and create a new model version."""
+    return await call(
+        brain().world_entity_create,
+        world_model_id,
+        kind,
+        name,
+        description,
+        attributes,
+    )
+
+
+@mcp.tool()
+async def causal_edge_create(
+    world_model_id: str,
+    source_id: str,
+    target_id: str,
+    relation: str,
+    status: str,
+    supporting_ids: list[str] | None = None,
+    against_ids: list[str] | None = None,
+    unresolved_prediction_ids: list[str] | None = None,
+    decision_id: str | None = None,
+):
+    """Create a provenance-bearing causal edge and version the WorldModel."""
+    return await call(
+        brain().causal_edge_create,
+        world_model_id,
+        source_id,
+        target_id,
+        relation,
+        status,
+        supporting_ids,
+        against_ids,
+        unresolved_prediction_ids,
+        decision_id,
+    )
+
+
+@mcp.tool()
+async def causal_edge_update(
+    edge_id: str,
+    status: str,
+    rationale: str,
+    supporting_ids: list[str] | None = None,
+    against_ids: list[str] | None = None,
+    decision_id: str | None = None,
+):
+    """Apply an evidence-linked causal-edge transition and preserve its model version delta."""
+    return await call(
+        brain().causal_edge_update,
+        edge_id,
+        status,
+        rationale,
+        supporting_ids,
+        against_ids,
+        decision_id,
+    )
+
+
+@mcp.tool()
+async def research_agenda_create(project_id: str, name: str):
+    """Create the project ResearchAgenda in canonical PostgreSQL state."""
+    return await call(brain().agenda_create, project_id, name)
+
+
+@mcp.tool()
+async def research_agenda_item_create(
+    agenda_id: str,
+    question: str,
+    importance: float,
+    uncertainty: float,
+    scientific_scope: str,
+    blocking_hypothesis_ids: list[str] | None = None,
+    related_anomaly_ids: list[str] | None = None,
+    related_contradiction_ids: list[str] | None = None,
+    candidate_experiments: list[dict] | None = None,
+    reproduction_required: bool = False,
+):
+    """Persist one scored scientific unknown and its candidate experiments."""
+    return await call(
+        brain().agenda_item_create,
+        agenda_id,
+        question,
+        importance,
+        uncertainty,
+        scientific_scope,
+        blocking_hypothesis_ids,
+        related_anomaly_ids,
+        related_contradiction_ids,
+        candidate_experiments,
+        reproduction_required,
+    )
+
+
+@mcp.tool()
+async def research_agenda_item_update(agenda_item_id: str, status: str, rationale: str):
+    """Apply an explicit provenance-bearing AgendaItem status transition."""
+    return await call(brain().agenda_item_update, agenda_item_id, status, rationale)
+
+
+@mcp.tool()
+async def hypothesis_portfolio_get(project_id: str):
+    """Materialize the competing active, refuted, and negative hypothesis portfolio."""
+    return await call(brain().portfolio_get, project_id)
+
+
+@mcp.tool()
+async def brain_step(project_id: str):
+    """Persist one evidence-aware scientific decision without executing an expensive action."""
+    return await call(brain().brain_step, project_id)
+
+
+@mcp.tool()
+async def brain_result_assess(
+    run_id: str,
+    decision_id: str,
+    hypothesis_id: str,
+    agenda_item_id: str,
+    prediction_outcome: str,
+    guard_condition_outcome: str,
+    evidence_supporting: list[str],
+    evidence_against: list[str],
+    unexpected_observations: list[str],
+    alternative_explanations: list[str],
+    scope: str,
+    hypothesis_transition: str,
+    rationale: str,
+    causal_edge_id: str | None = None,
+    causal_edge_status: str | None = None,
+    actual_information_gain: str = "MEDIUM",
+):
+    """Inspect a real result and explicitly update evidence, belief, agenda, and WorldModel."""
+    return await call(
+        brain().result_assess,
+        run_id,
+        decision_id,
+        hypothesis_id,
+        agenda_item_id,
+        prediction_outcome,
+        guard_condition_outcome,
+        evidence_supporting,
+        evidence_against,
+        unexpected_observations,
+        alternative_explanations,
+        scope,
+        hypothesis_transition,
+        rationale,
+        causal_edge_id,
+        causal_edge_status,
+        actual_information_gain,
+    )
 
 
 @mcp.tool()

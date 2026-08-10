@@ -17,7 +17,12 @@ For development, connect a local MCP client to the stdio process. For production
 
 ## Tools
 
-`gpu_list`, `gpu_status`, `gpu_search`, `gpu_create`, `gpu_stop`, `gpu_destroy`, `repo_checkout`, `env_prepare`, `experiment_submit`, `experiment_status`, `experiment_logs`, `experiment_cancel`, `experiment_list`, `artifact_list`, `artifact_read`, and disabled-by-default `remote_exec`.
+The MCP exposes GPU lifecycle, local and Vast execution, logs/artifacts, literature records,
+reproduction, canonical scientific state, and Brain v1 operations. Use MCP discovery for the full
+typed list. Brain tools include `world_model_create`, `world_model_get`, `world_entity_create`,
+`causal_edge_create`, `causal_edge_update`, `research_agenda_create`,
+`research_agenda_item_create`, `hypothesis_portfolio_get`, `brain_step`, and
+`brain_result_assess`.
 
 Use `gpu_search` before `gpu_create`; creation requires a specific offer rather than making an unbounded cost decision. `gpu_destroy` requires `confirmation="DESTROY"`.
 
@@ -102,5 +107,8 @@ remote jobs, detached local jobs, and a compact CLI. Scientific Research OS stat
 scientific events are stored separately in PostgreSQL with optional pgvector retrieval.
 `artifact_download` and `experiment_summary` are intentionally not exposed yet; large remote files
 remain on the worker. Vast endpoint shapes are normalized defensively and still require live
-provider integration checks before production use. Brain v1 planning, WorldModel, and ResearchAgenda
-are under active implementation and are not yet claimed as verified capabilities.
+provider integration checks before production use. Brain v1 has a native versioned WorldModel,
+ResearchAgenda, hypothesis portfolio, decision ledger, deterministic information-per-cost policy,
+unfinished-work recovery, and explicit result assessment. Its real smoke has exercised the vertical
+slice on PostgreSQL and a local GTX 1650. PaperQA, Paper2Agent, quality-diversity operators,
+experiment branching, and campaign automation remain later milestones.

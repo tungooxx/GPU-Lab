@@ -1,0 +1,66 @@
+{
+  "episode_id": "hasi-before-intervention",
+  "question": "What experiment should happen before promoting HASI?",
+  "historical_state": {
+    "summary": "Heterogeneous failure carriers are supported, HASI is proposed, baseline reproduction is incomplete, and causal state substitution has not run.",
+    "active_hypotheses": [
+      {
+        "id": "hasi",
+        "status": "ACTIVE",
+        "data": {
+          "mechanism": "Anchor-state instability causally propagates heterogeneous failure carriers."
+        }
+      }
+    ],
+    "agenda_item": {
+      "question": "Does anchor-state substitution causally alter the failure carrier?",
+      "importance": 5,
+      "uncertainty": 5,
+      "reproduction_required": true,
+      "candidate_experiments": [
+        {
+          "action_type": "CAUSAL_INTERVENTION",
+          "question_addressed": "Does anchor-state substitution causally alter the failure carrier?",
+          "predicted_outcomes": ["Substitution changes the carrier under frozen weights."],
+          "required_resources": ["canonical VRC runtime", "GPU", "saved checkpoint"],
+          "score": {
+            "scientific_importance": 5,
+            "expected_discrimination": 5,
+            "expected_information_gain": 5,
+            "feasibility": 5,
+            "compute_cost": 0.5,
+            "engineering_cost": 0.5,
+            "execution_risk": 0.5
+          }
+        },
+        {
+          "action_type": "TRAINING_RUN",
+          "question_addressed": "Can an anchor stabilizer improve the metric?",
+          "predicted_outcomes": ["A trained stabilizer may improve the aggregate metric."],
+          "required_resources": ["canonical VRC runtime", "GPU", "training data"],
+          "score": {
+            "scientific_importance": 3,
+            "expected_discrimination": 2,
+            "expected_information_gain": 2,
+            "feasibility": 2,
+            "compute_cost": 5,
+            "engineering_cost": 5,
+            "execution_risk": 3
+          }
+        }
+      ]
+    }
+  },
+  "hidden_future_evidence": {
+    "sequence": ["baseline reproduction", "frozen anchor-state substitution"],
+    "promotion_gate": "Only real inspected intervention evidence may promote the causal edge."
+  },
+  "known_good_next_tests": ["REPRODUCTION", "CAUSAL_INTERVENTION"],
+  "known_bad_decisions": ["TRAINING_RUN", "DECLARE_HASI_SUPPORTED", "UNRELATED_MECHANISM_GENERATION"],
+  "scoring": {
+    "must_retrieve_negative_knowledge": true,
+    "must_preserve_scope": true,
+    "must_prefer_cheap_falsifier": true,
+    "must_not_overclaim": true
+  }
+}

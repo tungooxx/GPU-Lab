@@ -9,6 +9,43 @@ from psycopg.rows import dict_row
 
 from .errors import GPUError
 
+RESEARCH_OBJECT_KINDS = (
+    "Paper",
+    "EvidenceUnit",
+    "Claim",
+    "Mechanism",
+    "Anomaly",
+    "Contradiction",
+    "Hypothesis",
+    "Prediction",
+    "HypothesisLineage",
+    "Experiment",
+    "ExperimentRun",
+    "Artifact",
+    "Reproduction",
+    "NegativeResult",
+    "Lesson",
+    "ResearchState",
+    "ScientificVariable",
+    "Phenomenon",
+    "MechanismState",
+    "CausalEdge",
+    "InformationPath",
+    "Assumption",
+    "Scope",
+    "Intervention",
+    "ExpectedEffect",
+    "WorldModel",
+    "WorldModelVersion",
+    "ResearchAgenda",
+    "AgendaItem",
+    "HypothesisPortfolio",
+    "ResearchDecision",
+    "ResearchActionCandidate",
+    "ComparativeLesson",
+    "MetaLesson",
+)
+
 
 class ResearchStore:
     """PostgreSQL canonical scientific state with immutable event history."""
@@ -35,7 +72,7 @@ class ResearchStore:
                 );
                 CREATE TABLE IF NOT EXISTS research_objects (
                     id UUID PRIMARY KEY, project_id UUID NOT NULL REFERENCES research_projects(id),
-                    kind TEXT NOT NULL CHECK(kind IN ('Paper','EvidenceUnit','Claim','Mechanism','Anomaly','Contradiction','Hypothesis','Prediction','HypothesisLineage','Experiment','ExperimentRun','Artifact','Reproduction','NegativeResult','Lesson','ResearchState')),
+                    kind TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'ACTIVE', data JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS research_edges (
@@ -63,6 +100,24 @@ class ResearchStore:
                 CREATE INDEX IF NOT EXISTS research_execution_attempts_job_idx
                     ON research_execution_attempts(job_id);
             """)
+            allowed_kinds = ",".join("'" + kind + "'" for kind in RESEARCH_OBJECT_KINDS)
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext('gpu_lab_research_migration'))")
+            cur.execute(
+                "SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint "
+                "WHERE conrelid='research_objects'::regclass "
+                "AND conname='research_objects_kind_check'"
+            )
+            constraint = cur.fetchone()
+            definition = constraint["definition"] if constraint else ""
+            if not all(kind in definition for kind in RESEARCH_OBJECT_KINDS):
+                cur.execute(
+                    "ALTER TABLE research_objects DROP CONSTRAINT IF EXISTS "
+                    "research_objects_kind_check"
+                )
+                cur.execute(
+                    "ALTER TABLE research_objects ADD CONSTRAINT research_objects_kind_check "
+                    f"CHECK(kind IN ({allowed_kinds}))"
+                )
             if self.vector_available:
                 cur.execute("ALTER TABLE research_objects ADD COLUMN IF NOT EXISTS embedding vector")
 
@@ -74,12 +129,55 @@ class ResearchStore:
             self._event(cur, ident, "RESEARCH_PROJECT_CREATED", None, {"name": name, "question": question})
         return {"project_id": str(ident), "name": name, "state": state}
 
-    def object_create(self, project_id: str, kind: str, data: dict[str, Any], event_type: str) -> dict:
+    def object_create(
+        self,
+        project_id: str,
+        kind: str,
+        data: dict[str, Any],
+        event_type: str,
+        status: str = "ACTIVE",
+    ) -> dict:
+        if kind not in RESEARCH_OBJECT_KINDS:
+            raise GPUError("INVALID_RESEARCH_OBJECT_KIND", kind)
         ident, now = uuid.uuid4(), datetime.now(UTC)
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute("INSERT INTO research_objects VALUES(%s,%s,%s,%s,%s,%s)", (ident, project_id, kind, "ACTIVE", json.dumps(data), now))
+            cur.execute(
+                "INSERT INTO research_objects VALUES(%s,%s,%s,%s,%s,%s)",
+                (ident, project_id, kind, status, json.dumps(data), now),
+            )
             self._event(cur, project_id, event_type, ident, data)
-        return {"id": str(ident), "project_id": project_id, "kind": kind, "status": "ACTIVE", "data": data}
+        return {
+            "id": str(ident),
+            "project_id": project_id,
+            "kind": kind,
+            "status": status,
+            "data": data,
+        }
+
+    def objects_list(
+        self,
+        project_id: str,
+        kind: str | None = None,
+        statuses: set[str] | None = None,
+        limit: int = 500,
+    ) -> list[dict]:
+        """List canonical research objects with typed filters for Brain services."""
+        with self._connect() as conn, conn.cursor() as cur:
+            sql = (
+                "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
+                "WHERE project_id=%s"
+            )
+            args: list[Any] = [project_id]
+            if kind:
+                sql += " AND kind=%s"
+                args.append(kind)
+            if statuses:
+                sql += " AND status=ANY(%s)"
+                args.append(list(statuses))
+            sql += " ORDER BY created_at DESC LIMIT %s"
+            args.append(min(max(limit, 1), 2000))
+            cur.execute(sql, args)
+            return cur.fetchall()
 
     def state_get(self, project_id: str) -> dict:
         with self._connect() as conn, conn.cursor() as cur:
