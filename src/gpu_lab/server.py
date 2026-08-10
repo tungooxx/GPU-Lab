@@ -281,6 +281,27 @@ async def claim_compare(claim_id: str, other_claim_id: str):
 
 
 @mcp.tool()
+async def contradiction_create(project_id: str, claim_id: str, other_claim_id: str, rationale: str):
+    """Record an explicit conflict between two scoped claims instead of silently averaging them."""
+    claim, other_claim = research().object_get(claim_id), research().object_get(other_claim_id)
+    if claim["kind"] != "Claim" or other_claim["kind"] != "Claim":
+        return {"error": {"type": "NOT_A_CLAIM", "message": "Both inputs must be Claim IDs"}}
+    if claim["project_id"] != other_claim["project_id"] or str(claim["project_id"]) != project_id:
+        return {"error": {"type": "RESEARCH_PROJECT_MISMATCH", "message": project_id}}
+    result = await call(
+        research().object_create,
+        project_id,
+        "Contradiction",
+        {"claim_id": claim_id, "other_claim_id": other_claim_id, "rationale": rationale},
+        "CONTRADICTION_CREATED",
+    )
+    if "error" not in result:
+        await call(research().edge_create, claim_id, result["id"], "CONTRADICTED_BY")
+        await call(research().edge_create, other_claim_id, result["id"], "CONTRADICTED_BY")
+    return result
+
+
+@mcp.tool()
 async def hypothesis_create(project_id: str, mechanism: str, prediction: str, kill_condition: str, parent_ids: list[str] | None = None):
     parents = parent_ids or []
     for parent_id in parents:
@@ -335,6 +356,34 @@ async def experiment_plan_register(project_id: str, hypothesis_id: str, plan: di
     if "error" not in result:
         await call(research().edge_create, hypothesis_id, result["id"], "TESTED_BY")
     return result
+
+
+@mcp.tool()
+async def experiment_priority(
+    scientific_importance: float,
+    hypothesis_discrimination: float,
+    expected_information_gain: float,
+    compute_cost: float,
+    implementation_cost: float,
+    execution_risk: float,
+):
+    """Rank a proposed experiment by explicit information gain per total cost; it does not execute it."""
+    values = [
+        scientific_importance,
+        hypothesis_discrimination,
+        expected_information_gain,
+        compute_cost,
+        implementation_cost,
+        execution_risk,
+    ]
+    if any(value < 0 for value in values):
+        return {"error": {"type": "INVALID_EXPERIMENT_ECONOMICS", "message": "Inputs must be non-negative"}}
+    denominator = max(compute_cost * implementation_cost * max(execution_risk, 0.01), 0.01)
+    return {
+        "priority": scientific_importance * hypothesis_discrimination * expected_information_gain / denominator,
+        "formula": "importance × discrimination × information_gain / (compute_cost × implementation_cost × execution_risk)",
+        "recommendation": "Prefer the smallest discriminating test before additional training.",
+    }
 
 
 @mcp.tool()
