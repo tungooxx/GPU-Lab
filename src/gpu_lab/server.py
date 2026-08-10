@@ -400,7 +400,25 @@ async def experiment_plan_register(project_id: str, hypothesis_id: str, plan: di
         "EXPERIMENT_REGISTERED",
     )
     if "error" not in result:
+        prediction = await call(
+            research().object_create,
+            project_id,
+            "Prediction",
+            {
+                "hypothesis_id": hypothesis_id,
+                "experiment_id": result["id"],
+                "statement": plan["prediction"],
+                "pass_condition": plan["pass_condition"],
+                "fail_condition": plan["fail_condition"],
+                "frozen": True,
+            },
+            "PREDICTION_REGISTERED",
+        )
         await call(research().edge_create, hypothesis_id, result["id"], "TESTED_BY")
+        if "error" not in prediction:
+            await call(research().edge_create, hypothesis_id, prediction["id"], "PREDICTS")
+            await call(research().edge_create, prediction["id"], result["id"], "TESTED_BY")
+            result["prediction"] = prediction
     return result
 
 
