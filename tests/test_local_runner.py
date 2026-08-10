@@ -46,6 +46,7 @@ async def test_local_submit_replays_reserved_job_id(monkeypatch, tmp_path):
     async def fake_subprocess(*args, **kwargs):
         nonlocal calls
         calls += 1
+        assert args[0].startswith("sh -c ")
         return _Process()
 
     monkeypatch.setattr("gpu_lab.local_runner.asyncio.create_subprocess_shell", fake_subprocess)

@@ -152,7 +152,11 @@ class LocalRunner:
         self.repo.save_job(job)
         with stdout.open("wb") as stdout_handle, stderr.open("wb") as stderr_handle:
             process = await asyncio.create_subprocess_shell(
-                f"sh -lc {shlex.quote(wrapper)}",
+                # A login shell may replace PATH from its profile.  That defeats
+                # the selected persistent Python environment, which is supplied
+                # through run_env above.  The wrapper has no need for login-shell
+                # initialization, so preserve the explicit execution environment.
+                f"sh -c {shlex.quote(wrapper)}",
                 cwd=workdir,
                 stdout=stdout_handle,
                 stderr=stderr_handle,

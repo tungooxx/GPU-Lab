@@ -48,7 +48,9 @@ canonical mapping. Commands, runtime, logs, exit code, and artifacts are preserv
 immutable event history. Do not assess a hypothesis from reasoning alone when a local or provider
 experiment is feasible.
 
-Local environments are persistent under `GPU_LAB_LOCAL_ENV_ROOT`. `local_env_prepare` accepts an
+Local environments are persistent under `GPU_LAB_LOCAL_ENV_ROOT`. Docker Compose stores that root
+in the `gpu-lab-envs` named volume, so environments remain available across container rebuilds and
+are not installed on the Windows workspace mount. `local_env_prepare` accepts an
 exact requirements file or a directory containing `requirements.txt`, plus an explicit
 `python_executable`. The canonical VRCNet internal-intervention runtime verified in August 2026 is
 the environment named `vrc-py313-torch260-cu124`, created with Python 3.13 and containing PyTorch
