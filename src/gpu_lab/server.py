@@ -1,15 +1,12 @@
 import argparse
-import base64
 import inspect
 import logging
 import re
-import secrets
 import time
 
 from mcp.server.fastmcp import FastMCP
-from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse
 
 from .config import Settings
 from .dashboard import DASHBOARD_HTML
@@ -22,11 +19,6 @@ from .terminal import TERMINAL_HTML
 logger = logging.getLogger(__name__)
 
 settings, service, research_store = Settings(), None, None
-allowed_hosts = [
-    host.strip()
-    for host in settings.gpu_lab_allowed_hosts.split(",")
-    if host.strip()
-]
 instructions = "Safe, structured remote GPU experiment control plane. Credentials are never returned."
 if settings.gpu_lab_enable_local_runner:
     instructions += (
@@ -40,13 +32,6 @@ mcp = FastMCP(
     json_response=True,
     stateless_http=True,
     instructions=instructions,
-    transport_security=TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
-        allowed_hosts=allowed_hosts,
-        allowed_origins=[
-            f"https://{host.removesuffix(':*')}" for host in allowed_hosts if ":*" not in host
-        ],
-    ),
 )
 
 
@@ -935,39 +920,21 @@ async def health(_: Request):
 
 @mcp.custom_route("/activity", methods=["GET"], include_in_schema=False)
 async def activity(_: Request):
-    return JSONResponse(svc().repo.list_audit(100)) if terminal_allowed(_) else terminal_unauthorized()
-
-
-def terminal_allowed(request: Request) -> bool:
-    password = settings.gpu_lab_terminal_password
-    header = request.headers.get("authorization", "")
-    if not password or not header.startswith("Basic "):
-        return False
-    try:
-        username, supplied = base64.b64decode(header[6:]).decode().split(":", 1)
-    except (ValueError, UnicodeDecodeError):
-        return False
-    return username == "gpu-lab" and secrets.compare_digest(supplied, password)
-
-
-def terminal_unauthorized() -> Response:
-    return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="GPU Lab Terminal"'})
+    return JSONResponse(svc().repo.list_audit(100))
 
 
 @mcp.custom_route("/terminal", methods=["GET"], include_in_schema=False)
-async def terminal(request: Request):
-    return HTMLResponse(TERMINAL_HTML) if terminal_allowed(request) else terminal_unauthorized()
+async def terminal(_: Request):
+    return HTMLResponse(TERMINAL_HTML)
 
 
 @mcp.custom_route("/terminal/activity", methods=["GET"], include_in_schema=False)
-async def terminal_activity(request: Request):
-    return JSONResponse(svc().repo.list_audit(100)) if terminal_allowed(request) else terminal_unauthorized()
+async def terminal_activity(_: Request):
+    return JSONResponse(svc().repo.list_audit(100))
 
 
 @mcp.custom_route("/terminal/jobs", methods=["GET"], include_in_schema=False)
-async def terminal_jobs(request: Request):
-    if not terminal_allowed(request):
-        return terminal_unauthorized()
+async def terminal_jobs(_: Request):
     if not settings.gpu_lab_enable_local_runner:
         return JSONResponse([])
     jobs = []
@@ -978,8 +945,6 @@ async def terminal_jobs(request: Request):
 
 @mcp.custom_route("/", methods=["GET"], include_in_schema=False)
 async def dashboard(_: Request):
-    # Keep the landing route public: connector registrars may probe the origin before /mcp.
-    # Sensitive audit data remains protected at /activity and /terminal.
     return HTMLResponse(DASHBOARD_HTML)
 
 
