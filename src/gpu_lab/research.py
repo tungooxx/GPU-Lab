@@ -73,18 +73,45 @@ class ResearchStore:
             by_kind = lambda kind, statuses=None: [item for item in objects if item["kind"] == kind and (not statuses or item["status"] in statuses)]
             canonical = {
                 "research_question": row["question"],
+                "established_facts": row["state"].get("established_facts", []),
                 "supported_claims": by_kind("Claim", {"SUPPORTED"}),
                 "weakened_claims": by_kind("Claim", {"WEAKENED"}),
                 "refuted_claims": by_kind("Claim", {"REFUTED"}),
                 "unresolved_claims": by_kind("Claim", {"ACTIVE"}),
                 "active_anomalies": by_kind("Anomaly", {"ACTIVE"}),
+                "active_contradictions": by_kind("Contradiction", {"ACTIVE"}),
                 "active_hypotheses": by_kind("Hypothesis", {"ACTIVE", "SURVIVES_INITIAL_TEST"}),
                 "refuted_lineages": by_kind("Hypothesis", {"REFUTED"}),
                 "completed_experiments": by_kind("ExperimentRun", {"completed"}),
                 "active_experiments": by_kind("ExperimentRun", {"ACTIVE", "running"}),
+                "open_experiments": by_kind("Experiment", {"ACTIVE"}),
+                "reproduction_status": by_kind("Reproduction"),
                 "negative_results": by_kind("NegativeResult"),
+                "current_best_explanation": row["state"].get("current_best_explanation"),
+                "highest_value_unknown": row["state"].get("highest_value_unknown"),
+                "next_discriminating_experiments": row["state"].get("next_discriminating_experiments", []),
             }
             return {**row, "canonical_state": canonical, "objects": objects}
+
+    def project_state_update(self, project_id: str, update: dict[str, Any]) -> dict:
+        allowed = {
+            "established_facts",
+            "current_best_explanation",
+            "highest_value_unknown",
+            "next_discriminating_experiments",
+        }
+        unexpected = sorted(set(update) - allowed)
+        if unexpected:
+            raise GPUError("INVALID_RESEARCH_STATE_FIELDS", ", ".join(unexpected))
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT state FROM research_projects WHERE id=%s FOR UPDATE", (project_id,))
+            row = cur.fetchone()
+            if not row:
+                raise GPUError("RESEARCH_PROJECT_NOT_FOUND", project_id)
+            state = {**row["state"], **update}
+            cur.execute("UPDATE research_projects SET state=%s WHERE id=%s", (json.dumps(state), project_id))
+            self._event(cur, project_id, "RESEARCH_STATE_UPDATED", None, update)
+        return state
 
     def object_get(self, object_id: str) -> dict:
         with self._connect() as conn, conn.cursor() as cur:

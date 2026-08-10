@@ -225,6 +225,12 @@ async def research_state_get(project_id: str):
 
 
 @mcp.tool()
+async def research_state_update(project_id: str, update: dict):
+    """Persist the evidence-backed research focus that guides the next discriminating test."""
+    return await call(research().project_state_update, project_id, update)
+
+
+@mcp.tool()
 async def claim_create(project_id: str, statement: str, scope: str, evidence_ids: list[str] | None = None):
     evidence = evidence_ids or []
     for evidence_id in evidence:
