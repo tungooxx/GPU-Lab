@@ -81,6 +81,10 @@ async def call(fn, *args, **kwargs):
             exc.message,
         )
         return exc.response()
+    except Exception:  # noqa: BLE001 - MCP boundary must return a structured, audited failure.
+        # Do not expose implementation details or leave an MCP request without an audit record.
+        svc().repo.audit(tool_name, arguments, "error", int((time.perf_counter() - started) * 1000), "Internal error")
+        return {"error": {"type": "INTERNAL_ERROR", "message": "Unexpected server error", "retryable": False}}
 
 
 def scrub(value):
@@ -222,7 +226,58 @@ async def research_state_get(project_id: str):
 
 @mcp.tool()
 async def claim_create(project_id: str, statement: str, scope: str, evidence_ids: list[str] | None = None):
-    return await call(research().object_create, project_id, "Claim", {"statement": statement, "scope": scope, "evidence_ids": evidence_ids or []}, "CLAIM_CREATED")
+    evidence = evidence_ids or []
+    for evidence_id in evidence:
+        item = research().object_get(evidence_id)
+        if str(item["project_id"]) != project_id or item["kind"] != "EvidenceUnit":
+            return {"error": {"type": "INVALID_CLAIM_EVIDENCE", "message": evidence_id}}
+    result = await call(
+        research().object_create,
+        project_id,
+        "Claim",
+        {"statement": statement, "scope": scope, "evidence_ids": evidence},
+        "CLAIM_CREATED",
+    )
+    if "error" not in result:
+        for evidence_id in evidence:
+            await call(research().edge_create, evidence_id, result["id"], "SUPPORTS")
+    return result
+
+
+@mcp.tool()
+async def claim_search(project_id: str, query: str, limit: int = 25):
+    """Find claims by their persisted statement, scope, or attached evidence identifiers."""
+    return await call(research().search, project_id, query, "Claim", min(max(limit, 1), 100))
+
+
+@mcp.tool()
+async def claim_get_evidence(claim_id: str):
+    """Retrieve the exact evidence units cited by a claim, never an uncited summary."""
+    claim = research().object_get(claim_id)
+    if claim["kind"] != "Claim":
+        return {"error": {"type": "NOT_A_CLAIM", "message": claim_id}}
+    units = [research().object_get(item) for item in claim["data"].get("evidence_ids", [])]
+    return {"claim": claim, "evidence": units}
+
+
+@mcp.tool()
+async def claim_compare(claim_id: str, other_claim_id: str):
+    """Compare scope and evidence overlap without inferring agreement from prose alone."""
+    first, second = research().object_get(claim_id), research().object_get(other_claim_id)
+    if first["kind"] != "Claim" or second["kind"] != "Claim":
+        return {"error": {"type": "NOT_A_CLAIM", "message": "Both inputs must be Claim IDs"}}
+    if first["project_id"] != second["project_id"]:
+        return {"error": {"type": "RESEARCH_PROJECT_MISMATCH", "message": "Claims must share a project"}}
+    first_evidence = set(first["data"].get("evidence_ids", []))
+    second_evidence = set(second["data"].get("evidence_ids", []))
+    return {
+        "claim": first,
+        "other_claim": second,
+        "same_scope": first["data"].get("scope") == second["data"].get("scope"),
+        "shared_evidence_ids": sorted(first_evidence & second_evidence),
+        "only_claim_evidence_ids": sorted(first_evidence - second_evidence),
+        "only_other_evidence_ids": sorted(second_evidence - first_evidence),
+    }
 
 
 @mcp.tool()
@@ -248,7 +303,22 @@ async def hypothesis_create(project_id: str, mechanism: str, prediction: str, ki
 @mcp.tool()
 async def experiment_plan_register(project_id: str, hypothesis_id: str, plan: dict):
     """Preregister a frozen experiment plan before results are inspected."""
-    required = {"research_question", "prediction", "intervention", "control", "primary_metric", "pass_condition", "fail_condition"}
+    required = {
+        "research_question",
+        "prediction",
+        "alternative_hypotheses",
+        "intervention",
+        "control",
+        "primary_metric",
+        "secondary_metrics",
+        "expected_direction",
+        "pass_condition",
+        "fail_condition",
+        "interpretation_if_pass",
+        "interpretation_if_fail",
+        "estimated_runtime_minutes",
+        "estimated_gpu_cost_usd",
+    }
     missing = sorted(required - set(plan))
     if missing:
         return {"error": {"type": "EXPERIMENT_PLAN_INCOMPLETE", "message": f"Missing: {', '.join(missing)}"}}
@@ -290,14 +360,48 @@ async def paper_search(project_id: str, query: str, limit: int = 25):
 
 
 @mcp.tool()
+async def paper_get(paper_id: str):
+    """Return the persisted paper card and provenance URL/version."""
+    paper = research().object_get(paper_id)
+    if paper["kind"] != "Paper":
+        return {"error": {"type": "NOT_A_PAPER", "message": paper_id}}
+    return paper
+
+
+@mcp.tool()
 async def paper_evidence_create(project_id: str, paper_id: str, text: str, locator: dict):
     """Store a source passage with page/section/figure provenance before making a claim."""
-    return await call(research().object_create, project_id, "EvidenceUnit", {"paper_id": paper_id, "text": text, "locator": locator}, "EVIDENCE_UNIT_CREATED")
+    paper = research().object_get(paper_id)
+    if str(paper["project_id"]) != project_id or paper["kind"] != "Paper":
+        return {"error": {"type": "INVALID_EVIDENCE_PAPER", "message": paper_id}}
+    result = await call(
+        research().object_create,
+        project_id,
+        "EvidenceUnit",
+        {"paper_id": paper_id, "text": text, "locator": locator},
+        "EVIDENCE_UNIT_CREATED",
+    )
+    if "error" not in result:
+        await call(research().edge_create, paper_id, result["id"], "CONTAINS_EVIDENCE")
+    return result
 
 
 @mcp.tool()
 async def paper_evidence_search(project_id: str, query: str, limit: int = 25):
     return await call(research().search, project_id, query, "EvidenceUnit", min(max(limit, 1), 100))
+
+
+@mcp.tool()
+async def paper_ask(project_id: str, question: str, limit: int = 8):
+    """Return retrieved source passages for a question; this is evidence retrieval, not a conclusion."""
+    evidence = await call(research().search, project_id, question, "EvidenceUnit", min(max(limit, 1), 25))
+    if isinstance(evidence, dict) and "error" in evidence:
+        return evidence
+    return {
+        "question": question,
+        "evidence": evidence,
+        "warning": "Retrieved passages are not canonical truth. Create a scoped Claim with explicit evidence IDs before drawing a conclusion.",
+    }
 
 
 @mcp.tool()
@@ -328,6 +432,9 @@ async def reproduction_prepare(
     tolerance: float | None,
 ):
     """Register the executable provenance required before attempting reproduction."""
+    paper = research().object_get(paper_id)
+    if str(paper["project_id"]) != project_id or paper["kind"] != "Paper":
+        return {"error": {"type": "INVALID_REPRODUCTION_PAPER", "message": paper_id}}
     data = {
         "paper_id": paper_id,
         "repository": repository,
@@ -339,12 +446,92 @@ async def reproduction_prepare(
         "tolerance": tolerance,
         "status": "PREPARED",
     }
-    return await call(research().object_create, project_id, "Reproduction", data, "REPRODUCTION_PREPARED")
+    result = await call(research().object_create, project_id, "Reproduction", data, "REPRODUCTION_PREPARED")
+    if "error" not in result:
+        await call(research().edge_create, paper_id, result["id"], "HAS_REPRODUCTION")
+    return result
 
 
 @mcp.tool()
 async def reproduction_status(reproduction_id: str):
     return await call(research().object_get, reproduction_id)
+
+
+@mcp.tool()
+async def reproduction_run(
+    reproduction_id: str,
+    command: str,
+    working_directory: str = ".",
+    env: dict[str, str] | None = None,
+    python_env: str | None = None,
+):
+    """Execute a prepared reproduction with recorded environment and command provenance."""
+    if not settings.gpu_lab_enable_local_runner:
+        return {"error": {"type": "LOCAL_RUNNER_DISABLED"}}
+    reproduction = research().object_get(reproduction_id)
+    if reproduction["kind"] != "Reproduction":
+        return {"error": {"type": "NOT_A_REPRODUCTION", "message": reproduction_id}}
+    if reproduction["status"] not in {"ACTIVE", "PREPARED", "BLOCKED"}:
+        return {"error": {"type": "REPRODUCTION_NOT_RUNNABLE", "message": reproduction["status"]}}
+    job = await call(local.submit, command, working_directory, "reproduction-" + reproduction_id[:8], env, python_env)
+    if "error" in job:
+        return job
+    return await call(
+        research().object_update,
+        reproduction_id,
+        {"status": "RUNNING", "job_id": job["job_id"], "command": command, "working_directory": working_directory, "environment": env or {}, "python_env": python_env},
+        "RUNNING",
+        "REPRODUCTION_STARTED",
+    )
+
+
+@mcp.tool()
+async def reproduction_sync(reproduction_id: str):
+    """Persist real execution logs/artifacts before evaluating a reproduction metric."""
+    reproduction = research().object_get(reproduction_id)
+    if reproduction["kind"] != "Reproduction":
+        return {"error": {"type": "NOT_A_REPRODUCTION", "message": reproduction_id}}
+    if reproduction["status"] in {"PARTIAL", "FAILED", "REPRODUCED"}:
+        return {"id": reproduction_id, "status": reproduction["status"], "data": reproduction["data"], "already_final": True}
+    job_id = reproduction["data"].get("job_id")
+    if not job_id:
+        return {"error": {"type": "REPRODUCTION_MISSING_JOB", "message": reproduction_id}}
+    outcome, artifacts = local.job_status(job_id), local.artifacts(job_id)
+    if outcome["status"] == "running":
+        return await call(research().object_update, reproduction_id, {"logs_tail": outcome["logs_tail"][-65536:]}, "RUNNING", "REPRODUCTION_LOGS_SYNCED")
+    status = "FAILED" if outcome["status"] != "completed" else "PARTIAL"
+    event = "REPRODUCTION_FAILED" if status == "FAILED" else "REPRODUCTION_EXECUTION_COMPLETED"
+    return await call(
+        research().object_update,
+        reproduction_id,
+        {"exit_code": outcome["exit_code"], "logs_tail": outcome["logs_tail"][-65536:], "artifacts": artifacts},
+        status,
+        event,
+    )
+
+
+@mcp.tool()
+async def reproduction_compare(reproduction_id: str, observed_metric: float, metric_name: str | None = None):
+    """Compare a real observed metric against the prepared paper metric and tolerance."""
+    reproduction = research().object_get(reproduction_id)
+    if reproduction["kind"] != "Reproduction":
+        return {"error": {"type": "NOT_A_REPRODUCTION", "message": reproduction_id}}
+    if reproduction["status"] == "FAILED":
+        return {"error": {"type": "REPRODUCTION_EXECUTION_FAILED", "message": "A failed run cannot be metric-compared"}}
+    reported = reproduction["data"].get("reported_metric") or {}
+    expected = reported.get("value")
+    tolerance = reproduction["data"].get("tolerance")
+    if not isinstance(expected, (int, float)) or not isinstance(tolerance, (int, float)):
+        return {"error": {"type": "REPRODUCTION_COMPARISON_UNAVAILABLE", "message": "reported_metric.value and tolerance are required"}}
+    difference = abs(observed_metric - expected)
+    status = "REPRODUCED" if difference <= tolerance else "PARTIAL"
+    return await call(
+        research().object_update,
+        reproduction_id,
+        {"observed_metric": {"name": metric_name or reported.get("name"), "value": observed_metric}, "difference": difference},
+        status,
+        "REPRODUCTION_COMPLETED",
+    )
 
 
 @mcp.tool()

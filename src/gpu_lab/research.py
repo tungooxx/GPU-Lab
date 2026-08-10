@@ -136,6 +136,15 @@ class ResearchStore:
             self._event(cur, item["project_id"], event, object_id, {"rationale": rationale})
         return {"id": object_id, "status": status, "rationale": rationale}
 
+    def object_update(self, object_id: str, data_update: dict[str, Any], status: str, event_type: str) -> dict:
+        """Materialize a new current view while preserving the scientific change as an event."""
+        item = self.object_get(object_id)
+        data = {**item["data"], **data_update}
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("UPDATE research_objects SET status=%s,data=%s WHERE id=%s", (status, json.dumps(data), object_id))
+            self._event(cur, item["project_id"], event_type, object_id, {"status": status, **data_update})
+        return {"id": object_id, "status": status, "data": data}
+
     def events(self, project_id: str, limit: int = 100) -> list[dict]:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT event_type,subject_id,payload,created_at FROM research_events WHERE project_id=%s ORDER BY created_at DESC LIMIT %s", (project_id, limit))
@@ -143,10 +152,14 @@ class ResearchStore:
 
     def search(self, project_id: str, query: str, kind: str | None = None, limit: int = 25) -> list[dict]:
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute(
-                "SELECT id,kind,status,data,created_at FROM research_objects WHERE project_id=%s AND (%s IS NULL OR kind=%s) AND data::text ILIKE %s ORDER BY created_at DESC LIMIT %s",
-                (project_id, kind, kind, f"%{query}%", limit),
-            )
+            sql = "SELECT id,kind,status,data,created_at FROM research_objects WHERE project_id=%s"
+            args: list[Any] = [project_id]
+            if kind:
+                sql += " AND kind=%s"
+                args.append(kind)
+            sql += " AND data::text ILIKE %s ORDER BY created_at DESC LIMIT %s"
+            args.extend((f"%{query}%", limit))
+            cur.execute(sql, args)
             return cur.fetchall()
 
     @staticmethod
