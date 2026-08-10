@@ -681,15 +681,21 @@ async def reproduction_sync(reproduction_id: str):
     job_id = reproduction["data"].get("job_id")
     if not job_id:
         return {"error": {"type": "REPRODUCTION_MISSING_JOB", "message": reproduction_id}}
-    outcome, artifacts = local.job_status(job_id), local.artifacts(job_id)
+    outcome, artifacts, runtime = local.job_status(job_id), local.artifacts(job_id), await local.status()
     if outcome["status"] == "running":
-        return await call(research().object_update, reproduction_id, {"logs_tail": outcome["logs_tail"][-65536:]}, "RUNNING", "REPRODUCTION_LOGS_SYNCED")
+        return await call(
+            research().object_update,
+            reproduction_id,
+            {"logs_tail": outcome["logs_tail"][-65536:], "runtime": runtime},
+            "RUNNING",
+            "REPRODUCTION_LOGS_SYNCED",
+        )
     status = "FAILED" if outcome["status"] != "completed" else "PARTIAL"
     event = "REPRODUCTION_FAILED" if status == "FAILED" else "REPRODUCTION_EXECUTION_COMPLETED"
     return await call(
         research().object_update,
         reproduction_id,
-        {"exit_code": outcome["exit_code"], "logs_tail": outcome["logs_tail"][-65536:], "artifacts": artifacts},
+        {"exit_code": outcome["exit_code"], "logs_tail": outcome["logs_tail"][-65536:], "artifacts": artifacts, "runtime": runtime},
         status,
         event,
     )
@@ -761,9 +767,18 @@ async def research_experiment_sync(run_id: str):
     job_id = run["data"].get("job_id")
     if not job_id:
         return {"error": {"type": "RUN_MISSING_JOB"}}
-    outcome = local.job_status(job_id)
-    artifacts = local.artifacts(job_id)
-    return await call(research().run_update, run_id, {"status": outcome["status"], "exit_code": outcome["exit_code"], "logs_tail": outcome["logs_tail"][-65536:], "artifacts": artifacts})
+    outcome, artifacts, runtime = local.job_status(job_id), local.artifacts(job_id), await local.status()
+    return await call(
+        research().run_update,
+        run_id,
+        {
+            "status": outcome["status"],
+            "exit_code": outcome["exit_code"],
+            "logs_tail": outcome["logs_tail"][-65536:],
+            "artifacts": artifacts,
+            "runtime": runtime,
+        },
+    )
 
 
 @mcp.tool()
