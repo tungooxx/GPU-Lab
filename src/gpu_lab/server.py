@@ -1,16 +1,30 @@
 import argparse
+import os
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from .config import Settings
 from .errors import GPUError
 from .service import GPUService
 
 settings, service = Settings(), None
+allowed_hosts = [
+    host.strip()
+    for host in os.getenv("GPU_LAB_ALLOWED_HOSTS", "127.0.0.1:*,localhost:*").split(",")
+    if host.strip()
+]
 mcp = FastMCP(
     "GPU Lab",
     json_response=True,
     instructions="Safe, structured remote GPU experiment control plane. Credentials are never returned.",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=[
+            f"https://{host.removesuffix(':*')}" for host in allowed_hosts if ":*" not in host
+        ],
+    ),
 )
 
 

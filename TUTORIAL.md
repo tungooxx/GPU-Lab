@@ -62,6 +62,7 @@ GPU_LAB_MAX_TEXT_ARTIFACT_BYTES=1048576
 GPU_LAB_SSH_TIMEOUT=20
 GPU_LAB_SSH_KNOWN_HOSTS=/home/gpu-lab/.ssh/known_hosts
 GPU_LAB_SSH_ALLOW_UNVERIFIED_HOSTS=false
+GPU_LAB_ALLOWED_HOSTS=127.0.0.1:*,localhost:*,chucky-lab.com
 ```
 
 Do not commit this file.
