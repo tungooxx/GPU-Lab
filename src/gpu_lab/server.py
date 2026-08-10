@@ -1,6 +1,7 @@
 import argparse
 import base64
 import inspect
+import logging
 import re
 import secrets
 import time
@@ -17,6 +18,8 @@ from .local_runner import LocalRunner
 from .research import ResearchStore
 from .service import GPUService
 from .terminal import TERMINAL_HTML
+
+logger = logging.getLogger(__name__)
 
 settings, service, research_store = Settings(), None, None
 allowed_hosts = [
@@ -81,8 +84,9 @@ async def call(fn, *args, **kwargs):
             exc.message,
         )
         return exc.response()
-    except Exception:  # noqa: BLE001 - MCP boundary must return a structured, audited failure.
+    except Exception:
         # Do not expose implementation details or leave an MCP request without an audit record.
+        logger.exception("Unexpected MCP tool failure: %s", tool_name)
         svc().repo.audit(tool_name, arguments, "error", int((time.perf_counter() - started) * 1000), "Internal error")
         return {"error": {"type": "INTERNAL_ERROR", "message": "Unexpected server error", "retryable": False}}
 
@@ -234,7 +238,9 @@ async def research_state_update(project_id: str, update: dict):
 async def claim_create(project_id: str, statement: str, scope: str, evidence_ids: list[str] | None = None):
     evidence = evidence_ids or []
     for evidence_id in evidence:
-        item = research().object_get(evidence_id)
+        item = await call(research().object_get, evidence_id)
+        if "error" in item:
+            return item
         if str(item["project_id"]) != project_id or item["kind"] != "EvidenceUnit":
             return {"error": {"type": "INVALID_CLAIM_EVIDENCE", "message": evidence_id}}
     result = await call(
@@ -289,6 +295,8 @@ async def claim_compare(claim_id: str, other_claim_id: str):
 @mcp.tool()
 async def contradiction_create(project_id: str, claim_id: str, other_claim_id: str, rationale: str):
     """Record an explicit conflict between two scoped claims instead of silently averaging them."""
+    if claim_id == other_claim_id:
+        return {"error": {"type": "INVALID_CONTRADICTION", "message": "A claim cannot contradict itself"}}
     claim, other_claim = research().object_get(claim_id), research().object_get(other_claim_id)
     if claim["kind"] != "Claim" or other_claim["kind"] != "Claim":
         return {"error": {"type": "NOT_A_CLAIM", "message": "Both inputs must be Claim IDs"}}
@@ -325,10 +333,11 @@ async def hypothesis_create(
     related = await call(research().related_hypotheses, project_id, mechanism)
     if isinstance(related, dict) and "error" in related:
         return related
+    related = [item for item in related if item["containment_similarity"] >= 0.35]
     close_dead = [
         item
         for item in related
-        if item["lexical_similarity"] >= 0.6
+        if item["containment_similarity"] >= 0.6
         and (item["status"] == "REFUTED" or item["kind"] == "NegativeResult")
     ]
     if close_dead and not scientific_difference:
@@ -445,7 +454,7 @@ async def experiment_priority(
     denominator = max(compute_cost * implementation_cost * max(execution_risk, 0.01), 0.01)
     return {
         "priority": scientific_importance * hypothesis_discrimination * expected_information_gain / denominator,
-        "formula": "importance × discrimination × information_gain / (compute_cost × implementation_cost × execution_risk)",
+        "formula": "importance * discrimination * information_gain / max(compute_cost * implementation_cost * max(execution_risk, 0.01), 0.01)",
         "recommendation": "Prefer the smallest discriminating test before additional training.",
     }
 
@@ -521,9 +530,17 @@ async def research_semantic_search(
 @mcp.tool()
 async def paper_ask(project_id: str, question: str, limit: int = 8):
     """Return retrieved source passages for a question; this is evidence retrieval, not a conclusion."""
-    evidence = await call(research().search, project_id, question, "EvidenceUnit", min(max(limit, 1), 25))
-    if isinstance(evidence, dict) and "error" in evidence:
-        return evidence
+    evidence, seen = [], set()
+    for term in ResearchStore._terms(question):
+        matches = await call(research().search, project_id, term, "EvidenceUnit", min(max(limit, 1), 25))
+        if isinstance(matches, dict) and "error" in matches:
+            return matches
+        for match in matches:
+            if match["id"] not in seen:
+                evidence.append(match)
+                seen.add(match["id"])
+                if len(evidence) >= min(max(limit, 1), 25):
+                    break
     return {
         "question": question,
         "evidence": evidence,
@@ -735,6 +752,8 @@ async def reproduction_compare(reproduction_id: str, observed_metric: float, met
         return {"error": {"type": "NOT_A_REPRODUCTION", "message": reproduction_id}}
     if reproduction["status"] == "FAILED":
         return {"error": {"type": "REPRODUCTION_EXECUTION_FAILED", "message": "A failed run cannot be metric-compared"}}
+    if reproduction["status"] != "PARTIAL":
+        return {"error": {"type": "REPRODUCTION_COMPARISON_UNAVAILABLE", "message": "Run reproduction_sync after execution before comparing metrics"}}
     reported = reproduction["data"].get("reported_metric") or {}
     expected = reported.get("value")
     tolerance = reproduction["data"].get("tolerance")
@@ -794,18 +813,21 @@ async def research_experiment_sync(run_id: str):
     if not job_id:
         return {"error": {"type": "RUN_MISSING_JOB"}}
     outcome, artifacts, runtime = local.job_status(job_id), local.artifacts(job_id), await local.status()
+    runner_status = outcome["status"]
+    research_status = "failed" if runner_status == "unknown" else runner_status
     updated = await call(
         research().run_update,
         run_id,
         {
-            "status": outcome["status"],
+            "status": research_status,
+            "runner_status": runner_status,
             "exit_code": outcome["exit_code"],
             "logs_tail": outcome["logs_tail"][-65536:],
             "artifacts": artifacts,
             "runtime": runtime,
         },
     )
-    if "error" in updated or updated.get("already_final") or outcome["status"] not in {"completed", "failed"}:
+    if "error" in updated or updated.get("already_final") or research_status not in {"completed", "failed"}:
         return updated
     for artifact in artifacts:
         recorded = await call(

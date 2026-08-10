@@ -45,6 +45,10 @@ class ResearchStore:
                     id UUID PRIMARY KEY, project_id UUID NOT NULL REFERENCES research_projects(id),
                     event_type TEXT NOT NULL, subject_id UUID, payload JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS research_events_project_created_idx
+                    ON research_events(project_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS research_objects_project_kind_created_idx
+                    ON research_objects(project_id, kind, created_at DESC);
             """)
             if self.vector_available:
                 cur.execute("ALTER TABLE research_objects ADD COLUMN IF NOT EXISTS embedding vector")
@@ -86,6 +90,9 @@ class ResearchStore:
                 "refuted_lineages": by_kind("Hypothesis", {"REFUTED"}),
                 "completed_experiments": by_kind("ExperimentRun", {"completed"}),
                 "active_experiments": by_kind("ExperimentRun", {"ACTIVE", "running"}),
+                "terminal_non_success_experiments": by_kind(
+                    "ExperimentRun", {"failed", "cancelled", "unknown"}
+                ),
                 "open_experiments": by_kind("Experiment", {"ACTIVE"}),
                 "reproduction_status": by_kind("Reproduction"),
                 "negative_results": by_kind("NegativeResult"),
@@ -105,6 +112,9 @@ class ResearchStore:
         unexpected = sorted(set(update) - allowed)
         if unexpected:
             raise GPUError("INVALID_RESEARCH_STATE_FIELDS", ", ".join(unexpected))
+        for field in ("established_facts", "next_discriminating_experiments"):
+            if field in update and not isinstance(update[field], list):
+                raise GPUError("INVALID_RESEARCH_STATE_FIELDS", f"{field} must be a list")
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT state FROM research_projects WHERE id=%s FOR UPDATE", (project_id,))
             row = cur.fetchone()
@@ -172,7 +182,10 @@ class ResearchStore:
         data = {**item["data"], **data_update}
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute("UPDATE research_objects SET status=%s,data=%s WHERE id=%s", (status, json.dumps(data), object_id))
-            self._event(cur, item["project_id"], event_type, object_id, {"status": status, **data_update})
+            event_update = dict(data_update)
+            if "logs_tail" in event_update:
+                event_update["logs_tail"] = {"updated": True, "bytes": len(event_update["logs_tail"])}
+            self._event(cur, item["project_id"], event_type, object_id, {"status": status, **event_update})
         return {"id": object_id, "status": status, "data": data}
 
     def events(self, project_id: str, limit: int = 100) -> list[dict]:
@@ -187,8 +200,9 @@ class ResearchStore:
             if kind:
                 sql += " AND kind=%s"
                 args.append(kind)
-            sql += " AND data::text ILIKE %s ORDER BY created_at DESC LIMIT %s"
-            args.extend((f"%{query}%", limit))
+            escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            sql += " AND data::text ILIKE %s ESCAPE '\\' ORDER BY created_at DESC LIMIT %s"
+            args.extend((f"%{escaped}%", limit))
             cur.execute(sql, args)
             return cur.fetchall()
 
@@ -206,8 +220,11 @@ class ResearchStore:
                 text = item["data"].get("mechanism") or item["data"].get("proposal", "")
                 terms = self._terms(text)
                 overlap = len(query_terms & terms) / len(query_terms | terms) if query_terms | terms else 0.0
+                containment = len(query_terms & terms) / len(query_terms) if query_terms else 0.0
                 if overlap:
-                    related.append({**item, "lexical_similarity": round(overlap, 3)})
+                    related.append(
+                        {**item, "lexical_similarity": round(overlap, 3), "containment_similarity": round(containment, 3)}
+                    )
             return sorted(related, key=lambda item: item["lexical_similarity"], reverse=True)[:limit]
 
     def embedding_set(self, object_id: str, embedding: list[float]) -> dict:
