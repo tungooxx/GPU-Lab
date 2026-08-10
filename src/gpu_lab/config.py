@@ -17,6 +17,14 @@ class Settings(BaseSettings):
     gpu_lab_ssh_timeout: int = 20
     gpu_lab_ssh_known_hosts: Path | None = None
     gpu_lab_ssh_allow_unverified_hosts: bool = False
+    gpu_lab_allowed_hosts: str = "127.0.0.1:*,localhost:*"
+    gpu_lab_enable_local_runner: bool = False
+    gpu_lab_local_workspace: Path = Path("/workspace/local-vlm")
+    gpu_lab_local_env_root: Path = Path("/opt/gpu-lab/envs")
+    gpu_lab_terminal_password: str | None = None
+    gpu_lab_research_database_url: str | None = None
+    fastmcp_host: str = "127.0.0.1"
+    fastmcp_port: int = 8000
 
     @field_validator("gpu_lab_ssh_private_key_path", "gpu_lab_ssh_known_hosts", mode="before")
     @classmethod

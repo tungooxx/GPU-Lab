@@ -1,6 +1,30 @@
 services:
+  postgres:
+    # Cached local development fallback. Use pgvector/pgvector:pg16 in production.
+    image: postgres:14
+    environment:
+      POSTGRES_DB: research_os
+      POSTGRES_USER: research
+      POSTGRES_PASSWORD: research
+    volumes: ["./research-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U research -d research_os"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
   gpu-lab:
     build: .
     env_file: .env
-    ports: ["8000:8000"]
-    volumes: ["./data:/data", "${GPU_LAB_SSH_PRIVATE_KEY_PATH:-/dev/null}:/run/ssh-key:ro"]
+    environment:
+      GPU_LAB_DATA_DIR: /data
+      GPU_LAB_DATABASE_URL: sqlite:////data/gpu_lab.db
+      GPU_LAB_SSH_PRIVATE_KEY_PATH: /run/ssh-key
+      GPU_LAB_LOCAL_WORKSPACE: /workspace/local-vlm
+      GPU_LAB_RESEARCH_DATABASE_URL: postgresql://research:research@postgres:5432/research_os
+    ports: ["127.0.0.1:8000:8000"]
+    volumes: ["./data:/data", "./local-envs:/opt/gpu-lab/envs", "${GPU_LAB_SSH_PRIVATE_KEY_PATH:-/dev/null}:/run/ssh-key:ro", "${GPU_LAB_LOCAL_WORKSPACE_HOST:-F:/Newgeneration/VLM}:/workspace/local-vlm"]
+    gpus: all
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
