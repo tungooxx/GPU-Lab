@@ -201,9 +201,16 @@ class ResearchBrain:
         source, target = self.store.object_get(source_id), self.store.object_get(target_id)
         if source["project_id"] != model["project_id"] or target["project_id"] != model["project_id"]:
             raise GPUError("RESEARCH_PROJECT_MISMATCH", "World-model nodes must share a project")
+        model_nodes = {str(item) for item in model["data"].get("node_ids", [])}
+        if source_id not in model_nodes or target_id not in model_nodes:
+            raise GPUError(
+                "WORLD_MODEL_NODE_REQUIRED",
+                "Causal-edge endpoints must already belong to the selected WorldModel",
+            )
         evidence = list(dict.fromkeys([*(supporting_ids or []), *(against_ids or [])]))
         predictions = list(dict.fromkeys(unresolved_prediction_ids or []))
-        self._validate_references(model["project_id"], [*evidence, *predictions])
+        references = [*evidence, *predictions, *([decision_id] if decision_id else [])]
+        self._validate_references(model["project_id"], references)
         if (
             status
             in {"OBSERVED_ASSOCIATION", "INTERVENTION_SUPPORTED", "WEAKENED", "REFUTED"}
@@ -267,7 +274,8 @@ class ResearchBrain:
             dict.fromkeys([*edge["data"].get("against_ids", []), *(against_ids or [])])
         )
         evidence = [*supporting, *against]
-        self._validate_references(model["project_id"], evidence)
+        references = [*evidence, *([decision_id] if decision_id else [])]
+        self._validate_references(model["project_id"], references)
         if status in {"INTERVENTION_SUPPORTED", "WEAKENED", "REFUTED"} and not evidence:
             raise GPUError("CAUSAL_EDGE_EVIDENCE_REQUIRED", status)
         updated = self.store.object_update(
@@ -325,6 +333,13 @@ class ResearchBrain:
             *(related_contradiction_ids or []),
         ]
         self._validate_references(agenda["project_id"], references)
+        experiments = candidate_experiments or []
+        for candidate in experiments:
+            if "action_type" not in candidate:
+                raise GPUError(
+                    "INVALID_RESEARCH_ACTION_TYPE", "Candidate action_type is required"
+                )
+            self._configured_candidate(candidate, question, blocking_hypothesis_ids or [])
         item = self.store.object_create(
             agenda["project_id"],
             "AgendaItem",
@@ -337,7 +352,7 @@ class ResearchBrain:
                 "blocking_hypothesis_ids": blocking_hypothesis_ids or [],
                 "related_anomaly_ids": related_anomaly_ids or [],
                 "related_contradiction_ids": related_contradiction_ids or [],
-                "candidate_experiments": candidate_experiments or [],
+                "candidate_experiments": experiments,
                 "reproduction_required": reproduction_required,
             },
             "AGENDA_ITEM_CREATED",
@@ -361,10 +376,10 @@ class ResearchBrain:
             "AGENDA_ITEM_STATUS_CHANGED",
         )
 
-    def portfolio_get(self, project_id: str) -> dict:
+    def _portfolio_data(self, project_id: str) -> dict:
         hypotheses = self.store.objects_list(project_id, "Hypothesis")
         negative = self.store.objects_list(project_id, "NegativeResult")
-        portfolio_data = {
+        return {
             "active_hypothesis_ids": [
                 str(item["id"])
                 for item in hypotheses
@@ -376,6 +391,21 @@ class ResearchBrain:
             "negative_result_ids": [str(item["id"]) for item in negative],
             "updated_at": datetime.now(UTC).isoformat(),
         }
+
+    def portfolio_get(self, project_id: str) -> dict:
+        portfolios = self.store.objects_list(project_id, "HypothesisPortfolio", {"ACTIVE"}, 1)
+        if portfolios:
+            return portfolios[0]
+        return {
+            "id": None,
+            "project_id": project_id,
+            "kind": "HypothesisPortfolio",
+            "status": "NOT_MATERIALIZED",
+            "data": self._portfolio_data(project_id),
+        }
+
+    def _portfolio_refresh(self, project_id: str) -> dict:
+        portfolio_data = self._portfolio_data(project_id)
         portfolios = self.store.objects_list(project_id, "HypothesisPortfolio", {"ACTIVE"}, 1)
         if portfolios:
             return self.store.object_update(
@@ -414,7 +444,7 @@ class ResearchBrain:
             key=lambda item: item["data"].get("importance", 1)
             * item["data"].get("uncertainty", 1),
         )
-        portfolio = self.portfolio_get(project_id)
+        portfolio = self._portfolio_refresh(project_id)
         hypotheses = self.store.objects_list(
             project_id, "Hypothesis", {"ACTIVE", "SURVIVES_INITIAL_TEST"}
         )
@@ -536,6 +566,16 @@ class ResearchBrain:
         }
         if hypothesis_transition not in allowed_transitions:
             raise GPUError("INVALID_SCIENTIFIC_STATUS", hypothesis_transition)
+        guard_passed = guard_condition_outcome.strip().upper() in {
+            "PASS",
+            "PASSED",
+            "SATISFIED",
+        } or guard_condition_outcome.strip().upper().startswith(("PASS:", "PASSED:"))
+        if hypothesis_transition in {"SUPPORTED", "SURVIVES_INITIAL_TEST"} and not guard_passed:
+            raise GPUError(
+                "EXPERIMENT_GUARD_NOT_PASSED",
+                "Positive scientific transitions require an explicitly passed guard condition",
+            )
         evidence = self.store.object_create(
             project_id,
             "EvidenceUnit",

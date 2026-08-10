@@ -103,3 +103,13 @@ def test_provider_failure_selects_an_alternative_action():
     assert selected.action_type == "LITERATURE_SEARCH"
     assert selected.payload["mode"] == "ALTERNATIVE_ACTION"
     assert selected.payload["blocked_actions"][0]["blocked_reason"] == "GPU unavailable"
+
+
+def test_portfolio_get_does_not_mutate_scientific_state():
+    store = CandidateStore()
+    brain = ResearchBrain(store)
+
+    portfolio = brain.portfolio_get("project")
+
+    assert portfolio["status"] == "NOT_MATERIALIZED"
+    assert portfolio["data"]["active_hypothesis_ids"] == []

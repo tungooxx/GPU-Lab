@@ -398,7 +398,7 @@ def main() -> None:
             "hypothesis_id": hypothesis["id"],
             "agenda_item_id": causal_item["id"],
             "prediction_outcome": "effect == 1.0 on the preregistered CUDA fixture",
-            "guard_condition_outcome": "CUDA available; canonical runtime used",
+            "guard_condition_outcome": "PASSED: CUDA available; canonical runtime used",
             "evidence_supporting": ["result.json effect equals 1.0"],
             "evidence_against": [],
             "unexpected_observations": [],

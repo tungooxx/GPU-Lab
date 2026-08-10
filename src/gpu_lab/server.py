@@ -471,7 +471,7 @@ async def research_agenda_item_update(agenda_item_id: str, status: str, rational
 
 @mcp.tool()
 async def hypothesis_portfolio_get(project_id: str):
-    """Materialize the competing active, refuted, and negative hypothesis portfolio."""
+    """Read the durable portfolio, or preview its current contents before the first brain step."""
     return await call(brain().portfolio_get, project_id)
 
 
