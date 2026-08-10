@@ -55,13 +55,20 @@ class VastProvider:
     @staticmethod
     def normalize(raw: dict) -> Instance:
         ident = str(raw.get("id", raw.get("contract_id")))
+        ssh_port = raw.get("ssh_port")
+        ports = raw.get("ports") or {}
+        if isinstance(ports, dict):
+            mapped = ports.get("22/tcp") or []
+            if mapped and isinstance(mapped[0], dict):
+                ssh_port = mapped[0].get("HostPort") or ssh_port
+        hostname = raw.get("public_ipaddr") or raw.get("ssh_host")
         return Instance(
             id=f"vast_{ident}",
             provider_instance_id=ident,
             status=str(raw.get("actual_status", raw.get("status", "unknown"))),
             label=raw.get("label"),
-            hostname=raw.get("ssh_host") or raw.get("public_ipaddr"),
-            ssh_port=raw.get("ssh_port"),
+            hostname=hostname,
+            ssh_port=int(ssh_port) if ssh_port is not None else None,
             ssh_user=raw.get("ssh_user", "root"),
             gpu_model=raw.get("gpu_name"),
             gpu_count=raw.get("num_gpus"),

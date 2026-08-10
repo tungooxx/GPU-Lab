@@ -28,6 +28,21 @@ def test_provider_normalizes_connection_metadata():
     assert item.id == "vast_12" and item.hostname == "host" and item.ssh_port == 123
 
 
+def test_provider_prefers_direct_public_ssh_mapping():
+    item = VastProvider.normalize(
+        {
+            "id": 12,
+            "actual_status": "running",
+            "ssh_host": "ssh3.vast.ai",
+            "ssh_port": 30072,
+            "public_ipaddr": "191.223.212.127",
+            "ports": {"22/tcp": [{"HostPort": "31708"}]},
+        }
+    )
+    assert item.hostname == "191.223.212.127"
+    assert item.ssh_port == 31708
+
+
 @pytest.mark.asyncio
 async def test_offer_search_uses_model_substring(monkeypatch):
     provider = VastProvider("not-a-real-key")
