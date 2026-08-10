@@ -131,7 +131,9 @@ class ResearchBrain:
         nodes = [self.store.object_get(item) for item in model["data"].get("node_ids", [])]
         edges = [self.store.object_get(item) for item in model["data"].get("edge_ids", [])]
         versions = self.store.objects_list(model["project_id"], "WorldModelVersion")
-        versions = [item for item in versions if item["data"].get("world_model_id") == world_model_id]
+        versions = [
+            item for item in versions if item["data"].get("world_model_id") == world_model_id
+        ]
         return {"world_model": model, "nodes": nodes, "edges": edges, "versions": versions}
 
     def world_entity_create(
@@ -199,7 +201,10 @@ class ResearchBrain:
             raise GPUError("INVALID_CAUSAL_EDGE_STATUS", status)
         model = self._expect(world_model_id, "WorldModel")
         source, target = self.store.object_get(source_id), self.store.object_get(target_id)
-        if source["project_id"] != model["project_id"] or target["project_id"] != model["project_id"]:
+        if (
+            source["project_id"] != model["project_id"]
+            or target["project_id"] != model["project_id"]
+        ):
             raise GPUError("RESEARCH_PROJECT_MISMATCH", "World-model nodes must share a project")
         model_nodes = {str(item) for item in model["data"].get("node_ids", [])}
         if source_id not in model_nodes or target_id not in model_nodes:
@@ -212,8 +217,7 @@ class ResearchBrain:
         references = [*evidence, *predictions, *([decision_id] if decision_id else [])]
         self._validate_references(model["project_id"], references)
         if (
-            status
-            in {"OBSERVED_ASSOCIATION", "INTERVENTION_SUPPORTED", "WEAKENED", "REFUTED"}
+            status in {"OBSERVED_ASSOCIATION", "INTERVENTION_SUPPORTED", "WEAKENED", "REFUTED"}
             and not evidence
         ):
             raise GPUError("CAUSAL_EDGE_EVIDENCE_REQUIRED", status)
@@ -270,9 +274,7 @@ class ResearchBrain:
         supporting = list(
             dict.fromkeys([*edge["data"].get("supporting_ids", []), *(supporting_ids or [])])
         )
-        against = list(
-            dict.fromkeys([*edge["data"].get("against_ids", []), *(against_ids or [])])
-        )
+        against = list(dict.fromkeys([*edge["data"].get("against_ids", []), *(against_ids or [])]))
         evidence = [*supporting, *against]
         references = [*evidence, *([decision_id] if decision_id else [])]
         self._validate_references(model["project_id"], references)
@@ -336,9 +338,7 @@ class ResearchBrain:
         experiments = candidate_experiments or []
         for candidate in experiments:
             if "action_type" not in candidate:
-                raise GPUError(
-                    "INVALID_RESEARCH_ACTION_TYPE", "Candidate action_type is required"
-                )
+                raise GPUError("INVALID_RESEARCH_ACTION_TYPE", "Candidate action_type is required")
             self._configured_candidate(candidate, question, blocking_hypothesis_ids or [])
         item = self.store.object_create(
             agenda["project_id"],
@@ -428,7 +428,11 @@ class ResearchBrain:
         models = self.store.objects_list(project_id, "WorldModel", limit=1)
         agendas = self.store.objects_list(project_id, "ResearchAgenda", {"ACTIVE"}, 1)
         if not models or not agendas:
-            missing = [name for name, values in (("WorldModel", models), ("ResearchAgenda", agendas)) if not values]
+            missing = [
+                name
+                for name, values in (("WorldModel", models), ("ResearchAgenda", agendas))
+                if not values
+            ]
             raise GPUError("BRAIN_STATE_INCOMPLETE", "Missing: " + ", ".join(missing))
         model, agenda = models[0], agendas[0]
         items = [
@@ -441,8 +445,7 @@ class ResearchBrain:
             raise GPUError("RESEARCH_AGENDA_EMPTY", str(agenda["id"]))
         agenda_item = max(
             items,
-            key=lambda item: item["data"].get("importance", 1)
-            * item["data"].get("uncertainty", 1),
+            key=lambda item: item["data"].get("importance", 1) * item["data"].get("uncertainty", 1),
         )
         portfolio = self._portfolio_refresh(project_id)
         hypotheses = self.store.objects_list(
@@ -499,9 +502,7 @@ class ResearchBrain:
             "hindsight_assessment": None,
             "duration_ms": 0,
         }
-        decision_data["duration_ms"] = int(
-            (datetime.now(UTC) - started).total_seconds() * 1000
-        )
+        decision_data["duration_ms"] = int((datetime.now(UTC) - started).total_seconds() * 1000)
         decision = self.store.object_create(
             project_id,
             "ResearchDecision",
@@ -552,7 +553,9 @@ class ResearchBrain:
         hypothesis = self._expect(hypothesis_id, "Hypothesis")
         agenda_item = self._expect(agenda_item_id, "AgendaItem")
         project_id = str(run["project_id"])
-        if any(str(item["project_id"]) != project_id for item in (decision, hypothesis, agenda_item)):
+        if any(
+            str(item["project_id"]) != project_id for item in (decision, hypothesis, agenda_item)
+        ):
             raise GPUError("RESEARCH_PROJECT_MISMATCH", "Assessment inputs must share a project")
         if run["status"] not in {"completed", "RESULT_NOT_INSPECTED"}:
             raise GPUError("EXPERIMENT_RESULT_NOT_READY", run["status"])
@@ -686,9 +689,7 @@ class ResearchBrain:
             and not run["data"].get("inspection")
         ]
         unfinished = [
-            run
-            for run in runs
-            if run["status"] in {"RESERVED", "SUBMITTED", "running", "unknown"}
+            run for run in runs if run["status"] in {"RESERVED", "SUBMITTED", "running", "unknown"}
         ]
         question = agenda_item["data"]["question"]
         hypothesis_ids = [str(item["id"]) for item in hypotheses]
@@ -735,8 +736,7 @@ class ResearchBrain:
         reproductions = self.store.objects_list(project_id, "Reproduction")
         baseline_reproduced = any(item["status"] == "REPRODUCED" for item in reproductions)
         needs_reproduction = (
-            bool(agenda_item["data"].get("reproduction_required"))
-            and not baseline_reproduced
+            bool(agenda_item["data"].get("reproduction_required")) and not baseline_reproduced
         ) or (bool(reproductions) and not baseline_reproduced)
         if needs_reproduction:
             return [
@@ -759,6 +759,35 @@ class ResearchBrain:
                 ).checked()
             ]
         configured = agenda_item["data"].get("candidate_experiments", [])
+        literature_requested = any(
+            item.get("action_type") == "LITERATURE_SEARCH" for item in configured
+        )
+        candidate_evidence = self.store.objects_list(project_id, "EvidenceUnit", {"CANDIDATE"})
+        if literature_requested and candidate_evidence:
+            return [
+                ActionCandidate(
+                    action_type="EVIDENCE_REVIEW",
+                    question_addressed=question,
+                    hypotheses_discriminated=hypothesis_ids,
+                    predicted_outcomes=[
+                        "Validate candidate provenance and decide whether a scoped claim survives"
+                    ],
+                    required_resources=["candidate evidence", "claim validation"],
+                    payload={
+                        "evidence_ids": [str(item["id"]) for item in candidate_evidence],
+                        "mode": "VALIDATE_LITERATURE_CANDIDATES",
+                    },
+                    score=ActionScore(
+                        scientific_importance=4,
+                        expected_discrimination=3,
+                        expected_information_gain=3,
+                        feasibility=5,
+                        compute_cost=0.1,
+                        engineering_cost=0.2,
+                        execution_risk=0.2,
+                    ),
+                ).checked()
+            ]
         candidates = [
             self._configured_candidate(item, question, hypothesis_ids)
             for item in configured

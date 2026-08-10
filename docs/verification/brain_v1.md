@@ -38,8 +38,12 @@ inspected run, five WorldModel versions, and continued with `GENERALIZATION`.
   recovery, and continuation after restart.
 - **VERIFIED_UNIT:** policy scoring, invalid action handling, finite agenda validation, the HASI
   reproduction-before-intervention gate, and unavailable-provider alternative action.
-- **UNVERIFIED:** scientific generality of HASI, PaperQA, Paper2Agent, quality-diversity operators,
-  branch search, meta-review, and autonomous campaigns.
+- **VERIFIED_INTEGRATION:** PaperQA 2026.3.18 import/API compatibility, isolated worker health,
+  authenticated gateway-to-worker connectivity, provenance normalization, canonical candidate
+  import, unavailable-provider behavior, and absence of Vast/SSH/PostgreSQL credentials in the
+  worker environment.
+- **UNVERIFIED:** scientific generality of HASI, real model-backed PaperQA answer quality,
+  Paper2Agent, quality-diversity operators, branch search, meta-review, and autonomous campaigns.
 
 ## Known risks and next highest-value build step
 

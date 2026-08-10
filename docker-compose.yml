@@ -29,6 +29,26 @@ services:
       postgres:
         condition: service_healthy
     restart: unless-stopped
+  literature:
+    profiles: ["literature"]
+    build:
+      context: .
+      dockerfile: literature.Dockerfile
+    environment:
+      GPU_LAB_LITERATURE_WORKER_TOKEN: ${GPU_LAB_LITERATURE_WORKER_TOKEN:-}
+      GPU_LAB_PAPERQA_DIRECTORY: /papers
+      PQA_HOME: /papers/.pqa
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      CROSSREF_API_KEY: ${CROSSREF_API_KEY:-}
+      SEMANTIC_SCHOLAR_API_KEY: ${SEMANTIC_SCHOLAR_API_KEY:-}
+    volumes: ["literature-papers:/papers"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8010/health', data=b'{}')).read()"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
 
 volumes:
   gpu-lab-envs:
+  literature-papers:

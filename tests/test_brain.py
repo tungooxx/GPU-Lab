@@ -47,15 +47,18 @@ def test_causal_edge_status_requires_finite_agenda_scores():
 
 
 class CandidateStore:
-    def __init__(self, *, reproductions=None, runs=None):
+    def __init__(self, *, reproductions=None, runs=None, evidence=None):
         self.reproductions = reproductions or []
         self.runs = runs or []
+        self.evidence = evidence or []
 
     def objects_list(self, _project_id, kind, *_args, **_kwargs):
         if kind == "ExperimentRun":
             return self.runs
         if kind == "Reproduction":
             return self.reproductions
+        if kind == "EvidenceUnit":
+            return self.evidence
         return []
 
 
@@ -68,9 +71,7 @@ def test_hasi_benchmark_enforces_reproduction_then_causal_intervention():
     episode = _hasi_episode()
     agenda = {"data": episode["historical_state"]["agenda_item"]}
     hypotheses = episode["historical_state"]["active_hypotheses"]
-    brain = ResearchBrain(
-        CandidateStore(reproductions=[{"id": "baseline", "status": "PARTIAL"}])
-    )
+    brain = ResearchBrain(CandidateStore(reproductions=[{"id": "baseline", "status": "PARTIAL"}]))
 
     before = brain._candidate_actions("project", agenda, hypotheses)
     assert before[0].action_type == "REPRODUCTION"
@@ -113,3 +114,22 @@ def test_portfolio_get_does_not_mutate_scientific_state():
 
     assert portfolio["status"] == "NOT_MATERIALIZED"
     assert portfolio["data"]["active_hypothesis_ids"] == []
+
+
+def test_literature_candidates_change_next_action_to_evidence_review():
+    brain = ResearchBrain(
+        CandidateStore(
+            evidence=[{"id": "evidence-1", "kind": "EvidenceUnit", "status": "CANDIDATE"}]
+        )
+    )
+    agenda = {
+        "data": {
+            "question": "What does prior work establish?",
+            "candidate_experiments": [{"action_type": "LITERATURE_SEARCH"}],
+        }
+    }
+
+    selected = brain._candidate_actions("project", agenda, [])[0]
+
+    assert selected.action_type == "EVIDENCE_REVIEW"
+    assert selected.payload["evidence_ids"] == ["evidence-1"]

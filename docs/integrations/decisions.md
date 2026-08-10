@@ -1,15 +1,20 @@
 # External research-engine decisions
 
-Audit date: 2026-08-10. These decisions protect PostgreSQL as the only canonical scientific memory.
+Audit date: 2026-08-11. These decisions protect PostgreSQL as the only canonical scientific memory.
 They must be revisited before adding or upgrading an external dependency.
 
 ## PaperQA
 
 - Official source: <https://github.com/Future-House/paper-qa>
 - License: Apache-2.0.
-- Runtime: Python 3.11+, LiteLLM-compatible model access, optional Crossref/Semantic Scholar keys,
-  and potentially a large local document/index state.
-- Decision: **OPTIONAL DEPENDENCY or SEPARATE WORKER**, behind `LiteratureProvider`.
+- Audited API family: `paper-qa>=2026.3.18,<2027`, Python 3.11+, Apache-2.0. PaperQA's CalVer
+  policy does not guarantee compatibility across releases, so the upper bound is intentional.
+- Runtime: LiteLLM-compatible model access, optional Crossref/Semantic Scholar keys, and a large
+  replaceable local document/index cache.
+- Decision: **OPTIONAL DEPENDENCY in a SEPARATE WORKER**, behind `LiteratureProvider`.
+- Implementation: the base gateway contains only `HttpLiteratureProvider`; the Compose
+  `literature` profile installs PaperQA. The worker receives only its scoped token, paper volume,
+  and optional literature/model credentials—not Vast, SSH, PostgreSQL, or repository secrets.
 - Boundary: results become provenance-rich evidence candidates. PaperQA never updates canonical
   claims, hypotheses, WorldModel edges, or scientific statuses directly.
 

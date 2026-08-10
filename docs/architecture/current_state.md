@@ -34,7 +34,7 @@ integration tests, and real execution.
 
 ## What is verified
 
-- **VERIFIED_UNIT:** 21 tests cover provider normalization, path safety, structured output metadata,
+- **VERIFIED_UNIT:** 32 tests cover provider normalization, path safety, structured output metadata,
   local requirements resolution, environment command construction, local job idempotency, action
   scoring, the HASI reproduction gate, and unavailable-provider fallback behavior.
 - **VERIFIED_INTEGRATION:** Docker PostgreSQL migration, MCP discovery, atomic execution reservation,
@@ -50,7 +50,9 @@ integration tests, and real execution.
 ## What is partial
 
 - pgvector storage/search exists, while automatic scientific embedding generation does not.
-- Literature records and retrieval exist, but PaperQA is not integrated.
+- PaperQA 2026.3.18 is integrated behind an optional isolated HTTP worker and typed
+  `LiteratureProvider`. Its contract, real import/API shape, container health, gateway-to-worker
+  connectivity, and credential isolation are verified; a paid/local-model evidence query is not.
 - Reproduction execution exists, but Paper2Agent is not integrated.
 - Hypothesis similarity uses lexical structure unless callers provide embeddings.
 - Brain v1 critics are deterministic advisory checks; LLM-backed typed ResearchOperators are not
@@ -60,7 +62,7 @@ integration tests, and real execution.
 
 - Automatic embedding generation, hypothesis niches/lineages, full comparative/meta-research
   memory, experiment branches, and autonomous campaign runtime.
-- PaperQA and executable-paper provider adapters.
+- Executable-paper provider adapters; PaperQA's real model-backed answer quality remains unverified.
 - Additional historical benchmark episodes beyond the permanent HASI gate.
 
 ## What should be reused

@@ -70,6 +70,21 @@ For a reproduction, use `reproduction_prepare`, `reproduction_run`, `reproductio
 `reproduction_compare`. A successful process is only `PARTIAL` until its observed metric is compared
 with the reported metric and tolerance; it becomes `REPRODUCED` only after that explicit comparison.
 
+## Optional PaperQA literature worker
+
+PaperQA is isolated from GPU/Vast/SSH/PostgreSQL credentials. Set a strong
+`GPU_LAB_LITERATURE_WORKER_TOKEN`, set `GPU_LAB_LITERATURE_PROVIDER=paperqa-http`, configure only
+the model/metadata credentials needed by PaperQA, and start:
+
+```bash
+docker compose --profile literature up -d --build
+```
+
+Use `literature_provider_status`, `literature_search`, and `literature_ask` for read-only candidates.
+`literature_gather` imports provenance-rich candidates into PostgreSQL and can create an unresolved
+scoped Claim, but it never marks a claim or hypothesis supported. The PaperQA index is a replaceable
+cache; PostgreSQL remains scientific truth.
+
 ## Local CLI
 
 ```bash
