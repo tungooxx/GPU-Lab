@@ -82,11 +82,14 @@ class Repository:
         duration_ms: int,
         error_message: str | None = None,
     ) -> None:
-        self.conn.execute(
-            "INSERT INTO audit_log(tool_name,arguments_json,outcome,error_message,duration_ms,created_at) VALUES(?,?,?,?,?,?)",
-            (tool_name, json.dumps(arguments, default=str), outcome, error_message, duration_ms, self._now()),
-        )
-        self.conn.commit()
+        try:
+            self.conn.execute(
+                "INSERT INTO audit_log(tool_name,arguments_json,outcome,error_message,duration_ms,created_at) VALUES(?,?,?,?,?,?)",
+                (tool_name, json.dumps(arguments, default=str), outcome, error_message, duration_ms, self._now()),
+            )
+            self.conn.commit()
+        except sqlite3.Error:
+            self.conn.rollback()
 
     def list_audit(self, limit: int = 50) -> list[dict]:
         rows = self.conn.execute(

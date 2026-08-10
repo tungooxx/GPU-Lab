@@ -935,7 +935,7 @@ async def health(_: Request):
 
 @mcp.custom_route("/activity", methods=["GET"], include_in_schema=False)
 async def activity(_: Request):
-    return JSONResponse(svc().repo.list_audit(100))
+    return JSONResponse(svc().repo.list_audit(100)) if terminal_allowed(_) else terminal_unauthorized()
 
 
 def terminal_allowed(request: Request) -> bool:
@@ -978,7 +978,7 @@ async def terminal_jobs(request: Request):
 
 @mcp.custom_route("/", methods=["GET"], include_in_schema=False)
 async def dashboard(_: Request):
-    return HTMLResponse(DASHBOARD_HTML)
+    return HTMLResponse(DASHBOARD_HTML) if terminal_allowed(_) else terminal_unauthorized()
 
 
 def main():

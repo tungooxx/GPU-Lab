@@ -33,13 +33,16 @@ class LocalRunner:
 
     async def status(self) -> dict:
         self._require_enabled()
-        proc = await asyncio.create_subprocess_exec(
-            "nvidia-smi",
-            "--query-gpu=name,memory.total,driver_version",
-            "--format=csv,noheader",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "nvidia-smi",
+                "--query-gpu=name,memory.total,driver_version",
+                "--format=csv,noheader",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:
+            raise GPUError("NVIDIA_SMI_UNAVAILABLE", "nvidia-smi is unavailable in the local runtime") from exc
         out, err = await proc.communicate()
         runtime = await asyncio.create_subprocess_shell(
             "python3 -c \"import sys; print(sys.executable); print(sys.version.split()[0]); import torch; print(torch.__version__); print(torch.version.cuda); print(torch.cuda.is_available())\"",
@@ -82,14 +85,15 @@ class LocalRunner:
             run_env["PATH"] = f"{venv / 'bin'}:{run_env.get('PATH', '')}"
             run_env["VIRTUAL_ENV"] = str(venv)
         wrapper = f"bash {shlex.quote(str(script))}; code=$?; printf '%s' $code > {shlex.quote(str(exit_code))}; exit $code"
-        process = await asyncio.create_subprocess_shell(
-            f"sh -lc {shlex.quote(wrapper)}",
-            cwd=workdir,
-            stdout=stdout.open("wb"),
-            stderr=stderr.open("wb"),
-            start_new_session=True,
-            env=run_env,
-        )
+        with stdout.open("wb") as stdout_handle, stderr.open("wb") as stderr_handle:
+            process = await asyncio.create_subprocess_shell(
+                f"sh -lc {shlex.quote(wrapper)}",
+                cwd=workdir,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                start_new_session=True,
+                env=run_env,
+            )
         job = Job(
             job_id=job_id,
             instance_id="local",
@@ -145,14 +149,20 @@ class LocalRunner:
         jobdir = self.workspace / ".gpu-lab" / "jobs" / job_id
         code_file = jobdir / "exit_code"
         if code_file.is_file():
-            job.exit_code = int(code_file.read_text().strip())
-            job.status = "completed" if job.exit_code == 0 else "failed"
-            job.completed_at = job.completed_at or datetime.now(UTC)
-        else:
             try:
-                os.kill(job.remote_pid or 0, 0)
-            except OSError:
+                job.exit_code = int(code_file.read_text().strip())
+                job.status = "completed" if job.exit_code == 0 else "failed"
+                job.completed_at = job.completed_at or datetime.now(UTC)
+            except ValueError:
+                pass
+        else:
+            if not job.remote_pid or job.remote_pid <= 0:
                 job.status = "unknown"
+            else:
+                try:
+                    os.kill(job.remote_pid, 0)
+                except OSError:
+                    job.status = "unknown"
         self.repo.save_job(job)
         logs = ""
         for file in (jobdir / "stdout.log", jobdir / "stderr.log"):
@@ -164,9 +174,11 @@ class LocalRunner:
         job = self.repo.get_job(job_id)
         if not job or job.instance_id != "local":
             raise GPUError("JOB_NOT_FOUND", f"No local job named {job_id}")
+        if not job.remote_pid or job.remote_pid <= 0:
+            raise GPUError("JOB_PID_UNKNOWN", f"No valid process ID for {job_id}")
         try:
-            os.killpg(job.remote_pid or 0, signal.SIGTERM)
-        except ProcessLookupError:
+            os.killpg(job.remote_pid, signal.SIGTERM)
+        except (PermissionError, ProcessLookupError):
             pass
         job.status, job.completed_at = "cancelled", datetime.now(UTC)
         self.repo.save_job(job)
