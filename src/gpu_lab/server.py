@@ -782,7 +782,7 @@ async def research_experiment_sync(run_id: str):
     if not job_id:
         return {"error": {"type": "RUN_MISSING_JOB"}}
     outcome, artifacts, runtime = local.job_status(job_id), local.artifacts(job_id), await local.status()
-    return await call(
+    updated = await call(
         research().run_update,
         run_id,
         {
@@ -793,6 +793,19 @@ async def research_experiment_sync(run_id: str):
             "runtime": runtime,
         },
     )
+    if "error" in updated or updated.get("already_final") or outcome["status"] not in {"completed", "failed"}:
+        return updated
+    for artifact in artifacts:
+        recorded = await call(
+            research().object_create,
+            str(run["project_id"]),
+            "Artifact",
+            {"run_id": run_id, "job_id": job_id, **artifact},
+            "ARTIFACT_RECORDED",
+        )
+        if "error" not in recorded:
+            await call(research().edge_create, run_id, recorded["id"], "PRODUCED")
+    return updated
 
 
 @mcp.tool()
