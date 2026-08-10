@@ -5,6 +5,7 @@ import re
 import time
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 
@@ -33,6 +34,85 @@ mcp = FastMCP(
     stateless_http=True,
     instructions=instructions,
 )
+
+
+_READ_ONLY_TOOLS = {
+    "gpu_list",
+    "gpu_status",
+    "gpu_search",
+    "experiment_status",
+    "experiment_logs",
+    "experiment_list",
+    "activity_recent",
+    "research_state_get",
+    "claim_search",
+    "claim_get_evidence",
+    "claim_compare",
+    "hypothesis_related",
+    "experiment_priority",
+    "research_events",
+    "paper_search",
+    "paper_get",
+    "paper_evidence_search",
+    "research_semantic_search",
+    "paper_ask",
+    "reproduction_status",
+    "reproduction_plan",
+    "artifact_list",
+    "artifact_read",
+    "local_status",
+    "local_experiment_status",
+    "local_experiment_logs",
+    "local_artifact_list",
+    "local_artifact_read",
+}
+_DESTRUCTIVE_TOOLS = {"gpu_destroy"}
+_OPEN_WORLD_TOOLS = {
+    "gpu_list",
+    "gpu_status",
+    "gpu_search",
+    "gpu_create",
+    "gpu_stop",
+    "gpu_destroy",
+    "repo_checkout",
+    "env_prepare",
+    "experiment_submit",
+    "experiment_status",
+    "experiment_logs",
+    "experiment_cancel",
+    "experiment_list",
+    "artifact_list",
+    "artifact_read",
+    "remote_exec",
+    "local_experiment_submit",
+    "local_env_prepare",
+}
+_ACRONYMS = {"api": "API", "gpu": "GPU", "id": "ID", "ssh": "SSH", "url": "URL", "vlm": "VLM"}
+_GENERIC_RESULT_SCHEMA = {
+    "anyOf": [
+        {"type": "object", "additionalProperties": True},
+        {"type": "array", "items": {}},
+    ],
+    "description": "A structured GPU Lab result or error object.",
+}
+
+
+def _tool_title(name: str) -> str:
+    return " ".join(_ACRONYMS.get(word, word.capitalize()) for word in name.split("_"))
+
+
+def _apply_tool_metadata() -> None:
+    """Fill MCP metadata for every tool, including conditional local/remote tools."""
+    for name, tool in mcp._tool_manager._tools.items():
+        tool.title = tool.title or _tool_title(name)
+        tool.description = tool.description or f"Perform the GPU Lab {tool.title.lower()} operation."
+        tool.annotations = ToolAnnotations(
+            readOnlyHint=name in _READ_ONLY_TOOLS,
+            destructiveHint=name in _DESTRUCTIVE_TOOLS,
+            openWorldHint=name in _OPEN_WORLD_TOOLS,
+        )
+        tool.fn_metadata.output_schema = _GENERIC_RESULT_SCHEMA
+        tool.__dict__.pop("output_schema", None)
 
 
 def svc() -> GPUService:
@@ -887,6 +967,9 @@ if settings.gpu_lab_enable_local_runner:
     @mcp.tool()
     async def local_experiment_cancel(job_id: str):
         return await call(local.cancel, job_id)
+
+
+_apply_tool_metadata()
 
 
 async def gateway_status() -> dict:
