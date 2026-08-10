@@ -1,7 +1,8 @@
 services:
   postgres:
-    # Cached local development fallback. Use pgvector/pgvector:pg16 in production.
-    image: postgres:14
+    build:
+      context: .
+      dockerfile: postgres.Dockerfile
     environment:
       POSTGRES_DB: research_os
       POSTGRES_USER: research

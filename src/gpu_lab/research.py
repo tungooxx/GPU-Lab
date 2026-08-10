@@ -46,6 +46,8 @@ class ResearchStore:
                     event_type TEXT NOT NULL, subject_id UUID, payload JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL
                 );
             """)
+            if self.vector_available:
+                cur.execute("ALTER TABLE research_objects ADD COLUMN IF NOT EXISTS embedding vector")
 
     def project_create(self, name: str, question: str) -> dict:
         ident, now = uuid.uuid4(), datetime.now(UTC)
@@ -207,6 +209,37 @@ class ResearchStore:
                 if overlap:
                     related.append({**item, "lexical_similarity": round(overlap, 3)})
             return sorted(related, key=lambda item: item["lexical_similarity"], reverse=True)[:limit]
+
+    def embedding_set(self, object_id: str, embedding: list[float]) -> dict:
+        if not self.vector_available:
+            raise GPUError("PGVECTOR_UNAVAILABLE", "The database does not have the vector extension")
+        if not embedding or len(embedding) > 4096:
+            raise GPUError("INVALID_EMBEDDING", "Embedding must contain 1 to 4096 numeric values")
+        if not all(isinstance(value, (int, float)) for value in embedding):
+            raise GPUError("INVALID_EMBEDDING", "Embedding values must be numeric")
+        item = self.object_get(object_id)
+        literal = "[" + ",".join(str(float(value)) for value in embedding) + "]"
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("UPDATE research_objects SET embedding=%s::vector WHERE id=%s", (literal, object_id))
+            self._event(cur, item["project_id"], "EMBEDDING_STORED", object_id, {"dimensions": len(embedding)})
+        return {"id": object_id, "dimensions": len(embedding)}
+
+    def semantic_search(
+        self, project_id: str, embedding: list[float], kind: str | None = None, limit: int = 25
+    ) -> list[dict]:
+        if not self.vector_available:
+            raise GPUError("PGVECTOR_UNAVAILABLE", "The database does not have the vector extension")
+        literal = "[" + ",".join(str(float(value)) for value in embedding) + "]"
+        with self._connect() as conn, conn.cursor() as cur:
+            sql = "SELECT id,kind,status,data,created_at,embedding <=> %s::vector AS distance FROM research_objects WHERE project_id=%s AND embedding IS NOT NULL"
+            args: list[Any] = [literal, project_id]
+            if kind:
+                sql += " AND kind=%s"
+                args.append(kind)
+            sql += " ORDER BY embedding <=> %s::vector LIMIT %s"
+            args.extend((literal, limit))
+            cur.execute(sql, args)
+            return cur.fetchall()
 
     @staticmethod
     def _terms(value: str) -> set[str]:

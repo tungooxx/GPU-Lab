@@ -505,6 +505,20 @@ async def paper_evidence_search(project_id: str, query: str, limit: int = 25):
 
 
 @mcp.tool()
+async def research_embedding_store(object_id: str, embedding: list[float]):
+    """Attach a caller-provided embedding to a research object for pgvector retrieval."""
+    return await call(research().embedding_set, object_id, embedding)
+
+
+@mcp.tool()
+async def research_semantic_search(
+    project_id: str, embedding: list[float], kind: str | None = None, limit: int = 25
+):
+    """Use pgvector cosine distance over persisted research-object embeddings."""
+    return await call(research().semantic_search, project_id, embedding, kind, min(max(limit, 1), 100))
+
+
+@mcp.tool()
 async def paper_ask(project_id: str, question: str, limit: int = 8):
     """Return retrieved source passages for a question; this is evidence retrieval, not a conclusion."""
     evidence = await call(research().search, project_id, question, "EvidenceUnit", min(max(limit, 1), 25))
