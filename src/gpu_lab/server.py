@@ -302,23 +302,63 @@ async def contradiction_create(project_id: str, claim_id: str, other_claim_id: s
 
 
 @mcp.tool()
-async def hypothesis_create(project_id: str, mechanism: str, prediction: str, kill_condition: str, parent_ids: list[str] | None = None):
+async def hypothesis_create(
+    project_id: str,
+    mechanism: str,
+    prediction: str,
+    kill_condition: str,
+    parent_ids: list[str] | None = None,
+    scientific_difference: str | None = None,
+):
+    """Create a falsifiable hypothesis after screening related active and failed mechanisms."""
     parents = parent_ids or []
     for parent_id in parents:
         parent = research().object_get(parent_id)
         if str(parent["project_id"]) != project_id or parent["kind"] != "Hypothesis":
             return {"error": {"type": "INVALID_HYPOTHESIS_PARENT", "message": parent_id}}
+    related = await call(research().related_hypotheses, project_id, mechanism)
+    if isinstance(related, dict) and "error" in related:
+        return related
+    close_dead = [
+        item
+        for item in related
+        if item["lexical_similarity"] >= 0.6
+        and (item["status"] == "REFUTED" or item["kind"] == "NegativeResult")
+    ]
+    if close_dead and not scientific_difference:
+        return {
+            "error": {
+                "type": "HYPOTHESIS_RESEMBLES_NEGATIVE_KNOWLEDGE",
+                "message": "Provide scientific_difference explaining the changed assumption.",
+                "related_ids": [str(item["id"]) for item in close_dead],
+            }
+        }
     result = await call(
         research().object_create,
         project_id,
         "Hypothesis",
-        {"mechanism": mechanism, "prediction": prediction, "kill_condition": kill_condition, "parent_ids": parents},
+        {
+            "mechanism": mechanism,
+            "prediction": prediction,
+            "kill_condition": kill_condition,
+            "parent_ids": parents,
+            "scientific_difference": scientific_difference,
+            "related_hypothesis_ids": [str(item["id"]) for item in related],
+        },
         "HYPOTHESIS_CREATED",
     )
     if "error" not in result:
         for parent_id in parents:
             await call(research().edge_create, parent_id, result["id"], "PARENT_OF")
+        for item in related:
+            await call(research().edge_create, item["id"], result["id"], "RELATED_TO")
     return result
+
+
+@mcp.tool()
+async def hypothesis_related(project_id: str, mechanism: str, limit: int = 10):
+    """Retrieve related active and failed mechanisms before proposing a new descendant."""
+    return await call(research().related_hypotheses, project_id, mechanism, min(max(limit, 1), 50))
 
 
 @mcp.tool()

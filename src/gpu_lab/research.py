@@ -1,4 +1,5 @@
 import json
+import re
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -161,6 +162,28 @@ class ResearchStore:
             args.extend((f"%{query}%", limit))
             cur.execute(sql, args)
             return cur.fetchall()
+
+    def related_hypotheses(self, project_id: str, mechanism: str, limit: int = 10) -> list[dict]:
+        """Lexically screen active and failed ideas until pgvector is available for semantic ranking."""
+        query_terms = self._terms(mechanism)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,kind,status,data,created_at FROM research_objects "
+                "WHERE project_id=%s AND kind IN ('Hypothesis','NegativeResult')",
+                (project_id,),
+            )
+            related = []
+            for item in cur.fetchall():
+                text = item["data"].get("mechanism") or item["data"].get("proposal", "")
+                terms = self._terms(text)
+                overlap = len(query_terms & terms) / len(query_terms | terms) if query_terms | terms else 0.0
+                if overlap:
+                    related.append({**item, "lexical_similarity": round(overlap, 3)})
+            return sorted(related, key=lambda item: item["lexical_similarity"], reverse=True)[:limit]
+
+    @staticmethod
+    def _terms(value: str) -> set[str]:
+        return {term for term in re.findall(r"[a-z0-9]{4,}", value.lower())}
 
     @staticmethod
     def _event(cur, project_id, event_type, subject_id, payload):
