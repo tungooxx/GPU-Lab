@@ -21,6 +21,36 @@ For development, connect a local MCP client to the stdio process. For production
 
 Use `gpu_search` before `gpu_create`; creation requires a specific offer rather than making an unbounded cost decision. `gpu_destroy` requires `confirmation="DESTROY"`.
 
+## Research OS workflow
+
+With `docker compose up -d --build`, PostgreSQL holds durable Research OS state alongside the
+GPU-Lab service. Start every serious investigation with `research_state_get`, then use this
+sequence:
+
+```text
+research_project_create
+→ paper_ingest / paper_evidence_create / claim_create
+→ anomaly_create / hypothesis_related / hypothesis_create
+→ experiment_plan_register
+→ research_experiment_execute / research_experiment_sync
+→ research_assess / negative_result_create / lesson_create
+→ research_state_update / research_state_get
+```
+
+`experiment_plan_register` freezes the question, competing explanations, intervention and
+control, metrics, expected direction, pass/fail interpretations, and estimated time/cost before
+execution. `research_experiment_execute` records local command, environment, job ID, logs, exit
+code, and artifacts in an immutable event history. Do not assess a hypothesis from reasoning alone
+when a local or provider experiment is feasible.
+
+`paper_ask` is retrieval only: use its cited `EvidenceUnit` IDs when creating a claim. It does not
+turn retrieved prose into a scientific conclusion. `hypothesis_create` checks related failed ideas
+and requires `scientific_difference` when a proposed mechanism resembles stored negative knowledge.
+
+For a reproduction, use `reproduction_prepare`, `reproduction_run`, `reproduction_sync`, and
+`reproduction_compare`. A successful process is only `PARTIAL` until its observed metric is compared
+with the reported metric and tolerance; it becomes `REPRODUCED` only after that explicit comparison.
+
 ## Local CLI
 
 ```bash
