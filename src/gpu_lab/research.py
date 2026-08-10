@@ -45,10 +45,23 @@ class ResearchStore:
                     id UUID PRIMARY KEY, project_id UUID NOT NULL REFERENCES research_projects(id),
                     event_type TEXT NOT NULL, subject_id UUID, payload JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS research_execution_attempts (
+                    experiment_id UUID NOT NULL REFERENCES research_objects(id),
+                    idempotency_key TEXT NOT NULL,
+                    run_id UUID UNIQUE NOT NULL REFERENCES research_objects(id),
+                    job_id TEXT UNIQUE NOT NULL,
+                    request_fingerprint TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY(experiment_id, idempotency_key)
+                );
                 CREATE INDEX IF NOT EXISTS research_events_project_created_idx
                     ON research_events(project_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS research_objects_project_kind_created_idx
                     ON research_objects(project_id, kind, created_at DESC);
+                CREATE INDEX IF NOT EXISTS research_execution_attempts_job_idx
+                    ON research_execution_attempts(job_id);
             """)
             if self.vector_available:
                 cur.execute("ALTER TABLE research_objects ADD COLUMN IF NOT EXISTS embedding vector")
@@ -153,15 +166,193 @@ class ResearchStore:
             cur.execute("INSERT INTO research_edges VALUES(%s,%s,%s,%s) ON CONFLICT DO NOTHING", (experiment_id, run["id"], "HAS_RUN", datetime.now(UTC)))
         return run
 
+    def run_reserve(
+        self,
+        experiment_id: str,
+        idempotency_key: str,
+        job_id: str,
+        request_fingerprint: str,
+        execution: dict[str, Any],
+    ) -> dict:
+        """Atomically reserve canonical run/job identity before process submission."""
+        if not idempotency_key or len(idempotency_key) > 200:
+            raise GPUError("INVALID_IDEMPOTENCY_KEY", "Use a non-empty key up to 200 characters")
+        now = datetime.now(UTC)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT project_id,kind,data FROM research_objects WHERE id=%s FOR UPDATE",
+                (experiment_id,),
+            )
+            experiment = cur.fetchone()
+            if not experiment:
+                raise GPUError("RESEARCH_OBJECT_NOT_FOUND", experiment_id)
+            if experiment["kind"] != "Experiment" or not experiment["data"].get("frozen"):
+                raise GPUError("EXPERIMENT_NOT_PREREGISTERED", experiment_id)
+            cur.execute(
+                "SELECT run_id,job_id,request_fingerprint,status FROM research_execution_attempts "
+                "WHERE experiment_id=%s AND idempotency_key=%s",
+                (experiment_id, idempotency_key),
+            )
+            existing = cur.fetchone()
+            if existing:
+                if existing["request_fingerprint"] != request_fingerprint:
+                    raise GPUError(
+                        "IDEMPOTENCY_KEY_REUSED",
+                        "The execution key is already bound to a different request",
+                    )
+                return self._execution_mapping(
+                    cur, existing["run_id"], existing["job_id"], idempotency_key, True
+                )
+
+            run_id = uuid.uuid4()
+            run_data = {
+                "experiment_id": experiment_id,
+                "job_id": job_id,
+                "idempotency_key": idempotency_key,
+                "request_fingerprint": request_fingerprint,
+                **execution,
+            }
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'ExperimentRun','RESERVED',%s,%s)",
+                (run_id, experiment["project_id"], json.dumps(run_data), now),
+            )
+            cur.execute(
+                "INSERT INTO research_execution_attempts "
+                "VALUES(%s,%s,%s,%s,%s,'RESERVED',%s,%s)",
+                (
+                    experiment_id,
+                    idempotency_key,
+                    run_id,
+                    job_id,
+                    request_fingerprint,
+                    now,
+                    now,
+                ),
+            )
+            cur.execute(
+                "INSERT INTO research_edges VALUES(%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                (experiment_id, run_id, "HAS_RUN", now),
+            )
+            self._event(
+                cur,
+                experiment["project_id"],
+                "EXPERIMENT_EXECUTION_RESERVED",
+                run_id,
+                {
+                    "experiment_id": experiment_id,
+                    "run_id": str(run_id),
+                    "job_id": job_id,
+                    "idempotency_key": idempotency_key,
+                },
+            )
+            return self._execution_mapping(cur, run_id, job_id, idempotency_key, False)
+
+    def run_mark_submitted(self, run_id: str) -> dict:
+        """Idempotently mark a reserved attempt as submitted and emit its canonical IDs."""
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT a.experiment_id,a.idempotency_key,a.job_id,a.status,o.project_id,o.data "
+                "FROM research_execution_attempts a JOIN research_objects o ON o.id=a.run_id "
+                "WHERE a.run_id=%s FOR UPDATE",
+                (run_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise GPUError("EXPERIMENT_RUN_NOT_FOUND", run_id)
+            if row["status"] == "RESERVED":
+                data = {**row["data"], "submission_status": "SUBMITTED"}
+                now = datetime.now(UTC)
+                cur.execute(
+                    "UPDATE research_objects SET status='running',data=%s WHERE id=%s",
+                    (json.dumps(data), run_id),
+                )
+                cur.execute(
+                    "UPDATE research_execution_attempts SET status='SUBMITTED',updated_at=%s "
+                    "WHERE run_id=%s",
+                    (now, run_id),
+                )
+                self._event(
+                    cur,
+                    row["project_id"],
+                    "EXPERIMENT_STARTED",
+                    run_id,
+                    {
+                        "experiment_id": str(row["experiment_id"]),
+                        "run_id": run_id,
+                        "job_id": row["job_id"],
+                        "idempotency_key": row["idempotency_key"],
+                    },
+                )
+            return self._execution_mapping(
+                cur, run_id, row["job_id"], row["idempotency_key"], row["status"] != "RESERVED"
+            )
+
+    def run_resolve(self, identifier: str) -> dict:
+        """Resolve a canonical execution mapping from either run ID or local job ID."""
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT run_id,job_id,idempotency_key FROM research_execution_attempts "
+                "WHERE run_id::text=%s OR job_id=%s",
+                (identifier, identifier),
+            )
+            row = cur.fetchone()
+            if row:
+                return self._execution_mapping(
+                    cur, row["run_id"], row["job_id"], row["idempotency_key"], True
+                )
+        # Backward compatibility for runs created before execution-attempt mappings existed.
+        if re.fullmatch(r"[0-9a-fA-F-]{36}", identifier):
+            run = self.object_get(identifier)
+            if run["kind"] == "ExperimentRun" and run["data"].get("job_id"):
+                return {
+                    "experiment_id": run["data"].get("experiment_id"),
+                    "run_id": str(run["id"]),
+                    "job_id": run["data"]["job_id"],
+                    "idempotency_key": run["data"].get("idempotency_key"),
+                    "status": run["status"],
+                    "run": run,
+                    "legacy_mapping": True,
+                }
+        raise GPUError("EXPERIMENT_EXECUTION_NOT_FOUND", identifier)
+
+    @staticmethod
+    def _execution_mapping(cur, run_id, job_id, idempotency_key, idempotent_replay) -> dict:
+        cur.execute(
+            "SELECT id,project_id,kind,status,data,created_at FROM research_objects WHERE id=%s",
+            (run_id,),
+        )
+        run = cur.fetchone()
+        if not run:
+            raise GPUError("EXPERIMENT_RUN_NOT_FOUND", str(run_id))
+        return {
+            "experiment_id": str(run["data"]["experiment_id"]),
+            "run_id": str(run["id"]),
+            "job_id": job_id,
+            "idempotency_key": idempotency_key,
+            "status": run["status"],
+            "run": run,
+            "idempotent_replay": idempotent_replay,
+        }
+
     def run_update(self, run_id: str, result: dict) -> dict:
         run = self.object_get(run_id)
         if run["status"] in {"completed", "failed", "cancelled"}:
             return {"id": run_id, "status": run["status"], "data": run["data"], "already_final": True}
         data = {**run["data"], **result}
         status = result.get("status", run["status"])
-        event = "EXPERIMENT_COMPLETED" if status == "completed" else "EXPERIMENT_FAILED"
+        if status == "completed":
+            event = "EXPERIMENT_COMPLETED"
+        elif status in {"failed", "cancelled", "unknown"}:
+            event = "EXPERIMENT_FAILED"
+        else:
+            event = "EXPERIMENT_PROGRESS_SYNCED"
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute("UPDATE research_objects SET status=%s,data=%s WHERE id=%s", (status, json.dumps(data), run_id))
+            cur.execute(
+                "UPDATE research_execution_attempts SET status=%s,updated_at=%s WHERE run_id=%s",
+                (status, datetime.now(UTC), run_id),
+            )
             self._event(cur, run["project_id"], event, run_id, result)
         return {"id": run_id, "status": status, "data": data}
 

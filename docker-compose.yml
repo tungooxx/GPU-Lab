@@ -23,9 +23,12 @@ services:
       GPU_LAB_LOCAL_WORKSPACE: /workspace/local-vlm
       GPU_LAB_RESEARCH_DATABASE_URL: postgresql://research:research@postgres:5432/research_os
     ports: ["127.0.0.1:8000:8000"]
-    volumes: ["./data:/data", "./local-envs:/opt/gpu-lab/envs", "${GPU_LAB_SSH_PRIVATE_KEY_PATH:-/dev/null}:/run/ssh-key:ro", "${GPU_LAB_LOCAL_WORKSPACE_HOST:-F:/Newgeneration/VLM}:/workspace/local-vlm"]
+    volumes: ["./data:/data", "gpu-lab-envs:/opt/gpu-lab/envs", "${GPU_LAB_SSH_PRIVATE_KEY_PATH:-/dev/null}:/run/ssh-key:ro", "${GPU_LAB_LOCAL_WORKSPACE_HOST:-F:/Newgeneration/VLM}:/workspace/local-vlm"]
     gpus: all
     depends_on:
       postgres:
         condition: service_healthy
     restart: unless-stopped
+
+volumes:
+  gpu-lab-envs:

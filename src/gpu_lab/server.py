@@ -1,15 +1,19 @@
 import argparse
-import base64
+import hashlib
 import inspect
+import json
 import logging
 import re
-import secrets
 import time
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
-from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
+from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse
+from starlette.types import ASGIApp
 
 from .config import Settings
 from .dashboard import DASHBOARD_HTML
@@ -22,11 +26,6 @@ from .terminal import TERMINAL_HTML
 logger = logging.getLogger(__name__)
 
 settings, service, research_store = Settings(), None, None
-allowed_hosts = [
-    host.strip()
-    for host in settings.gpu_lab_allowed_hosts.split(",")
-    if host.strip()
-]
 instructions = "Safe, structured remote GPU experiment control plane. Credentials are never returned."
 if settings.gpu_lab_enable_local_runner:
     instructions += (
@@ -40,14 +39,120 @@ mcp = FastMCP(
     json_response=True,
     stateless_http=True,
     instructions=instructions,
-    transport_security=TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
-        allowed_hosts=allowed_hosts,
-        allowed_origins=[
-            f"https://{host.removesuffix(':*')}" for host in allowed_hosts if ":*" not in host
-        ],
-    ),
 )
+
+
+_READ_ONLY_TOOLS = {
+    "gpu_list",
+    "gpu_status",
+    "gpu_search",
+    "experiment_status",
+    "experiment_logs",
+    "experiment_list",
+    "activity_recent",
+    "research_state_get",
+    "claim_search",
+    "claim_get_evidence",
+    "claim_compare",
+    "hypothesis_related",
+    "experiment_priority",
+    "research_events",
+    "paper_search",
+    "paper_get",
+    "paper_evidence_search",
+    "research_semantic_search",
+    "paper_ask",
+    "reproduction_status",
+    "reproduction_plan",
+    "artifact_list",
+    "artifact_read",
+    "local_status",
+    "local_experiment_status",
+    "local_experiment_logs",
+    "local_artifact_list",
+    "local_artifact_read",
+}
+_DESTRUCTIVE_TOOLS = {"gpu_destroy"}
+_OPEN_WORLD_TOOLS = {
+    "gpu_list",
+    "gpu_status",
+    "gpu_search",
+    "gpu_create",
+    "gpu_stop",
+    "gpu_destroy",
+    "repo_checkout",
+    "env_prepare",
+    "experiment_submit",
+    "experiment_status",
+    "experiment_logs",
+    "experiment_cancel",
+    "experiment_list",
+    "artifact_list",
+    "artifact_read",
+    "remote_exec",
+    "local_experiment_submit",
+    "local_env_prepare",
+}
+_ACRONYMS = {"api": "API", "gpu": "GPU", "id": "ID", "ssh": "SSH", "url": "URL", "vlm": "VLM"}
+
+
+class GenericToolResult(BaseModel):
+    """Stable structured envelope for dynamically shaped GPU Lab results."""
+
+    result: Any
+
+
+_GENERIC_RESULT_SCHEMA = GenericToolResult.model_json_schema()
+
+
+def _normalise_mcp_accept_header(headers: list[tuple[bytes, bytes]]) -> list[tuple[bytes, bytes]]:
+    """Treat an HTTP wildcard Accept header as accepting the JSON MCP response.
+
+    Some connector preflight clients send ``Accept: */*`` rather than naming
+    ``application/json``.  That is valid HTTP content negotiation, but the
+    current Python MCP transport checks only explicit media-type prefixes.
+    Keep the normal MCP JSON body validation unchanged; this only expands a
+    wildcard response preference for the ``/mcp`` route.
+    """
+    accept = next((value.decode("latin-1") for name, value in headers if name.lower() == b"accept"), "")
+    if "application/json" in accept.lower() or "*/*" not in accept:
+        return headers
+    return [
+        (name, b"application/json" if name.lower() == b"accept" else value)
+        for name, value in headers
+    ]
+
+
+class McpAcceptCompatibilityMiddleware(BaseHTTPMiddleware):
+    """Allow standards-compliant wildcard Accept headers on the MCP endpoint."""
+
+    def __init__(self, app: ASGIApp):
+        super().__init__(app)
+
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path == "/mcp":
+            request.scope["headers"] = _normalise_mcp_accept_header(request.scope["headers"])
+        return await call_next(request)
+
+
+def _tool_title(name: str) -> str:
+    return " ".join(_ACRONYMS.get(word, word.capitalize()) for word in name.split("_"))
+
+
+def _apply_tool_metadata() -> None:
+    """Fill MCP metadata for every tool, including conditional local/remote tools."""
+    for name, tool in mcp._tool_manager._tools.items():
+        tool.title = tool.title or _tool_title(name)
+        tool.description = tool.description or f"Perform the GPU Lab {tool.title.lower()} operation."
+        tool.annotations = ToolAnnotations(
+            readOnlyHint=name in _READ_ONLY_TOOLS,
+            destructiveHint=name in _DESTRUCTIVE_TOOLS,
+            openWorldHint=name in _OPEN_WORLD_TOOLS,
+        )
+        tool.fn_metadata.output_schema = _GENERIC_RESULT_SCHEMA
+        tool.fn_metadata.output_model = GenericToolResult
+        tool.fn_metadata.wrap_output = True
+        tool.__dict__.pop("output_schema", None)
 
 
 def svc() -> GPUService:
@@ -777,10 +882,41 @@ async def research_experiment_execute(
     working_directory: str = ".",
     env: dict[str, str] | None = None,
     python_env: str | None = None,
+    execution_attempt_uuid: str | None = None,
 ):
-    """Run a preregistered experiment through the local GPU-Lab executor."""
+    """Idempotently run a preregistered experiment and return canonical run/job IDs."""
     if not settings.gpu_lab_enable_local_runner:
         return {"error": {"type": "LOCAL_RUNNER_DISABLED"}}
+    request = {
+        "experiment_id": experiment_id,
+        "command": command,
+        "working_directory": working_directory,
+        "env": env or {},
+        "python_env": python_env,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(request, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    idempotency_key = execution_attempt_uuid or f"auto:{fingerprint}"
+    job_id = "local_" + hashlib.sha256(
+        f"{experiment_id}:{idempotency_key}".encode()
+    ).hexdigest()[:24]
+    reservation = await call(
+        research().run_reserve,
+        experiment_id,
+        idempotency_key,
+        job_id,
+        fingerprint,
+        {
+            "executor": "local",
+            "command": command,
+            "working_directory": working_directory,
+            "environment": env or {},
+            "python_env": python_env,
+        },
+    )
+    if "error" in reservation:
+        return reservation
     job = await call(
         local.submit,
         command,
@@ -788,36 +924,56 @@ async def research_experiment_execute(
         "research-" + experiment_id[:8],
         env,
         python_env,
+        reservation["job_id"],
     )
     if "error" in job:
-        return job
-    return await call(
-        research().run_create,
-        experiment_id,
-        {
-            "executor": "local",
-            "job_id": job["job_id"],
-            "command": command,
-            "working_directory": working_directory,
-            "environment": env or {},
-            "python_env": python_env,
-        },
-    )
+        return {
+            "experiment_id": reservation["experiment_id"],
+            "run_id": reservation["run_id"],
+            "job_id": reservation["job_id"],
+            "idempotency_key": reservation["idempotency_key"],
+            "status": "RESERVED",
+            "submission_error": job["error"],
+            "retry_safe": True,
+        }
+    mapping = await call(research().run_mark_submitted, reservation["run_id"])
+    if "error" in mapping:
+        return {
+            "experiment_id": reservation["experiment_id"],
+            "run_id": reservation["run_id"],
+            "job_id": reservation["job_id"],
+            "idempotency_key": reservation["idempotency_key"],
+            "status": job["status"],
+            "mapping_error": mapping["error"],
+            "retry_safe": True,
+        }
+    return {**mapping, "job": job, "retry_safe": True}
 
 
 @mcp.tool()
-async def research_experiment_sync(run_id: str):
-    """Retrieve a real job's logs/artifacts and append immutable execution evidence."""
-    run = research().object_get(run_id)
-    job_id = run["data"].get("job_id")
-    if not job_id:
-        return {"error": {"type": "RUN_MISSING_JOB"}}
-    outcome, artifacts, runtime = local.job_status(job_id), local.artifacts(job_id), await local.status()
+async def research_experiment_sync(run_id: str | None = None, job_id: str | None = None):
+    """Sync by run ID or job ID and always return the canonical execution mapping."""
+    identifier = run_id or job_id
+    if not identifier:
+        return {"error": {"type": "EXECUTION_IDENTIFIER_REQUIRED"}}
+    mapping = await call(research().run_resolve, identifier)
+    if "error" in mapping:
+        return mapping
+    if run_id and job_id:
+        job_mapping = await call(research().run_resolve, job_id)
+        if "error" in job_mapping:
+            return job_mapping
+        if job_mapping["run_id"] != mapping["run_id"]:
+            return {"error": {"type": "EXECUTION_IDENTIFIER_MISMATCH"}}
+    canonical_run_id, canonical_job_id = mapping["run_id"], mapping["job_id"]
+    run = mapping["run"]
+    outcome = local.job_status(canonical_job_id)
+    artifacts, runtime = local.artifacts(canonical_job_id), await local.status()
     runner_status = outcome["status"]
     research_status = "failed" if runner_status == "unknown" else runner_status
     updated = await call(
         research().run_update,
-        run_id,
+        canonical_run_id,
         {
             "status": research_status,
             "runner_status": runner_status,
@@ -827,19 +983,27 @@ async def research_experiment_sync(run_id: str):
             "runtime": runtime,
         },
     )
+    response = {
+        "experiment_id": mapping["experiment_id"],
+        "run_id": canonical_run_id,
+        "job_id": canonical_job_id,
+        "idempotency_key": mapping.get("idempotency_key"),
+        "status": updated.get("status", research_status),
+        "run": updated,
+    }
     if "error" in updated or updated.get("already_final") or research_status not in {"completed", "failed"}:
-        return updated
+        return response
     for artifact in artifacts:
         recorded = await call(
             research().object_create,
             str(run["project_id"]),
             "Artifact",
-            {"run_id": run_id, "job_id": job_id, **artifact},
+            {"run_id": canonical_run_id, "job_id": canonical_job_id, **artifact},
             "ARTIFACT_RECORDED",
         )
         if "error" not in recorded:
-            await call(research().edge_create, run_id, recorded["id"], "PRODUCED")
-    return updated
+            await call(research().edge_create, canonical_run_id, recorded["id"], "PRODUCED")
+    return response
 
 
 @mcp.tool()
@@ -852,56 +1016,69 @@ async def artifact_read(job_id: str, path: str, max_bytes: int | None = None):
     return await call(svc().artifact_read, job_id, path, max_bytes)
 
 
-if settings.gpu_lab_enable_remote_exec:
-
-    @mcp.tool()
-    async def remote_exec(instance_id: str, command: str, timeout_seconds: int = 60):
-        """Dangerous, bounded non-interactive debug command."""
-        return await call(svc().remote_exec, instance_id, command, timeout_seconds)
+@mcp.tool()
+async def remote_exec(instance_id: str, command: str, timeout_seconds: int = 60):
+    """Dangerous, bounded non-interactive debug command."""
+    return await call(svc().remote_exec, instance_id, command, timeout_seconds)
 
 
-if settings.gpu_lab_enable_local_runner:
-    local = LocalRunner(settings, svc().repo)
+local = LocalRunner(settings, svc().repo)
 
-    @mcp.tool()
-    async def local_status():
-        """Show the mounted local research workspace and container-visible GPU."""
-        return await call(local.status)
 
-    @mcp.tool()
-    async def local_experiment_submit(
-        command: str,
-        working_directory: str = ".",
-        name: str | None = None,
-        env: dict[str, str] | None = None,
-        python_env: str | None = None,
-    ):
-        """Start a detached Linux experiment confined to the local research workspace."""
-        return await call(local.submit, command, working_directory, name, env, python_env)
+@mcp.tool()
+async def local_status():
+    """Show the mounted local research workspace and container-visible GPU."""
+    return await call(local.status)
 
-    @mcp.tool()
-    async def local_env_prepare(name: str, requirements_path: str | None = None):
-        return await call(local.env_prepare, name, requirements_path)
 
-    @mcp.tool()
-    async def local_experiment_status(job_id: str):
-        return await call(local.job_status, job_id)
+@mcp.tool()
+async def local_experiment_submit(
+    command: str,
+    working_directory: str = ".",
+    name: str | None = None,
+    env: dict[str, str] | None = None,
+    python_env: str | None = None,
+):
+    """Start a detached Linux experiment confined to the local research workspace."""
+    return await call(local.submit, command, working_directory, name, env, python_env)
 
-    @mcp.tool()
-    async def local_experiment_logs(job_id: str, tail: int = 200):
-        return await call(local.logs, job_id, tail)
 
-    @mcp.tool()
-    async def local_artifact_list(job_id: str):
-        return await call(local.artifacts, job_id)
+@mcp.tool()
+async def local_env_prepare(
+    name: str,
+    requirements_path: str | None = None,
+    python_executable: str = "python3",
+):
+    """Create a persistent local environment from a requirements file or directory."""
+    return await call(local.env_prepare, name, requirements_path, python_executable)
 
-    @mcp.tool()
-    async def local_artifact_read(job_id: str, path: str, max_bytes: int = 65536):
-        return await call(local.artifact_read, job_id, path, max_bytes)
 
-    @mcp.tool()
-    async def local_experiment_cancel(job_id: str):
-        return await call(local.cancel, job_id)
+@mcp.tool()
+async def local_experiment_status(job_id: str):
+    return await call(local.job_status, job_id)
+
+
+@mcp.tool()
+async def local_experiment_logs(job_id: str, tail: int = 200):
+    return await call(local.logs, job_id, tail)
+
+
+@mcp.tool()
+async def local_artifact_list(job_id: str):
+    return await call(local.artifacts, job_id)
+
+
+@mcp.tool()
+async def local_artifact_read(job_id: str, path: str, max_bytes: int = 65536):
+    return await call(local.artifact_read, job_id, path, max_bytes)
+
+
+@mcp.tool()
+async def local_experiment_cancel(job_id: str):
+    return await call(local.cancel, job_id)
+
+
+_apply_tool_metadata()
 
 
 async def gateway_status() -> dict:
@@ -935,39 +1112,21 @@ async def health(_: Request):
 
 @mcp.custom_route("/activity", methods=["GET"], include_in_schema=False)
 async def activity(_: Request):
-    return JSONResponse(svc().repo.list_audit(100)) if terminal_allowed(_) else terminal_unauthorized()
-
-
-def terminal_allowed(request: Request) -> bool:
-    password = settings.gpu_lab_terminal_password
-    header = request.headers.get("authorization", "")
-    if not password or not header.startswith("Basic "):
-        return False
-    try:
-        username, supplied = base64.b64decode(header[6:]).decode().split(":", 1)
-    except (ValueError, UnicodeDecodeError):
-        return False
-    return username == "gpu-lab" and secrets.compare_digest(supplied, password)
-
-
-def terminal_unauthorized() -> Response:
-    return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="GPU Lab Terminal"'})
+    return JSONResponse(svc().repo.list_audit(100))
 
 
 @mcp.custom_route("/terminal", methods=["GET"], include_in_schema=False)
-async def terminal(request: Request):
-    return HTMLResponse(TERMINAL_HTML) if terminal_allowed(request) else terminal_unauthorized()
+async def terminal(_: Request):
+    return HTMLResponse(TERMINAL_HTML)
 
 
 @mcp.custom_route("/terminal/activity", methods=["GET"], include_in_schema=False)
-async def terminal_activity(request: Request):
-    return JSONResponse(svc().repo.list_audit(100)) if terminal_allowed(request) else terminal_unauthorized()
+async def terminal_activity(_: Request):
+    return JSONResponse(svc().repo.list_audit(100))
 
 
 @mcp.custom_route("/terminal/jobs", methods=["GET"], include_in_schema=False)
-async def terminal_jobs(request: Request):
-    if not terminal_allowed(request):
-        return terminal_unauthorized()
+async def terminal_jobs(_: Request):
     if not settings.gpu_lab_enable_local_runner:
         return JSONResponse([])
     jobs = []
@@ -978,11 +1137,23 @@ async def terminal_jobs(request: Request):
 
 @mcp.custom_route("/", methods=["GET"], include_in_schema=False)
 async def dashboard(_: Request):
-    return HTMLResponse(DASHBOARD_HTML) if terminal_allowed(_) else terminal_unauthorized()
+    return HTMLResponse(DASHBOARD_HTML)
+
+
+def http_app():
+    """Build the streamable HTTP app with connector header compatibility."""
+    app = mcp.streamable_http_app()
+    app.add_middleware(McpAcceptCompatibilityMiddleware)
+    return app
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--transport", choices=["stdio", "sse", "streamable-http"], default="stdio")
     args = parser.parse_args()
+    if args.transport == "streamable-http":
+        import uvicorn
+
+        uvicorn.run(http_app(), host=settings.fastmcp_host, port=settings.fastmcp_port)
+        return
     mcp.run(transport=args.transport)

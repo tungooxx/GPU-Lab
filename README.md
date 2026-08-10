@@ -39,9 +39,23 @@ research_project_create
 
 `experiment_plan_register` freezes the question, competing explanations, intervention and
 control, metrics, expected direction, pass/fail interpretations, and estimated time/cost before
-execution. `research_experiment_execute` records local command, environment, job ID, logs, exit
-code, and artifacts in an immutable event history. Do not assess a hypothesis from reasoning alone
-when a local or provider experiment is feasible.
+execution. `research_experiment_execute` first reserves a canonical PostgreSQL mapping of
+`experiment_id`, `run_id`, and `job_id`, then submits a deterministic local job. Pass a stable
+`execution_attempt_uuid` when retrying a request; retries return the same mapping and do not launch
+a duplicate job. If no key is supplied, identical requests use an automatically derived key.
+`research_experiment_sync` accepts either `run_id` or `job_id` and always returns the complete
+canonical mapping. Commands, runtime, logs, exit code, and artifacts are preserved in the run and
+immutable event history. Do not assess a hypothesis from reasoning alone when a local or provider
+experiment is feasible.
+
+Local environments are persistent under `GPU_LAB_LOCAL_ENV_ROOT`. Docker Compose stores that root
+in the `gpu-lab-envs` named volume, so environments remain available across container rebuilds and
+are not installed on the Windows workspace mount. `local_env_prepare` accepts an
+exact requirements file or a directory containing `requirements.txt`, plus an explicit
+`python_executable`. The canonical VRCNet internal-intervention runtime verified in August 2026 is
+the environment named `vrc-py313-torch260-cu124`, created with Python 3.13 and containing PyTorch
+2.6.0+cu124. It reproduced saved predictions exactly (`maxabs=0`). This is a project-specific real
+verification, not a claim that the gateway container itself uses that runtime.
 
 `paper_ask` is retrieval only: use its cited `EvidenceUnit` IDs when creating a claim. It does not
 turn retrieved prose into a scientific conclusion. `hypothesis_create` checks related failed ideas
@@ -83,4 +97,10 @@ The server never returns API keys or private keys, only allows repository and ar
 
 ## Limitations
 
-The MVP currently has one provider (Vast), SQLite state, tmux-based detached jobs, and a compact CLI. `artifact_download` and `experiment_summary` are intentionally not exposed yet; large files remain on the remote host. Vast endpoint shapes are normalized defensively but should be integration-tested against the account before production use.
+The execution gateway currently has one provider (Vast), SQLite operational state, tmux-based
+remote jobs, detached local jobs, and a compact CLI. Scientific Research OS state and immutable
+scientific events are stored separately in PostgreSQL with optional pgvector retrieval.
+`artifact_download` and `experiment_summary` are intentionally not exposed yet; large remote files
+remain on the worker. Vast endpoint shapes are normalized defensively and still require live
+provider integration checks before production use. Brain v1 planning, WorldModel, and ResearchAgenda
+are under active implementation and are not yet claimed as verified capabilities.

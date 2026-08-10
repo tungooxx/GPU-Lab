@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     gpu_lab_enable_local_runner: bool = False
     gpu_lab_local_workspace: Path = Path("/workspace/local-vlm")
     gpu_lab_local_env_root: Path = Path("/opt/gpu-lab/envs")
+    gpu_lab_canonical_vrc_env: str = "vrc-py313-torch260-cu124"
     gpu_lab_terminal_password: str | None = None
     gpu_lab_research_database_url: str | None = None
     fastmcp_host: str = "127.0.0.1"
