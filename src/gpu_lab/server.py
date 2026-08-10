@@ -978,7 +978,9 @@ async def terminal_jobs(request: Request):
 
 @mcp.custom_route("/", methods=["GET"], include_in_schema=False)
 async def dashboard(_: Request):
-    return HTMLResponse(DASHBOARD_HTML) if terminal_allowed(_) else terminal_unauthorized()
+    # Keep the landing route public: connector registrars may probe the origin before /mcp.
+    # Sensitive audit data remains protected at /activity and /terminal.
+    return HTMLResponse(DASHBOARD_HTML)
 
 
 def main():
