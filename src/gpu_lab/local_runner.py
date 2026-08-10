@@ -121,7 +121,7 @@ class LocalRunner:
 
     def logs(self, job_id: str, tail: int = 200) -> dict:
         status = self.job_status(job_id)
-        return {**status, "logs_tail": status["logs_tail"].splitlines()[-max(1, min(tail, 2000)):]} 
+        return {**status, "logs_tail": status["logs_tail"].splitlines()[-max(1, min(tail, 2000)):]}
 
     def artifacts(self, job_id: str) -> list[dict]:
         root = self.workspace / ".gpu-lab" / "jobs" / job_id
