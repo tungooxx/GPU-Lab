@@ -66,6 +66,33 @@ def test_post_commit_finalizer_failure_never_turns_committed_write_into_failure(
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_deferred_recovery_uses_a_boundary_after_the_pending_commit():
+    store = ResearchStore(TEST_DATABASE_URL)
+    project = store.project_create(f"deferred-{time.time_ns()}", "When is recovery visible?")
+    hypothesis = store.object_create(
+        project["project_id"],
+        "Hypothesis",
+        {"mechanism": "old committed state"},
+        "HYPOTHESIS_CREATED",
+    )
+    with psycopg.connect(TEST_DATABASE_URL) as connection, connection.cursor() as cursor:
+        cursor.execute(
+            "UPDATE research_objects SET data=%s::jsonb WHERE id=%s",
+            ('{"mechanism":"pending recovered state"}', hypothesis["id"]),
+        )
+    cutoff_after_commit_before_recovery = datetime.now(UTC)
+    time.sleep(0.01)
+
+    store.temporal_finalize_pending()
+    after_recovery = datetime.now(UTC)
+
+    before = store.object_get(hypothesis["id"], as_of=cutoff_after_commit_before_recovery)
+    after = store.object_get(hypothesis["id"], as_of=after_recovery)
+    assert before["data"]["mechanism"] == "old committed state"
+    assert after["data"]["mechanism"] == "pending recovered state"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_future_objects_updates_events_and_lexical_hits_do_not_leak():
     store = ResearchStore(TEST_DATABASE_URL)
     project = store.project_create(f"temporal-{time.time_ns()}", "Can future records leak?")

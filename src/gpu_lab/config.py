@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     gpu_lab_research_bench_dir: Path = Path("./research_bench")
     gpu_lab_embedding_provider: str = "local-hash"
     gpu_lab_embedding_dimension: int = Field(default=384, ge=32, le=4096)
+    gpu_lab_research_operator_provider: str = "disabled"
     gpu_lab_literature_provider: str = "disabled"
     gpu_lab_literature_worker_url: str = "http://literature:8010"
     gpu_lab_literature_worker_token: str | None = None
@@ -58,6 +59,16 @@ class Settings(BaseSettings):
         normalized = value.strip().lower()
         if normalized not in {"disabled", "local-hash"}:
             raise ValueError("GPU_LAB_EMBEDDING_PROVIDER must be disabled or local-hash")
+        return normalized
+
+    @field_validator("gpu_lab_research_operator_provider")
+    @classmethod
+    def valid_research_operator_provider(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"disabled", "literature-http"}:
+            raise ValueError(
+                "GPU_LAB_RESEARCH_OPERATOR_PROVIDER must be disabled or literature-http"
+            )
         return normalized
 
     @field_validator("gpu_lab_executable_paper_provider")

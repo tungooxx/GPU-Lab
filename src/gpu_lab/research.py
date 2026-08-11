@@ -142,7 +142,6 @@ class ResearchStore:
         return _TrackedResearchConnection(self)
 
     def _finalize_transaction(self, transaction_id: int) -> None:
-        effective_time = datetime.now(UTC)
         with psycopg.connect(self.url) as conn, conn.cursor() as cur:
             for table in (
                 "research_object_versions",
@@ -150,19 +149,13 @@ class ResearchStore:
                 "research_events",
             ):
                 cur.execute(
-                    f"UPDATE {table} SET committed_at=%s "
+                    f"UPDATE {table} SET committed_at=clock_timestamp() "
                     "WHERE commit_token=%s AND committed_at IS NULL",
-                    (effective_time, transaction_id),
-                )
-                cur.execute(
-                    f"UPDATE {table} SET committed_at=%s,legacy_backfill=TRUE "
-                    "WHERE committed_at IS NULL",
-                    (effective_time,),
+                    (transaction_id,),
                 )
 
     def _finalize_orphaned_transactions(self) -> None:
         """Recover transactions committed before their post-commit finalizer completed."""
-        effective_time = datetime.now(UTC)
         with psycopg.connect(self.url) as conn, conn.cursor() as cur:
             for table in (
                 "research_object_versions",
@@ -170,9 +163,8 @@ class ResearchStore:
                 "research_events",
             ):
                 cur.execute(
-                    f"UPDATE {table} SET committed_at=%s,legacy_backfill=TRUE "
-                    "WHERE committed_at IS NULL",
-                    (effective_time,),
+                    f"UPDATE {table} SET committed_at=clock_timestamp(),legacy_backfill=TRUE "
+                    "WHERE committed_at IS NULL"
                 )
 
     def _migrate(self) -> None:
@@ -610,6 +602,11 @@ class ResearchStore:
                 raise GPUError("NOT_AN_EVIDENCEFAMILY", family_id)
             if family["project_id"] != entity["project_id"]:
                 raise GPUError("RESEARCH_PROJECT_MISMATCH", entity_id)
+            if entity["kind"] == "CausalEdge" and relationship in {"SUPPORTS", "CONTRADICTS"}:
+                raise GPUError(
+                    "CAUSAL_EVIDENCE_FAMILY_REQUIRES_RESULT_ASSESSMENT",
+                    "Causal support families are attached only by atomic result assessment",
+                )
             family_data = {**family["data"]}
             entity_data = {**entity["data"]}
             already_linked = (
@@ -1046,6 +1043,40 @@ class ResearchStore:
             model = cur.fetchone()
             if not model:
                 raise GPUError("NOT_A_WORLDMODEL", world_model_id)
+            if child_kind == "CausalEdge":
+                edge_status = str(child_data.get("edge_status"))
+                if edge_status == "INTERVENTION_SUPPORTED" or any(
+                    child_data.get(field)
+                    for field in (
+                        "supporting_evidence_family_ids",
+                        "contradicting_evidence_family_ids",
+                    )
+                ):
+                    raise GPUError(
+                        "CAUSAL_PROMOTION_REQUIRES_RESULT_ASSESSMENT",
+                        "Causal intervention support must come from an inspected result",
+                    )
+                if edge_status in {"OBSERVED_ASSOCIATION", "HYPOTHESIZED_CAUSAL"}:
+                    cur.execute(
+                        "SELECT id FROM research_objects WHERE project_id=%s "
+                        "AND kind='CausalEdge' "
+                        "AND data->>'source_id'=%s AND data->>'target_id'=%s "
+                        "AND data->>'relation'=%s "
+                        "AND coalesce(data->'scope','{}'::jsonb)=%s::jsonb "
+                        "AND data->>'edge_status'='REFUTED' LIMIT 1",
+                        (
+                            model["project_id"],
+                            child_data.get("source_id"),
+                            child_data.get("target_id"),
+                            child_data.get("relation"),
+                            json.dumps(child_data.get("scope", {})),
+                        ),
+                    )
+                    if cur.fetchone():
+                        raise GPUError(
+                            "WORLD_MODEL_CONSISTENCY_ERROR",
+                            "An identical-scope refuted edge blocks positive edge creation",
+                        )
             cur.execute(
                 "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
                 "VALUES(%s,%s,%s,%s,%s,%s)",
@@ -1720,7 +1751,14 @@ class ResearchStore:
             }
             contradicting_transition = hypothesis_transition in {"WEAKENED", "REFUTED"}
             if family:
-                if str(family["data"].get("origin_id")) != run_id:
+                canonical_family = family["data"]
+                if (
+                    str(canonical_family.get("origin_id")) != run_id
+                    or canonical_family.get("origin_type") != "EXPERIMENT"
+                    or "EXPERIMENT" not in canonical_family.get("origin_roles", [])
+                    or canonical_family.get("derived_from_evidence_family_id") is not None
+                    or canonical_family.get("dependency_note") is not None
+                ):
                     raise GPUError("EVIDENCE_FAMILY_KEY_CONFLICT", independence_key)
                 family_id = family["id"]
                 family_data = {**family["data"]}
@@ -1907,10 +1945,54 @@ class ResearchStore:
                     edge_data[family_field] = list(
                         dict.fromkeys([*edge_data.get(family_field, []), family_id_text])
                     )
-                support_count = len(edge_data.get("supporting_evidence_family_ids", []))
-                against_count = len(edge_data.get("contradicting_evidence_family_ids", []))
+                cur.execute(
+                    "SELECT id,data FROM research_objects WHERE project_id=%s "
+                    "AND kind='EvidenceFamily' FOR SHARE",
+                    (project_id,),
+                )
+                all_families = {str(item["id"]): item["data"] for item in cur.fetchall()}
+
+                def family_roots(family_ids: list[str]) -> dict[str, dict[str, Any]]:
+                    roots = {}
+                    for linked_id in family_ids:
+                        current, visited = str(linked_id), set()
+                        while current:
+                            if current in visited:
+                                raise GPUError(
+                                    "EVIDENCE_FAMILY_DEPENDENCY_CYCLE", current
+                                )
+                            visited.add(current)
+                            data = all_families.get(current)
+                            if data is None:
+                                raise GPUError("NOT_AN_EVIDENCEFAMILY", current)
+                            parent = data.get("derived_from_evidence_family_id")
+                            if not parent:
+                                roots[current] = data
+                                break
+                            current = str(parent)
+                    return roots
+
+                support_roots = family_roots(
+                    edge_data.get("supporting_evidence_family_ids", [])
+                )
+                against_roots = family_roots(
+                    edge_data.get("contradicting_evidence_family_ids", [])
+                )
+                support_count = len(support_roots)
+                against_count = len(against_roots)
                 scope = evidence_data["scope"]
                 architectures = {str(item) for item in scope.get("architectures", [])}
+                intervention_roles = {"EXPERIMENT", "INDEPENDENT_REPLICATION"}
+                if causal_edge_status == "INTERVENTION_SUPPORTED" and any(
+                    not intervention_roles.intersection(
+                        {root.get("origin_type"), *root.get("origin_roles", [])}
+                    )
+                    for root in support_roots.values()
+                ):
+                    raise GPUError(
+                        "CAUSAL_PROMOTION_INTERVENTION_FAMILY_REQUIRED",
+                        "Every independent causal support root must be experimental",
+                    )
                 if support_count == 0:
                     support_level = "NONE"
                 elif support_count == 1:
@@ -2892,12 +2974,47 @@ class ResearchStore:
             }
 
     def assess(self, object_id: str, status: str, rationale: str) -> dict:
-        item = self.object_get(object_id)
         if status not in {"SUPPORTED", "WEAKENED", "REFUTED", "SURVIVES_INITIAL_TEST", "INCONCLUSIVE", "BLOCKED"}:
             raise GPUError("INVALID_SCIENTIFIC_STATUS", status)
-        event = f"{item['kind'].upper()}_{status}"
-        data = {**item["data"], "assessment_rationale": rationale}
         with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,project_id,kind,status,data FROM research_objects "
+                "WHERE id=%s FOR UPDATE",
+                (object_id,),
+            )
+            item = cur.fetchone()
+            if not item:
+                raise GPUError("RESEARCH_OBJECT_NOT_FOUND", object_id)
+            if item["kind"] == "Hypothesis" and status in {
+                "SUPPORTED",
+                "SURVIVES_INITIAL_TEST",
+            }:
+                required_edges = list(
+                    dict.fromkeys(
+                        [
+                            *item["data"].get("required_edge_ids", []),
+                            *item["data"].get("causal_edge_ids", []),
+                        ]
+                    )
+                )
+                if required_edges:
+                    cur.execute(
+                        "SELECT id FROM research_objects WHERE id=ANY(%s::uuid[]) "
+                        "AND kind='CausalEdge' AND data->>'edge_status'='REFUTED' LIMIT 1",
+                        (required_edges,),
+                    )
+                    if cur.fetchone():
+                        raise GPUError(
+                            "WORLD_MODEL_CONSISTENCY_ERROR",
+                            "A positive hypothesis assessment requires no refuted causal edge",
+                        )
+                if not item["data"].get("supporting_evidence_family_ids"):
+                    raise GPUError(
+                        "SCIENTIFIC_PROMOTION_EVIDENCE_FAMILY_REQUIRED",
+                        "Positive hypothesis assessment requires independent evidence provenance",
+                    )
+            event = f"{item['kind'].upper()}_{status}"
+            data = {**item["data"], "assessment_rationale": rationale}
             cur.execute("UPDATE research_objects SET status=%s,data=%s WHERE id=%s", (status, json.dumps(data), object_id))
             self._event(cur, item["project_id"], event, object_id, {"rationale": rationale})
         return {"id": object_id, "status": status, "rationale": rationale}
@@ -3080,15 +3197,20 @@ class ResearchStore:
     ) -> list[dict]:
         if not self.vector_available:
             raise GPUError("PGVECTOR_UNAVAILABLE", "The database does not have the vector extension")
+        if not embedding or len(embedding) > 4096 or not all(
+            isinstance(value, (int, float)) for value in embedding
+        ):
+            raise GPUError("INVALID_EMBEDDING", "Query embedding must contain numeric values")
         literal = "[" + ",".join(str(float(value)) for value in embedding) + "]"
         cutoff = self._prepare_as_of(as_of)
         with self._connect() as conn, conn.cursor() as cur:
             if cutoff is None:
                 sql = (
                     "SELECT id,kind,status,data,created_at,embedding <=> %s::vector AS distance "
-                    "FROM research_objects WHERE project_id=%s AND embedding IS NOT NULL"
+                    "FROM research_objects WHERE project_id=%s AND embedding IS NOT NULL "
+                    "AND vector_dims(embedding)=%s"
                 )
-                args: list[Any] = [literal, project_id]
+                args: list[Any] = [literal, project_id, len(embedding)]
             else:
                 sql = (
                     "WITH latest AS ("
@@ -3100,9 +3222,10 @@ class ResearchStore:
                     "v.revision_id DESC) "
                     "SELECT id,kind,status,data,created_at,"
                     "embedding_text::vector <=> %s::vector AS distance FROM latest "
-                    "WHERE embedding_text IS NOT NULL AND embedding_updated_at<=%s"
+                    "WHERE embedding_text IS NOT NULL AND embedding_updated_at<=%s "
+                    "AND vector_dims(embedding_text::vector)=%s"
                 )
-                args = [project_id, cutoff, literal, cutoff]
+                args = [project_id, cutoff, literal, cutoff, len(embedding)]
             if kind:
                 sql += " AND kind=%s"
                 args.append(kind)

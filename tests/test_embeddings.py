@@ -98,6 +98,22 @@ async def test_embedding_refresh_persists_metadata_and_recomputes_after_source_c
     assert changed["metadata"]["dimension"] == 32
 
 
+@pytest.mark.asyncio
+async def test_embedding_status_detects_source_hash_and_dimension_drift_before_refresh():
+    store = EmbeddingStore()
+    service = EmbeddingService(store, LocalHashEmbeddingProvider(32))
+    await service.refresh_object(store.object["id"])
+
+    store.object["data"]["mechanism"] = "mutated after indexing"
+    source_stale = service.project_status("project-1")
+    store.object["data"]["mechanism"] = "decoder state propagation"
+    store.metadata["dimension"] = 64
+    dimension_stale = service.project_status("project-1")
+
+    assert source_stale["stale_or_missing"] == 1
+    assert dimension_stale["stale_or_missing"] == 1
+
+
 def test_canonical_text_excludes_volatile_identity_and_timestamp_fields():
     store = EmbeddingStore()
     item = {
@@ -180,3 +196,31 @@ async def test_postgres_embedding_recomputes_after_mutation_and_survives_store_r
     assert changed["metadata"]["source_text_hash"] != first_hash
     assert status["indexed_objects"] == 1
     assert status["stale_or_missing"] == 0
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_postgres_semantic_search_ignores_vectors_from_other_dimensions():
+    store = ResearchStore(TEST_DATABASE_URL)
+    if not store.vector_available:
+        pytest.skip("pgvector is unavailable")
+    project = store.project_create(
+        f"embedding-dimensions-{time.time_ns()}", "Can mixed dimensions break retrieval?"
+    )
+    two_dimensional = store.object_create(
+        project["project_id"],
+        "Hypothesis",
+        {"mechanism": "two dimensional fixture"},
+        "HYPOTHESIS_CREATED",
+    )
+    three_dimensional = store.object_create(
+        project["project_id"],
+        "Hypothesis",
+        {"mechanism": "three dimensional fixture"},
+        "HYPOTHESIS_CREATED",
+    )
+    store.embedding_set(two_dimensional["id"], [1.0, 0.0])
+    store.embedding_set(three_dimensional["id"], [1.0, 0.0, 0.0])
+
+    hits = store.semantic_search(project["project_id"], [1.0, 0.0])
+
+    assert [str(item["id"]) for item in hits] == [two_dimensional["id"]]

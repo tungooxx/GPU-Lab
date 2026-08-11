@@ -168,3 +168,21 @@ def test_research_map_payload_contains_only_graph_rendering_fields(monkeypatch):
         "relation": "CAUSES",
         "edge_status": "HYPOTHESIZED_CAUSAL",
     }
+
+
+def test_research_runtime_is_initialized_before_mcp_accepts_requests(monkeypatch):
+    created = []
+
+    class InitializedStore:
+        def __init__(self, url):
+            created.append(url)
+
+    monkeypatch.setattr(server.settings, "gpu_lab_research_database_url", "postgresql://fixture")
+    monkeypatch.setattr(server, "research_store", None)
+    monkeypatch.setattr(server, "ResearchStore", InitializedStore)
+
+    initialized = server.initialize_research_runtime()
+    replay = server.research()
+
+    assert initialized is replay
+    assert created == ["postgresql://fixture"]

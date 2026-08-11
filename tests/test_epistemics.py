@@ -501,3 +501,159 @@ def test_postgres_concurrent_direct_edge_updates_detect_stale_writer_without_los
     assert [error.error_type for error in errors] == ["CAUSAL_EDGE_CONCURRENT_UPDATE"]
     persisted = store.object_get(edge["id"])
     assert persisted["data"]["supporting_ids"] in ([evidence[0]["id"]], [evidence[1]["id"]])
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_postgres_generic_family_link_cannot_mutate_causal_support():
+    store = ResearchStore(TEST_DATABASE_URL)
+    service = EpistemicService(store)
+    project = store.project_create(f"causal-link-{time.time_ns()}", "Can links bypass assessment?")
+    run = store.object_create(
+        project["project_id"], "ExperimentRun", {"job_id": "fixture"}, "EXPERIMENT_STARTED"
+    )
+    family = service.evidence_family_create(
+        project["project_id"], "EXPERIMENT", run["id"], "One experiment"
+    )
+    edge = store.object_create(
+        project["project_id"],
+        "CausalEdge",
+        {"edge_status": "HYPOTHESIZED_CAUSAL"},
+        "CAUSAL_EDGE_CREATED",
+    )
+
+    with pytest.raises(GPUError) as error:
+        service.evidence_family_link(family["id"], edge["id"], "SUPPORTS")
+
+    assert error.value.error_type == "CAUSAL_EVIDENCE_FAMILY_REQUIRES_RESULT_ASSESSMENT"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_postgres_result_assessment_rejects_precreated_dependent_run_family():
+    store = ResearchStore(TEST_DATABASE_URL)
+    service = EpistemicService(store)
+    project = store.project_create(
+        f"dependent-run-family-{time.time_ns()}", "Can a dependent run look independent?"
+    )
+    project_id = project["project_id"]
+    paper = store.object_create(project_id, "Paper", {"title": "root"}, "PAPER_INGESTED")
+    root = service.evidence_family_create(project_id, "PAPER", paper["id"], "Root evidence")
+    decision = store.object_create(
+        project_id, "ResearchDecision", {}, "RESEARCH_DECISION_SELECTED", "SELECTED"
+    )
+    hypothesis = store.object_create(
+        project_id, "Hypothesis", {"mechanism": "fixture"}, "HYPOTHESIS_CREATED"
+    )
+    agenda = store.object_create(
+        project_id, "AgendaItem", {"question": "fixture"}, "AGENDA_ITEM_CREATED"
+    )
+    run = store.object_create(
+        project_id,
+        "ExperimentRun",
+        {"decision_id": decision["id"], "experiment_id": str(uuid.uuid4())},
+        "EXPERIMENT_FINISHED",
+        "completed",
+    )
+    service.evidence_family_create(
+        project_id,
+        "EXPERIMENT",
+        run["id"],
+        "Dependent run alias",
+        root["id"],
+        "Reuses the paper's empirical origin",
+    )
+
+    with pytest.raises(GPUError) as error:
+        store.result_assessment_apply(
+            run_id=run["id"],
+            decision_id=decision["id"],
+            hypothesis_id=hypothesis["id"],
+            agenda_item_id=agenda["id"],
+            evidence_data={"prediction_outcome": "fixture", "scope": {}},
+            hypothesis_transition="INCONCLUSIVE",
+            rationale="fixture",
+            inspection={},
+            agenda_status="ACTIVE",
+            actual_information_gain="LOW",
+        )
+
+    assert error.value.error_type == "EVIDENCE_FAMILY_KEY_CONFLICT"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_postgres_cannot_recreate_identical_scope_positive_edge_after_refutation():
+    store = ResearchStore(TEST_DATABASE_URL)
+    brain = ResearchBrain(store)
+    project = store.project_create(
+        f"refuted-edge-create-{time.time_ns()}", "Can refuted causality be recreated?"
+    )
+    project_id = project["project_id"]
+    model = brain.world_model_create(project_id, "Model", "fixture")
+    model_id = model["world_model"]["id"]
+    source = brain.world_entity_create(model_id, "MechanismState", "A", "source")
+    target = brain.world_entity_create(model_id, "MechanismState", "B", "target")
+    evidence = store.object_create(
+        project_id, "EvidenceUnit", {"statement": "failed intervention"}, "EVIDENCE_RECORDED"
+    )
+    scope = {"architectures": ["VRCNet"], "interventions": ["state swap"], "metrics": ["CD"]}
+    brain.causal_edge_create(
+        model_id,
+        source["entity"]["id"],
+        target["entity"]["id"],
+        "CAUSES",
+        "REFUTED",
+        against_ids=[evidence["id"]],
+        scope=scope,
+    )
+    prediction = store.object_create(
+        project_id, "Prediction", {"statement": "A changes B"}, "PREDICTION_CREATED"
+    )
+
+    with pytest.raises(GPUError) as error:
+        brain.causal_edge_create(
+            model_id,
+            source["entity"]["id"],
+            target["entity"]["id"],
+            "CAUSES",
+            "HYPOTHESIZED_CAUSAL",
+            unresolved_prediction_ids=[prediction["id"]],
+            scope=scope,
+        )
+
+    assert error.value.error_type == "WORLD_MODEL_CONSISTENCY_ERROR"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_postgres_generic_positive_assessment_rejects_refuted_required_edge():
+    store = ResearchStore(TEST_DATABASE_URL)
+    service = EpistemicService(store)
+    project = store.project_create(
+        f"refuted-hypothesis-assess-{time.time_ns()}", "Can assessment bypass consistency?"
+    )
+    edge = store.object_create(
+        project["project_id"],
+        "CausalEdge",
+        {"edge_status": "REFUTED"},
+        "CAUSAL_EDGE_CREATED",
+        "RESULT_INSPECTED",
+    )
+    run = store.object_create(
+        project["project_id"], "ExperimentRun", {"job_id": "fixture"}, "EXPERIMENT_STARTED"
+    )
+    family = service.evidence_family_create(
+        project["project_id"], "EXPERIMENT", run["id"], "Supporting family"
+    )
+    hypothesis = store.object_create(
+        project["project_id"],
+        "Hypothesis",
+        {
+            "mechanism": "requires a refuted edge",
+            "required_edge_ids": [edge["id"]],
+            "supporting_evidence_family_ids": [family["id"]],
+        },
+        "HYPOTHESIS_CREATED",
+    )
+
+    with pytest.raises(GPUError) as error:
+        store.assess(hypothesis["id"], "SUPPORTED", "generic promotion attempt")
+
+    assert error.value.error_type == "WORLD_MODEL_CONSISTENCY_ERROR"

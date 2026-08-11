@@ -34,6 +34,7 @@ from .local_runner import LocalRunner
 from .meta_research import MetaResearchService
 from .qd import HypothesisQDService
 from .research import ResearchStore
+from .research_operators import HttpResearchOperatorProvider, ResearchOperatorService
 from .service import GPUService
 from .terminal import TERMINAL_HTML
 
@@ -54,6 +55,7 @@ settings, service, research_store, research_brain, brain_bench_service, epistemi
 )
 _singleton_lock = threading.RLock()
 embedding_service: EmbeddingService | None = None
+research_operator_service: ResearchOperatorService | None = None
 instructions = (
     "Safe, structured remote GPU experiment control plane. Credentials are never returned. "
     "Before research_experiment_execute, call research_decision_create and pass its decision_id; "
@@ -117,6 +119,9 @@ _READ_ONLY_TOOLS = {
     "research_semantic_search",
     "research_embedding_status",
     "research_embedding_search",
+    "research_operator_status",
+    "research_null_model_critique",
+    "research_operator_critique",
     "paper_ask",
     "reproduction_status",
     "reproduction_plan",
@@ -132,6 +137,9 @@ _DESTRUCTIVE_TOOLS = {
     "gpu_destroy",
     "executable_paper_build",
     "executable_paper_invoke",
+    "research_hypothesis_generate",
+    "research_null_model_critique",
+    "research_operator_critique",
     "executable_paper_action_approve",
 }
 _OPEN_WORLD_TOOLS = {
@@ -309,6 +317,13 @@ def research() -> ResearchStore:
     return research_store
 
 
+def initialize_research_runtime() -> ResearchStore | None:
+    """Run migrations and deferred temporal recovery before MCP begins accepting requests."""
+    if not settings.gpu_lab_research_database_url:
+        return None
+    return research()
+
+
 def brain() -> ResearchBrain:
     global research_brain
     if research_brain is None:
@@ -402,6 +417,27 @@ def qd() -> HypothesisQDService:
             if qd_service is None:
                 qd_service = HypothesisQDService(research())
     return qd_service
+
+
+def research_operators() -> ResearchOperatorService:
+    global research_operator_service
+    if settings.gpu_lab_research_operator_provider != "literature-http":
+        raise GPUError(
+            "RESEARCH_OPERATOR_UNAVAILABLE",
+            "Start the isolated literature profile and set provider=literature-http.",
+        )
+    if research_operator_service is None:
+        with _singleton_lock:
+            if research_operator_service is None:
+                research_operator_service = ResearchOperatorService(
+                    research(),
+                    qd(),
+                    HttpResearchOperatorProvider(
+                        settings.gpu_lab_literature_worker_url,
+                        settings.gpu_lab_literature_worker_token or "",
+                    ),
+                )
+    return research_operator_service
 
 
 def branches() -> ExperimentBranchService:
@@ -1308,6 +1344,73 @@ async def hypothesis_niche_create(
 async def hypothesis_niche_list(project_id: str):
     """List the project's mechanistic niches and explicitly selected active representatives."""
     return await call(qd().niche_list, project_id)
+
+
+@mcp.tool()
+async def research_operator_status():
+    """Report whether typed model-backed research operators are isolated and available."""
+    if settings.gpu_lab_research_operator_provider == "disabled":
+        return {
+            "status": "disabled",
+            "provider": "none",
+            "scientific_truth_access": False,
+        }
+    result = await call(
+        HttpLiteratureProvider(
+            settings.gpu_lab_literature_worker_url,
+            settings.gpu_lab_literature_worker_token or "",
+        ).health
+    )
+    if "error" in result:
+        return {
+            "status": "unavailable",
+            "provider": settings.gpu_lab_research_operator_provider,
+            "error": result["error"],
+            "scientific_truth_access": False,
+        }
+    return {
+        "status": "ready" if result.get("status") == "ready" else "unavailable",
+        "provider": settings.gpu_lab_research_operator_provider,
+        "worker": result,
+        "scientific_truth_access": False,
+    }
+
+
+@mcp.tool()
+async def research_hypothesis_generate(
+    project_id: str, agenda_item_id: str, persist: bool = False
+):
+    """Generate 3-5 typed advisory mechanisms, then run dead-memory and QD screening."""
+    return await call(
+        research_operators().generate_hypotheses,
+        project_id,
+        agenda_item_id,
+        persist=persist,
+    )
+
+
+@mcp.tool()
+async def research_null_model_critique(
+    project_id: str, target_claim: str, context: dict
+):
+    """Generate typed cheap null explanations and controls without scientific promotion."""
+    return await call(
+        research_operators().null_model_critique,
+        project_id,
+        target_claim,
+        context,
+    )
+
+
+@mcp.tool()
+async def research_operator_critique(operator_name: str, project_id: str, context: dict):
+    """Run one typed advisory Mechanism, Design, Proximity, or Novelty critic."""
+    return await call(
+        research_operators().critique,
+        operator_name,
+        project_id,
+        context,
+    )
 
 
 async def _hypothesis_draft_with_embedding(draft: dict) -> dict:
@@ -2614,6 +2717,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--transport", choices=["stdio", "sse", "streamable-http"], default="stdio")
     args = parser.parse_args()
+    # Complete schema migration/recovery before accepting MCP traffic so read-only tools remain
+    # read-only even on their first request.
+    initialize_research_runtime()
     reconciliation = local.reconcile_jobs()
     if reconciliation["reconciled"]:
         logger.info("Reconciled persisted local jobs at startup: %s", reconciliation)

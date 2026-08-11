@@ -234,9 +234,8 @@ class EmbeddingService:
             for item in self.store.objects_list(project_id, limit=None)
             if item["kind"] in EMBEDDING_TARGETS
         ]
-        metadata = [
-            self.store.embedding_metadata_get(str(item["id"])) for item in objects
-        ]
+        metadata = [self.store.embedding_metadata_get(str(item["id"])) for item in objects]
+        expected_hashes = [self.source_hash(self.canonical_text(item)) for item in objects]
         return {
             "project_id": project_id,
             "provider": self.provider.name,
@@ -248,7 +247,9 @@ class EmbeddingService:
                 or item.get("provider") != self.provider.name
                 or item.get("model") != self.provider.model
                 or item.get("model_version") != self.provider.model_version
-                for item in metadata
+                or item.get("dimension") != self.provider.dimension
+                or item.get("source_text_hash") != expected_hash
+                for item, expected_hash in zip(metadata, expected_hashes, strict=True)
             ),
             "canonical_truth_owner": "PostgreSQL scientific objects",
         }

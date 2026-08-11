@@ -464,6 +464,7 @@ async def test_worker_health_is_secret_free_and_other_routes_require_auth(monkey
                 "/search",
                 "/retrieve-evidence",
                 "/inspect-document",
+                "/operator",
             )
         ]
         non_ascii = await client.post(
