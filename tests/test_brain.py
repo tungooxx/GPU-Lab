@@ -161,6 +161,32 @@ def test_provider_failure_selects_an_alternative_action():
     assert selected.payload["blocked_actions"][0]["blocked_reason"] == "GPU unavailable"
 
 
+def test_operationally_inspected_abandoned_run_does_not_block_new_experiment():
+    agenda = {
+        "data": {
+            "question": "Does the frozen intervention discriminate?",
+            "candidate_experiments": [
+                {"action_type": "CAUSAL_INTERVENTION", "available": True}
+            ],
+        }
+    }
+    brain = ResearchBrain(
+        CandidateStore(
+            runs=[
+                {
+                    "id": "abandoned-run",
+                    "status": "cancelled",
+                    "data": {"inspection": {"mode": "EXECUTION_NOT_SUBMITTED"}},
+                }
+            ]
+        )
+    )
+
+    selected = brain._candidate_actions("project", agenda, [])[0]
+
+    assert selected.action_type == "CAUSAL_INTERVENTION"
+
+
 def test_portfolio_get_does_not_mutate_scientific_state():
     store = CandidateStore()
     brain = ResearchBrain(store)

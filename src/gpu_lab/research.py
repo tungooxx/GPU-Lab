@@ -1862,7 +1862,41 @@ class ResearchStore:
             if run["status"] == "cancelled":
                 abandoned = run["data"].get("legacy_abandonment", {})
                 if abandoned.get("job_id") == job_id:
-                    return {"id": run_id, "status": "cancelled", "data": run["data"], "idempotent_replay": True}
+                    if run["data"].get("inspection") is None:
+                        data = {
+                            **run["data"],
+                            "inspection": {
+                                "mode": "EXECUTION_NOT_SUBMITTED",
+                                "recorded_at": now.isoformat(),
+                                "rationale": abandoned.get("rationale", rationale),
+                                "limitations": [
+                                    "This is operational bookkeeping, not a scientific result assessment."
+                                ],
+                            },
+                        }
+                        cur.execute(
+                            "UPDATE research_objects SET data=%s WHERE id=%s",
+                            (json.dumps(data), run_id),
+                        )
+                        self._event(
+                            cur,
+                            run["project_id"],
+                            "EXPERIMENT_RUN_LEGACY_ABANDONMENT_RECORDED",
+                            run_id,
+                            {"job_id": job_id, "mode": "EXECUTION_NOT_SUBMITTED"},
+                        )
+                        return {
+                            "id": run_id,
+                            "status": "cancelled",
+                            "data": data,
+                            "idempotent_replay": True,
+                        }
+                    return {
+                        "id": run_id,
+                        "status": "cancelled",
+                        "data": run["data"],
+                        "idempotent_replay": True,
+                    }
                 raise GPUError("LEGACY_RUN_ALREADY_FINAL", run_id)
             if run["status"] != "RESERVED":
                 raise GPUError("LEGACY_RUN_NOT_ABANDONABLE", run["status"])
@@ -1881,6 +1915,14 @@ class ResearchStore:
                     "limitations": [
                         "No backing local job record existed at abandonment.",
                         "Cancellation is execution bookkeeping, not scientific evidence.",
+                    ],
+                },
+                "inspection": {
+                    "mode": "EXECUTION_NOT_SUBMITTED",
+                    "recorded_at": now.isoformat(),
+                    "rationale": rationale,
+                    "limitations": [
+                        "This is operational bookkeeping, not a scientific result assessment."
                     ],
                 },
             }
