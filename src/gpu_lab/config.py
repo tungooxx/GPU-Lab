@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     gpu_lab_literature_worker_url: str = "http://literature:8010"
     gpu_lab_literature_worker_token: str | None = None
     gpu_lab_paperqa_directory: Path = Path("/opt/gpu-lab/papers")
+    gpu_lab_denied_mcp_client_cidrs: str = ""
     fastmcp_host: str = "127.0.0.1"
     fastmcp_port: int = 8000
 

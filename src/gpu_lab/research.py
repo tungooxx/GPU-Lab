@@ -99,7 +99,7 @@ class ResearchStore:
             try:
                 cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
                 self.vector_available = True
-            except psycopg.errors.UndefinedFile:
+            except (psycopg.errors.UndefinedFile, psycopg.errors.InsufficientPrivilege):
                 conn.rollback()
                 cur.execute("SELECT pg_advisory_xact_lock(hashtext('gpu_lab_research_migration'))")
             cur.execute("""
@@ -596,6 +596,14 @@ class ResearchStore:
     ) -> dict:
         """Apply a complete scientific result assessment atomically."""
         now, evidence_id = datetime.now(UTC), uuid.uuid4()
+        try:
+            run_id = str(uuid.UUID(run_id))
+            decision_id = str(uuid.UUID(decision_id))
+            hypothesis_id = str(uuid.UUID(hypothesis_id))
+            agenda_item_id = str(uuid.UUID(agenda_item_id))
+            causal_edge_id = str(uuid.UUID(causal_edge_id)) if causal_edge_id else None
+        except (ValueError, AttributeError) as exc:
+            raise GPUError("INVALID_RESEARCH_OBJECT_ID", str(exc)) from exc
         identifiers = [run_id, decision_id, hypothesis_id, agenda_item_id]
         if causal_edge_id:
             identifiers.append(causal_edge_id)
@@ -704,8 +712,18 @@ class ResearchStore:
                     raise GPUError("NOT_A_CAUSALEDGE", causal_edge_id)
                 supporting = list(edge["data"].get("supporting_ids", []))
                 against = list(edge["data"].get("against_ids", []))
-                target = supporting if causal_edge_status == "INTERVENTION_SUPPORTED" else against
-                if str(evidence_id) not in target:
+                evidence_targets = {
+                    "OBSERVED_ASSOCIATION": supporting,
+                    "HYPOTHESIZED_CAUSAL": supporting,
+                    "INTERVENTION_SUPPORTED": supporting,
+                    "WEAKENED": against,
+                    "REFUTED": against,
+                    "UNKNOWN": None,
+                }
+                target = evidence_targets.get(str(causal_edge_status))
+                if target is None and causal_edge_status != "UNKNOWN":
+                    raise GPUError("INVALID_CAUSAL_EDGE_STATUS", str(causal_edge_status))
+                if target is not None and str(evidence_id) not in target:
                     target.append(str(evidence_id))
                 edge_data = {
                     **edge["data"],

@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import inspect
+import ipaddress
 import json
 import logging
 import re
@@ -158,6 +159,33 @@ class McpAcceptCompatibilityMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+def _mcp_client_denied(host: str | None, cidrs: str) -> bool:
+    """Return whether a client belongs to an explicitly blocked internal network."""
+    if not host:
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+        return any(
+            address in ipaddress.ip_network(item.strip(), strict=False)
+            for item in cidrs.split(",")
+            if item.strip()
+        )
+    except ValueError:
+        return True
+
+
+class McpClientNetworkPolicyMiddleware(BaseHTTPMiddleware):
+    """Prevent isolated worker networks from calling the execution-bearing MCP endpoint."""
+
+    async def dispatch(self, request: Request, call_next):
+        client_host = request.client.host if request.client else None
+        if request.url.path == "/mcp" and _mcp_client_denied(
+            client_host, settings.gpu_lab_denied_mcp_client_cidrs
+        ):
+            return JSONResponse({"error": "MCP client network is not authorized"}, status_code=403)
+        return await call_next(request)
+
+
 def _tool_title(name: str) -> str:
     return " ".join(_ACRONYMS.get(word, word.capitalize()) for word in name.split("_"))
 
@@ -278,7 +306,7 @@ def scrub(value):
         return [scrub(item) for item in value]
     if isinstance(value, str):
         return re.sub(
-            r"(?i)(bearer\s+|token\s*[=:]\s*|api[_-]?key\s*[=:]\s*|password\s*[=:]\s*)[^\s'\"]+",
+            r"(?i)(bearer\s+|token\s*[=:]\s*|api[_-]?key\s*[=:]\s*|secret\s*[=:]\s*|password\s*[=:]\s*)[^\s'\"]+",
             r"\1[REDACTED]",
             value,
         )[:4096]
@@ -1603,6 +1631,7 @@ def http_app():
     """Build the streamable HTTP app with connector header compatibility."""
     app = mcp.streamable_http_app()
     app.add_middleware(McpAcceptCompatibilityMiddleware)
+    app.add_middleware(McpClientNetworkPolicyMiddleware)
     return app
 
 

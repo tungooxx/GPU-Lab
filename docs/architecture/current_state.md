@@ -34,7 +34,7 @@ integration tests, and real execution.
 
 ## What is verified
 
-- **VERIFIED_UNIT:** 36 tests cover provider normalization, malformed worker responses, audit
+- **VERIFIED_UNIT:** 37 tests cover provider normalization, malformed worker responses, audit
   redaction, path safety, structured output metadata, local requirements resolution, environment
   command construction, local job idempotency, action
   scoring, the HASI reproduction gate, and unavailable-provider fallback behavior.

@@ -13,6 +13,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    networks: [backend]
   gpu-lab:
     build: .
     env_file: .env
@@ -25,6 +26,7 @@ services:
       GPU_LAB_LITERATURE_PROVIDER: ${GPU_LAB_LITERATURE_PROVIDER:-disabled}
       GPU_LAB_LITERATURE_WORKER_URL: http://literature:8010
       GPU_LAB_LITERATURE_WORKER_TOKEN: ${GPU_LAB_LITERATURE_WORKER_TOKEN:-}
+      GPU_LAB_DENIED_MCP_CLIENT_CIDRS: 172.29.0.0/24
     ports: ["127.0.0.1:8000:8000"]
     volumes: ["./data:/data", "gpu-lab-envs:/opt/gpu-lab/envs", "${GPU_LAB_SSH_PRIVATE_KEY_PATH:-/dev/null}:/run/ssh-key:ro", "${GPU_LAB_LOCAL_WORKSPACE_HOST:-F:/Newgeneration/VLM}:/workspace/local-vlm"]
     gpus: all
@@ -32,6 +34,7 @@ services:
       postgres:
         condition: service_healthy
     restart: unless-stopped
+    networks: [backend, literature]
   literature:
     profiles: ["literature"]
     build:
@@ -54,7 +57,16 @@ services:
       timeout: 5s
       retries: 12
     restart: unless-stopped
+    networks: [literature]
 
 volumes:
   gpu-lab-envs:
   literature-papers:
+
+networks:
+  backend:
+    ipam:
+      config: [{subnet: 172.28.0.0/24}]
+  literature:
+    ipam:
+      config: [{subnet: 172.29.0.0/24}]

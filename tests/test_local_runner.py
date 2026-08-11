@@ -5,7 +5,7 @@ import pytest
 from gpu_lab.config import Settings
 from gpu_lab.db import Repository
 from gpu_lab.local_runner import LocalRunner
-from gpu_lab.server import _normalise_mcp_accept_header, scrub
+from gpu_lab.server import _mcp_client_denied, _normalise_mcp_accept_header, scrub
 
 
 class _Process:
@@ -49,7 +49,10 @@ def test_mcp_wildcard_accept_header_allows_json_response():
 
 
 def test_audit_scrub_redacts_bearer_and_assignment_credentials():
-    value = "Authorization: Bearer top-secret api_key=abc password:xyz token=qwerty"
+    value = (
+        "Authorization: Bearer top-secret api_key=abc password:xyz token=qwerty "
+        "client_secret=hidden --secret=also-hidden"
+    )
 
     scrubbed = scrub(value)
 
@@ -57,6 +60,16 @@ def test_audit_scrub_redacts_bearer_and_assignment_credentials():
     assert "abc" not in scrubbed
     assert "xyz" not in scrubbed
     assert "qwerty" not in scrubbed
+    assert "hidden" not in scrubbed
+    assert "also-hidden" not in scrubbed
+
+
+def test_mcp_network_policy_blocks_only_the_isolated_worker_subnet():
+    denied = "172.29.0.0/24"
+
+    assert _mcp_client_denied("172.29.0.12", denied) is True
+    assert _mcp_client_denied("172.28.0.12", denied) is False
+    assert _mcp_client_denied("127.0.0.1", denied) is False
 
 
 @pytest.mark.asyncio
