@@ -84,8 +84,10 @@ services:
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
     mem_limit: 8g
+    pids_limit: 512
+    cpus: 4.0
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8020/health', data=b'{}')).read()"]
+      test: ["CMD", "python", "-c", "import json,urllib.request; data=json.load(urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8020/health', data=b'{}'))); assert data.get('result', {}).get('status') == 'ready'"]
       interval: 5s
       timeout: 5s
       retries: 12

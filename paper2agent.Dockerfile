@@ -14,7 +14,7 @@ RUN git clone --filter=blob:none https://github.com/jmiao24/Paper2Agent.git /opt
 
 RUN python3 -m venv /opt/worker \
     && /opt/worker/bin/pip install --no-cache-dir \
-       "httpx>=0.28,<1" "mcp[cli]>=1.27,<2" "psycopg[binary]>=3.2,<4" \
+       "mcp[cli]>=1.27,<2" \
        "pydantic>=2.10,<3" "starlette>=0.41,<1" "uvicorn>=0.34,<1"
 
 COPY src/gpu_lab /opt/gpu-lab/gpu_lab

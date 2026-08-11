@@ -92,11 +92,13 @@ async def test_call_audits_only_scrubbed_arguments(monkeypatch):
 
 
 def test_mcp_network_policy_blocks_only_the_isolated_worker_subnet():
-    denied = "172.29.0.0/24"
+    denied = "172.29.0.0/24,172.30.0.0/24"
 
     assert _mcp_client_denied("172.29.0.12", denied) is True
+    assert _mcp_client_denied("172.30.0.12", denied) is True
     assert _mcp_client_denied("172.28.0.12", denied) is False
     assert _mcp_client_denied("127.0.0.1", denied) is False
+    assert _mcp_client_denied("not-an-ip", denied) is True
 
 
 @pytest.mark.asyncio

@@ -326,6 +326,8 @@ async def test_http_executable_paper_rejects_non_object_nested_error():
         "https://example.com/owner/repo",
         "https://github.com/owner/repo/extra",
         "https://github.com/owner/repo?token=secret",
+        "https://github.com/owner/.",
+        "https://github.com/owner/..",
     ],
 )
 def test_paper2agent_worker_accepts_only_public_github_repositories(tmp_path, repository):
@@ -406,6 +408,43 @@ async def test_paper2agent_build_survives_disconnected_request(monkeypatch, tmp_
 
     assert result.commit == commit
     assert not provider._build_tasks
+    assert not provider._locks
+
+
+@pytest.mark.asyncio
+async def test_paper2agent_build_cleanup_survives_cancelled_only_waiter(monkeypatch, tmp_path):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "task-scoped-test-key")
+    provider = Paper2AgentSubprocessProvider(tmp_path)
+    commit = "1" * 40
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def build_once(build_id, _repository, expected_commit, _tutorials):
+        started.set()
+        await finish.wait()
+        project = provider._project(build_id)
+        project.mkdir(parents=True)
+        (project / ".gpu-lab-build-complete").write_text(expected_commit, encoding="ascii")
+
+    async def remote_head(_repository):
+        return commit
+
+    monkeypatch.setattr(provider, "_remote_head", remote_head)
+    monkeypatch.setattr(provider, "_build_once", build_once)
+
+    waiter = asyncio.create_task(
+        provider.build("paper", "https://github.com/owner/repo", commit)
+    )
+    await started.wait()
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    finish.set()
+    await next(iter(provider._build_tasks.values()))
+    await asyncio.sleep(0)
+
+    assert not provider._build_tasks
+    assert not provider._locks
 
 
 @pytest.mark.asyncio

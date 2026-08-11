@@ -2,6 +2,7 @@ from contextlib import contextmanager
 
 import pytest
 
+from gpu_lab.errors import GPUError
 from gpu_lab.research import ResearchStore
 
 
@@ -89,3 +90,55 @@ def test_world_model_create_atomic_rolls_back_mid_transaction_failure():
     assert connection.committed is False
     assert connection.rolled_back is True
     assert connection.persisted == []
+
+
+def test_world_model_child_rejects_invalid_status_before_persistence():
+    store = object.__new__(ResearchStore)
+
+    with pytest.raises(GPUError, match="not-a-status") as error:
+        store.world_model_child_create(
+            "model",
+            "Phenomenon",
+            {},
+            "PHENOMENON_CREATED",
+            "node_ids",
+            {},
+            child_status="not-a-status",
+        )
+
+    assert error.value.error_type == "INVALID_RESEARCH_OBJECT_STATUS"
+
+
+def test_causal_edge_update_rejects_invalid_status_before_persistence():
+    store = object.__new__(ResearchStore)
+
+    with pytest.raises(GPUError, match="not-a-status") as error:
+        store.causal_edge_update_atomic("edge", {}, "not-a-status", {}, [], None)
+
+    assert error.value.error_type == "INVALID_RESEARCH_OBJECT_STATUS"
+
+
+@pytest.mark.parametrize(
+    ("hypothesis_status", "agenda_status"),
+    [("not-a-status", "ACTIVE"), ("SUPPORTED", "not-a-status")],
+)
+def test_result_assessment_rejects_invalid_status_before_persistence(
+    hypothesis_status, agenda_status
+):
+    store = object.__new__(ResearchStore)
+
+    with pytest.raises(GPUError, match="not-a-status") as error:
+        store.result_assessment_apply(
+            run_id="run",
+            decision_id="decision",
+            hypothesis_id="hypothesis",
+            agenda_item_id="agenda",
+            evidence_data={},
+            hypothesis_transition=hypothesis_status,
+            rationale="test",
+            inspection={},
+            agenda_status=agenda_status,
+            actual_information_gain="LOW",
+        )
+
+    assert error.value.error_type == "INVALID_RESEARCH_OBJECT_STATUS"

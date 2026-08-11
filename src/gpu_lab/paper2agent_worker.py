@@ -39,6 +39,7 @@ class Paper2AgentSubprocessProvider:
     def __init__(self, upstream_root: Path, timeout_seconds: int = 14_400):
         self.upstream_root = upstream_root.resolve()
         self.timeout_seconds = timeout_seconds
+        self._coordination_lock = asyncio.Lock()
         self._locks: dict[str, asyncio.Lock] = {}
         self._build_tasks: dict[str, asyncio.Task[None]] = {}
 
@@ -55,6 +56,7 @@ class Paper2AgentSubprocessProvider:
             or parsed.query
             or parsed.fragment
             or len(parts) != 2
+            or any(part in {".", ".."} for part in parts)
             or not all(re.fullmatch(r"[A-Za-z0-9_.-]+", part) for part in parts)
         ):
             raise GPUError(
@@ -62,6 +64,19 @@ class Paper2AgentSubprocessProvider:
                 "Paper2Agent accepts only public https://github.com/<owner>/<repo> repositories",
             )
         return f"https://github.com/{parts[0]}/{parts[1].removesuffix('.git')}.git"
+
+    async def _cleanup_build(
+        self, build_id: str, lock: asyncio.Lock, task: asyncio.Task[None] | None
+    ) -> None:
+        async with self._coordination_lock:
+            if task is not None and task.done() and self._build_tasks.get(build_id) is task:
+                self._build_tasks.pop(build_id, None)
+            if (
+                self._locks.get(build_id) is lock
+                and not lock.locked()
+                and build_id not in self._build_tasks
+            ):
+                self._locks.pop(build_id, None)
 
     @staticmethod
     def _build_id(paper_id: str, repository: str, commit: str, tutorials: str | None) -> str:
@@ -183,24 +198,32 @@ class Paper2AgentSubprocessProvider:
                 "The official Paper2Agent pipeline cannot pin arbitrary target refs; pass the exact current default-branch HEAD",
             )
         build_id = self._build_id(paper_id, repository, commit, tutorials)
-        lock = self._locks.setdefault(build_id, asyncio.Lock())
-        async with lock:
-            project = self._project(build_id)
-            completed = project / ".gpu-lab-build-complete"
-            if not completed.exists():
-                task = self._build_tasks.get(build_id)
-                if task is None or task.done():
-                    task = asyncio.create_task(
-                        self._build_once(build_id, repository, commit, tutorials)
-                    )
-                    self._build_tasks[build_id] = task
-            else:
-                task = None
-        if task is not None:
-            # A disconnected/retried HTTP request must not cancel a costly in-flight build.
-            await asyncio.shield(task)
-            if task.done() and self._build_tasks.get(build_id) is task:
-                self._build_tasks.pop(build_id, None)
+        async with self._coordination_lock:
+            lock = self._locks.setdefault(build_id, asyncio.Lock())
+        task = None
+        try:
+            async with lock:
+                project = self._project(build_id)
+                completed = project / ".gpu-lab-build-complete"
+                if not completed.exists():
+                    task = self._build_tasks.get(build_id)
+                    if task is None or task.done():
+                        task = asyncio.create_task(
+                            self._build_once(build_id, repository, commit, tutorials)
+                        )
+                        self._build_tasks[build_id] = task
+                        task.add_done_callback(
+                            lambda finished, build_id=build_id, lock=lock: asyncio.create_task(
+                                self._cleanup_build(build_id, lock, finished)
+                            )
+                        )
+                else:
+                    task = None
+            if task is not None:
+                # A disconnected/retried HTTP request must not cancel a costly in-flight build.
+                await asyncio.shield(task)
+        finally:
+            await self._cleanup_build(build_id, lock, task)
         if not completed.is_file() or completed.read_text(encoding="ascii").strip() != commit:
             raise GPUError(
                 "EXECUTABLE_PAPER_BUILD_INCOMPLETE",

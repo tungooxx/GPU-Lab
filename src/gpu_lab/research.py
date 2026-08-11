@@ -582,6 +582,7 @@ class ResearchStore:
         """Atomically create a model child, append it, and advance the model version."""
         if child_kind not in RESEARCH_OBJECT_KINDS or list_field not in {"node_ids", "edge_ids"}:
             raise GPUError("INVALID_WORLD_MODEL_CHILD", child_kind)
+        self._validate_status(child_status)
         now, child_id, version_id = datetime.now(UTC), uuid.uuid4(), uuid.uuid4()
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
@@ -871,6 +872,7 @@ class ResearchStore:
         decision_id: str | None,
     ) -> dict:
         """Update a causal edge and advance its world model in one transaction."""
+        self._validate_status(object_status)
         now, version_id = datetime.now(UTC), uuid.uuid4()
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
@@ -1029,6 +1031,8 @@ class ResearchStore:
         causal_edge_status: str | None = None,
     ) -> dict:
         """Apply a complete scientific result assessment atomically."""
+        self._validate_status(hypothesis_transition)
+        self._validate_status(agenda_status)
         now, evidence_id = datetime.now(UTC), uuid.uuid4()
         try:
             run_id = str(uuid.UUID(run_id))
