@@ -478,6 +478,7 @@ def main() -> None:
             "causal_edge_id": edge["id"],
             "causal_edge_status": "INTERVENTION_SUPPORTED",
             "actual_information_gain": "HIGH",
+            "matched_control_passed": True,
         },
     )
     after = call_tool("brain_step", {"project_id": project_id})

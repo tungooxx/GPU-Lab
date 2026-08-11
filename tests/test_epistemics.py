@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 import uuid
 
@@ -410,7 +411,8 @@ def test_postgres_result_assessment_atomically_creates_scoped_causal_support():
         evidence_data={
             "prediction_outcome": "The frozen prediction passed",
             "scope": scope,
-            "matched_control_present": True,
+            "matched_control_preregistered": True,
+            "matched_control_passed": True,
         },
         hypothesis_transition="SURVIVES_INITIAL_TEST",
         rationale="One bounded intervention passed",
@@ -431,3 +433,71 @@ def test_postgres_result_assessment_atomically_creates_scoped_causal_support():
     assert persisted_edge["data"]["support_level"] == "SINGLE_INTERVENTION"
     assert persisted_edge["data"]["supporting_evidence_family_ids"] == family_ids
     assert persisted_edge["data"]["matched_control_count"] == 1
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_postgres_concurrent_direct_edge_updates_detect_stale_writer_without_lost_evidence():
+    store = ResearchStore(TEST_DATABASE_URL)
+    brain = ResearchBrain(store)
+    project = store.project_create(
+        f"causal-concurrency-{time.time_ns()}", "Can concurrent evidence be lost?"
+    )
+    project_id = project["project_id"]
+    model = brain.world_model_create(project_id, "Concurrent model", "fixture")
+    model_id = model["world_model"]["id"]
+    source = brain.world_entity_create(model_id, "MechanismState", "A", "source")
+    target = brain.world_entity_create(model_id, "MechanismState", "B", "target")
+    prediction = store.object_create(
+        project_id, "Prediction", {"statement": "A changes B"}, "PREDICTION_CREATED"
+    )
+    edge = brain.causal_edge_create(
+        model_id,
+        source["entity"]["id"],
+        target["entity"]["id"],
+        "CAUSES",
+        "HYPOTHESIZED_CAUSAL",
+        unresolved_prediction_ids=[prediction["id"]],
+    )["edge"]
+    evidence = [
+        store.object_create(
+            project_id,
+            "EvidenceUnit",
+            {"statement": f"observation {index}"},
+            "EVIDENCE_RECORDED",
+        )
+        for index in range(2)
+    ]
+    barrier = threading.Barrier(2)
+    results, errors = [], []
+
+    def update(evidence_id):
+        barrier.wait()
+        try:
+            results.append(
+                store.causal_edge_update_atomic(
+                    edge["id"],
+                    {
+                        "edge_status": "OBSERVED_ASSOCIATION",
+                        "supporting_ids": [evidence_id],
+                    },
+                    "RESULT_INSPECTED",
+                    {},
+                    [evidence_id],
+                    None,
+                    expected_edge_status="HYPOTHESIZED_CAUSAL",
+                )
+            )
+        except GPUError as exc:
+            errors.append(exc)
+
+    workers = [threading.Thread(target=update, args=(item["id"],)) for item in evidence]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=10)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert len(results) == 1
+    assert [error.error_type for error in errors] == ["CAUSAL_EDGE_CONCURRENT_UPDATE"]
+    persisted = store.object_get(edge["id"])
+    assert persisted["data"]["supporting_ids"] in ([evidence[0]["id"]], [evidence[1]["id"]])

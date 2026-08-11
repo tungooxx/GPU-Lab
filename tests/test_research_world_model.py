@@ -118,6 +118,38 @@ def test_causal_edge_update_rejects_invalid_status_before_persistence():
     assert error.value.error_type == "INVALID_RESEARCH_OBJECT_STATUS"
 
 
+def test_direct_causal_edge_update_cannot_manufacture_intervention_support():
+    store = object.__new__(ResearchStore)
+
+    with pytest.raises(GPUError) as error:
+        store.causal_edge_update_atomic(
+            "edge",
+            {"edge_status": "INTERVENTION_SUPPORTED"},
+            "VERIFIED_REAL",
+            {},
+            [],
+            None,
+        )
+
+    assert error.value.error_type == "CAUSAL_PROMOTION_REQUIRES_RESULT_ASSESSMENT"
+
+
+def test_direct_causal_edge_update_cannot_attach_evidence_families():
+    store = object.__new__(ResearchStore)
+
+    with pytest.raises(GPUError) as error:
+        store.causal_edge_update_atomic(
+            "edge",
+            {"supporting_evidence_family_ids": ["arbitrary-family"]},
+            "RESULT_INSPECTED",
+            {},
+            [],
+            None,
+        )
+
+    assert error.value.error_type == "CAUSAL_EVIDENCE_FAMILY_REQUIRES_RESULT_ASSESSMENT"
+
+
 @pytest.mark.parametrize(
     ("hypothesis_status", "agenda_status"),
     [("not-a-status", "ACTIVE"), ("SUPPORTED", "not-a-status")],

@@ -25,6 +25,7 @@ from .brain_bench import BenchmarkPolicy, ResearchBrainBench
 from .branches import ExperimentBranchService
 from .config import Settings
 from .dashboard import DASHBOARD_HTML
+from .embeddings import EmbeddingService, LocalHashEmbeddingProvider
 from .epistemics import EpistemicService
 from .errors import GPUError
 from .executable_papers import ExecutablePaperService, HttpExecutablePaperProvider
@@ -52,6 +53,7 @@ settings, service, research_store, research_brain, brain_bench_service, epistemi
     None,
 )
 _singleton_lock = threading.RLock()
+embedding_service: EmbeddingService | None = None
 instructions = (
     "Safe, structured remote GPU experiment control plane. Credentials are never returned. "
     "Before research_experiment_execute, call research_decision_create and pass its decision_id; "
@@ -113,6 +115,8 @@ _READ_ONLY_TOOLS = {
     "paper_get",
     "paper_evidence_search",
     "research_semantic_search",
+    "research_embedding_status",
+    "research_embedding_search",
     "paper_ask",
     "reproduction_status",
     "reproduction_plan",
@@ -332,6 +336,23 @@ def epistemics() -> EpistemicService:
             if epistemic_service is None:
                 epistemic_service = EpistemicService(research())
     return epistemic_service
+
+
+def embeddings() -> EmbeddingService:
+    global embedding_service
+    if settings.gpu_lab_embedding_provider != "local-hash":
+        raise GPUError(
+            "EMBEDDING_PROVIDER_UNAVAILABLE",
+            "Automatic embeddings are disabled; structured and lexical retrieval remain available.",
+        )
+    if embedding_service is None:
+        with _singleton_lock:
+            if embedding_service is None:
+                embedding_service = EmbeddingService(
+                    research(),
+                    LocalHashEmbeddingProvider(settings.gpu_lab_embedding_dimension),
+                )
+    return embedding_service
 
 
 def literature() -> LiteratureService:
@@ -967,6 +988,8 @@ async def hypothesis_portfolio_get(project_id: str):
 @mcp.tool()
 async def brain_step(project_id: str, as_of: str | None = None):
     """Persist a current decision, or return a non-mutating decision at historical cutoff as_of."""
+    if as_of is None and settings.gpu_lab_embedding_provider != "disabled":
+        await call(embeddings().refresh_project, project_id)
     result = await call(brain().brain_step, project_id, as_of, as_of is None)
     if "error" in result:
         return result
@@ -1086,6 +1109,7 @@ async def brain_result_assess(
     causal_edge_status: str | None = None,
     actual_information_gain: str = "MEDIUM",
     guard_passed: bool | None = None,
+    matched_control_passed: bool | None = None,
 ):
     """Inspect a real result and explicitly update evidence, belief, agenda, and WorldModel."""
     return await call(
@@ -1108,6 +1132,7 @@ async def brain_result_assess(
         causal_edge_status=causal_edge_status,
         actual_information_gain=actual_information_gain,
         guard_passed=guard_passed,
+        matched_control_passed=matched_control_passed,
     )
 
 
@@ -1285,16 +1310,33 @@ async def hypothesis_niche_list(project_id: str):
     return await call(qd().niche_list, project_id)
 
 
+async def _hypothesis_draft_with_embedding(draft: dict) -> dict:
+    if draft.get("embedding") or settings.gpu_lab_embedding_provider == "disabled":
+        return draft
+    try:
+        service = embeddings()
+        text = service.canonical_text({"kind": "Hypothesis", "data": draft})
+        vectors = await service.provider.embed_texts([text])
+        return {**draft, "embedding": vectors[0]}
+    except Exception:  # noqa: BLE001 - QD remains available if the secondary index fails
+        return draft
+
+
 @mcp.tool()
 async def hypothesis_qd_screen(project_id: str, draft: dict):
     """Compare a typed draft with active/dead ideas using retrieval and structured mechanisms."""
-    return await call(qd().screen, project_id, draft)
+    return await call(qd().screen, project_id, await _hypothesis_draft_with_embedding(draft))
 
 
 @mcp.tool()
 async def hypothesis_qd_create(project_id: str, draft: dict):
     """Persist a screened hypothesis with niche, ancestry, similarity, and scientific difference."""
-    return await call(qd().create, project_id, draft)
+    created = await call(qd().create, project_id, await _hypothesis_draft_with_embedding(draft))
+    if "error" not in created and settings.gpu_lab_embedding_provider != "disabled":
+        created["automatic_embedding"] = await call(
+            embeddings().refresh_object, created["id"]
+        )
+    return created
 
 
 @mcp.tool()
@@ -1481,6 +1523,12 @@ async def research_events(project_id: str, limit: int = 100, as_of: str | None =
 
 
 @mcp.tool()
+async def research_temporal_finalize_pending():
+    """Recover deferred temporal commit markers without mutating historical read operations."""
+    return await call(research().temporal_finalize_pending)
+
+
+@mcp.tool()
 async def research_assess(object_id: str, status: str, rationale: str):
     """Update a claim or hypothesis only with an explicit evidence-backed assessment event."""
     return await call(research().assess, object_id, status, rationale)
@@ -1554,6 +1602,45 @@ async def paper_evidence_search(
 async def research_embedding_store(object_id: str, embedding: list[float]):
     """Attach a caller-provided embedding to a research object for pgvector retrieval."""
     return await call(research().embedding_set, object_id, embedding)
+
+
+@mcp.tool()
+async def research_embedding_status(project_id: str):
+    """Report automatic embedding coverage without treating the secondary index as truth."""
+    if settings.gpu_lab_embedding_provider == "disabled":
+        return {
+            "status": "disabled",
+            "fallback": "structured_and_lexical_retrieval",
+        }
+    return await call(embeddings().project_status, project_id)
+
+
+@mcp.tool()
+async def research_embedding_refresh(project_id: str):
+    """Generate or refresh source-hashed embeddings for canonical scientific objects."""
+    if settings.gpu_lab_embedding_provider == "disabled":
+        return {
+            "status": "disabled",
+            "fallback": "structured_and_lexical_retrieval",
+        }
+    return await call(embeddings().refresh_project, project_id)
+
+
+@mcp.tool()
+async def research_embedding_search(
+    project_id: str, query: str, kind: str | None = None, limit: int = 25
+):
+    """Search the automatic vector index, falling back to lexical retrieval on provider failure."""
+    if settings.gpu_lab_embedding_provider == "disabled":
+        return {
+            "mode": "lexical_fallback",
+            "hits": await call(
+                research().search, project_id, query, kind, min(max(limit, 1), 100)
+            ),
+        }
+    return await call(
+        embeddings().search, project_id, query, kind, min(max(limit, 1), 100)
+    )
 
 
 @mcp.tool()

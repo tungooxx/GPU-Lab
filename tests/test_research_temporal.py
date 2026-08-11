@@ -10,7 +10,7 @@ import pytest
 
 from gpu_lab.brain import ResearchBrain
 from gpu_lab.errors import GPUError
-from gpu_lab.research import ResearchStore
+from gpu_lab.research import ResearchStore, _TrackedResearchConnection
 
 TEST_DATABASE_URL = os.getenv("GPU_LAB_TEST_DATABASE_URL")
 
@@ -20,6 +20,49 @@ def test_temporal_cutoff_requires_an_aware_timestamp():
         ResearchStore._normalize_as_of("2026-08-11T12:00:00")
 
     assert error.value.error_type == "INVALID_TEMPORAL_CUTOFF"
+
+
+def test_historical_cutoff_normalization_does_not_run_write_recovery():
+    store = object.__new__(ResearchStore)
+    store._finalize_orphaned_transactions = lambda: (_ for _ in ()).throw(
+        AssertionError("historical read attempted a write")
+    )
+
+    cutoff = store._prepare_as_of("2026-08-11T12:00:00+00:00")
+
+    assert cutoff == datetime(2026, 8, 11, 12, tzinfo=UTC)
+
+
+def test_post_commit_finalizer_failure_never_turns_committed_write_into_failure():
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, _statement):
+            return None
+
+        def fetchone(self):
+            return {"transaction_id": 42}
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    store = object.__new__(ResearchStore)
+    store._finalize_transaction = lambda _transaction_id: (_ for _ in ()).throw(
+        RuntimeError("maintenance unavailable")
+    )
+    tracked = object.__new__(_TrackedResearchConnection)
+    tracked.store = store
+    tracked.connection = Connection()
+
+    assert tracked.__exit__(None, None, None) is False
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")

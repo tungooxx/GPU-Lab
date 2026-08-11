@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import re
 import uuid
 from datetime import UTC, datetime
@@ -9,6 +10,8 @@ import psycopg
 from psycopg.rows import dict_row
 
 from .errors import GPUError
+
+logger = logging.getLogger(__name__)
 
 RESEARCH_OBJECT_KINDS = (
     "Paper",
@@ -114,7 +117,15 @@ class _TrackedResearchConnection:
                 transaction_id = cur.fetchone()["transaction_id"]
         result = self.connection.__exit__(exc_type, exc_value, traceback)
         if exc_type is None and transaction_id is not None:
-            self.store._finalize_transaction(int(transaction_id))
+            try:
+                self.store._finalize_transaction(int(transaction_id))
+            except Exception:
+                # The domain transaction is already committed. Never report it as failed and
+                # invite a duplicate retry; pending temporal bookkeeping is recoverable.
+                logger.exception(
+                    "Temporal finalization deferred for committed transaction %s",
+                    transaction_id,
+                )
         return result
 
 
@@ -125,6 +136,7 @@ class ResearchStore:
         self.url = url
         self.vector_available = False
         self._migrate()
+        self._finalize_orphaned_transactions()
 
     def _connect(self):
         return _TrackedResearchConnection(self)
@@ -141,6 +153,11 @@ class ResearchStore:
                     f"UPDATE {table} SET committed_at=%s "
                     "WHERE commit_token=%s AND committed_at IS NULL",
                     (effective_time, transaction_id),
+                )
+                cur.execute(
+                    f"UPDATE {table} SET committed_at=%s,legacy_backfill=TRUE "
+                    "WHERE committed_at IS NULL",
+                    (effective_time,),
                 )
 
     def _finalize_orphaned_transactions(self) -> None:
@@ -250,6 +267,12 @@ class ResearchStore:
                 ALTER TABLE research_events ADD COLUMN IF NOT EXISTS committed_at TIMESTAMPTZ;
                 ALTER TABLE research_events ADD COLUMN IF NOT EXISTS commit_token BIGINT;
                 ALTER TABLE research_events ADD COLUMN IF NOT EXISTS legacy_backfill BOOLEAN NOT NULL DEFAULT FALSE;
+                CREATE INDEX IF NOT EXISTS research_object_versions_pending_commit_idx
+                    ON research_object_versions(commit_token) WHERE committed_at IS NULL;
+                CREATE INDEX IF NOT EXISTS research_project_versions_pending_commit_idx
+                    ON research_project_versions(commit_token) WHERE committed_at IS NULL;
+                CREATE INDEX IF NOT EXISTS research_events_pending_commit_idx
+                    ON research_events(commit_token) WHERE committed_at IS NULL;
             """)
             migration_boundary = datetime.now(UTC)
             for table in (
@@ -411,10 +434,21 @@ class ResearchStore:
         return value.astimezone(UTC)
 
     def _prepare_as_of(self, as_of: datetime | str | None) -> datetime | None:
-        cutoff = self._normalize_as_of(as_of)
-        if cutoff is not None:
-            self._finalize_orphaned_transactions()
-        return cutoff
+        return self._normalize_as_of(as_of)
+
+    def temporal_finalize_pending(self) -> dict[str, Any]:
+        """Explicit maintenance recovery; historical read tools remain side-effect free."""
+        self._finalize_orphaned_transactions()
+        with psycopg.connect(self.url, row_factory=dict_row) as conn, conn.cursor() as cur:
+            pending = {}
+            for table in (
+                "research_object_versions",
+                "research_project_versions",
+                "research_events",
+            ):
+                cur.execute(f"SELECT count(*) AS count FROM {table} WHERE committed_at IS NULL")
+                pending[table] = int(cur.fetchone()["count"])
+        return {"status": "recovered", "pending": pending}
 
     def project_get(self, project_id: str, as_of: datetime | str | None = None) -> dict:
         cutoff = self._prepare_as_of(as_of)
@@ -1311,11 +1345,29 @@ class ResearchStore:
         changes: dict[str, Any],
         evidence_ids: list[str],
         decision_id: str | None,
+        expected_edge_status: str | None = None,
     ) -> dict:
         """Update a causal edge and advance its world model in one transaction."""
         self._validate_status(object_status)
         if "world_model_id" in data_update:
             raise GPUError("CAUSAL_EDGE_WORLD_MODEL_IMMUTABLE", edge_id)
+        if any(
+            data_update.get(field)
+            for field in (
+                "supporting_evidence_family_ids",
+                "contradicting_evidence_family_ids",
+                "evidence_family_ids",
+            )
+        ):
+            raise GPUError(
+                "CAUSAL_EVIDENCE_FAMILY_REQUIRES_RESULT_ASSESSMENT",
+                "Direct edge updates cannot attach empirical EvidenceFamilies",
+            )
+        if data_update.get("edge_status") == "INTERVENTION_SUPPORTED":
+            raise GPUError(
+                "CAUSAL_PROMOTION_REQUIRES_RESULT_ASSESSMENT",
+                "Intervention support must be derived by result_assessment_apply",
+            )
         now, version_id = datetime.now(UTC), uuid.uuid4()
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
@@ -1326,6 +1378,13 @@ class ResearchStore:
             edge = cur.fetchone()
             if not edge:
                 raise GPUError("NOT_A_CAUSALEDGE", edge_id)
+            current_edge_status = str(edge["data"].get("edge_status"))
+            if expected_edge_status is not None and current_edge_status != expected_edge_status:
+                raise GPUError(
+                    "CAUSAL_EDGE_CONCURRENT_UPDATE",
+                    f"Expected {expected_edge_status}, found {current_edge_status}; reload and retry",
+                    retryable=True,
+                )
             model_id = edge["data"].get("world_model_id")
             cur.execute(
                 "SELECT project_id,status,data FROM research_objects "
@@ -1338,6 +1397,60 @@ class ResearchStore:
             if str(model["project_id"]) != str(edge["project_id"]):
                 raise GPUError("RESEARCH_PROJECT_MISMATCH", edge_id)
             edge_data = {**edge["data"], **data_update}
+            for field in ("supporting_ids", "against_ids"):
+                edge_data[field] = list(
+                    dict.fromkeys(
+                        [*edge["data"].get(field, []), *data_update.get(field, [])]
+                    )
+                )
+            new_edge_status = str(edge_data.get("edge_status"))
+            combined_evidence_ids = list(
+                dict.fromkeys(
+                    [*edge_data.get("supporting_ids", []), *edge_data.get("against_ids", [])]
+                )
+            )
+            if new_edge_status in {"OBSERVED_ASSOCIATION", "WEAKENED", "REFUTED"} and not combined_evidence_ids:
+                raise GPUError("CAUSAL_EDGE_EVIDENCE_REQUIRED", new_edge_status)
+            scope = edge_data.get("scope", {})
+            if new_edge_status in {"OBSERVED_ASSOCIATION", "HYPOTHESIZED_CAUSAL"}:
+                cur.execute(
+                    "SELECT id FROM research_objects WHERE project_id=%s "
+                    "AND kind='CausalEdge' AND id<>%s "
+                    "AND data->>'source_id'=%s AND data->>'target_id'=%s "
+                    "AND data->>'relation'=%s AND coalesce(data->'scope','{}'::jsonb)=%s::jsonb "
+                    "AND data->>'edge_status'='REFUTED' LIMIT 1",
+                    (
+                        edge["project_id"],
+                        edge_id,
+                        edge_data.get("source_id"),
+                        edge_data.get("target_id"),
+                        edge_data.get("relation"),
+                        json.dumps(scope),
+                    ),
+                )
+                if cur.fetchone():
+                    raise GPUError(
+                        "WORLD_MODEL_CONSISTENCY_ERROR",
+                        "An identical-scope refuted edge blocks a positive causal transition",
+                    )
+            if new_edge_status == "REFUTED":
+                cur.execute(
+                    "SELECT id FROM research_objects WHERE project_id=%s "
+                    "AND kind='Hypothesis' AND status=ANY(%s) "
+                    "AND ((coalesce(data->'required_edge_ids','[]'::jsonb) ? %s) "
+                    "OR (coalesce(data->'causal_edge_ids','[]'::jsonb) ? %s)) LIMIT 1",
+                    (
+                        edge["project_id"],
+                        ["ACTIVE", "SURVIVES_INITIAL_TEST", "SUPPORTED"],
+                        edge_id,
+                        edge_id,
+                    ),
+                )
+                if cur.fetchone():
+                    raise GPUError(
+                        "WORLD_MODEL_CONSISTENCY_ERROR",
+                        "An active hypothesis still requires the edge being refuted",
+                    )
             cur.execute(
                 "UPDATE research_objects SET status=%s,data=%s WHERE id=%s",
                 (object_status, json.dumps(edge_data), edge_id),
@@ -1347,15 +1460,24 @@ class ResearchStore:
                 edge["project_id"],
                 "CAUSAL_EDGE_STATUS_CHANGED",
                 edge_id,
-                {"status": object_status, **data_update},
+                {"status": object_status, **data_update, "evidence_ids": combined_evidence_ids},
             )
             version_number = int(model["data"].get("version", 0)) + 1
             version_data = {
                 "world_model_id": str(model_id),
                 "version": version_number,
                 "parent_version_id": model["data"].get("current_version_id"),
-                "changes": changes,
-                "evidence_ids": evidence_ids,
+                "changes": {
+                    **changes,
+                    "edges_status_changed": [
+                        {
+                            "edge_id": edge_id,
+                            "from": current_edge_status,
+                            "to": new_edge_status,
+                        }
+                    ],
+                },
+                "evidence_ids": combined_evidence_ids,
                 "decision_id": decision_id,
                 "timestamp": now.isoformat(),
             }
@@ -1809,7 +1931,7 @@ class ResearchStore:
                         "matched_control_count": int(
                             edge["data"].get("matched_control_count", 0)
                         )
-                        + int(bool(evidence_data.get("matched_control_present"))),
+                        + int(evidence_data.get("matched_control_passed") is True),
                         "counter_intervention_count": int(
                             edge["data"].get("counter_intervention_count", 0)
                         ),
@@ -2891,7 +3013,22 @@ class ResearchStore:
                 )
         return sorted(related, key=lambda item: item["lexical_similarity"], reverse=True)[:limit]
 
-    def embedding_set(self, object_id: str, embedding: list[float]) -> dict:
+    def embedding_metadata_get(self, object_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT embedding_metadata FROM research_objects WHERE id=%s", (object_id,)
+            )
+            row = cur.fetchone()
+        if not row:
+            raise GPUError("RESEARCH_OBJECT_NOT_FOUND", object_id)
+        return row["embedding_metadata"]
+
+    def embedding_set(
+        self,
+        object_id: str,
+        embedding: list[float],
+        metadata: dict[str, Any] | None = None,
+    ) -> dict:
         if not self.vector_available:
             raise GPUError("PGVECTOR_UNAVAILABLE", "The database does not have the vector extension")
         if not embedding or len(embedding) > 4096:
@@ -2899,16 +3036,39 @@ class ResearchStore:
         if not all(isinstance(value, (int, float)) for value in embedding):
             raise GPUError("INVALID_EMBEDDING", "Embedding values must be numeric")
         item = self.object_get(object_id)
+        metadata = _json_document(metadata or {})
+        if metadata and int(metadata.get("dimension", len(embedding))) != len(embedding):
+            raise GPUError(
+                "INVALID_EMBEDDING_METADATA", "Metadata dimension differs from the vector"
+            )
         literal = "[" + ",".join(str(float(value)) for value in embedding) + "]"
         now = datetime.now(UTC)
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
-                "UPDATE research_objects SET embedding=%s::vector,embedding_updated_at=%s "
+                "UPDATE research_objects SET embedding=%s::vector,embedding_updated_at=%s,"
+                "embedding_metadata=%s "
                 "WHERE id=%s",
-                (literal, now, object_id),
+                (literal, now, json.dumps(metadata), object_id),
             )
-            self._event(cur, item["project_id"], "EMBEDDING_STORED", object_id, {"dimensions": len(embedding)})
-        return {"id": object_id, "dimensions": len(embedding), "updated_at": now}
+            self._event(
+                cur,
+                item["project_id"],
+                "EMBEDDING_STORED",
+                object_id,
+                {
+                    "dimensions": len(embedding),
+                    "provider": metadata.get("provider"),
+                    "model": metadata.get("model"),
+                    "model_version": metadata.get("model_version"),
+                    "source_text_hash": metadata.get("source_text_hash"),
+                },
+            )
+        return {
+            "id": object_id,
+            "dimensions": len(embedding),
+            "updated_at": now,
+            "metadata": metadata,
+        }
 
     def semantic_search(
         self,
