@@ -129,10 +129,10 @@ slice on PostgreSQL and a local GTX 1650. PaperQA is integrated as an optional i
 its real model-backed answer quality is not yet verified. Paper2Agent is also integrated behind an
 optional isolated executable-paper worker pinned to an audited upstream commit. Its provider,
 generated-MCP inspection/invocation, network isolation, and canonical-truth boundary are verified,
-but a paid model-backed paper conversion has not been run. Automatic embedding generation,
-experiment branching, and campaign automation remain later milestones. Native QD niches, lineage,
-and dead-idea proximity screening are implemented and integration verified, but their longitudinal
-scientific value is not yet established.
+but a paid model-backed paper conversion has not been run. Automatic embedding generation and
+campaign automation remain later milestones. Native QD niches, lineage, dead-idea proximity, and
+deterministic experiment branches are implemented; their longitudinal scientific value is not yet
+established, and no MCTS policy is present.
 
 Enable the Paper2Agent worker only with a task-scoped Anthropic credential and explicit approval of
 the upstream model cost:

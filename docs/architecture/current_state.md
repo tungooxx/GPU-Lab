@@ -34,14 +34,18 @@ integration tests, and real execution.
 - Native hypothesis QD stores mechanistic niches and lineage, combines optional pgvector retrieval
   with structured mechanism comparison, retrieves related dead ideas, and requires an explicit
   scientific difference before accepting a likely duplicate or descendant of a failed mechanism.
+- Deterministic experiment branches store scored nodes, typed parent/comparison relations,
+  inspected-run attachments, and confound-aware ComparativeLessons. The policy prioritizes result
+  inspection, then unfinished recovery, then information-per-cost execution, then comparison.
 
 ## What is verified
 
-- **VERIFIED_UNIT:** 62 tests cover provider normalization, malformed worker responses, audit
+- **VERIFIED_UNIT:** 67 tests cover provider normalization, malformed worker responses, audit
   redaction, path safety, structured output metadata, local requirements resolution, environment
   command construction, local job idempotency, action
   scoring, the HASI reproduction gate, unavailable-provider fallback behavior, and QD niche,
-  lineage, dead-idea, vector/structured-proximity, operator, and cache-failure behavior.
+  lineage, dead-idea, vector/structured-proximity, operator, cache-failure behavior, branch scoring,
+  result-inspection gates, recovery priority, and comparative lessons.
 - **VERIFIED_INTEGRATION:** Docker PostgreSQL migration, MCP discovery, atomic execution reservation,
   repeated submission, immutable `EXPERIMENT_STARTED` identity, job-ID sync, logs/artifacts, and
   completed-run persistence.
@@ -54,6 +58,12 @@ integration tests, and real execution.
 - **VERIFIED_INTEGRATION:** `scripts/qd_e2e_smoke.py` discovered all QD MCP tools, blocked an
   unexplained descendant of a PostgreSQL negative result, persisted the differentiated lineage and
   niche representative, restarted PostgreSQL/GPU-Lab, and recovered the same scientific objects.
+- **VERIFIED_INTEGRATION:** `scripts/branch_e2e_smoke.py` discovered all branch tools, persisted two
+  preregistered nodes and a typed relation, selected state substitution over a cheaper-to-score but
+  less discriminating correlation study, restarted services, and recovered the branch. It did not
+  execute either scientific experiment and reports `scientific_result=NOT_EXECUTED`.
+- **VERIFIED_INTEGRATION:** repeated Compose restarts retain host MCP access through the prioritized
+  backend network; direct MCP access from the isolated Paper2Agent network remains blocked with 403.
 
 ## What is partial
 
@@ -71,8 +81,7 @@ integration tests, and real execution.
 
 ## What is missing
 
-- Automatic embedding generation, full comparative/meta-research memory, experiment branches, and
-  autonomous campaign runtime.
+- Automatic embedding generation, meta-research memory, and autonomous campaign runtime.
 - PaperQA's real model-backed answer quality remains unverified.
 - Additional historical benchmark episodes beyond the permanent HASI gate.
 

@@ -38,7 +38,12 @@ services:
       postgres:
         condition: service_healthy
     restart: unless-stopped
-    networks: [backend, literature, paper-agents]
+    networks:
+      backend:
+        # Keep published host/Caddy traffic off the worker CIDRs blocked by MCP middleware.
+        gw_priority: 100
+      literature: {}
+      paper-agents: {}
   literature:
     profiles: ["literature"]
     build:

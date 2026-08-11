@@ -7,12 +7,24 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 MCP_URL = os.environ.get("GPU_LAB_MCP_URL", "http://127.0.0.1:8000/mcp")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+_parsed_mcp_url = urlparse(MCP_URL)
+if _parsed_mcp_url.scheme not in {"http", "https"} or _parsed_mcp_url.hostname not in {
+    "127.0.0.1",
+    "::1",
+    "localhost",
+    "chucky-lab.com",
+}:
+    raise ValueError("GPU_LAB_MCP_URL must use HTTP(S) and an approved GPU-Lab hostname")
 
 
-def rpc(method: str, params: dict[str, Any]) -> Any:
+def rpc(method: str, params: dict[str, Any], timeout: int = 60) -> Any:
     request = urllib.request.Request(
         MCP_URL,
         data=json.dumps(
@@ -24,7 +36,7 @@ def rpc(method: str, params: dict[str, Any]) -> Any:
             "User-Agent": "gpu-lab-qd-e2e/1",
         },
     )
-    with urllib.request.urlopen(request, timeout=60) as response:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         envelope = json.loads(response.read())
     if "error" in envelope:
         raise RuntimeError(envelope["error"])
@@ -42,15 +54,14 @@ def call(name: str, arguments: dict[str, Any]) -> Any:
 
 
 def wait_for_gateway() -> None:
-    health_url = MCP_URL.removesuffix("/mcp") + "/health"
     deadline = time.monotonic() + 45
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(health_url, timeout=3) as response:
-                if response.status == 200:
-                    return
-        except (OSError, urllib.error.URLError):
-            time.sleep(1)
+            rpc("tools/list", {}, timeout=5)
+            return
+        except (OSError, urllib.error.URLError, RuntimeError):
+            pass
+        time.sleep(1)
     raise TimeoutError("GPU-Lab did not recover after restart")
 
 
@@ -72,15 +83,20 @@ def main() -> None:
         {"name": f"QD live smoke {nonce}", "question": "Which mechanism carries viewpoint failure?"},
     )
     project_id = project["project_id"]
-    niche = call(
-        "hypothesis_niche_create",
-        {
-            "project_id": project_id,
-            "name": "state propagation",
-            "description": "Intermediate states that transmit failure information",
-            "diversity_signature": {"family": "state propagation", "stage": "decoder entry"},
-        },
-    )
+    niche_arguments = {
+        "project_id": project_id,
+        "name": "state propagation",
+        "description": "Intermediate states that transmit failure information",
+        "diversity_signature": {"family": "state propagation", "stage": "decoder entry"},
+    }
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        concurrent_niches = list(
+            executor.map(
+                lambda _index: call("hypothesis_niche_create", niche_arguments), range(5)
+            )
+        )
+    assert len({str(item["id"]) for item in concurrent_niches}) == 1
+    niche = concurrent_niches[0]
     dead = call(
         "negative_result_create",
         {
@@ -119,7 +135,11 @@ def main() -> None:
         },
     )
 
-    subprocess.run(["docker", "compose", "restart", "postgres", "gpu-lab"], check=True)
+    subprocess.run(
+        ["docker", "compose", "restart", "postgres", "gpu-lab"],
+        check=True,
+        cwd=REPO_ROOT,
+    )
     wait_for_gateway()
     niches = call("hypothesis_niche_list", {"project_id": project_id})
     recovered = next(item for item in niches if item["id"] == niche["id"])

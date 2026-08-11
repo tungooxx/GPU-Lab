@@ -62,6 +62,39 @@ class FakeStore:
     def edge_create(self, source, target, relation):
         self.edges.append((source, target, relation))
 
+    def hypothesis_niche_create(self, project_id, name, description, diversity_signature):
+        existing = self.objects_list(
+            project_id, "HypothesisNiche", limit=None, data_filters={"name": name}
+        )
+        if existing:
+            data = existing[0]["data"]
+            if data["description"] != description or data["diversity_signature"] != diversity_signature:
+                raise GPUError("HYPOTHESIS_NICHE_CONFLICT", name)
+            return {**existing[0], "idempotent_replay": True}
+        return self.object_create(
+            project_id,
+            "HypothesisNiche",
+            {
+                "name": name,
+                "description": description,
+                "active_best_hypothesis_id": None,
+                "diversity_signature": diversity_signature,
+            },
+            "HYPOTHESIS_NICHE_CREATED",
+        )
+
+    def hypothesis_niche_set_best(self, niche_id, hypothesis_id, rationale):
+        niche = self.object_get(niche_id)
+        hypothesis = self.object_get(hypothesis_id)
+        if hypothesis["status"] not in {"ACTIVE", "SURVIVES_INITIAL_TEST", "SUPPORTED"}:
+            raise GPUError("HYPOTHESIS_NOT_ACTIVE", hypothesis["status"])
+        return self.object_update(
+            niche_id,
+            {"active_best_hypothesis_id": hypothesis_id, "selection_rationale": rationale},
+            niche["status"],
+            "HYPOTHESIS_NICHE_BEST_CHANGED",
+        )
+
     def hypothesis_create_with_edges(self, project_id, data, edges):
         item = self.object_create(
             project_id, "Hypothesis", data, "QD_HYPOTHESIS_CREATED"
@@ -222,6 +255,7 @@ def test_qd_operators_are_advisory_and_niche_best_requires_active_member():
     service = HypothesisQDService(store)
     niche = service.niche_create("project", "routing", "Routing", {"family": "routing"})
     hypothesis = service.create("project", draft(niche["id"]))
+    niche["status"] = "DEFERRED"
 
     selected = service.niche_set_best(niche["id"], hypothesis["id"], "Cheapest falsifier first")
     generated = HypothesisGenerator().run({"drafts": [draft(niche["id"])]})
@@ -231,6 +265,7 @@ def test_qd_operators_are_advisory_and_niche_best_requires_active_member():
     )
 
     assert selected["data"]["active_best_hypothesis_id"] == hypothesis["id"]
+    assert selected["status"] == "DEFERRED"
     assert generated.advisory is True
     assert reflected.operator == "ScientificReflector"
     assert criticized.accepted is False

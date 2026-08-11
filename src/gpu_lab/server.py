@@ -19,6 +19,7 @@ from starlette.responses import HTMLResponse, JSONResponse
 from starlette.types import ASGIApp
 
 from .brain import ResearchBrain
+from .branches import ExperimentBranchService
 from .config import Settings
 from .dashboard import DASHBOARD_HTML
 from .errors import GPUError
@@ -32,8 +33,9 @@ from .terminal import TERMINAL_HTML
 
 logger = logging.getLogger(__name__)
 
-settings, service, research_store, research_brain, literature_service, executable_paper_service, qd_service = (
+settings, service, research_store, research_brain, literature_service, executable_paper_service, qd_service, branch_service = (
     Settings(),
+    None,
     None,
     None,
     None,
@@ -81,6 +83,8 @@ _READ_ONLY_TOOLS = {
     "hypothesis_related",
     "hypothesis_niche_list",
     "hypothesis_qd_screen",
+    "experiment_branch_get",
+    "experiment_branch_next",
     "experiment_priority",
     "research_events",
     "paper_search",
@@ -299,6 +303,15 @@ def qd() -> HypothesisQDService:
             if qd_service is None:
                 qd_service = HypothesisQDService(research())
     return qd_service
+
+
+def branches() -> ExperimentBranchService:
+    global branch_service
+    if branch_service is None:
+        with _singleton_lock:
+            if branch_service is None:
+                branch_service = ExperimentBranchService(research())
+    return branch_service
 
 
 async def call(fn, *args, **kwargs):
@@ -849,6 +862,63 @@ async def hypothesis_qd_create(project_id: str, draft: dict):
 async def hypothesis_niche_set_best(niche_id: str, hypothesis_id: str, rationale: str):
     """Select a surviving niche representative for test priority, never as proof of truth."""
     return await call(qd().niche_set_best, niche_id, hypothesis_id, rationale)
+
+
+@mcp.tool()
+async def experiment_branch_create(
+    project_id: str, hypothesis_id: str, objective: str, budget: dict
+):
+    """Create a deterministic experiment branch for one surviving hypothesis and explicit budget."""
+    return await call(branches().create, project_id, hypothesis_id, objective, budget)
+
+
+@mcp.tool()
+async def experiment_branch_node_add(
+    branch_id: str, draft: dict, parent_node_id: str | None = None
+):
+    """Add a scored, predicted branch action without executing or interpreting results."""
+    return await call(branches().node_add, branch_id, draft, parent_node_id)
+
+
+@mcp.tool()
+async def experiment_branch_get(branch_id: str):
+    """Retrieve the branch, nodes, typed relations, and comparative lessons."""
+    return await call(branches().get, branch_id)
+
+
+@mcp.tool()
+async def experiment_branch_next(branch_id: str):
+    """Select inspect, recover, execute, compare, or complete using a deterministic policy."""
+    return await call(branches().next_action, branch_id)
+
+
+@mcp.tool()
+async def experiment_branch_result_record(
+    node_id: str,
+    run_id: str,
+    result: dict,
+    scientific_interpretation: str,
+    actual_cost: dict,
+    information_gained: str,
+):
+    """Attach only an already-inspected canonical run result to its matching branch node."""
+    return await call(
+        branches().record_result,
+        node_id,
+        run_id,
+        result,
+        scientific_interpretation,
+        actual_cost,
+        information_gained,
+    )
+
+
+@mcp.tool()
+async def experiment_branch_compare(
+    branch_id: str, node_a_id: str, node_b_id: str, lesson: dict
+):
+    """Persist a confound-aware ComparativeLesson across two inspected branch results."""
+    return await call(branches().compare, branch_id, node_a_id, node_b_id, lesson)
 
 
 @mcp.tool()

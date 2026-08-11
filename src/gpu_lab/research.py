@@ -41,6 +41,9 @@ RESEARCH_OBJECT_KINDS = (
     "AgendaItem",
     "HypothesisPortfolio",
     "HypothesisNiche",
+    "ExperimentBranch",
+    "ExperimentNode",
+    "BranchRelation",
     "ResearchDecision",
     "ResearchActionCandidate",
     "ActionApproval",
@@ -242,6 +245,233 @@ class ResearchStore:
             "kind": "Hypothesis",
             "status": "ACTIVE",
             "data": data,
+        }
+
+    def hypothesis_niche_create(
+        self,
+        project_id: str,
+        name: str,
+        description: str,
+        diversity_signature: dict[str, Any],
+    ) -> dict:
+        """Serialize niche identity creation across gateway processes with an advisory lock."""
+        ident, now = uuid.uuid4(), datetime.now(UTC)
+        data = {
+            "name": name,
+            "description": description,
+            "active_best_hypothesis_id": None,
+            "diversity_signature": diversity_signature,
+        }
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"hypothesis-niche:{project_id}:{name}",),
+            )
+            cur.execute(
+                "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
+                "WHERE project_id=%s AND kind='HypothesisNiche' AND data->>'name'=%s "
+                "ORDER BY created_at LIMIT 1",
+                (project_id, name),
+            )
+            existing = cur.fetchone()
+            if existing:
+                if (
+                    existing["data"].get("description") != description
+                    or existing["data"].get("diversity_signature") != diversity_signature
+                ):
+                    raise GPUError(
+                        "HYPOTHESIS_NICHE_CONFLICT",
+                        "A niche with this name already has a different definition",
+                    )
+                return {**existing, "idempotent_replay": True}
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'HypothesisNiche','ACTIVE',%s,%s)",
+                (ident, project_id, json.dumps(data), now),
+            )
+            self._event(cur, project_id, "HYPOTHESIS_NICHE_CREATED", ident, data)
+        return {
+            "id": str(ident),
+            "project_id": project_id,
+            "kind": "HypothesisNiche",
+            "status": "ACTIVE",
+            "data": data,
+        }
+
+    def hypothesis_niche_set_best(
+        self, niche_id: str, hypothesis_id: str, rationale: str
+    ) -> dict:
+        """Lock and revalidate niche membership before selecting its representative."""
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
+                "WHERE id=ANY(%s::uuid[]) FOR UPDATE",
+                ([niche_id, hypothesis_id],),
+            )
+            items = {str(item["id"]): item for item in cur.fetchall()}
+            if len(items) != 2:
+                raise GPUError("RESEARCH_OBJECT_NOT_FOUND", "Niche or hypothesis")
+            niche, hypothesis = items[niche_id], items[hypothesis_id]
+            if niche["kind"] != "HypothesisNiche" or hypothesis["kind"] != "Hypothesis":
+                raise GPUError("INVALID_HYPOTHESIS_NICHE_MEMBER", hypothesis_id)
+            if str(niche["project_id"]) != str(hypothesis["project_id"]):
+                raise GPUError("RESEARCH_PROJECT_MISMATCH", hypothesis_id)
+            if str(hypothesis["data"].get("niche_id")) != niche_id:
+                raise GPUError("HYPOTHESIS_NOT_IN_NICHE", hypothesis_id)
+            if hypothesis["status"] not in {"ACTIVE", "SURVIVES_INITIAL_TEST", "SUPPORTED"}:
+                raise GPUError("HYPOTHESIS_NOT_ACTIVE", hypothesis["status"])
+            data = {
+                **niche["data"],
+                "active_best_hypothesis_id": hypothesis_id,
+                "selection_rationale": rationale,
+            }
+            cur.execute("UPDATE research_objects SET data=%s WHERE id=%s", (json.dumps(data), niche_id))
+            self._event(
+                cur,
+                niche["project_id"],
+                "HYPOTHESIS_NICHE_BEST_CHANGED",
+                niche_id,
+                {"active_best_hypothesis_id": hypothesis_id, "selection_rationale": rationale},
+            )
+        return {**niche, "data": data}
+
+    def experiment_branch_node_create(
+        self,
+        project_id: str,
+        branch_id: str,
+        data: dict[str, Any],
+        parent_node_id: str | None,
+        experiment_id: str | None,
+    ) -> dict:
+        """Atomically persist one branch node, its typed relation, edges, and events."""
+        node_id, relation_id, now = uuid.uuid4(), uuid.uuid4(), datetime.now(UTC)
+        reference_ids = [branch_id, *([parent_node_id] if parent_node_id else []), *([experiment_id] if experiment_id else [])]
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,project_id,kind,data FROM research_objects "
+                "WHERE id=ANY(%s::uuid[]) FOR SHARE",
+                (reference_ids,),
+            )
+            references = {str(item["id"]): item for item in cur.fetchall()}
+            if len(references) != len(set(reference_ids)):
+                raise GPUError("RESEARCH_OBJECT_NOT_FOUND", "One or more branch references")
+            if any(str(item["project_id"]) != str(project_id) for item in references.values()):
+                raise GPUError("RESEARCH_PROJECT_MISMATCH", "Branch references must share a project")
+            if references[branch_id]["kind"] != "ExperimentBranch":
+                raise GPUError("NOT_AN_EXPERIMENT_BRANCH", branch_id)
+            if parent_node_id:
+                parent = references[parent_node_id]
+                if parent["kind"] != "ExperimentNode" or str(parent["data"].get("branch_id")) != branch_id:
+                    raise GPUError("INVALID_BRANCH_PARENT", parent_node_id)
+            if experiment_id:
+                experiment = references[experiment_id]
+                if experiment["kind"] != "Experiment" or not experiment["data"].get("frozen"):
+                    raise GPUError("EXPERIMENT_NOT_PREREGISTERED", experiment_id)
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'ExperimentNode','PLANNED',%s,%s)",
+                (node_id, project_id, json.dumps(data), now),
+            )
+            cur.execute(
+                "INSERT INTO research_edges VALUES(%s,%s,'CONTAINS_NODE',%s)",
+                (branch_id, node_id, now),
+            )
+            if experiment_id:
+                cur.execute(
+                    "INSERT INTO research_edges VALUES(%s,%s,'PLANNED_BY_NODE',%s)",
+                    (experiment_id, node_id, now),
+                )
+            relation = None
+            if parent_node_id:
+                relation = {
+                    "branch_id": branch_id,
+                    "source_node_id": parent_node_id,
+                    "target_node_id": str(node_id),
+                    "relation": "BRANCHES_TO",
+                }
+                cur.execute(
+                    "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                    "VALUES(%s,%s,'BranchRelation','ACTIVE',%s,%s)",
+                    (relation_id, project_id, json.dumps(relation), now),
+                )
+                cur.execute(
+                    "INSERT INTO research_edges VALUES(%s,%s,'BRANCHES_TO',%s)",
+                    (parent_node_id, node_id, now),
+                )
+                self._event(cur, project_id, "BRANCH_RELATION_CREATED", relation_id, relation)
+            self._event(cur, project_id, "EXPERIMENT_NODE_CREATED", node_id, data)
+        return {
+            "id": str(node_id),
+            "project_id": project_id,
+            "kind": "ExperimentNode",
+            "status": "PLANNED",
+            "data": data,
+            "relation_id": str(relation_id) if relation else None,
+        }
+
+    def comparative_lesson_create(
+        self,
+        project_id: str,
+        branch_id: str,
+        node_a_id: str,
+        node_b_id: str,
+        data: dict[str, Any],
+    ) -> dict:
+        """Atomically persist a comparative lesson, relation, graph edges, and events."""
+        lesson_id, relation_id, now = uuid.uuid4(), uuid.uuid4(), datetime.now(UTC)
+        reference_ids = [branch_id, node_a_id, node_b_id]
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,project_id,kind,status,data FROM research_objects "
+                "WHERE id=ANY(%s::uuid[]) FOR SHARE",
+                (reference_ids,),
+            )
+            references = {str(item["id"]): item for item in cur.fetchall()}
+            if len(references) != 3:
+                raise GPUError("RESEARCH_OBJECT_NOT_FOUND", "One or more comparison references")
+            if any(str(item["project_id"]) != str(project_id) for item in references.values()):
+                raise GPUError("RESEARCH_PROJECT_MISMATCH", "Comparison references must share a project")
+            if references[branch_id]["kind"] != "ExperimentBranch":
+                raise GPUError("NOT_AN_EXPERIMENT_BRANCH", branch_id)
+            for node_id in (node_a_id, node_b_id):
+                node = references[node_id]
+                if (
+                    node["kind"] != "ExperimentNode"
+                    or node["status"] != "RESULT_INSPECTED"
+                    or str(node["data"].get("branch_id")) != branch_id
+                ):
+                    raise GPUError("INVALID_BRANCH_COMPARISON", node_id)
+            relation = {
+                "branch_id": branch_id,
+                "source_node_id": node_a_id,
+                "target_node_id": node_b_id,
+                "relation": "COMPARED_WITH",
+                "comparative_lesson_id": str(lesson_id),
+            }
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'ComparativeLesson','RESULT_INSPECTED',%s,%s)",
+                (lesson_id, project_id, json.dumps(data), now),
+            )
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'BranchRelation','ACTIVE',%s,%s)",
+                (relation_id, project_id, json.dumps(relation), now),
+            )
+            for node_id in (node_a_id, node_b_id):
+                cur.execute(
+                    "INSERT INTO research_edges VALUES(%s,%s,'INFORMS_COMPARISON',%s)",
+                    (node_id, lesson_id, now),
+                )
+            self._event(cur, project_id, "COMPARATIVE_LESSON_CREATED", lesson_id, data)
+            self._event(cur, project_id, "BRANCH_RELATION_CREATED", relation_id, relation)
+        return {
+            "id": str(lesson_id),
+            "project_id": project_id,
+            "kind": "ComparativeLesson",
+            "status": "RESULT_INSPECTED",
+            "data": data,
+            "relation_id": str(relation_id),
         }
 
     def world_model_child_create(

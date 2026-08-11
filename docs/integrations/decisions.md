@@ -72,8 +72,9 @@ They must be revisited before adding or upgrading an external dependency.
 - Relevant concepts: budget-aware branch search, modular experiment construction, and comparative
   reflective memory.
 - No authoritative implementation/license was identified in this audit.
-- Decision: **PAPER / DESIGN INSPIRATION ONLY**. Brain v1 will use deterministic heuristic action
-  scoring and branch records; it will not implement MCTS yet.
+- Decision: **PAPER / DESIGN INSPIRATION ONLY**. Native deterministic heuristic branch records and
+  comparative lessons are implemented; MCTS/UCB remain intentionally absent until measured use
+  demonstrates that the simpler policy is insufficient.
 
 ## Dependency policy
 

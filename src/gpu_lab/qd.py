@@ -109,30 +109,11 @@ class HypothesisQDService:
                 "INVALID_HYPOTHESIS_NICHE",
                 "Name, description, and a structured diversity signature are required",
             )
-        existing = self.store.objects_list(
-            project_id, "HypothesisNiche", limit=None, data_filters={"name": name.strip()}
-        )
-        if existing:
-            data = existing[0]["data"]
-            if (
-                data.get("description") != description.strip()
-                or data.get("diversity_signature") != diversity_signature
-            ):
-                raise GPUError(
-                    "HYPOTHESIS_NICHE_CONFLICT",
-                    "A niche with this name already has a different definition",
-                )
-            return {**existing[0], "idempotent_replay": True}
-        return self.store.object_create(
+        return self.store.hypothesis_niche_create(
             project_id,
-            "HypothesisNiche",
-            {
-                "name": name.strip(),
-                "description": description.strip(),
-                "active_best_hypothesis_id": None,
-                "diversity_signature": diversity_signature,
-            },
-            "HYPOTHESIS_NICHE_CREATED",
+            name.strip(),
+            description.strip(),
+            diversity_signature,
         )
 
     def niche_list(self, project_id: str) -> list[dict[str, Any]]:
@@ -255,27 +236,9 @@ class HypothesisQDService:
     def niche_set_best(
         self, niche_id: str, hypothesis_id: str, rationale: str
     ) -> dict[str, Any]:
-        niche = self.store.object_get(niche_id)
-        hypothesis = self.store.object_get(hypothesis_id)
-        if niche["kind"] != "HypothesisNiche" or hypothesis["kind"] != "Hypothesis":
-            raise GPUError("INVALID_HYPOTHESIS_NICHE_MEMBER", hypothesis_id)
-        if str(niche["project_id"]) != str(hypothesis["project_id"]):
-            raise GPUError("RESEARCH_PROJECT_MISMATCH", hypothesis_id)
-        if str(hypothesis["data"].get("niche_id")) != str(niche_id):
-            raise GPUError("HYPOTHESIS_NOT_IN_NICHE", hypothesis_id)
-        if hypothesis["status"] not in {"ACTIVE", "SURVIVES_INITIAL_TEST", "SUPPORTED"}:
-            raise GPUError("HYPOTHESIS_NOT_ACTIVE", hypothesis["status"])
         if not rationale.strip():
             raise GPUError("NICHE_SELECTION_RATIONALE_REQUIRED", niche_id)
-        return self.store.object_update(
-            niche_id,
-            {
-                "active_best_hypothesis_id": hypothesis_id,
-                "selection_rationale": rationale.strip(),
-            },
-            "ACTIVE",
-            "HYPOTHESIS_NICHE_BEST_CHANGED",
-        )
+        return self.store.hypothesis_niche_set_best(niche_id, hypothesis_id, rationale.strip())
 
     def _ancestors(self, project_id: str, parent_ids: list[str]) -> list[str]:
         ancestors, queue = set(), list(parent_ids)
