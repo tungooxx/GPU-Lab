@@ -157,8 +157,10 @@ class FakeStore:
         return [
             item
             for item in self.created
-            if item["kind"] == kind and query.lower() in json.dumps(item["data"]).lower()
-        ]
+            if item["project_id"] == _project_id
+            and item["kind"] == kind
+            and query.lower() in json.dumps(item["data"]).lower()
+        ][:_limit]
 
     def object_create(self, project_id, kind, data, event_type, status="ACTIVE"):
         item = {
@@ -224,6 +226,17 @@ async def test_literature_service_requires_claim_scope():
     assert error.value.error_type == "LITERATURE_CLAIM_INCOMPLETE"
 
 
+def test_fake_store_search_respects_project_and_limit():
+    store = FakeStore()
+    for project_id in ("other", "project", "project"):
+        store.object_create(project_id, "Paper", {"title": "matching paper"}, "CREATED")
+
+    matches = store.search("project", "matching", "Paper", 1)
+
+    assert len(matches) == 1
+    assert matches[0]["project_id"] == "project"
+
+
 @pytest.mark.asyncio
 async def test_http_literature_worker_contract_and_auth_header():
     def handler(request: httpx.Request) -> httpx.Response:
@@ -280,6 +293,23 @@ async def test_http_literature_worker_preserves_structured_errors():
 
 
 @pytest.mark.asyncio
+async def test_http_literature_worker_normalizes_non_object_errors():
+    provider = HttpLiteratureProvider(
+        "http://literature:8010",
+        "scoped-token",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(400, json={"error": "worker exploded"})
+        ),
+    )
+
+    with pytest.raises(GPUError) as error:
+        await provider.health()
+
+    assert error.value.error_type == "LITERATURE_PROVIDER_ERROR"
+    assert error.value.message == "Literature worker error"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("response", "expected_message"),
     [
@@ -312,7 +342,16 @@ async def test_worker_health_is_secret_free_and_other_routes_require_auth(monkey
     transport = httpx.ASGITransport(app=literature_worker.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://worker") as client:
         health = await client.post("/health", json={})
-        unauthorized = await client.post("/ask", json={"question": "q"})
+        unauthorized = [
+            await client.post(path, json={})
+            for path in (
+                "/ask",
+                "/ingest",
+                "/search",
+                "/retrieve-evidence",
+                "/inspect-document",
+            )
+        ]
         non_ascii = await client.post(
             "/ask",
             json={"question": "q"},
@@ -320,8 +359,8 @@ async def test_worker_health_is_secret_free_and_other_routes_require_auth(monkey
         )
 
     assert health.json() == {"result": {"provider": "paperqa", "status": "ready"}}
-    assert unauthorized.status_code == 401
-    assert unauthorized.json()["error"]["type"] == "UNAUTHORIZED"
+    assert all(response.status_code == 401 for response in unauthorized)
+    assert all(response.json()["error"]["type"] == "UNAUTHORIZED" for response in unauthorized)
     assert non_ascii.status_code == 401
 
 

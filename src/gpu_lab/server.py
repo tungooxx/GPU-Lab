@@ -1183,7 +1183,7 @@ async def research_semantic_search(
 async def paper_ask(project_id: str, question: str, limit: int = 8):
     """Return retrieved source passages for a question; this is evidence retrieval, not a conclusion."""
     evidence, seen = [], set()
-    for term in ResearchStore._terms(question):
+    for term in ResearchStore.terms(question):
         matches = await call(
             research().search, project_id, term, "EvidenceUnit", min(max(limit, 1), 25)
         )

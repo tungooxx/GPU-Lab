@@ -61,6 +61,26 @@ class CandidateStore:
             return self.evidence
         return []
 
+    def objects_identifiers(self, _project_id, kind, _statuses=None):
+        return [
+            {"id": item["id"], "status": item["status"]}
+            for item in self.objects_list(_project_id, kind)
+        ]
+
+    def experiment_run_first(self, _project_id, statuses, inspected=None):
+        return next(
+            (
+                run
+                for run in self.runs
+                if run["status"] in statuses
+                and (
+                    inspected is None
+                    or bool(run.get("data", {}).get("inspection")) is inspected
+                )
+            ),
+            None,
+        )
+
 
 def _hasi_episode():
     path = Path(__file__).parents[1] / "research_bench" / "hasi_before_intervention.json"
@@ -190,3 +210,83 @@ def test_execution_decision_requires_exact_bound_command():
     assert error.value.error_type == "RESEARCH_EXECUTION_NOT_BOUND"
     authorized = brain.authorize_execution("experiment", "decision", "bound-request")
     assert authorized["action_type"] == "FROZEN_DIAGNOSTIC"
+
+
+class AssessmentStore:
+    def __init__(self):
+        self.applied = None
+        self.objects = {
+            "run": {
+                "id": "run",
+                "project_id": "project",
+                "kind": "ExperimentRun",
+                "status": "completed",
+                "data": {"decision_id": "decision", "experiment_id": "experiment"},
+            },
+            "decision": {
+                "id": "decision",
+                "project_id": "project",
+                "kind": "ResearchDecision",
+                "status": "SELECTED",
+                "data": {"agenda_item_id": "agenda", "hypotheses_affected": ["hypothesis"]},
+            },
+            "hypothesis": {
+                "id": "hypothesis",
+                "project_id": "project",
+                "kind": "Hypothesis",
+                "status": "ACTIVE",
+                "data": {},
+            },
+            "agenda": {
+                "id": "agenda",
+                "project_id": "project",
+                "kind": "AgendaItem",
+                "status": "ACTIVE",
+                "data": {},
+            },
+            "experiment": {
+                "id": "experiment",
+                "project_id": "project",
+                "kind": "Experiment",
+                "status": "PREREGISTERED",
+                "data": {
+                    "hypothesis_id": "hypothesis",
+                    "plan": {"pass_condition": "metric > 0"},
+                },
+            },
+        }
+
+    def object_get(self, object_id):
+        return self.objects[object_id]
+
+    def objects_list(self, *_args, **_kwargs):
+        return [{"data": {"pass_condition": "metric > 0"}}]
+
+    def result_assessment_apply(self, **kwargs):
+        self.applied = kwargs
+        return {"run": {"status": "RESULT_INSPECTED"}}
+
+
+@pytest.mark.parametrize("transition", ["INCONCLUSIVE", "BLOCKED"])
+def test_nonconclusive_assessment_keeps_agenda_active(transition):
+    store = AssessmentStore()
+    brain = ResearchBrain(store)
+
+    brain.result_assess(
+        run_id="run",
+        decision_id="decision",
+        hypothesis_id="hypothesis",
+        agenda_item_id="agenda",
+        prediction_outcome="No conclusive result",
+        guard_condition_outcome="Guard evaluated",
+        condition_evaluations={"metric > 0": False},
+        evidence_supporting=[],
+        evidence_against=[],
+        unexpected_observations=[],
+        alternative_explanations=[],
+        scope="fixture",
+        hypothesis_transition=transition,
+        rationale="More work is required",
+    )
+
+    assert store.applied["agenda_status"] == "ACTIVE"

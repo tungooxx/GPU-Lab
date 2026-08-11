@@ -303,8 +303,8 @@ class HttpLiteratureProvider:
                 f"The isolated worker returned a non-object body with status {response.status_code}",
                 retryable=response.status_code >= 500,
             )
-        if data.get("error"):
-            error = data["error"]
+        if "error" in data and data["error"] is not None:
+            error = data["error"] if isinstance(data["error"], dict) else {}
             raise GPUError(
                 error.get("type", "LITERATURE_PROVIDER_ERROR"),
                 error.get("message", "Literature worker error"),

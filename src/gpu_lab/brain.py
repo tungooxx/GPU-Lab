@@ -136,13 +136,18 @@ class ResearchBrain:
             "WORLD_MODEL_CREATED",
             "IMPLEMENTED_UNVERIFIED",
         )
-        version = self._version_world_model(
-            model,
+        advanced = self.store.world_model_update_and_version(
+            str(model["id"]),
+            {},
             {"world_model_created": True},
-            evidence_ids=[],
-            decision_id=None,
+            [],
+            None,
+            "WORLD_MODEL_VERSION_ADVANCED",
         )
-        return {"world_model": self.store.object_get(model["id"]), "version": version}
+        return {
+            "world_model": self.store.object_get(model["id"]),
+            "version": advanced["version"],
+        }
 
     def world_model_get(self, world_model_id: str) -> dict:
         model = self._expect(world_model_id, "WorldModel")
@@ -364,8 +369,8 @@ class ResearchBrain:
         )
 
     def _portfolio_data(self, project_id: str) -> dict:
-        hypotheses = self.store.objects_list(project_id, "Hypothesis", limit=None)
-        negative = self.store.objects_list(project_id, "NegativeResult", limit=None)
+        hypotheses = self.store.objects_identifiers(project_id, "Hypothesis")
+        negative = self.store.objects_identifiers(project_id, "NegativeResult")
         niches = self.store.objects_list(project_id, "HypothesisNiche", limit=None)
         return {
             "active_hypothesis_ids": [
@@ -448,7 +453,7 @@ class ResearchBrain:
         )
         portfolio = self._portfolio_refresh(project_id)
         hypotheses = self.store.objects_list(
-            project_id, "Hypothesis", {"ACTIVE", "SURVIVES_INITIAL_TEST"}
+            project_id, "Hypothesis", {"ACTIVE", "SURVIVES_INITIAL_TEST"}, limit=None
         )
         comparative_lessons = self.store.objects_list(
             project_id, "ComparativeLesson", limit=None
@@ -778,7 +783,11 @@ class ResearchBrain:
                 "guard_passed": guard_passed,
                 "scope": scope,
             },
-            agenda_status="RESOLVED" if hypothesis_transition != "INCONCLUSIVE" else "ACTIVE",
+            agenda_status=(
+                "ACTIVE"
+                if hypothesis_transition in {"INCONCLUSIVE", "BLOCKED"}
+                else "RESOLVED"
+            ),
             actual_information_gain=actual_information_gain,
             causal_edge_id=causal_edge_id,
             causal_edge_status=causal_edge_status,
@@ -788,27 +797,18 @@ class ResearchBrain:
     def _candidate_actions(
         self, project_id: str, agenda_item: dict, hypotheses: list[dict]
     ) -> list[ActionCandidate]:
-        runs = self.store.objects_list(
-            project_id,
-            "ExperimentRun",
-            {"completed", "RESULT_NOT_INSPECTED", "RESERVED", "running", "unknown", "failed", "cancelled"},
-            limit=None,
+        uninspected = self.store.experiment_run_first(
+            project_id, {"completed", "RESULT_NOT_INSPECTED"}, inspected=False
         )
-        uninspected = [
-            run
-            for run in runs
-            if run["status"] in {"completed", "RESULT_NOT_INSPECTED"}
-            and not run["data"].get("inspection")
-        ]
-        unfinished = [run for run in runs if run["status"] in {"RESERVED", "running", "unknown"}]
-        failed_uninspected = [
-            run
-            for run in runs
-            if run["status"] in {"failed", "cancelled"} and not run["data"].get("inspection")
-        ]
+        unfinished = self.store.experiment_run_first(
+            project_id, {"RESERVED", "running", "unknown"}
+        )
+        failed_uninspected = self.store.experiment_run_first(
+            project_id, {"failed", "cancelled"}, inspected=False
+        )
         question = agenda_item["data"]["question"]
         hypothesis_ids = [str(item["id"]) for item in hypotheses]
-        if uninspected:
+        if uninspected is not None:
             return [
                 ActionCandidate(
                     action_type="ARTIFACT_ANALYSIS",
@@ -816,7 +816,7 @@ class ResearchBrain:
                     hypotheses_discriminated=hypothesis_ids,
                     predicted_outcomes=["Inspect completed evidence before launching new work"],
                     required_resources=["experiment logs", "artifacts"],
-                    payload={"run_id": str(uninspected[0]["id"]), "mode": "INSPECT_RESULT"},
+                    payload={"run_id": str(uninspected["id"]), "mode": "INSPECT_RESULT"},
                     score=ActionScore(
                         scientific_importance=5,
                         expected_discrimination=5,
@@ -828,7 +828,7 @@ class ResearchBrain:
                     ),
                 ).checked()
             ]
-        if failed_uninspected:
+        if failed_uninspected is not None:
             return [
                 ActionCandidate(
                     action_type="ARTIFACT_ANALYSIS",
@@ -837,7 +837,7 @@ class ResearchBrain:
                     predicted_outcomes=["Inspect failure evidence and preserve negative knowledge"],
                     required_resources=["experiment logs", "failure artifacts"],
                     payload={
-                        "run_id": str(failed_uninspected[0]["id"]),
+                        "run_id": str(failed_uninspected["id"]),
                         "mode": "INSPECT_FAILURE",
                     },
                     score=ActionScore(
@@ -851,7 +851,7 @@ class ResearchBrain:
                     ),
                 ).checked()
             ]
-        if unfinished:
+        if unfinished is not None:
             return [
                 ActionCandidate(
                     action_type="ARTIFACT_ANALYSIS",
@@ -859,7 +859,7 @@ class ResearchBrain:
                     hypotheses_discriminated=hypothesis_ids,
                     predicted_outcomes=["Recover and synchronize unfinished execution"],
                     required_resources=["job status"],
-                    payload={"run_id": str(unfinished[0]["id"]), "mode": "RECOVER_UNFINISHED"},
+                    payload={"run_id": str(unfinished["id"]), "mode": "RECOVER_UNFINISHED"},
                     score=ActionScore(
                         scientific_importance=5,
                         expected_discrimination=4,
@@ -871,7 +871,7 @@ class ResearchBrain:
                     ),
                 ).checked()
             ]
-        reproductions = self.store.objects_list(project_id, "Reproduction")
+        reproductions = self.store.objects_list(project_id, "Reproduction", limit=None)
         baseline_reproduced = any(item["status"] == "REPRODUCED" for item in reproductions)
         needs_reproduction = (
             bool(agenda_item["data"].get("reproduction_required")) and not baseline_reproduced
@@ -900,7 +900,9 @@ class ResearchBrain:
         literature_requested = any(
             item.get("action_type") == "LITERATURE_SEARCH" for item in configured
         )
-        candidate_evidence = self.store.objects_list(project_id, "EvidenceUnit", {"CANDIDATE"})
+        candidate_evidence = self.store.objects_list(
+            project_id, "EvidenceUnit", {"CANDIDATE"}, limit=None
+        )
         if literature_requested and candidate_evidence:
             return [
                 ActionCandidate(
@@ -1034,11 +1036,11 @@ class ResearchBrain:
         ]
         for hypothesis in hypotheses:
             mechanism = hypothesis["data"].get("mechanism", "")
-            query_terms = self.store._terms(mechanism)
+            query_terms = self.store.terms(mechanism)
             scored = []
             for related in candidates:
                 text = related["data"].get("mechanism") or related["data"].get("proposal", "")
-                terms = self.store._terms(text)
+                terms = self.store.terms(text)
                 union = query_terms | terms
                 overlap = len(query_terms & terms) / len(union) if union else 0.0
                 if overlap:
@@ -1066,37 +1068,6 @@ class ResearchBrain:
                         "related_hypothesis_id": str(hypothesis["id"]),
                     }
         return list(found.values())
-
-    def _version_world_model(
-        self,
-        model: dict,
-        changes: dict[str, Any],
-        evidence_ids: list[str],
-        decision_id: str | None,
-    ) -> dict:
-        current_version = int(model["data"].get("version", 0))
-        version = self.store.object_create(
-            str(model["project_id"]),
-            "WorldModelVersion",
-            {
-                "world_model_id": str(model["id"]),
-                "version": current_version + 1,
-                "parent_version_id": model["data"].get("current_version_id"),
-                "changes": changes,
-                "evidence_ids": evidence_ids,
-                "decision_id": decision_id,
-                "timestamp": datetime.now(UTC).isoformat(),
-            },
-            "WORLD_MODEL_VERSION_CREATED",
-            "IMPLEMENTED_UNVERIFIED",
-        )
-        self.store.object_update(
-            str(model["id"]),
-            {"current_version_id": version["id"], "version": current_version + 1},
-            model["status"],
-            "WORLD_MODEL_VERSION_ADVANCED",
-        )
-        return version
 
     def _validate_references(self, project_id: str, identifiers: list[str]) -> None:
         unique = list(dict.fromkeys(identifiers))

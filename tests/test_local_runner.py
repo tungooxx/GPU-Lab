@@ -7,7 +7,7 @@ from gpu_lab.config import Settings
 from gpu_lab.db import Repository
 from gpu_lab.local_runner import LocalRunner
 from gpu_lab.models import Job
-from gpu_lab.server import _mcp_client_denied, _normalise_mcp_accept_header, scrub
+from gpu_lab.server import _mcp_client_denied, _normalise_mcp_accept_header, call, scrub
 
 
 class _Process:
@@ -64,6 +64,31 @@ def test_audit_scrub_redacts_bearer_and_assignment_credentials():
     assert "qwerty" not in scrubbed
     assert "hidden" not in scrubbed
     assert "also-hidden" not in scrubbed
+
+
+@pytest.mark.asyncio
+async def test_call_audits_only_scrubbed_arguments(monkeypatch):
+    audits = []
+
+    class FakeRepository:
+        def audit(self, *args):
+            audits.append(args)
+
+    class FakeService:
+        repo = FakeRepository()
+
+    monkeypatch.setattr("gpu_lab.server.svc", lambda: FakeService())
+
+    await call(
+        lambda value, *, authorization: {"ok": bool(value and authorization)},
+        "client_secret=hidden",
+        authorization="Bearer top-secret",
+    )
+
+    payload = str(audits[0][1])
+    assert "hidden" not in payload
+    assert "top-secret" not in payload
+    assert "[REDACTED]" in payload
 
 
 def test_mcp_network_policy_blocks_only_the_isolated_worker_subnet():

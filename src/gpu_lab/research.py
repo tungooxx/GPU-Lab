@@ -1317,6 +1317,46 @@ class ResearchStore:
             cur.execute(sql, args)
             return int(cur.fetchone()["count"])
 
+    def objects_identifiers(
+        self,
+        project_id: str,
+        kind: str,
+        statuses: set[str] | None = None,
+    ) -> list[dict]:
+        """Return only identity and status fields for complete lightweight classifications."""
+        sql = "SELECT id,status FROM research_objects WHERE project_id=%s AND kind=%s"
+        args: list[Any] = [project_id, kind]
+        if statuses:
+            sql += " AND status=ANY(%s)"
+            args.append(list(statuses))
+        sql += " ORDER BY created_at DESC"
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(sql, args)
+            return cur.fetchall()
+
+    def experiment_run_first(
+        self,
+        project_id: str,
+        statuses: set[str],
+        inspected: bool | None = None,
+    ) -> dict | None:
+        """Return the newest matching run without loading its JSON payload."""
+        sql = (
+            "SELECT id,status,created_at FROM research_objects "
+            "WHERE project_id=%s AND kind='ExperimentRun' AND status=ANY(%s)"
+        )
+        args: list[Any] = [project_id, list(statuses)]
+        if inspected is not None:
+            comparison = "<>" if inspected else "="
+            sql += (
+                " AND coalesce(data->'inspection','null'::jsonb) "
+                f"{comparison} 'null'::jsonb"
+            )
+        sql += " ORDER BY created_at DESC LIMIT 1"
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(sql, args)
+            return cur.fetchone()
+
     def references_get(self, identifiers: list[str]) -> dict[str, dict]:
         """Fetch a bounded reference set with one database round trip."""
         if len(identifiers) > 200:
@@ -1759,7 +1799,7 @@ class ResearchStore:
 
     def related_hypotheses(self, project_id: str, mechanism: str, limit: int = 10) -> list[dict]:
         """Lexically screen active and failed ideas until pgvector is available for semantic ranking."""
-        query_terms = self._terms(mechanism)
+        query_terms = self.terms(mechanism)
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT id,kind,status,data,created_at FROM research_objects "
@@ -1769,7 +1809,7 @@ class ResearchStore:
             related = []
             for item in cur.fetchall():
                 text = item["data"].get("mechanism") or item["data"].get("proposal", "")
-                terms = self._terms(text)
+                terms = self.terms(text)
                 overlap = len(query_terms & terms) / len(query_terms | terms) if query_terms | terms else 0.0
                 containment = len(query_terms & terms) / len(query_terms) if query_terms else 0.0
                 if overlap:
@@ -1810,7 +1850,7 @@ class ResearchStore:
             return cur.fetchall()
 
     @staticmethod
-    def _terms(value: str) -> set[str]:
+    def terms(value: str) -> set[str]:
         return {term for term in re.findall(r"[a-z0-9]{4,}", value.lower())}
 
     @staticmethod
