@@ -221,6 +221,75 @@ def test_causal_execution_is_authorized_without_a_separate_approval():
     assert authorized["approved"] is True
 
 
+class LegacyRepairStore:
+    def __init__(self):
+        self.created = []
+        self.objects = {
+            "run": {
+                "id": "run",
+                "project_id": "project",
+                "kind": "ExperimentRun",
+                "status": "completed",
+                "data": {"experiment_id": "experiment", "artifacts": [{"path": "stdout.log"}]},
+            },
+            "experiment": {
+                "id": "experiment",
+                "project_id": "project",
+                "kind": "Experiment",
+                "status": "ACTIVE",
+                "data": {"hypothesis_id": "hypothesis", "plan": {"research_question": "Q?"}},
+            },
+            "hypothesis": {
+                "id": "hypothesis",
+                "project_id": "project",
+                "kind": "Hypothesis",
+                "status": "ACTIVE",
+                "data": {},
+            },
+            "agenda": {
+                "id": "agenda",
+                "project_id": "project",
+                "kind": "AgendaItem",
+                "status": "OPEN",
+                "data": {"question": "Q?"},
+            },
+        }
+
+    def object_get(self, object_id):
+        return self.objects[object_id]
+
+    def object_create(self, project_id, kind, data, event_type, status="ACTIVE"):
+        item = {
+            "id": "reconstructed-decision",
+            "project_id": project_id,
+            "kind": kind,
+            "status": status,
+            "data": data,
+        }
+        self.objects[item["id"]] = item
+        self.created.append((item, event_type))
+        return item
+
+    def object_update(self, object_id, data_update, status, event_type):
+        item = self.objects[object_id]
+        item["data"] = {**item["data"], **data_update}
+        item["status"] = status
+        return item
+
+
+def test_legacy_run_provenance_repair_reconstructs_inspection_decision_once():
+    store = LegacyRepairStore()
+    brain = ResearchBrain(store)
+
+    repaired = brain.legacy_run_provenance_repair("run", "agenda", "Historical run predates binding")
+    replay = brain.legacy_run_provenance_repair("run", "agenda", "Historical run predates binding")
+
+    assert repaired["decision"]["data"]["legacy_provenance"]["reconstructed"] is True
+    assert repaired["decision"]["data"]["selected_action"]["action_type"] == "ARTIFACT_ANALYSIS"
+    assert store.objects["run"]["data"]["decision_id"] == "reconstructed-decision"
+    assert replay["idempotent_replay"] is True
+
+
 class AssessmentStore:
     def __init__(self):
         self.applied = None

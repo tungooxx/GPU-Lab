@@ -534,6 +534,71 @@ class ResearchBrain:
             "RESEARCH_DECISION_APPROVED",
         )
 
+    def legacy_run_provenance_repair(
+        self, run_id: str, agenda_item_id: str, rationale: str
+    ) -> dict:
+        """Attach inspect-only reconstructed provenance to one pre-binding run."""
+        run = self._expect(run_id, "ExperimentRun")
+        if run["status"] not in {"completed", "RESULT_NOT_INSPECTED", "failed", "cancelled", "unknown"}:
+            raise GPUError("LEGACY_RUN_NOT_INSPECTABLE", run["status"])
+        agenda_item = self._expect(agenda_item_id, "AgendaItem")
+        experiment = self._expect(str(run["data"].get("experiment_id")), "Experiment")
+        hypothesis_id = str(experiment["data"].get("hypothesis_id"))
+        hypothesis = self._expect(hypothesis_id, "Hypothesis")
+        project_id = str(run["project_id"])
+        if any(str(item["project_id"]) != project_id for item in (agenda_item, experiment, hypothesis)):
+            raise GPUError("RESEARCH_PROJECT_MISMATCH", "Legacy repair inputs must share a project")
+        existing_id = run["data"].get("decision_id")
+        if existing_id:
+            decision = self._expect(str(existing_id), "ResearchDecision")
+            legacy = decision["data"].get("legacy_provenance", {})
+            if legacy.get("run_id") == run_id and legacy.get("reconstructed") is True:
+                return {"run": run, "decision": decision, "idempotent_replay": True}
+            raise GPUError("LEGACY_RUN_ALREADY_HAS_DECISION", run_id)
+        if not rationale.strip():
+            raise GPUError("LEGACY_REPAIR_RATIONALE_REQUIRED", "Provide the provenance reconstruction reason")
+        question = agenda_item["data"].get("question") or experiment["data"].get("plan", {}).get(
+            "research_question", "Legacy result inspection"
+        )
+        decision = self.store.object_create(
+            project_id,
+            "ResearchDecision",
+            {
+                "agenda_item_id": agenda_item_id,
+                "question": question,
+                "hypotheses_affected": [hypothesis_id],
+                "selected_action": {
+                    "id": f"legacy-inspect:{run_id}",
+                    "action_type": "ARTIFACT_ANALYSIS",
+                    "question_addressed": question,
+                    "payload": {"run_id": run_id, "mode": "INSPECT_LEGACY_RESULT"},
+                },
+                "legacy_provenance": {
+                    "reconstructed": True,
+                    "run_id": run_id,
+                    "experiment_id": str(experiment["id"]),
+                    "artifact_count": len(run["data"].get("artifacts", [])),
+                    "rationale": rationale.strip(),
+                    "limitations": [
+                        "Decision was reconstructed after execution.",
+                        "Repair authorizes artifact inspection only; it does not validate the result.",
+                    ],
+                },
+            },
+            "LEGACY_PROVENANCE_RECONSTRUCTED",
+            "SELECTED",
+        )
+        repaired_run = self.store.object_update(
+            run_id,
+            {
+                "decision_id": str(decision["id"]),
+                "legacy_provenance": {"reconstructed": True, "decision_id": str(decision["id"])},
+            },
+            run["status"],
+            "EXPERIMENT_RUN_LEGACY_PROVENANCE_REPAIRED",
+        )
+        return {"run": repaired_run, "decision": decision, "idempotent_replay": False}
+
     def execution_decision_bind(
         self, experiment_id: str, decision_id: str, request_fingerprint: str
     ) -> dict:

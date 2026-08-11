@@ -704,6 +704,12 @@ async def brain_decision_approve(decision_id: str, approver: str, rationale: str
 
 
 @mcp.tool()
+async def legacy_run_provenance_repair(run_id: str, agenda_item_id: str, rationale: str):
+    """Reconstruct inspect-only decision provenance for one completed legacy ExperimentRun."""
+    return await call(brain().legacy_run_provenance_repair, run_id, agenda_item_id, rationale)
+
+
+@mcp.tool()
 async def brain_result_assess(
     run_id: str,
     decision_id: str,
