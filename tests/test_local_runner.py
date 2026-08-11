@@ -41,6 +41,23 @@ def test_requirements_path_accepts_file_or_directory(tmp_path):
     assert runner._requirements_path("project/requirements.txt") == requirements
 
 
+def test_local_job_environment_excludes_gateway_secrets(monkeypatch, tmp_path):
+    runner = _runner(tmp_path)
+    monkeypatch.setenv("PATH", "/usr/local/bin")
+    monkeypatch.setenv("VAST_API_KEY", "vast-secret")
+    monkeypatch.setenv("GPU_LAB_APPROVAL_SECRET", "approval-secret")
+    monkeypatch.setenv("GPU_LAB_RESEARCH_DATABASE_URL", "postgresql://secret")
+    monkeypatch.setenv("GPU_LAB_LITERATURE_WORKER_TOKEN", "literature-secret")
+
+    environment = runner._job_environment({"PYTHONPATH": "/project", "EXPERIMENT_SEED": "7"})
+
+    assert environment == {
+        "PATH": "/usr/local/bin",
+        "PYTHONPATH": "/project",
+        "EXPERIMENT_SEED": "7",
+    }
+
+
 def test_mcp_wildcard_accept_header_allows_json_response():
     headers = [(b"accept", b"text/html, */*"), (b"content-type", b"application/json")]
 

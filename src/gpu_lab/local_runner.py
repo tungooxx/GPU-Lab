@@ -13,6 +13,19 @@ from .db import Repository
 from .errors import GPUError
 from .models import Job
 
+_JOB_ENV_ALLOWLIST = (
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LD_LIBRARY_PATH",
+    "NVIDIA_DRIVER_CAPABILITIES",
+    "NVIDIA_VISIBLE_DEVICES",
+    "PATH",
+    "TERM",
+    "TMPDIR",
+    "TZ",
+)
+
 
 class LocalRunner:
     """Run detached Linux experiments only within the mounted local workspace."""
@@ -72,6 +85,25 @@ class LocalRunner:
         if not candidate.is_file():
             raise GPUError("REQUIREMENTS_NOT_FOUND", f"Requirements file is unavailable: {candidate}")
         return candidate
+
+    @staticmethod
+    def _job_environment(env: dict[str, str] | None) -> dict[str, str]:
+        """Build a non-secret process environment for user-submitted commands."""
+        run_env = {
+            name: value
+            for name in _JOB_ENV_ALLOWLIST
+            if isinstance((value := os.environ.get(name)), str)
+        }
+        run_env.update(
+            {
+                key: value
+                for key, value in (env or {}).items()
+                if isinstance(key, str)
+                and isinstance(value, str)
+                and key.replace("_", "a").isalnum()
+            }
+        )
+        return run_env
 
     async def status(self) -> dict:
         self._require_enabled()
@@ -140,7 +172,7 @@ class LocalRunner:
         fingerprint = hashlib.sha256(
             repr((command, str(workdir), sorted((env or {}).items()), python_env)).encode()
         ).hexdigest()
-        run_env = {**os.environ, **{k: v for k, v in (env or {}).items() if k.replace("_", "a").isalnum()}}
+        run_env = self._job_environment(env)
         if python_env:
             venv = self._environment_path(python_env)
             if not venv.is_dir():
