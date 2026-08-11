@@ -82,6 +82,26 @@ def read_json_artifact(job_id: str, path: str) -> dict:
 def main() -> None:
     wait_for_server()
     nonce = uuid.uuid4().hex[:10]
+    vrc_working_directory = "/workspace/local-vlm/external/VRCNet"
+    baseline_command = (
+        "set -e\n"
+        "mkdir -p \"$GPU_LAB_JOB_DIR/artifacts\"\n"
+        "python - <<'PY'\n"
+        "import json, os, sys, numpy as np, torch\n"
+        "sys.path.insert(0, '../../scripts')\n"
+        "from run_hasi1_hierarchical_splices import state, out\n"
+        "from run_stage6k_decoder_entry_mediation import ARRAYS, load_model\n"
+        "assert torch.cuda.is_available()\n"
+        "model=load_model(); uid='novel_0148'; view=5; root=ARRAYS/uid\n"
+        "inp=np.load(root/f'view_{view:02d}_input.npy').astype('float32')\n"
+        "saved=np.load(root/f'view_{view:02d}_pred.npy').astype('float32')\n"
+        "current=out(state(model, inp)[0].fine).astype('float32')\n"
+        "result={'native_reconstruction_maxabs': float(np.abs(current-saved).max()), "
+        "'gpu': torch.cuda.get_device_name(0), 'torch': torch.__version__}\n"
+        "with open(os.path.join(os.environ['GPU_LAB_JOB_DIR'],'artifacts','baseline.json'),'w') as h: json.dump(result,h)\n"
+        "print(json.dumps(result))\n"
+        "PY"
+    )
     project = call_tool(
         "research_project_create",
         {
@@ -106,11 +126,11 @@ def main() -> None:
         {
             "project_id": project_id,
             "paper_id": paper["id"],
-            "repository": "/workspace/local-vlm/external/VRCNet",
+            "repository": vrc_working_directory,
             "commit": "smoke-fixture",
             "dataset": "saved prediction fixture",
             "checkpoint": "canonical VRC runtime",
-            "evaluation_command": "Reload one saved VRCNet prediction and verify exact equality",
+            "evaluation_command": baseline_command,
             "reported_metric": {"name": "native_reconstruction_maxabs", "value": 0.0},
             "tolerance": 0.0,
         },
@@ -120,26 +140,9 @@ def main() -> None:
         {
             "reproduction_id": reproduction["id"],
             "python_env": "vrc-py313-torch260-cu124",
-            "working_directory": "/workspace/local-vlm",
+            "working_directory": vrc_working_directory,
             "env": {"PYTHONPATH": "/opt/gpu-lab/envs/vrc-analysis-deps"},
-            "command": (
-                "mkdir -p \"$GPU_LAB_JOB_DIR/artifacts\"\n"
-                "python - <<'PY'\n"
-                "import json, os, sys, numpy as np, torch\n"
-                "sys.path.insert(0, 'scripts')\n"
-                "from run_hasi1_hierarchical_splices import state, out\n"
-                "from run_stage6k_decoder_entry_mediation import ARRAYS, load_model\n"
-                "assert torch.cuda.is_available()\n"
-                "model=load_model(); uid='novel_0148'; view=5; root=ARRAYS/uid\n"
-                "inp=np.load(root/f'view_{view:02d}_input.npy').astype('float32')\n"
-                "saved=np.load(root/f'view_{view:02d}_pred.npy').astype('float32')\n"
-                "current=out(state(model, inp)[0].fine).astype('float32')\n"
-                "result={'native_reconstruction_maxabs': float(np.abs(current-saved).max()), "
-                "'gpu': torch.cuda.get_device_name(0), 'torch': torch.__version__}\n"
-                "with open(os.path.join(os.environ['GPU_LAB_JOB_DIR'],'artifacts','baseline.json'),'w') as h: json.dump(result,h)\n"
-                "print(json.dumps(result))\n"
-                "PY"
-            ),
+            "command": baseline_command,
         },
     )
     reproduction_run = wait_for_reproduction(reproduction["id"])
@@ -370,7 +373,7 @@ def main() -> None:
         "mkdir -p \"$GPU_LAB_JOB_DIR/artifacts\"\n"
         "python - <<'PY'\n"
         "import json, os, sys, torch\n"
-        "sys.path.insert(0, 'scripts')\n"
+        "sys.path.insert(0, '../../scripts')\n"
         "from run_hasi1_hierarchical_splices import load_model, runpair\n"
         "assert torch.cuda.is_available()\n"
         "rows, states, _ = runpair(load_model(), 'novel_0148', 5, 18, 'strict_residual')\n"
@@ -388,7 +391,7 @@ def main() -> None:
             "project_id": project_id,
             "experiment_id": plan["id"],
             "command": experiment_command,
-            "working_directory": "/workspace/local-vlm",
+            "working_directory": vrc_working_directory,
             "env": {"PYTHONPATH": "/opt/gpu-lab/envs/vrc-analysis-deps"},
             "python_env": "vrc-py313-torch260-cu124",
         },
@@ -400,7 +403,7 @@ def main() -> None:
         "decision_id": execution_decision["decision_id"],
         "execution_attempt_uuid": attempt,
         "python_env": "vrc-py313-torch260-cu124",
-        "working_directory": "/workspace/local-vlm",
+        "working_directory": vrc_working_directory,
         "env": {"PYTHONPATH": "/opt/gpu-lab/envs/vrc-analysis-deps"},
         "command": experiment_command,
     }
