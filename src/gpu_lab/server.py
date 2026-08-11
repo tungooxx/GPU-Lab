@@ -728,6 +728,7 @@ async def brain_result_assess(
     causal_edge_id: str | None = None,
     causal_edge_status: str | None = None,
     actual_information_gain: str = "MEDIUM",
+    guard_passed: bool | None = None,
 ):
     """Inspect a real result and explicitly update evidence, belief, agenda, and WorldModel."""
     return await call(
@@ -749,6 +750,7 @@ async def brain_result_assess(
         causal_edge_id=causal_edge_id,
         causal_edge_status=causal_edge_status,
         actual_information_gain=actual_information_gain,
+        guard_passed=guard_passed,
     )
 
 

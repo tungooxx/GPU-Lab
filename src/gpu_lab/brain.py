@@ -694,6 +694,7 @@ class ResearchBrain:
         causal_edge_id: str | None = None,
         causal_edge_status: str | None = None,
         actual_information_gain: str = "MEDIUM",
+        guard_passed: bool | None = None,
     ) -> dict:
         run = self._expect(run_id, "ExperimentRun")
         decision = self._expect(decision_id, "ResearchDecision")
@@ -736,7 +737,16 @@ class ResearchBrain:
             raise GPUError("EXPERIMENT_GUARD_NOT_PREREGISTERED", experiment_id)
         if any(item["data"].get("pass_condition") != pass_condition for item in predictions):
             raise GPUError("EXPERIMENT_GUARD_MISMATCH", experiment_id)
-        if set(condition_evaluations) != {pass_condition} or not all(
+        if guard_passed is not None:
+            if not isinstance(guard_passed, bool):
+                raise GPUError(
+                    "EXPERIMENT_GUARD_EVALUATION_INVALID",
+                    "guard_passed must be a boolean",
+                )
+            # Bind the supplied outcome to the server-side preregistered text.
+            # This avoids requiring clients to round-trip long Unicode condition keys.
+            condition_evaluations = {pass_condition: guard_passed}
+        elif set(condition_evaluations) != {pass_condition} or not all(
             isinstance(value, bool) for value in condition_evaluations.values()
         ):
             raise GPUError(

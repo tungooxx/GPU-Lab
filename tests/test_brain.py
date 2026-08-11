@@ -368,3 +368,29 @@ def test_nonconclusive_assessment_keeps_agenda_active(transition):
     )
 
     assert store.applied["agenda_status"] == "ACTIVE"
+
+
+def test_assessment_binds_guard_boolean_to_frozen_condition():
+    store = AssessmentStore()
+    brain = ResearchBrain(store)
+
+    brain.result_assess(
+        run_id="run",
+        decision_id="decision",
+        hypothesis_id="hypothesis",
+        agenda_item_id="agenda",
+        prediction_outcome="Guard failed",
+        guard_condition_outcome="FAIL",
+        # Simulate a transport that cannot preserve a Unicode condition key.
+        condition_evaluations={"metric ? 0": False},
+        evidence_supporting=[],
+        evidence_against=[],
+        unexpected_observations=[],
+        alternative_explanations=[],
+        scope="fixture",
+        hypothesis_transition="BLOCKED",
+        rationale="The frozen guard failed",
+        guard_passed=False,
+    )
+
+    assert store.applied["evidence_data"]["condition_evaluations"] == {"metric > 0": False}
