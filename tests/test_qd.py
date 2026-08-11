@@ -33,7 +33,10 @@ class FakeStore:
         return item
 
     def object_get(self, object_id):
-        return next(item for item in self.items if item["id"] == object_id)
+        for item in self.items:
+            if item["id"] == object_id:
+                return item
+        raise GPUError("RESEARCH_OBJECT_NOT_FOUND", object_id)
 
     def object_update(self, object_id, data_update, status, event_type):
         item = self.object_get(object_id)
@@ -248,6 +251,30 @@ def test_qd_embedding_cache_unavailable_does_not_rollback_canonical_hypothesis()
     assert created["kind"] == "Hypothesis"
     assert created["embedding_status"] == "unavailable"
     assert store.embeddings == []
+
+
+def test_qd_embedding_cache_failure_and_vector_query_failure_preserve_hypothesis():
+    store = FakeStore()
+    service = HypothesisQDService(store)
+    niche = service.niche_create("project", "routing", "Routing", {"family": "routing"})
+
+    def embedding_failure(_object_id, _embedding):
+        raise GPUError("EMBEDDING_CACHE_UNAVAILABLE", "transient index failure")
+
+    store.embedding_set = embedding_failure
+    created = service.create("project", draft(niche["id"], embedding=[0.1, 0.2]))
+
+    assert created["embedding_status"] == "failed_noncanonical_cache"
+    assert store.object_get(created["id"])["data"]["mechanism"] == draft(niche["id"])["mechanism"]
+
+    def semantic_failure(*_args):
+        raise GPUError("PGVECTOR_UNAVAILABLE", "extension unavailable")
+
+    store.semantic_search = semantic_failure
+    screened = service.screen("project", draft(niche["id"], embedding=[0.1, 0.2]))
+
+    assert screened["semantic_retrieval_unavailable"] is True
+    assert store.object_get(created["id"])["kind"] == "Hypothesis"
 
 
 def test_qd_operators_are_advisory_and_niche_best_requires_active_member():

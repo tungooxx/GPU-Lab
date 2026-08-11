@@ -13,6 +13,7 @@ from .errors import GPUError
 RESEARCH_OBJECT_KINDS = (
     "Paper",
     "EvidenceUnit",
+    "ExecutablePaper",
     "Claim",
     "Mechanism",
     "Anomaly",
@@ -144,6 +145,9 @@ class ResearchStore:
                     ON research_objects USING GIN (data jsonb_path_ops);
                 CREATE INDEX IF NOT EXISTS research_execution_attempts_job_idx
                     ON research_execution_attempts(job_id);
+                CREATE UNIQUE INDEX IF NOT EXISTS research_objects_hypothesis_niche_name_unique
+                    ON research_objects(project_id, (data->>'name'))
+                    WHERE kind='HypothesisNiche';
             """)
             allowed_kinds = ",".join("'" + kind + "'" for kind in RESEARCH_OBJECT_KINDS)
             cur.execute(
@@ -258,6 +262,7 @@ class ResearchStore:
         diversity_signature: dict[str, Any],
     ) -> dict:
         """Serialize niche identity creation across gateway processes with an advisory lock."""
+        project_id = self._canonical_uuid(project_id)
         ident, now = uuid.uuid4(), datetime.now(UTC)
         data = {
             "name": name,
@@ -612,7 +617,10 @@ class ResearchStore:
                 "world_model_id": world_model_id,
                 "version": current_version + 1,
                 "parent_version_id": model["data"].get("current_version_id"),
-                "changes": {**changes, change_key: [str(child_id)]},
+                "changes": {
+                    **changes,
+                    change_key: [*changes.get(change_key, []), str(child_id)],
+                },
                 "evidence_ids": evidence_ids or [],
                 "decision_id": decision_id,
                 "timestamp": now.isoformat(),
@@ -724,6 +732,19 @@ class ResearchStore:
 
     def agenda_create_once(self, project_id: str, name: str) -> dict:
         """Serialize creation so a project has at most one active research agenda."""
+        project_id = self._canonical_uuid(project_id)
+
+        def response(row: dict, *, idempotent_replay: bool) -> dict:
+            return {
+                "id": str(row["id"]),
+                "project_id": str(row["project_id"]),
+                "kind": row["kind"],
+                "status": row["status"],
+                "data": row["data"],
+                "created_at": row["created_at"],
+                "idempotent_replay": idempotent_replay,
+            }
+
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"agenda:{project_id}",))
             cur.execute(
@@ -734,7 +755,7 @@ class ResearchStore:
             )
             existing = cur.fetchone()
             if existing:
-                return {**existing, "idempotent_replay": True}
+                return response(existing, idempotent_replay=True)
             ident, now = uuid.uuid4(), datetime.now(UTC)
             data = {"name": name, "item_ids": []}
             cur.execute(
@@ -743,13 +764,17 @@ class ResearchStore:
                 (ident, project_id, json.dumps(data), now),
             )
             self._event(cur, project_id, "RESEARCH_AGENDA_CREATED", ident, data)
-            return {
-                "id": str(ident),
-                "project_id": project_id,
-                "kind": "ResearchAgenda",
-                "status": "ACTIVE",
-                "data": data,
-            }
+            return response(
+                {
+                    "id": ident,
+                    "project_id": project_id,
+                    "kind": "ResearchAgenda",
+                    "status": "ACTIVE",
+                    "data": data,
+                    "created_at": now,
+                },
+                idempotent_replay=False,
+            )
 
     def agenda_item_create_atomic(self, agenda_id: str, data: dict[str, Any]) -> dict:
         """Create an agenda item and append its ID without losing concurrent inserts."""
@@ -763,6 +788,8 @@ class ResearchStore:
             agenda = cur.fetchone()
             if not agenda:
                 raise GPUError("NOT_A_RESEARCHAGENDA", agenda_id)
+            if agenda["status"] != "ACTIVE":
+                raise GPUError("RESEARCH_AGENDA_NOT_ACTIVE", agenda["status"])
             cur.execute(
                 "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
                 "VALUES(%s,%s,'AgendaItem','OPEN',%s,%s)",
@@ -873,6 +900,8 @@ class ResearchStore:
     ) -> dict:
         """Update a causal edge and advance its world model in one transaction."""
         self._validate_status(object_status)
+        if "world_model_id" in data_update:
+            raise GPUError("CAUSAL_EDGE_WORLD_MODEL_IMMUTABLE", edge_id)
         now, version_id = datetime.now(UTC), uuid.uuid4()
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
@@ -892,6 +921,8 @@ class ResearchStore:
             model = cur.fetchone()
             if not model:
                 raise GPUError("NOT_A_WORLDMODEL", str(model_id))
+            if str(model["project_id"]) != str(edge["project_id"]):
+                raise GPUError("RESEARCH_PROJECT_MISMATCH", edge_id)
             edge_data = {**edge["data"], **data_update}
             cur.execute(
                 "UPDATE research_objects SET status=%s,data=%s WHERE id=%s",
@@ -1117,7 +1148,11 @@ class ResearchStore:
                 hypothesis_id,
                 {"rationale": rationale},
             )
-            inspection_data = {**inspection, "evidence_id": str(evidence_id)}
+            inspection_data = {
+                **inspection,
+                "evidence_id": str(evidence_id),
+                "decision_id": decision_id,
+            }
             run_data = {**run["data"], "inspection": inspection_data}
             cur.execute(
                 "UPDATE research_objects SET status='RESULT_INSPECTED',data=%s WHERE id=%s",
@@ -1148,6 +1183,8 @@ class ResearchStore:
                 edge = rows[causal_edge_id]
                 if edge["kind"] != "CausalEdge":
                     raise GPUError("NOT_A_CAUSALEDGE", causal_edge_id)
+                if str(edge["project_id"]) != project_id:
+                    raise GPUError("RESEARCH_PROJECT_MISMATCH", causal_edge_id)
                 supporting = list(edge["data"].get("supporting_ids", []))
                 against = list(edge["data"].get("against_ids", []))
                 evidence_targets = {
@@ -1196,6 +1233,8 @@ class ResearchStore:
                 model = cur.fetchone()
                 if not model:
                     raise GPUError("NOT_A_WORLDMODEL", world_model_id)
+                if str(model["project_id"]) != project_id:
+                    raise GPUError("RESEARCH_PROJECT_MISMATCH", world_model_id)
                 version_id = uuid.uuid4()
                 version_number = int(model["data"].get("version", 0)) + 1
                 version_data = {
@@ -1738,6 +1777,7 @@ class ResearchStore:
                 }
             data = {**run["data"], **result}
             status = result.get("status", run["status"])
+            self._validate_status(status)
             if status == "completed":
                 event = "EXPERIMENT_COMPLETED"
             elif status in {"failed", "cancelled"}:
