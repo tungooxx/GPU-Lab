@@ -396,6 +396,28 @@ def test_legacy_reserved_run_abandon_preserves_pre_decision_provenance():
     )
 
 
+def test_legacy_abandonment_replay_allows_reconstructed_decision():
+    store = LegacyAbandonStore()
+    store.objects["run"]["status"] = "cancelled"
+    store.objects["run"]["data"]["legacy_abandonment"] = {
+        "verified_missing_backing_job": True
+    }
+    store.objects["run"]["data"]["decision_id"] = "reconstructed-decision"
+    store.objects["reconstructed-decision"] = {
+        "id": "reconstructed-decision",
+        "project_id": "project",
+        "kind": "ResearchDecision",
+        "status": "SELECTED",
+        "data": {},
+    }
+
+    ResearchBrain(store).legacy_reserved_run_abandon(
+        "run", "missing-job", "No local job was ever submitted"
+    )
+
+    assert store.abandon_args[3]["original_decision_kind"] == "ResearchDecision"
+
+
 def test_legacy_repair_replaces_only_abandoned_pre_decision_provenance():
     store = LegacyAbandonStore()
     store.objects["run"]["status"] = "cancelled"

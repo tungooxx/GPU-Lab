@@ -650,7 +650,7 @@ class ResearchBrain:
                     raise
             else:
                 decision_kind = decision["kind"]
-                if decision_kind == "ResearchDecision":
+                if decision_kind == "ResearchDecision" and not is_abandoned_replay:
                     raise GPUError("LEGACY_RUN_HAS_RESEARCH_DECISION", str(decision_id))
         return self.store.legacy_reserved_run_abandon(
             run_id,
