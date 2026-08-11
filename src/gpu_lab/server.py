@@ -1816,6 +1816,17 @@ async def research_experiment_sync(run_id: str | None = None, job_id: str | None
                     "same experiment_id, decision_id, command, and execution_attempt_uuid."
                 ),
             }
+        if outcome.get("status") not in {"running", "completed", "failed", "cancelled"}:
+            return {
+                **mapping,
+                "runner_status": outcome.get("status", "unknown"),
+                "retry_safe": True,
+                "recovery_action": "RETRY_EXECUTION",
+                "message": (
+                    "The local job does not prove that a process launched. Retry "
+                    "research_experiment_execute with the original execution arguments."
+                ),
+            }
         promoted = await call(research().run_mark_submitted, canonical_run_id)
         if "error" in promoted:
             return {

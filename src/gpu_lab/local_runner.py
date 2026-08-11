@@ -137,18 +137,6 @@ class LocalRunner:
         fingerprint = hashlib.sha256(
             repr((command, str(workdir), sorted((env or {}).items()), python_env)).encode()
         ).hexdigest()
-        existing = self.repo.get_job(job_id)
-        if existing:
-            if existing.metadata.get("request_fingerprint") != fingerprint:
-                raise GPUError("LOCAL_JOB_ID_REUSED", "Job ID is bound to a different command")
-            current = self.job_status(job_id)
-            if current["status"] not in {"queued", "unknown"}:
-                return {
-                    "job_id": job_id,
-                    "status": current["status"],
-                    "logs": str(self.workspace / ".gpu-lab" / "jobs" / job_id),
-                    "idempotent_replay": True,
-                }
         run_env = {**os.environ, **{k: v for k, v in (env or {}).items() if k.replace("_", "a").isalnum()}}
         if python_env:
             venv = self._environment_path(python_env)
@@ -185,20 +173,42 @@ class LocalRunner:
                 "runner_instance_id": self.runner_instance_id,
             },
         )
-        self.repo.save_job(job)
-        with stdout.open("wb") as stdout_handle, stderr.open("wb") as stderr_handle:
-            process = await asyncio.create_subprocess_shell(
-                # A login shell may replace PATH from its profile.  That defeats
-                # the selected persistent Python environment, which is supplied
-                # through run_env above.  The wrapper has no need for login-shell
-                # initialization, so preserve the explicit execution environment.
-                f"sh -c {shlex.quote(wrapper)}",
-                cwd=workdir,
-                stdout=stdout_handle,
-                stderr=stderr_handle,
-                start_new_session=True,
-                env=run_env,
+        claim, existing = self.repo.claim_job(job)
+        if claim == "conflict":
+            raise GPUError("LOCAL_JOB_ID_REUSED", "Job ID is bound to a different command")
+        if claim == "existing":
+            # A queued row is an active inter-process submission claim. Do not
+            # probe it here: job_status would turn the pre-spawn row into unknown
+            # and allow a second process to launch the same command.
+            current = (
+                {"status": "queued"}
+                if existing.status == "queued"
+                else self.job_status(job_id)
             )
+            return {
+                "job_id": job_id,
+                "status": current["status"],
+                "logs": str(jobdir),
+                "idempotent_replay": True,
+            }
+        try:
+            with stdout.open("wb") as stdout_handle, stderr.open("wb") as stderr_handle:
+                process = await asyncio.create_subprocess_shell(
+                    # A login shell may replace PATH from its profile.  That defeats
+                    # the selected persistent Python environment, which is supplied
+                    # through run_env above.  The wrapper has no need for login-shell
+                    # initialization, so preserve the explicit execution environment.
+                    f"sh -c {shlex.quote(wrapper)}",
+                    cwd=workdir,
+                    stdout=stdout_handle,
+                    stderr=stderr_handle,
+                    start_new_session=True,
+                    env=run_env,
+                )
+        except Exception:
+            job.status = "unknown"
+            self.repo.save_job(job)
+            raise
         job.status = "running"
         job.remote_pid = process.pid
         job.metadata["process_identity"] = self._process_identity(process.pid)

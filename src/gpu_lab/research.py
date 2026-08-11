@@ -1617,20 +1617,32 @@ class ResearchStore:
         }
 
     def run_update(self, run_id: str, result: dict) -> dict:
-        run = self.object_get(run_id)
-        if run["status"] in {"completed", "failed", "cancelled", "RESULT_INSPECTED"}:
-            return {"id": run_id, "status": run["status"], "data": run["data"], "already_final": True}
-        data = {**run["data"], **result}
-        status = result.get("status", run["status"])
-        if status == "completed":
-            event = "EXPERIMENT_COMPLETED"
-        elif status in {"failed", "cancelled"}:
-            event = "EXPERIMENT_FAILED"
-        elif status == "unknown":
-            event = "EXPERIMENT_STATUS_UNKNOWN"
-        else:
-            event = "EXPERIMENT_PROGRESS_SYNCED"
         with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,project_id,kind,status,data FROM research_objects "
+                "WHERE id=%s FOR UPDATE",
+                (run_id,),
+            )
+            run = cur.fetchone()
+            if not run or run["kind"] != "ExperimentRun":
+                raise GPUError("EXPERIMENT_RUN_NOT_FOUND", run_id)
+            if run["status"] in {"completed", "failed", "cancelled", "RESULT_INSPECTED"}:
+                return {
+                    "id": run_id,
+                    "status": run["status"],
+                    "data": run["data"],
+                    "already_final": True,
+                }
+            data = {**run["data"], **result}
+            status = result.get("status", run["status"])
+            if status == "completed":
+                event = "EXPERIMENT_COMPLETED"
+            elif status in {"failed", "cancelled"}:
+                event = "EXPERIMENT_FAILED"
+            elif status == "unknown":
+                event = "EXPERIMENT_STATUS_UNKNOWN"
+            else:
+                event = "EXPERIMENT_PROGRESS_SYNCED"
             cur.execute("UPDATE research_objects SET status=%s,data=%s WHERE id=%s", (status, json.dumps(data), run_id))
             cur.execute(
                 "UPDATE research_execution_attempts SET status=%s,updated_at=%s WHERE run_id=%s",

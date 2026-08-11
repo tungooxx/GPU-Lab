@@ -8,6 +8,7 @@ class FakeResearch:
         self.mapping = mapping
         self.updates = []
         self.artifacts = []
+        self.promotions = 0
 
     def run_resolve(self, _identifier):
         return self.mapping
@@ -17,6 +18,7 @@ class FakeResearch:
         return {"id": run_id, "status": result["status"], "data": result}
 
     def run_mark_submitted(self, _run_id):
+        self.promotions += 1
         self.mapping = {
             **self.mapping,
             "status": "running",
@@ -63,6 +65,14 @@ class RunningLocal:
         return {"instance_id": "local"}
 
 
+class UnprovenLocal:
+    def __init__(self, status):
+        self.status = status
+
+    def job_status(self, job_id):
+        return {"job_id": job_id, "status": self.status, "exit_code": None, "logs_tail": ""}
+
+
 def _mapping(status):
     return {
         "experiment_id": "experiment-id",
@@ -106,6 +116,23 @@ async def test_sync_promotes_reserved_mapping_when_local_job_exists(monkeypatch)
     assert result["status"] == "running"
     assert result["run_id"] == "run-id"
     assert research.updates[0][1]["status"] == "running"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runner_status", ["queued", "unknown"])
+async def test_sync_does_not_promote_reserved_mapping_without_launch_proof(
+    monkeypatch, runner_status
+):
+    research = FakeResearch(_mapping("RESERVED"))
+    monkeypatch.setattr(server, "research", lambda: research)
+    monkeypatch.setattr(server, "local", UnprovenLocal(runner_status))
+
+    result = await server.research_experiment_sync(run_id="run-id")
+
+    assert result["status"] == "RESERVED"
+    assert result["runner_status"] == runner_status
+    assert result["recovery_action"] == "RETRY_EXECUTION"
+    assert research.promotions == 0
 
 
 @pytest.mark.asyncio

@@ -19,7 +19,7 @@ class _Process:
 
 def _runner(tmp_path: Path) -> LocalRunner:
     workspace = tmp_path / "workspace"
-    workspace.mkdir()
+    workspace.mkdir(exist_ok=True)
     return LocalRunner(
         Settings(
             gpu_lab_enable_local_runner=True,
@@ -124,6 +124,40 @@ async def test_concurrent_local_submit_spawns_canonical_job_once(monkeypatch, tm
 
     assert first["job_id"] == second["job_id"]
     assert second["idempotent_replay"] is True
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_separate_runners_atomically_claim_canonical_job(monkeypatch, tmp_path):
+    first_runner = _runner(tmp_path)
+    second_runner = _runner(tmp_path)
+    spawn_entered = asyncio.Event()
+    allow_spawn = asyncio.Event()
+    calls = 0
+
+    async def fake_subprocess(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        spawn_entered.set()
+        await allow_spawn.wait()
+        return _Process()
+
+    monkeypatch.setattr("gpu_lab.local_runner.asyncio.create_subprocess_shell", fake_subprocess)
+    monkeypatch.setattr(first_runner, "_process_identity", lambda _pid: "start-ticks")
+
+    first_task = asyncio.create_task(
+        first_runner.submit("echo ok", job_id="local_cross_process_attempt")
+    )
+    await spawn_entered.wait()
+    replay = await second_runner.submit(
+        "echo ok", job_id="local_cross_process_attempt"
+    )
+    allow_spawn.set()
+    first = await first_task
+
+    assert first["status"] == "running"
+    assert replay["status"] == "queued"
+    assert replay["idempotent_replay"] is True
     assert calls == 1
 
 
