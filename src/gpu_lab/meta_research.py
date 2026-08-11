@@ -4,6 +4,7 @@ import math
 from collections import Counter, defaultdict
 from typing import Any
 
+from .branches import INSPECTABLE_RUN_STATUSES, RECOVERABLE_RUN_STATUSES
 from .research import ResearchStore
 
 _INFORMATION_VALUE = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
@@ -16,11 +17,12 @@ class MetaResearchService:
         self.store = store
 
     def progress(self, project_id: str) -> dict[str, Any]:
-        state = self.store.state_get(project_id)
-        objects = state["objects"]
-        by_kind: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for item in objects:
-            by_kind[item["kind"]].append(item)
+        _objects, by_kind = self._snapshot(project_id)
+        return self._progress(project_id, by_kind)
+
+    def _progress(
+        self, project_id: str, by_kind: dict[str, list[dict[str, Any]]]
+    ) -> dict[str, Any]:
         decisions = by_kind["ResearchDecision"]
         runs = by_kind["ExperimentRun"]
         information_points = sum(
@@ -67,21 +69,18 @@ class MetaResearchService:
         }
 
     def meta_review(self, project_id: str) -> dict[str, Any]:
-        progress = self.progress(project_id)
-        objects = self.store.state_get(project_id)["objects"]
-        by_kind: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for item in objects:
-            by_kind[item["kind"]].append(item)
+        objects, by_kind = self._snapshot(project_id)
+        progress = self._progress(project_id, by_kind)
         runs = by_kind["ExperimentRun"]
         unfinished = [
             str(item["id"])
             for item in runs
-            if item["status"] in {"RESERVED", "RUNNING", "running", "unknown"}
+            if item["status"] in RECOVERABLE_RUN_STATUSES
         ]
         uninspected = [
             str(item["id"])
             for item in runs
-            if item["status"] in {"completed", "failed", "cancelled", "RESULT_NOT_INSPECTED"}
+            if item["status"] in INSPECTABLE_RUN_STATUSES
         ]
         incomplete_reproductions = [
             str(item["id"])
@@ -130,7 +129,9 @@ class MetaResearchService:
         campaign_reasons = []
         if inspected < 5:
             campaign_reasons.append("fewer than five inspected experiments")
-        if decisions == 0 or hindsight / decisions < 0.8:
+        if decisions == 0:
+            campaign_reasons.append("no research decisions recorded")
+        elif hindsight / decisions < 0.8:
             campaign_reasons.append("decision hindsight coverage below 80%")
         if metrics["information_gained_per_gpu_hour"] is None:
             campaign_reasons.append("information-per-GPU-hour is not measurable")
@@ -181,6 +182,15 @@ class MetaResearchService:
 
     def list_lessons(self, project_id: str) -> list[dict[str, Any]]:
         return self.store.objects_list(project_id, "MetaLesson", limit=None)
+
+    def _snapshot(
+        self, project_id: str
+    ) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+        objects = self.store.state_get(project_id)["objects"]
+        by_kind: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for item in objects:
+            by_kind[item["kind"]].append(item)
+        return objects, by_kind
 
     @staticmethod
     def _status(items: list[dict[str, Any]], status: str) -> int:

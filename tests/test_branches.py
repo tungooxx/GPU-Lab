@@ -24,7 +24,10 @@ class FakeStore:
         return item
 
     def object_get(self, object_id):
-        return next(item for item in self.items if item["id"] == object_id)
+        item = next((item for item in self.items if item["id"] == object_id), None)
+        if item is None:
+            raise GPUError("RESEARCH_OBJECT_NOT_FOUND", object_id)
+        return item
 
     def object_update(self, object_id, data_update, status, event_type):
         item = self.object_get(object_id)
@@ -50,6 +53,27 @@ class FakeStore:
     def experiment_branch_node_create(
         self, project_id, branch_id, data, parent_node_id, experiment_id
     ):
+        branch = self.object_get(branch_id)
+        if branch["project_id"] != project_id:
+            raise GPUError("RESEARCH_PROJECT_MISMATCH", branch_id)
+        if branch["kind"] != "ExperimentBranch":
+            raise GPUError("NOT_AN_EXPERIMENT_BRANCH", branch_id)
+        if parent_node_id:
+            parent = self.object_get(parent_node_id)
+            if (
+                parent["project_id"] != project_id
+                or parent["kind"] != "ExperimentNode"
+                or parent["data"].get("branch_id") != branch_id
+            ):
+                raise GPUError("INVALID_BRANCH_PARENT", parent_node_id)
+        if experiment_id:
+            experiment = self.object_get(experiment_id)
+            if (
+                experiment["project_id"] != project_id
+                or experiment["kind"] != "Experiment"
+                or not experiment["data"].get("frozen")
+            ):
+                raise GPUError("EXPERIMENT_NOT_PREREGISTERED", experiment_id)
         node = self.object_create(
             project_id, "ExperimentNode", data, "EXPERIMENT_NODE_CREATED", "PLANNED"
         )
@@ -74,6 +98,19 @@ class FakeStore:
     def comparative_lesson_create(
         self, project_id, branch_id, node_a_id, node_b_id, data
     ):
+        existing = next(
+            (
+                item
+                for item in self.items
+                if item["kind"] == "ComparativeLesson"
+                and item["data"].get("branch_id") == branch_id
+                and item["data"].get("node_a_id") == node_a_id
+                and item["data"].get("node_b_id") == node_b_id
+            ),
+            None,
+        )
+        if existing:
+            return {**existing, "idempotent_replay": True}
         lesson = self.object_create(
             project_id,
             "ComparativeLesson",
@@ -197,10 +234,11 @@ def test_result_gate_and_comparative_lesson_preserve_confounded_interpretation()
     assert error.value.error_type == "BRANCH_RESULT_NOT_INSPECTED"
 
     run_a["status"] = "RESULT_INSPECTED"
+    run_a["data"]["inspection"] = {"carrier_change": 1.0}
     run_b = store.object_create(
         "project",
         "ExperimentRun",
-        {"experiment_id": experiment_b["id"]},
+        {"experiment_id": experiment_b["id"], "inspection": {"carrier_change": 0.0}},
         "EXPERIMENT_STARTED",
         "RESULT_INSPECTED",
     )
@@ -209,7 +247,42 @@ def test_result_gate_and_comparative_lesson_preserve_confounded_interpretation()
             node["id"], run["id"], {"carrier_change": metric}, "Inspected result", {"gpu_hours": 0.1}, "HIGH"
         )
 
+    wrong_run = store.object_create(
+        "project",
+        "ExperimentRun",
+        {"experiment_id": experiment_b["id"], "inspection": {"carrier_change": 0.0}},
+        "EXPERIMENT_STARTED",
+        "RESULT_INSPECTED",
+    )
+    with pytest.raises(GPUError) as error:
+        service.record_result(
+            node_a["id"], wrong_run["id"], wrong_run["data"]["inspection"], "Wrong", {}, "LOW"
+        )
+    assert error.value.error_type == "BRANCH_RUN_MISMATCH"
+    with pytest.raises(GPUError) as error:
+        service.record_result(
+            node_a["id"], run_a["id"], {"carrier_change": 999}, "Fabricated", {}, "HIGH"
+        )
+    assert error.value.error_type == "BRANCH_RESULT_MISMATCH"
+
     assert service.next_action(branch["id"])["action"] == "COMPARE_RESULTS"
+    with pytest.raises(GPUError) as error:
+        service.compare(branch["id"], node_a["id"], node_a["id"], {})
+    assert error.value.error_type == "INVALID_BRANCH_COMPARISON"
+    invalid_lesson = {
+        "code_delta": {},
+        "config_delta": {},
+        "state_delta": {},
+        "data_delta": {},
+        "metric_delta": {"carrier_change": 1.0},
+        "shared_conditions": ["same checkpoint"],
+        "candidate_causal_difference": "The intervention location changed the carrier response",
+        "scope": "VRCNet frozen inference",
+        "confidence": "CERTAIN",
+    }
+    with pytest.raises(GPUError) as error:
+        service.compare(branch["id"], node_a["id"], node_b["id"], invalid_lesson)
+    assert error.value.error_type == "INVALID_COMPARATIVE_LESSON"
     lesson = service.compare(
         branch["id"],
         node_a["id"],
@@ -230,6 +303,9 @@ def test_result_gate_and_comparative_lesson_preserve_confounded_interpretation()
 
     assert lesson["data"]["remaining_confounds"]
     assert lesson["data"]["warning"].endswith("it is not proof.")
+    replay = service.compare(branch["id"], node_a["id"], node_b["id"], lesson["data"])
+    assert replay["id"] == lesson["id"]
+    assert replay["idempotent_replay"] is True
     assert service.next_action(branch["id"])["action"] == "BRANCH_COMPLETE"
 
 

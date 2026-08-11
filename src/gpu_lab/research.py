@@ -140,6 +140,8 @@ class ResearchStore:
                     ON research_events(project_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS research_objects_project_kind_created_idx
                     ON research_objects(project_id, kind, created_at DESC);
+                CREATE INDEX IF NOT EXISTS research_objects_data_gin_idx
+                    ON research_objects USING GIN (data jsonb_path_ops);
                 CREATE INDEX IF NOT EXISTS research_execution_attempts_job_idx
                     ON research_execution_attempts(job_id);
             """)
@@ -303,6 +305,8 @@ class ResearchStore:
         self, niche_id: str, hypothesis_id: str, rationale: str
     ) -> dict:
         """Lock and revalidate niche membership before selecting its representative."""
+        niche_id = self._canonical_uuid(niche_id)
+        hypothesis_id = self._canonical_uuid(hypothesis_id)
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
@@ -345,6 +349,16 @@ class ResearchStore:
         experiment_id: str | None,
     ) -> dict:
         """Atomically persist one branch node, its typed relation, edges, and events."""
+        project_id = self._canonical_uuid(project_id)
+        branch_id = self._canonical_uuid(branch_id)
+        parent_node_id = self._canonical_uuid(parent_node_id) if parent_node_id else None
+        experiment_id = self._canonical_uuid(experiment_id) if experiment_id else None
+        data = {
+            **data,
+            "branch_id": branch_id,
+            "parent_node_id": parent_node_id,
+            "experiment_id": experiment_id,
+        }
         node_id, relation_id, now = uuid.uuid4(), uuid.uuid4(), datetime.now(UTC)
         reference_ids = [branch_id, *([parent_node_id] if parent_node_id else []), *([experiment_id] if experiment_id else [])]
         with self._connect() as conn, conn.cursor() as cur:
@@ -419,9 +433,23 @@ class ResearchStore:
         data: dict[str, Any],
     ) -> dict:
         """Atomically persist a comparative lesson, relation, graph edges, and events."""
+        project_id = self._canonical_uuid(project_id)
+        branch_id = self._canonical_uuid(branch_id)
+        node_a_id = self._canonical_uuid(node_a_id)
+        node_b_id = self._canonical_uuid(node_b_id)
+        data = {
+            **data,
+            "branch_id": branch_id,
+            "node_a_id": node_a_id,
+            "node_b_id": node_b_id,
+        }
         lesson_id, relation_id, now = uuid.uuid4(), uuid.uuid4(), datetime.now(UTC)
         reference_ids = [branch_id, node_a_id, node_b_id]
         with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"comparative-lesson:{branch_id}:{node_a_id}:{node_b_id}",),
+            )
             cur.execute(
                 "SELECT id,project_id,kind,status,data FROM research_objects "
                 "WHERE id=ANY(%s::uuid[]) FOR SHARE",
@@ -442,6 +470,33 @@ class ResearchStore:
                     or str(node["data"].get("branch_id")) != branch_id
                 ):
                     raise GPUError("INVALID_BRANCH_COMPARISON", node_id)
+            pair_filter = {
+                "branch_id": branch_id,
+                "node_a_id": node_a_id,
+                "node_b_id": node_b_id,
+            }
+            cur.execute(
+                "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
+                "WHERE project_id=%s AND kind='ComparativeLesson' AND data @> %s::jsonb "
+                "ORDER BY created_at LIMIT 1",
+                (project_id, json.dumps(pair_filter)),
+            )
+            existing = cur.fetchone()
+            if existing:
+                cur.execute(
+                    "SELECT id FROM research_objects WHERE project_id=%s "
+                    "AND kind='BranchRelation' AND data->>'comparative_lesson_id'=%s "
+                    "ORDER BY created_at LIMIT 1",
+                    (project_id, str(existing["id"])),
+                )
+                existing_relation = cur.fetchone()
+                return {
+                    **existing,
+                    "relation_id": (
+                        str(existing_relation["id"]) if existing_relation else None
+                    ),
+                    "idempotent_replay": True,
+                }
             relation = {
                 "branch_id": branch_id,
                 "source_node_id": node_a_id,
@@ -477,8 +532,10 @@ class ResearchStore:
 
     def meta_lesson_create(self, project_id: str, data: dict[str, Any]) -> dict:
         """Idempotently persist one process lesson for an exact scientific-state basis."""
+        if not isinstance(data.get("basis"), dict):
+            raise GPUError("INVALID_META_LESSON", "A structured basis is required")
         fingerprint = hashlib.sha256(
-            json.dumps(data["basis"], sort_keys=True, separators=(",", ":")).encode()
+            json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
         payload = {**data, "basis_fingerprint": fingerprint}
         ident, now = uuid.uuid4(), datetime.now(UTC)
@@ -1689,6 +1746,13 @@ class ResearchStore:
     def _validate_status(status: str) -> None:
         if status not in RESEARCH_OBJECT_STATUSES:
             raise GPUError("INVALID_RESEARCH_OBJECT_STATUS", status)
+
+    @staticmethod
+    def _canonical_uuid(value: str) -> str:
+        try:
+            return str(uuid.UUID(str(value)))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise GPUError("INVALID_RESEARCH_OBJECT_ID", str(value)) from exc
 
     @staticmethod
     def _event(cur, project_id, event_type, subject_id, payload):

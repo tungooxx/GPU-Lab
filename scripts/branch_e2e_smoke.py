@@ -131,6 +131,7 @@ def main() -> None:
         ["docker", "compose", "restart", "postgres", "gpu-lab"],
         check=True,
         cwd=REPO_ROOT,
+        timeout=300,
     )
     wait_for_gateway()
     recovered = call("experiment_branch_get", {"branch_id": branch["id"]})

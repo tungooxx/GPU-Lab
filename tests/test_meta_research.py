@@ -8,6 +8,7 @@ from gpu_lab.meta_research import MetaResearchService
 class FakeStore:
     def __init__(self):
         self.items = []
+        self.state_reads = 0
 
     def create(self, kind, status="ACTIVE", data=None):
         item = {
@@ -22,6 +23,7 @@ class FakeStore:
 
     def state_get(self, project_id):
         assert project_id == "project"
+        self.state_reads += 1
         return {"objects": list(reversed(self.items))}
 
     def objects_list(self, project_id, kind=None, statuses=None, limit=100, data_filters=None):
@@ -37,7 +39,7 @@ class FakeStore:
 
     def meta_lesson_create(self, project_id, data):
         fingerprint = hashlib.sha256(
-            json.dumps(data["basis"], sort_keys=True, separators=(",", ":")).encode()
+            json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
         existing = next(
             (
@@ -113,6 +115,7 @@ def test_meta_review_prioritizes_existing_work_and_rejects_campaign_prematurity(
     service = MetaResearchService(store)
 
     review = service.meta_review("project")
+    assert store.state_reads == 1
     replay = service.meta_review("project")
 
     assert review["data"]["campaign_readiness"] == "DO_NOT_BUILD_YET"
@@ -124,6 +127,16 @@ def test_meta_review_prioritizes_existing_work_and_rejects_campaign_prematurity(
     assert any("Inspect available" in item for item in review["data"]["recommendations"])
     assert replay["id"] == review["id"]
     assert replay["idempotent_replay"] is True
+
+
+def test_meta_review_reports_absent_decisions_separately():
+    store = FakeStore()
+    review = MetaResearchService(store).meta_review("project")
+
+    assert "no research decisions recorded" in review["data"]["campaign_readiness_reasons"]
+    assert "decision hindsight coverage below 80%" not in review["data"][
+        "campaign_readiness_reasons"
+    ]
 
 
 def test_meta_review_payload_change_creates_new_lesson():

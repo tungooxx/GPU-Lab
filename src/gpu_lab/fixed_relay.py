@@ -8,6 +8,7 @@ TARGET_HOST = os.environ.get("RELAY_TARGET_HOST", "")
 TARGET_PORT = int(os.environ.get("RELAY_TARGET_PORT", "0"))
 LISTEN_PORT = int(os.environ.get("RELAY_LISTEN_PORT", "0"))
 MAX_REQUEST_BODY = 1_048_576
+CLIENT_READ_TIMEOUT = 30
 _HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -22,6 +23,10 @@ _HOP_HEADERS = {
 
 class RelayHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+
+    def setup(self) -> None:
+        super().setup()
+        self.connection.settimeout(CLIENT_READ_TIMEOUT)
 
     def do_GET(self) -> None:
         self._forward()
@@ -41,7 +46,11 @@ class RelayHandler(BaseHTTPRequestHandler):
         if length > MAX_REQUEST_BODY:
             self.send_error(413, "request body exceeds 1 MiB relay limit")
             return
-        body = self.rfile.read(length) if length else None
+        try:
+            body = self.rfile.read(length) if length else None
+        except TimeoutError:
+            self.send_error(408, "request body timeout")
+            return
         headers = {
             name: value
             for name, value in self.headers.items()
@@ -64,8 +73,8 @@ class RelayHandler(BaseHTTPRequestHandler):
         finally:
             connection.close()
 
-    def log_message(self, format: str, *args) -> None:
-        print(f"relay {self.client_address[0]} {format % args}", flush=True)
+    def log_message(self, format_string: str, *args) -> None:
+        print(f"relay {self.client_address[0]} {format_string % args}", flush=True)
 
 
 if __name__ == "__main__":

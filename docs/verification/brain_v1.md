@@ -29,8 +29,9 @@ evidence. A successful tool call or unit test is not treated as proof of a mecha
 `uv run python scripts/brain_e2e_smoke.py` passed against the Docker MCP endpoint and PostgreSQL.
 The run reloaded an actual saved VRCNet prediction with exact equality, found a related negative
 mechanism through pgvector-backed search,
-selected `CAUSAL_INTERVENTION`, submitted a retry-safe canonical run/job mapping, executed CUDA on
-an NVIDIA GeForce GTX 1650, ran the frozen HASI hierarchical-state intervention, parsed the
+selected `CAUSAL_INTERVENTION`, reserved a retry-safe canonical run/job mapping, and only after
+explicit human approval executed CUDA on an NVIDIA GeForce GTX 1650, ran the frozen HASI
+hierarchical-state intervention, parsed the
 persisted result artifact, recovered the completed result as `INSPECT_RESULT`, and explicitly
 inspected the evidence. The edge changed from `HYPOTHESIZED_CAUSAL` to
 `INTERVENTION_SUPPORTED`; the following `brain_step()` changed to `GENERALIZATION`.

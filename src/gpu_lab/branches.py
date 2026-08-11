@@ -1,10 +1,25 @@
 import math
+from collections import defaultdict
 from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from .errors import GPUError
 from .research import ResearchStore
+
+RECOVERABLE_RUN_STATUSES = {"RESERVED", "RUNNING", "running", "unknown"}
+INSPECTABLE_RUN_STATUSES = {
+    "RESULT_NOT_INSPECTED",
+    "completed",
+    "failed",
+    "cancelled",
+}
+_KIND_ERRORS = {
+    "ExperimentBranch": "NOT_AN_EXPERIMENT_BRANCH",
+    "ExperimentNode": "NOT_AN_EXPERIMENT_NODE",
+    "ExperimentRun": "NOT_AN_EXPERIMENT_RUN",
+    "Hypothesis": "NOT_A_HYPOTHESIS",
+}
 
 
 class BranchNodeDraft(BaseModel):
@@ -123,41 +138,51 @@ class ExperimentBranchService:
 
     def next_action(self, branch_id: str) -> dict[str, Any]:
         branch = self.get(branch_id)
-        recoverable = {"RESERVED", "RUNNING", "running", "unknown"}
-        inspectable = {"RESULT_NOT_INSPECTED", "completed", "failed", "cancelled"}
+        experiment_ids = {
+            str(node["data"]["experiment_id"])
+            for node in branch["nodes"]
+            if node["data"].get("experiment_id")
+        }
+        runs_by_experiment: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for run in self.store.objects_list(
+            str(branch["project_id"]), "ExperimentRun", limit=None
+        ):
+            experiment_id = run["data"].get("experiment_id")
+            if experiment_id and str(experiment_id) in experiment_ids:
+                runs_by_experiment[str(experiment_id)].append(run)
         planned, inspectable_nodes, recoverable_nodes = [], [], []
         for node in branch["nodes"]:
             if node["status"] == "RESULT_INSPECTED":
                 continue
             experiment_id = node["data"].get("experiment_id")
-            runs = (
-                self.store.objects_list(
-                    str(branch["project_id"]),
-                    "ExperimentRun",
-                    limit=None,
-                    data_filters={"experiment_id": experiment_id},
+            runs = runs_by_experiment.get(str(experiment_id), []) if experiment_id else []
+            if any(run["status"] in INSPECTABLE_RUN_STATUSES for run in runs):
+                run = min(
+                    (run for run in runs if run["status"] in INSPECTABLE_RUN_STATUSES),
+                    key=lambda item: str(item["id"]),
                 )
-                if experiment_id
-                else []
-            )
-            if any(run["status"] in inspectable for run in runs):
-                run = next(run for run in runs if run["status"] in inspectable)
                 inspectable_nodes.append((node, run))
-            elif any(run["status"] in recoverable for run in runs):
-                run = next(run for run in runs if run["status"] in recoverable)
+            elif any(run["status"] in RECOVERABLE_RUN_STATUSES for run in runs):
+                run = min(
+                    (run for run in runs if run["status"] in RECOVERABLE_RUN_STATUSES),
+                    key=lambda item: str(item["id"]),
+                )
                 recoverable_nodes.append((node, run))
             else:
                 planned.append(node)
         if inspectable_nodes:
-            node, run = inspectable_nodes[0]
+            node, run = min(inspectable_nodes, key=lambda pair: str(pair[0]["id"]))
             return self._recommend(branch_id, "INSPECT_RESULT", node, run_id=str(run["id"]))
         if recoverable_nodes:
-            node, run = recoverable_nodes[0]
+            node, run = min(recoverable_nodes, key=lambda pair: str(pair[0]["id"]))
             return self._recommend(
                 branch_id, "RECOVER_UNFINISHED", node, run_id=str(run["id"])
             )
         if planned:
-            selected = max(planned, key=lambda item: float(item["data"]["priority_score"]))
+            selected = max(
+                planned,
+                key=lambda item: (float(item["data"]["priority_score"]), str(item["id"])),
+            )
             return self._recommend(branch_id, "EXECUTE_BRANCH_NODE", selected)
         inspected = [item for item in branch["nodes"] if item["status"] == "RESULT_INSPECTED"]
         if len(inspected) >= 2 and not branch["comparative_lessons"]:
@@ -188,15 +213,26 @@ class ExperimentBranchService:
         run = self._expect(run_id, str(node["project_id"]), "ExperimentRun")
         if run["status"] != "RESULT_INSPECTED":
             raise GPUError("BRANCH_RESULT_NOT_INSPECTED", run_id)
-        if str(run["data"].get("experiment_id")) != str(node["data"].get("experiment_id")):
+        node_experiment_id = node["data"].get("experiment_id")
+        run_experiment_id = run["data"].get("experiment_id")
+        if (
+            not node_experiment_id
+            or not run_experiment_id
+            or str(run_experiment_id) != str(node_experiment_id)
+        ):
             raise GPUError("BRANCH_RUN_MISMATCH", run_id)
-        if not result or not scientific_interpretation.strip() or not information_gained.strip():
+        canonical_result = run["data"].get("inspection")
+        if not isinstance(canonical_result, dict) or not canonical_result:
+            raise GPUError("BRANCH_RESULT_NOT_INSPECTED", run_id)
+        if result != canonical_result:
+            raise GPUError("BRANCH_RESULT_MISMATCH", run_id)
+        if not scientific_interpretation.strip() or not information_gained.strip():
             raise GPUError("INCOMPLETE_BRANCH_RESULT", node_id)
         return self.store.object_update(
             node_id,
             {
                 "run_id": run_id,
-                "result": result,
+                "result": canonical_result,
                 "scientific_interpretation": scientific_interpretation.strip(),
                 "actual_cost": actual_cost,
                 "information_gained": information_gained.strip(),
@@ -246,7 +282,7 @@ class ExperimentBranchService:
     def _expect(self, object_id: str, project_id: str, kind: str) -> dict[str, Any]:
         item = self.store.object_get(object_id)
         if item["kind"] != kind:
-            raise GPUError(f"NOT_A_{kind.upper()}", object_id)
+            raise GPUError(_KIND_ERRORS.get(kind, f"NOT_A_{kind.upper()}"), object_id)
         if str(item["project_id"]) != str(project_id):
             raise GPUError("RESEARCH_PROJECT_MISMATCH", object_id)
         return item

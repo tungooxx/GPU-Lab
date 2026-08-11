@@ -8,12 +8,16 @@ from urllib.parse import urlsplit
 
 MAX_HEADER = 65_536
 LISTEN_PORT = int(os.environ.get("EGRESS_PROXY_PORT", "3128"))
+UPSTREAM_CONNECT_TIMEOUT = float(os.environ.get("EGRESS_PROXY_CONNECT_TIMEOUT", "15"))
 
 
 async def _public_target(host: str, port: int) -> tuple[str, int]:
     if port not in {80, 443}:
         raise ValueError("only public HTTP(S) egress is allowed")
-    infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    infos = await asyncio.wait_for(
+        asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM),
+        timeout=UPSTREAM_CONNECT_TIMEOUT,
+    )
     addresses = {item[4][0] for item in infos}
     if not addresses or any(not ipaddress.ip_address(item).is_global for item in addresses):
         raise ValueError("private, loopback, and non-global destinations are blocked")
@@ -48,7 +52,9 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> 
             if not separator or not host:
                 raise ValueError("CONNECT requires host:port")
             address, port = await _public_target(host.strip("[]"), int(port_text))
-            upstream_reader, upstream_writer = await asyncio.open_connection(address, port)
+            upstream_reader, upstream_writer = await asyncio.wait_for(
+                asyncio.open_connection(address, port), timeout=UPSTREAM_CONNECT_TIMEOUT
+            )
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await writer.drain()
         else:
@@ -58,7 +64,9 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> 
             if parsed.scheme != "http" or not parsed.hostname:
                 raise ValueError("plain proxy requests require an http URL")
             address, port = await _public_target(parsed.hostname, parsed.port or 80)
-            upstream_reader, upstream_writer = await asyncio.open_connection(address, port)
+            upstream_reader, upstream_writer = await asyncio.wait_for(
+                asyncio.open_connection(address, port), timeout=UPSTREAM_CONNECT_TIMEOUT
+            )
             path = parsed.path or "/"
             if parsed.query:
                 path += "?" + parsed.query
