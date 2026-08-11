@@ -8,6 +8,7 @@ import logging
 import re
 import threading
 import time
+import uuid
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -212,6 +213,42 @@ class McpClientNetworkPolicyMiddleware(BaseHTTPMiddleware):
         ):
             return JSONResponse({"error": "MCP client network is not authorized"}, status_code=403)
         return await call_next(request)
+
+
+class McpRequestObservabilityMiddleware(BaseHTTPMiddleware):
+    """Correlate every MCP request that reaches this process with its final HTTP result."""
+
+    async def dispatch(self, request: Request, call_next):
+        request_id = _safe_request_id(request.headers.get("x-request-id"))
+        started = time.perf_counter()
+        try:
+            response = await call_next(request)
+        except Exception:
+            logger.exception(
+                "MCP request failed before a response request_id=%s method=%s path=%s",
+                request_id,
+                request.method,
+                request.url.path,
+            )
+            raise
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        response.headers["X-Request-ID"] = request_id
+        if request.url.path == "/mcp":
+            logger.info(
+                "MCP request complete request_id=%s method=%s status=%s duration_ms=%s",
+                request_id,
+                request.method,
+                response.status_code,
+                duration_ms,
+            )
+        return response
+
+
+def _safe_request_id(value: str | None) -> str:
+    """Accept a trace ID only when it is safe to reflect into headers and logs."""
+    if value and len(value) <= 128 and re.fullmatch(r"[A-Za-z0-9._-]+", value):
+        return value
+    return str(uuid.uuid4())
 
 
 def _tool_title(name: str) -> str:
@@ -429,14 +466,7 @@ def _compact_research_state(state: dict[str, Any], limit: int = 10) -> dict[str,
         kind = str(item.get("kind", "Unknown"))
         object_counts[kind] = object_counts.get(kind, 0) + 1
 
-    canonical_state: dict[str, Any] = {}
-    for key, value in state.get("canonical_state", {}).items():
-        if isinstance(value, list):
-            canonical_state[key] = [_state_object_summary(item) for item in value[:limit]]
-            if len(value) > limit:
-                canonical_state[f"{key}_truncated"] = len(value) - limit
-        else:
-            canonical_state[key] = value
+    canonical_state = _compact_canonical_state(state.get("canonical_state", {}), limit)
 
     project_state = state.get("state", {})
     return {
@@ -457,6 +487,43 @@ def _compact_research_state(state: dict[str, Any], limit: int = 10) -> dict[str,
         "canonical_state": canonical_state,
         "object_counts": dict(sorted(object_counts.items())),
         "detail_hint": "Use research_object_get with an object ID for its complete persisted record.",
+    }
+
+
+def _compact_canonical_state(canonical_state: dict[str, Any], limit: int) -> dict[str, Any]:
+    """Keep the decision context traceable by ID without copying full object payloads."""
+    compact: dict[str, Any] = {}
+    for key, value in canonical_state.items():
+        if isinstance(value, list):
+            compact[key] = [_state_object_summary(item) for item in value[:limit]]
+            if len(value) > limit:
+                compact[f"{key}_truncated"] = len(value) - limit
+        else:
+            compact[key] = value
+    return compact
+
+
+def _compact_brain_step(result: dict[str, Any], limit: int = 10) -> dict[str, Any]:
+    """Return an MCP-safe planning recommendation; full decision data remains durable by ID."""
+    return {
+        "brain_step_id": result["brain_step_id"],
+        "decision_id": result["decision_id"],
+        "agenda_item": _state_object_summary(result["agenda_item"]),
+        "question": result["question"],
+        "scientific_state": _compact_canonical_state(result["scientific_state"], limit),
+        "world_model": _state_object_summary(result["world_model"]),
+        "competing_hypotheses": [
+            _state_object_summary(item) for item in result["competing_hypotheses"][:limit]
+        ],
+        "dead_ideas_retrieved": result["dead_ideas_retrieved"][:limit],
+        "candidate_actions": result["candidate_actions"][:limit],
+        "selected_action": result["selected_action"],
+        "reason": result.get("reason"),
+        "expected_information_gain": result.get("expected_information_gain"),
+        "estimated_cost": result.get("estimated_cost"),
+        "requires_human_approval": result.get("requires_human_approval", False),
+        "verification_status": result.get("verification_status"),
+        "detail_hint": "Use research_object_get with the decision ID for its complete persisted trace.",
     }
 
 
@@ -726,7 +793,10 @@ async def hypothesis_portfolio_get(project_id: str):
 @mcp.tool()
 async def brain_step(project_id: str):
     """Persist one evidence-aware scientific decision for immediate execution when it is preregistered."""
-    return await call(brain().brain_step, project_id)
+    result = await call(brain().brain_step, project_id)
+    if "error" in result:
+        return result
+    return _compact_brain_step(result)
 
 
 def _execution_action_fingerprint(
@@ -2155,6 +2225,7 @@ def http_app():
     app = mcp.streamable_http_app()
     app.add_middleware(McpAcceptCompatibilityMiddleware)
     app.add_middleware(McpClientNetworkPolicyMiddleware)
+    app.add_middleware(McpRequestObservabilityMiddleware)
     return app
 
 

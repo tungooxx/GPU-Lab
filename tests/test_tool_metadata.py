@@ -1,4 +1,4 @@
-from gpu_lab.server import _compact_research_state, mcp
+from gpu_lab.server import _compact_brain_step, _compact_research_state, _safe_request_id, mcp
 
 
 def test_vast_status_tool_has_provider_specific_name():
@@ -70,3 +70,33 @@ def test_research_state_summary_excludes_large_object_payloads():
     assert compact["canonical_state"]["active_hypotheses"][0]["data"] == {
         "mechanism": "A mechanism"
     }
+
+
+def test_brain_step_summary_excludes_large_scientific_state_payloads():
+    result = {
+        "brain_step_id": "step-1",
+        "decision_id": "decision-1",
+        "agenda_item": {"id": "agenda-1", "kind": "AgendaItem", "status": "ACTIVE", "data": {}},
+        "question": "What next?",
+        "scientific_state": {
+            "active_hypotheses": [
+                {"id": "hypothesis-1", "kind": "Hypothesis", "status": "ACTIVE", "data": {"large": "x" * 100_000}}
+            ]
+        },
+        "world_model": {"id": "model-1", "kind": "WorldModel", "status": "ACTIVE", "data": {}},
+        "competing_hypotheses": [],
+        "dead_ideas_retrieved": [],
+        "candidate_actions": [],
+        "selected_action": {"action_type": "ARTIFACT_ANALYSIS"},
+    }
+
+    compact = _compact_brain_step(result)
+
+    assert compact["scientific_state"]["active_hypotheses"][0]["data"] == {}
+    assert "large" not in str(compact)
+
+
+def test_request_ids_are_safe_to_reflect_in_mcp_logs_and_headers():
+    assert _safe_request_id("trace-42.request") == "trace-42.request"
+    assert _safe_request_id("bad\r\nlog-forgery") != "bad\r\nlog-forgery"
+    assert _safe_request_id("x" * 129) != "x" * 129

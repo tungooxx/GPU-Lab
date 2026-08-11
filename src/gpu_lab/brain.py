@@ -123,6 +123,24 @@ class ResearchBrain:
             return str(value)
         return value
 
+    @staticmethod
+    def _state_snapshot(state: dict) -> dict:
+        """Persist a traceable planning snapshot without embedding every object payload."""
+        snapshot: dict[str, Any] = {}
+        for key, value in state["canonical_state"].items():
+            if isinstance(value, list):
+                snapshot[key] = [
+                    {
+                        field: str(item[field]) if field == "id" else item[field]
+                        for field in ("id", "kind", "status")
+                        if field in item
+                    }
+                    for item in value
+                ]
+            else:
+                snapshot[key] = value
+        return snapshot
+
     def world_model_create(self, project_id: str, name: str, scope: str) -> dict:
         return self.store.world_model_create_atomic(project_id, name, scope)
 
@@ -458,7 +476,7 @@ class ResearchBrain:
                 "world_model_version_id": model["data"].get("current_version_id"),
                 "agenda_id": str(agenda["id"]),
                 "portfolio_id": str(portfolio["id"]),
-                "research_state": self._json_safe(state["canonical_state"]),
+                "research_state": self._state_snapshot(state),
                 "comparative_lesson_ids": [str(item["id"]) for item in comparative_lessons],
                 "meta_lesson_ids": [str(item["id"]) for item in meta_lessons],
             },

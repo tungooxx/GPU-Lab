@@ -46,6 +46,29 @@ def test_causal_edge_status_requires_finite_agenda_scores():
     assert error.value.error_type == "INVALID_AGENDA_SCORE"
 
 
+def test_state_snapshot_keeps_object_identity_without_copying_large_payloads():
+    state = {
+        "canonical_state": {
+            "research_question": "What happened?",
+            "active_hypotheses": [
+                {
+                    "id": "hypothesis-1",
+                    "kind": "Hypothesis",
+                    "status": "ACTIVE",
+                    "data": {"large": "x" * 100_000},
+                }
+            ],
+        }
+    }
+
+    snapshot = ResearchBrain._state_snapshot(state)
+
+    assert snapshot["active_hypotheses"] == [
+        {"id": "hypothesis-1", "kind": "Hypothesis", "status": "ACTIVE"}
+    ]
+    assert "large" not in str(snapshot)
+
+
 class CandidateStore:
     def __init__(self, *, reproductions=None, runs=None, evidence=None):
         self.reproductions = reproductions or []
