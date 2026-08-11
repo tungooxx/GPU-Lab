@@ -75,6 +75,7 @@ _READ_ONLY_TOOLS = {
     "experiment_list",
     "activity_recent",
     "research_state_get",
+    "research_object_get",
     "world_model_get",
     "hypothesis_portfolio_get",
     "literature_provider_status",
@@ -387,6 +388,78 @@ def scrub(value):
     return value
 
 
+_STATE_SUMMARY_FIELDS = (
+    "statement",
+    "mechanism",
+    "question",
+    "prediction",
+    "scope",
+    "status_rationale",
+    "failed_assumption",
+    "revisit_condition",
+    "experiment_id",
+    "run_id",
+    "decision_id",
+    "name",
+    "title",
+)
+
+
+def _state_object_summary(item: dict[str, Any]) -> dict[str, Any]:
+    """Return an MCP-safe object summary; large scientific payloads stay retrievable by ID."""
+    data = item.get("data", {})
+    summary_data = {
+        field: value[:1000] if isinstance(value, str) else value
+        for field, value in data.items()
+        if field in _STATE_SUMMARY_FIELDS and isinstance(value, (str, int, float, bool, type(None)))
+    }
+    return {
+        key: item[key]
+        for key in ("id", "project_id", "kind", "status", "created_at")
+        if key in item
+    } | {"data": summary_data}
+
+
+def _compact_research_state(state: dict[str, Any], limit: int = 10) -> dict[str, Any]:
+    """Keep state discovery below connector response limits without hiding object identities."""
+    limit = min(max(limit, 1), 50)
+    objects = state.get("objects", [])
+    object_counts: dict[str, int] = {}
+    for item in objects:
+        kind = str(item.get("kind", "Unknown"))
+        object_counts[kind] = object_counts.get(kind, 0) + 1
+
+    canonical_state: dict[str, Any] = {}
+    for key, value in state.get("canonical_state", {}).items():
+        if isinstance(value, list):
+            canonical_state[key] = [_state_object_summary(item) for item in value[:limit]]
+            if len(value) > limit:
+                canonical_state[f"{key}_truncated"] = len(value) - limit
+        else:
+            canonical_state[key] = value
+
+    project_state = state.get("state", {})
+    return {
+        "name": state.get("name"),
+        "question": state.get("question"),
+        "state": {
+            key: value
+            for key, value in project_state.items()
+            if key
+            in {
+                "research_question",
+                "current_best_explanation",
+                "highest_value_unknown",
+                "established_facts",
+                "next_discriminating_experiments",
+            }
+        },
+        "canonical_state": canonical_state,
+        "object_counts": dict(sorted(object_counts.items())),
+        "detail_hint": "Use research_object_get with an object ID for its complete persisted record.",
+    }
+
+
 @mcp.tool()
 async def gpu_list():
     """List known and provider-visible GPU instances."""
@@ -504,9 +577,18 @@ async def research_project_create(name: str, question: str):
 
 
 @mcp.tool()
-async def research_state_get(project_id: str):
-    """Retrieve canonical scientific state before serious research work."""
-    return await call(research().state_get, project_id)
+async def research_state_get(project_id: str, limit: int = 10):
+    """Retrieve compact canonical scientific state; fetch complete records individually by ID."""
+    state = await call(research().state_get, project_id)
+    if "error" in state:
+        return state
+    return _compact_research_state(state, limit)
+
+
+@mcp.tool()
+async def research_object_get(object_id: str):
+    """Retrieve one complete persisted research record by its ID."""
+    return await call(research().object_get, object_id)
 
 
 @mcp.tool()
@@ -2018,8 +2100,23 @@ async def gateway_status() -> dict:
     }
 
 
+def gateway_liveness() -> dict:
+    """Return an inexpensive readiness response that never depends on a provider API."""
+    return {
+        "status": "ok",
+        "mcp_endpoint": "/mcp",
+        "local_runner_enabled": settings.gpu_lab_enable_local_runner,
+        "tool_count": len(mcp._tool_manager._tools),
+    }
+
+
 @mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
 async def health(_: Request):
+    return JSONResponse(gateway_liveness())
+
+
+@mcp.custom_route("/status", methods=["GET"], include_in_schema=False)
+async def status(_: Request):
     return JSONResponse(await gateway_status())
 
 

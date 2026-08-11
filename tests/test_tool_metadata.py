@@ -1,4 +1,4 @@
-from gpu_lab.server import mcp
+from gpu_lab.server import _compact_research_state, mcp
 
 
 def test_vast_status_tool_has_provider_specific_name():
@@ -39,3 +39,34 @@ def test_every_mcp_tool_can_convert_a_structured_result():
         assert isinstance(converted, tuple)
         _, structured_content = converted
         assert structured_content == {"result": {"smoke": "ok"}}
+
+
+def test_research_state_summary_excludes_large_object_payloads():
+    state = {
+        "name": "Fixture",
+        "question": "What happened?",
+        "state": {"research_question": "What happened?"},
+        "canonical_state": {
+            "active_hypotheses": [
+                {
+                    "id": "hypothesis-1",
+                    "kind": "Hypothesis",
+                    "status": "ACTIVE",
+                    "data": {"mechanism": "A mechanism", "large": "x" * 100_000},
+                }
+            ],
+            "active_anomalies": [],
+        },
+        "objects": [
+            {"id": "hypothesis-1", "kind": "Hypothesis", "status": "ACTIVE", "data": {}},
+            {"id": "decision-1", "kind": "ResearchDecision", "status": "SELECTED", "data": {}},
+        ],
+    }
+
+    compact = _compact_research_state(state, limit=10)
+
+    assert "objects" not in compact
+    assert compact["object_counts"] == {"Hypothesis": 1, "ResearchDecision": 1}
+    assert compact["canonical_state"]["active_hypotheses"][0]["data"] == {
+        "mechanism": "A mechanism"
+    }
