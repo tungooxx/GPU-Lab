@@ -1773,6 +1773,15 @@ async def research_experiment_execute(
             "submission_error": job["error"],
             "retry_safe": True,
         }
+    if job.get("status") not in {"running", "completed", "failed", "cancelled"}:
+        return {
+            **reservation,
+            "status": "RESERVED",
+            "runner_status": job.get("status", "unknown"),
+            "job": job,
+            "retry_safe": True,
+            "recovery_action": "RETRY_EXECUTION",
+        }
     mapping = await call(research().run_mark_submitted, reservation["run_id"])
     if "error" in mapping:
         return {

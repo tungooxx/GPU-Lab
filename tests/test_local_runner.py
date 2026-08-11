@@ -161,6 +161,40 @@ async def test_separate_runners_atomically_claim_canonical_job(monkeypatch, tmp_
     assert calls == 1
 
 
+@pytest.mark.asyncio
+async def test_status_poll_cannot_invalidate_active_submission_claim(monkeypatch, tmp_path):
+    first_runner = _runner(tmp_path)
+    second_runner = _runner(tmp_path)
+    spawn_entered = asyncio.Event()
+    allow_spawn = asyncio.Event()
+    calls = 0
+
+    async def fake_subprocess(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        spawn_entered.set()
+        await allow_spawn.wait()
+        return _Process()
+
+    monkeypatch.setattr("gpu_lab.local_runner.asyncio.create_subprocess_shell", fake_subprocess)
+    monkeypatch.setattr(first_runner, "_process_identity", lambda _pid: "start-ticks")
+
+    first_task = asyncio.create_task(
+        first_runner.submit("echo ok", job_id="local_polled_submission")
+    )
+    await spawn_entered.wait()
+    polled = second_runner.job_status("local_polled_submission")
+    replay = await second_runner.submit("echo ok", job_id="local_polled_submission")
+    allow_spawn.set()
+    first = await first_task
+
+    assert polled["status"] == "queued"
+    assert replay["status"] == "queued"
+    assert replay["idempotent_replay"] is True
+    assert first["status"] == "running"
+    assert calls == 1
+
+
 def test_reconcile_marks_foreign_running_job_unknown(tmp_path):
     runner = _runner(tmp_path)
     job = Job(

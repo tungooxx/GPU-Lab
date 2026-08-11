@@ -72,6 +72,14 @@ class UnprovenLocal:
     def job_status(self, job_id):
         return {"job_id": job_id, "status": self.status, "exit_code": None, "logs_tail": ""}
 
+    async def submit(self, *_args):
+        return {"job_id": "local_reserved_job", "status": self.status}
+
+
+class AuthorizingBrain:
+    def authorize_execution(self, *_args):
+        return {"authorized": True}
+
 
 def _mapping(status):
     return {
@@ -131,6 +139,25 @@ async def test_sync_does_not_promote_reserved_mapping_without_launch_proof(
 
     assert result["status"] == "RESERVED"
     assert result["runner_status"] == runner_status
+    assert result["recovery_action"] == "RETRY_EXECUTION"
+    assert research.promotions == 0
+
+
+@pytest.mark.asyncio
+async def test_execute_does_not_mark_queued_replay_as_started(monkeypatch):
+    research = FakeResearch(_mapping("RESERVED"))
+    research.run_reserve = lambda *_args: research.mapping
+    monkeypatch.setattr(server.settings, "gpu_lab_enable_local_runner", True)
+    monkeypatch.setattr(server, "research", lambda: research)
+    monkeypatch.setattr(server, "brain", lambda: AuthorizingBrain())
+    monkeypatch.setattr(server, "local", UnprovenLocal("queued"))
+
+    result = await server.research_experiment_execute(
+        "experiment-id", "decision-id", "echo ok", execution_attempt_uuid="attempt-id"
+    )
+
+    assert result["status"] == "RESERVED"
+    assert result["runner_status"] == "queued"
     assert result["recovery_action"] == "RETRY_EXECUTION"
     assert research.promotions == 0
 

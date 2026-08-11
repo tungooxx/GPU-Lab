@@ -28,6 +28,9 @@ class LocalRunner:
             or os.environ.get("COMPUTERNAME")
             or "local-host"
         )
+        self.submission_owner_id = uuid.uuid4().hex
+        self.submission_owner_pid = os.getpid()
+        self.submission_owner_identity = self._process_identity(self.submission_owner_pid)
         self._submission_lock = asyncio.Lock()
 
     @staticmethod
@@ -171,6 +174,10 @@ class LocalRunner:
                 "request_fingerprint": fingerprint,
                 "python_env": python_env,
                 "runner_instance_id": self.runner_instance_id,
+                "submission_owner_id": self.submission_owner_id,
+                "submission_owner_pid": self.submission_owner_pid,
+                "submission_owner_identity": self.submission_owner_identity,
+                "submission_claimed_at": datetime.now(UTC).isoformat(),
             },
         )
         claim, existing = self.repo.claim_job(job)
@@ -283,6 +290,26 @@ class LocalRunner:
                 job.completed_at = job.completed_at or datetime.now(UTC)
             except ValueError:
                 pass
+        elif job.status == "queued":
+            # ``queued`` is the durable pre-spawn claim. A status reader must
+            # not invalidate a live claimant and make the ID reclaimable while
+            # its subprocess creation is still in flight.
+            owner_pid = job.metadata.get("submission_owner_pid")
+            owner_identity = job.metadata.get("submission_owner_identity")
+            same_owner = job.metadata.get("submission_owner_id") == self.submission_owner_id
+            owner_alive = (
+                job.metadata.get("runner_instance_id") == self.runner_instance_id
+                and isinstance(owner_pid, int)
+                and bool(owner_identity)
+                and self._process_identity(owner_pid) == owner_identity
+            )
+            try:
+                claimed_at = datetime.fromisoformat(job.metadata["submission_claimed_at"])
+                fresh_claim = (datetime.now(UTC) - claimed_at).total_seconds() < 60
+            except (KeyError, TypeError, ValueError):
+                fresh_claim = False
+            if not (same_owner or owner_alive or fresh_claim):
+                job.status = "unknown"
         else:
             launched_by_current_runner = (
                 job.metadata.get("runner_instance_id") == self.runner_instance_id
