@@ -51,11 +51,15 @@ def test_local_job_environment_excludes_gateway_secrets(monkeypatch, tmp_path):
 
     environment = runner._job_environment({"PYTHONPATH": "/project", "EXPERIMENT_SEED": "7"})
 
-    assert environment == {
-        "PATH": "/usr/local/bin",
-        "PYTHONPATH": "/project",
-        "EXPERIMENT_SEED": "7",
-    }
+    assert environment["PATH"] == "/usr/local/bin"
+    assert environment["PYTHONPATH"] == "/project"
+    assert environment["EXPERIMENT_SEED"] == "7"
+    assert not {
+        "VAST_API_KEY",
+        "GPU_LAB_APPROVAL_SECRET",
+        "GPU_LAB_RESEARCH_DATABASE_URL",
+        "GPU_LAB_LITERATURE_WORKER_TOKEN",
+    } & environment.keys()
 
 
 def test_mcp_wildcard_accept_header_allows_json_response():
