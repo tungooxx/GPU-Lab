@@ -444,6 +444,10 @@ class ResearchBrain:
         hypotheses = self.store.objects_list(
             project_id, "Hypothesis", {"ACTIVE", "SURVIVES_INITIAL_TEST"}
         )
+        comparative_lessons = self.store.objects_list(
+            project_id, "ComparativeLesson", limit=None
+        )
+        meta_lessons = self.store.objects_list(project_id, "MetaLesson", limit=None)
         related_dead = self._related_dead_ideas(project_id, hypotheses)
         candidates = self._candidate_actions(project_id, agenda_item, hypotheses)
         candidate_data = [
@@ -467,10 +471,14 @@ class ResearchBrain:
                 "agenda_id": str(agenda["id"]),
                 "portfolio_id": str(portfolio["id"]),
                 "research_state": self._json_safe(state["canonical_state"]),
+                "comparative_lesson_ids": [str(item["id"]) for item in comparative_lessons],
+                "meta_lesson_ids": [str(item["id"]) for item in meta_lessons],
             },
             "evidence_considered": self._evidence_ids(state),
             "hypotheses_affected": [str(item["id"]) for item in hypotheses],
             "dead_ideas_retrieved": related_dead,
+            "comparative_lessons": comparative_lessons,
+            "meta_lessons": meta_lessons,
             "rationale": self._decision_rationale(selected, related_dead),
             "expected_information_gain": self._information_gain_label(
                 selected["score"]["expected_information_gain"]

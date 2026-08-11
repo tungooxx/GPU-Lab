@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 import uuid
@@ -472,6 +473,41 @@ class ResearchStore:
             "status": "RESULT_INSPECTED",
             "data": data,
             "relation_id": str(relation_id),
+        }
+
+    def meta_lesson_create(self, project_id: str, data: dict[str, Any]) -> dict:
+        """Idempotently persist one process lesson for an exact scientific-state basis."""
+        fingerprint = hashlib.sha256(
+            json.dumps(data["basis"], sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        payload = {**data, "basis_fingerprint": fingerprint}
+        ident, now = uuid.uuid4(), datetime.now(UTC)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"meta-lesson:{project_id}:{fingerprint}",),
+            )
+            cur.execute(
+                "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
+                "WHERE project_id=%s AND kind='MetaLesson' "
+                "AND data->>'basis_fingerprint'=%s ORDER BY created_at LIMIT 1",
+                (project_id, fingerprint),
+            )
+            existing = cur.fetchone()
+            if existing:
+                return {**existing, "idempotent_replay": True}
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'MetaLesson','RESULT_INSPECTED',%s,%s)",
+                (ident, project_id, json.dumps(payload), now),
+            )
+            self._event(cur, project_id, "META_REVIEW_COMPLETED", ident, payload)
+        return {
+            "id": str(ident),
+            "project_id": project_id,
+            "kind": "MetaLesson",
+            "status": "RESULT_INSPECTED",
+            "data": payload,
         }
 
     def world_model_child_create(
@@ -1268,6 +1304,10 @@ class ResearchStore:
                 "open_experiments": by_kind("Experiment", {"ACTIVE"}),
                 "reproduction_status": by_kind("Reproduction"),
                 "negative_results": by_kind("NegativeResult"),
+                "lessons": by_kind("Lesson"),
+                "comparative_lessons": by_kind("ComparativeLesson"),
+                "meta_lessons": by_kind("MetaLesson"),
+                "experiment_branches": by_kind("ExperimentBranch"),
                 "current_best_explanation": row["state"].get("current_best_explanation"),
                 "highest_value_unknown": row["state"].get("highest_value_unknown"),
                 "next_discriminating_experiments": row["state"].get("next_discriminating_experiments", []),

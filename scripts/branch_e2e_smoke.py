@@ -17,6 +17,9 @@ def main() -> None:
         "experiment_branch_next",
         "experiment_branch_result_record",
         "experiment_branch_compare",
+        "research_progress",
+        "meta_review",
+        "meta_lesson_list",
     }
     assert required <= tools
     nonce = uuid.uuid4().hex[:10]
@@ -121,6 +124,8 @@ def main() -> None:
     selected = call("experiment_branch_next", {"branch_id": branch["id"]})
     assert selected["node_id"] == strong["id"]
     assert selected["action"] == "EXECUTE_BRANCH_NODE"
+    meta = call("meta_review", {"project_id": project_id})
+    assert meta["data"]["campaign_readiness"] == "DO_NOT_BUILD_YET"
 
     subprocess.run(
         ["docker", "compose", "restart", "postgres", "gpu-lab"],
@@ -131,6 +136,8 @@ def main() -> None:
     recovered = call("experiment_branch_get", {"branch_id": branch["id"]})
     assert len(recovered["nodes"]) == 2
     assert len(recovered["relations"]) == 1
+    lessons = call("meta_lesson_list", {"project_id": project_id})
+    assert any(item["id"] == meta["id"] for item in lessons)
     print(
         json.dumps(
             {
@@ -140,6 +147,7 @@ def main() -> None:
                 "selected_action": "STATE_SUBSTITUTION",
                 "restart_recovered": True,
                 "scientific_result": "NOT_EXECUTED",
+                "campaign_readiness": "DO_NOT_BUILD_YET",
             },
             indent=2,
         )

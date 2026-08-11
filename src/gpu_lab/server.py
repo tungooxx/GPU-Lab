@@ -26,6 +26,7 @@ from .errors import GPUError
 from .executable_papers import ExecutablePaperService, HttpExecutablePaperProvider
 from .literature import HttpLiteratureProvider, LiteratureService
 from .local_runner import LocalRunner
+from .meta_research import MetaResearchService
 from .qd import HypothesisQDService
 from .research import ResearchStore
 from .service import GPUService
@@ -33,8 +34,9 @@ from .terminal import TERMINAL_HTML
 
 logger = logging.getLogger(__name__)
 
-settings, service, research_store, research_brain, literature_service, executable_paper_service, qd_service, branch_service = (
+settings, service, research_store, research_brain, literature_service, executable_paper_service, qd_service, branch_service, meta_research_service = (
     Settings(),
+    None,
     None,
     None,
     None,
@@ -85,6 +87,8 @@ _READ_ONLY_TOOLS = {
     "hypothesis_qd_screen",
     "experiment_branch_get",
     "experiment_branch_next",
+    "research_progress",
+    "meta_lesson_list",
     "experiment_priority",
     "research_events",
     "paper_search",
@@ -312,6 +316,15 @@ def branches() -> ExperimentBranchService:
             if branch_service is None:
                 branch_service = ExperimentBranchService(research())
     return branch_service
+
+
+def meta_research() -> MetaResearchService:
+    global meta_research_service
+    if meta_research_service is None:
+        with _singleton_lock:
+            if meta_research_service is None:
+                meta_research_service = MetaResearchService(research())
+    return meta_research_service
 
 
 async def call(fn, *args, **kwargs):
@@ -919,6 +932,24 @@ async def experiment_branch_compare(
 ):
     """Persist a confound-aware ComparativeLesson across two inspected branch results."""
     return await call(branches().compare, branch_id, node_a_id, node_b_id, lesson)
+
+
+@mcp.tool()
+async def research_progress(project_id: str):
+    """Return transparent scientific-progress counts and information-per-GPU-hour when measurable."""
+    return await call(meta_research().progress, project_id)
+
+
+@mcp.tool()
+async def meta_review(project_id: str):
+    """Persist a process-only MetaLesson and assess readiness for bounded campaign automation."""
+    return await call(meta_research().meta_review, project_id)
+
+
+@mcp.tool()
+async def meta_lesson_list(project_id: str):
+    """List durable research-process lessons without treating them as scientific evidence."""
+    return await call(meta_research().list_lessons, project_id)
 
 
 @mcp.tool()

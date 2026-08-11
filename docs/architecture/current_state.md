@@ -37,15 +37,19 @@ integration tests, and real execution.
 - Deterministic experiment branches store scored nodes, typed parent/comparison relations,
   inspected-run attachments, and confound-aware ComparativeLessons. The policy prioritizes result
   inspection, then unfinished recovery, then information-per-cost execution, then comparison.
+- Research progress metrics count uncertainty resolution, falsification, negative-memory reuse,
+  inspected evidence, and information per recorded GPU-hour. `meta_review` persists idempotent
+  process-only MetaLessons and applies an explicit bounded-campaign readiness gate.
 
 ## What is verified
 
-- **VERIFIED_UNIT:** 67 tests cover provider normalization, malformed worker responses, audit
+- **VERIFIED_UNIT:** 73 tests cover provider normalization, malformed worker responses, audit
   redaction, path safety, structured output metadata, local requirements resolution, environment
   command construction, local job idempotency, action
   scoring, the HASI reproduction gate, unavailable-provider fallback behavior, and QD niche,
   lineage, dead-idea, vector/structured-proximity, operator, cache-failure behavior, branch scoring,
-  result-inspection gates, recovery priority, and comparative lessons.
+  result-inspection gates, recovery priority, comparative lessons, progress metrics, MetaLesson
+  idempotency, and campaign-prematurity detection.
 - **VERIFIED_INTEGRATION:** Docker PostgreSQL migration, MCP discovery, atomic execution reservation,
   repeated submission, immutable `EXPERIMENT_STARTED` identity, job-ID sync, logs/artifacts, and
   completed-run persistence.
@@ -61,9 +65,12 @@ integration tests, and real execution.
 - **VERIFIED_INTEGRATION:** `scripts/branch_e2e_smoke.py` discovered all branch tools, persisted two
   preregistered nodes and a typed relation, selected state substitution over a cheaper-to-score but
   less discriminating correlation study, restarted services, and recovered the branch. It did not
-  execute either scientific experiment and reports `scientific_result=NOT_EXECUTED`.
-- **VERIFIED_INTEGRATION:** repeated Compose restarts retain host MCP access through the prioritized
-  backend network; direct MCP access from the isolated Paper2Agent network remains blocked with 403.
+  execute either scientific experiment and reports `scientific_result=NOT_EXECUTED`. The same smoke
+  persisted/recovered a MetaLesson whose campaign gate is `DO_NOT_BUILD_YET`.
+- **VERIFIED_INTEGRATION:** repeated Compose restarts retain host MCP access on the backend network.
+  External workers use internal-only networks, fixed-target API relays, and a public-address-only
+  HTTP(S) proxy. Direct worker access to service DNS and host-gateway MCP endpoints is blocked with
+  403 while public GitHub and Crossref requests succeed.
 
 ## What is partial
 
@@ -81,7 +88,7 @@ integration tests, and real execution.
 
 ## What is missing
 
-- Automatic embedding generation, meta-research memory, and autonomous campaign runtime.
+- Automatic embedding generation and autonomous campaign runtime.
 - PaperQA's real model-backed answer quality remains unverified.
 - Additional historical benchmark episodes beyond the permanent HASI gate.
 

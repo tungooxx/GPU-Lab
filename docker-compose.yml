@@ -24,10 +24,10 @@ services:
       GPU_LAB_LOCAL_WORKSPACE: /workspace/local-vlm
       GPU_LAB_RESEARCH_DATABASE_URL: postgresql://research:research@postgres:5432/research_os
       GPU_LAB_LITERATURE_PROVIDER: ${GPU_LAB_LITERATURE_PROVIDER:-disabled}
-      GPU_LAB_LITERATURE_WORKER_URL: http://literature:8010
+      GPU_LAB_LITERATURE_WORKER_URL: http://literature-relay:8010
       GPU_LAB_LITERATURE_WORKER_TOKEN: ${GPU_LAB_LITERATURE_WORKER_TOKEN:-}
       GPU_LAB_EXECUTABLE_PAPER_PROVIDER: ${GPU_LAB_EXECUTABLE_PAPER_PROVIDER:-disabled}
-      GPU_LAB_EXECUTABLE_PAPER_WORKER_URL: http://paper2agent:8020
+      GPU_LAB_EXECUTABLE_PAPER_WORKER_URL: http://paper2agent-relay:8020
       GPU_LAB_EXECUTABLE_PAPER_WORKER_TOKEN: ${GPU_LAB_EXECUTABLE_PAPER_WORKER_TOKEN:-}
       GPU_LAB_APPROVAL_SECRET: ${GPU_LAB_APPROVAL_SECRET:-}
       GPU_LAB_DENIED_MCP_CLIENT_CIDRS: 172.29.0.0/24,172.30.0.0/24
@@ -38,12 +38,9 @@ services:
       postgres:
         condition: service_healthy
     restart: unless-stopped
-    networks:
-      backend:
-        # Keep published host/Caddy traffic off the worker CIDRs blocked by MCP middleware.
-        gw_priority: 100
-      literature: {}
-      paper-agents: {}
+    # The gateway is deliberately not attached to worker networks. Fixed-target relays expose only
+    # each authenticated worker API; untrusted workers cannot route arbitrary traffic through them.
+    networks: [backend]
   literature:
     profiles: ["literature"]
     build:
@@ -56,6 +53,9 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       CROSSREF_API_KEY: ${CROSSREF_API_KEY:-}
       SEMANTIC_SCHOLAR_API_KEY: ${SEMANTIC_SCHOLAR_API_KEY:-}
+      HTTP_PROXY: http://egress-proxy:3128
+      HTTPS_PROXY: http://egress-proxy:3128
+      NO_PROXY: 127.0.0.1,localhost
     volumes: ["literature-papers:/papers"]
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
@@ -77,6 +77,9 @@ services:
       PAPER2AGENT_ROOT: /opt/paper2agent
       PAPER2AGENT_UPSTREAM_COMMIT: e573687e15f345e3f375cd0851373d588e436be3
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      HTTP_PROXY: http://egress-proxy:3128
+      HTTPS_PROXY: http://egress-proxy:3128
+      NO_PROXY: 127.0.0.1,localhost
     volumes: ["paper2agent-projects:/opt/paper2agent/projects", "paper2agent-claude:/home/paperagent/.claude"]
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
@@ -88,6 +91,41 @@ services:
       retries: 12
     restart: unless-stopped
     networks: [paper-agents]
+  literature-relay:
+    profiles: ["literature"]
+    build:
+      context: .
+      dockerfile: relay.Dockerfile
+    environment:
+      RELAY_TARGET_HOST: literature
+      RELAY_TARGET_PORT: 8010
+      RELAY_LISTEN_PORT: 8010
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    networks: [backend, literature]
+  paper2agent-relay:
+    profiles: ["paper-agents"]
+    build:
+      context: .
+      dockerfile: relay.Dockerfile
+    environment:
+      RELAY_TARGET_HOST: paper2agent
+      RELAY_TARGET_PORT: 8020
+      RELAY_LISTEN_PORT: 8020
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    networks: [backend, paper-agents]
+  egress-proxy:
+    profiles: ["literature", "paper-agents"]
+    build:
+      context: .
+      dockerfile: egress-proxy.Dockerfile
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    networks: [literature, paper-agents, egress]
 
 volumes:
   gpu-lab-envs:
@@ -100,8 +138,11 @@ networks:
     ipam:
       config: [{subnet: 172.28.0.0/24}]
   literature:
+    internal: true
     ipam:
       config: [{subnet: 172.29.0.0/24}]
   paper-agents:
+    internal: true
     ipam:
       config: [{subnet: 172.30.0.0/24}]
+  egress: {}

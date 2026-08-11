@@ -132,7 +132,8 @@ generated-MCP inspection/invocation, network isolation, and canonical-truth boun
 but a paid model-backed paper conversion has not been run. Automatic embedding generation and
 campaign automation remain later milestones. Native QD niches, lineage, dead-idea proximity, and
 deterministic experiment branches are implemented; their longitudinal scientific value is not yet
-established, and no MCTS policy is present.
+established, and no MCTS policy is present. Native progress metrics and `meta_review` currently mark
+campaign readiness `DO_NOT_BUILD_YET` because the inspected/hindsight evidence threshold is unmet.
 
 Enable the Paper2Agent worker only with a task-scoped Anthropic credential and explicit approval of
 the upstream model cost:
