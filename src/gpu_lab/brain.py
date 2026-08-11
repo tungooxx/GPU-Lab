@@ -122,32 +122,7 @@ class ResearchBrain:
         return value
 
     def world_model_create(self, project_id: str, name: str, scope: str) -> dict:
-        model = self.store.object_create(
-            project_id,
-            "WorldModel",
-            {
-                "name": name,
-                "scope": scope,
-                "node_ids": [],
-                "edge_ids": [],
-                "current_version_id": None,
-                "version": 0,
-            },
-            "WORLD_MODEL_CREATED",
-            "IMPLEMENTED_UNVERIFIED",
-        )
-        advanced = self.store.world_model_update_and_version(
-            str(model["id"]),
-            {},
-            {"world_model_created": True},
-            [],
-            None,
-            "WORLD_MODEL_VERSION_ADVANCED",
-        )
-        return {
-            "world_model": self.store.object_get(model["id"]),
-            "version": advanced["version"],
-        }
+        return self.store.world_model_create_atomic(project_id, name, scope)
 
     def world_model_get(self, world_model_id: str) -> dict:
         model = self._expect(world_model_id, "WorldModel")

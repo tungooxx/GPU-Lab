@@ -662,6 +662,65 @@ class ResearchStore:
             },
         }
 
+    def world_model_create_atomic(self, project_id: str, name: str, scope: str) -> dict:
+        """Create a WorldModel and its required initial version in one transaction."""
+        now, model_id, version_id = datetime.now(UTC), uuid.uuid4(), uuid.uuid4()
+        version_data = {
+            "world_model_id": str(model_id),
+            "version": 1,
+            "parent_version_id": None,
+            "changes": {"world_model_created": True},
+            "evidence_ids": [],
+            "decision_id": None,
+            "timestamp": now.isoformat(),
+        }
+        model_data = {
+            "name": name,
+            "scope": scope,
+            "node_ids": [],
+            "edge_ids": [],
+            "current_version_id": str(version_id),
+            "version": 1,
+        }
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'WorldModel','IMPLEMENTED_UNVERIFIED',%s,%s)",
+                (model_id, project_id, json.dumps(model_data), now),
+            )
+            self._event(cur, project_id, "WORLD_MODEL_CREATED", model_id, model_data)
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'WorldModelVersion','IMPLEMENTED_UNVERIFIED',%s,%s)",
+                (version_id, project_id, json.dumps(version_data), now),
+            )
+            self._event(
+                cur, project_id, "WORLD_MODEL_VERSION_CREATED", version_id, version_data
+            )
+            self._event(
+                cur,
+                project_id,
+                "WORLD_MODEL_VERSION_ADVANCED",
+                model_id,
+                {"version": 1},
+            )
+        return {
+            "world_model": {
+                "id": str(model_id),
+                "project_id": project_id,
+                "kind": "WorldModel",
+                "status": "IMPLEMENTED_UNVERIFIED",
+                "data": model_data,
+            },
+            "version": {
+                "id": str(version_id),
+                "project_id": project_id,
+                "kind": "WorldModelVersion",
+                "status": "IMPLEMENTED_UNVERIFIED",
+                "data": version_data,
+            },
+        }
+
     def agenda_create_once(self, project_id: str, name: str) -> dict:
         """Serialize creation so a project has at most one active research agenda."""
         with self._connect() as conn, conn.cursor() as cur:

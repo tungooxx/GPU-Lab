@@ -310,6 +310,27 @@ async def test_http_literature_worker_normalizes_non_object_errors():
 
 
 @pytest.mark.asyncio
+async def test_http_literature_worker_normalizes_malformed_error_fields():
+    provider = HttpLiteratureProvider(
+        "http://literature:8010",
+        "scoped-token",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                400,
+                json={"error": {"type": None, "message": [], "retryable": "yes"}},
+            )
+        ),
+    )
+
+    with pytest.raises(GPUError) as error:
+        await provider.health()
+
+    assert error.value.error_type == "LITERATURE_PROVIDER_ERROR"
+    assert error.value.message == "Literature worker error"
+    assert error.value.retryable is False
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("response", "expected_message"),
     [

@@ -305,10 +305,17 @@ class HttpLiteratureProvider:
             )
         if "error" in data and data["error"] is not None:
             error = data["error"] if isinstance(data["error"], dict) else {}
+            error_type = error.get("type")
+            message = error.get("message")
+            retryable = error.get("retryable")
             raise GPUError(
-                error.get("type", "LITERATURE_PROVIDER_ERROR"),
-                error.get("message", "Literature worker error"),
-                error.get("retryable", False),
+                error_type
+                if isinstance(error_type, str) and error_type
+                else "LITERATURE_PROVIDER_ERROR",
+                message
+                if isinstance(message, str) and message
+                else "Literature worker error",
+                retryable if isinstance(retryable, bool) else False,
             )
         if response.is_error:
             raise GPUError(
