@@ -5,6 +5,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
+from .epistemics import normalize_scientific_scope, scope_is_empirically_bounded
 from .errors import GPUError
 from .research import ResearchStore
 
@@ -210,6 +211,9 @@ class ResearchBrain:
         against_ids: list[str] | None = None,
         unresolved_prediction_ids: list[str] | None = None,
         decision_id: str | None = None,
+        scope: str | dict[str, Any] | None = None,
+        supporting_evidence_family_ids: list[str] | None = None,
+        contradicting_evidence_family_ids: list[str] | None = None,
     ) -> dict:
         if status not in EDGE_STATUSES:
             raise GPUError("INVALID_CAUSAL_EDGE_STATUS", status)
@@ -230,8 +234,18 @@ class ResearchBrain:
             )
         evidence = list(dict.fromkeys([*(supporting_ids or []), *(against_ids or [])]))
         predictions = list(dict.fromkeys(unresolved_prediction_ids or []))
-        references = [*evidence, *predictions, *([decision_id] if decision_id else [])]
+        support_families = list(dict.fromkeys(supporting_evidence_family_ids or []))
+        against_families = list(dict.fromkeys(contradicting_evidence_family_ids or []))
+        references = [
+            *evidence,
+            *predictions,
+            *support_families,
+            *against_families,
+            *([decision_id] if decision_id else []),
+        ]
         self._validate_references(model["project_id"], references)
+        for family_id in [*support_families, *against_families]:
+            self._expect(family_id, "EvidenceFamily")
         if decision_id:
             self._expect(decision_id, "ResearchDecision")
         if (
@@ -244,6 +258,14 @@ class ResearchBrain:
                 "CAUSAL_EDGE_PROVENANCE_REQUIRED",
                 "Hypothesized edges need evidence or an unresolved prediction",
             )
+        normalized_scope = normalize_scientific_scope(scope)
+        if status == "INTERVENTION_SUPPORTED" and (
+            not support_families or not scope_is_empirically_bounded(normalized_scope)
+        ):
+            raise GPUError(
+                "CAUSAL_PROMOTION_SCOPE_OR_FAMILY_REQUIRED",
+                "Intervention support requires an EvidenceFamily and explicit bounded scope",
+            )
         edge_data = {
             "world_model_id": world_model_id,
             "source_id": source_id,
@@ -254,6 +276,17 @@ class ResearchBrain:
             "against_ids": against_ids or [],
             "unresolved_prediction_ids": predictions,
             "decision_id": decision_id,
+            "scope": normalized_scope,
+            "support_level": (
+                "SINGLE_INTERVENTION" if status == "INTERVENTION_SUPPORTED" else "NONE"
+            ),
+            "supporting_evidence_family_ids": support_families,
+            "contradicting_evidence_family_ids": against_families,
+            "independent_support_family_count": len(support_families),
+            "independent_contradicting_family_count": len(against_families),
+            "replication_count": 0,
+            "matched_control_count": 0,
+            "counter_intervention_count": 0,
         }
         created = self.store.world_model_child_create(
             world_model_id,
@@ -275,6 +308,9 @@ class ResearchBrain:
         supporting_ids: list[str] | None = None,
         against_ids: list[str] | None = None,
         decision_id: str | None = None,
+        scope: str | dict[str, Any] | None = None,
+        supporting_evidence_family_ids: list[str] | None = None,
+        contradicting_evidence_family_ids: list[str] | None = None,
     ) -> dict:
         if status not in EDGE_STATUSES:
             raise GPUError("INVALID_CAUSAL_EDGE_STATUS", status)
@@ -285,8 +321,31 @@ class ResearchBrain:
         )
         against = list(dict.fromkeys([*edge["data"].get("against_ids", []), *(against_ids or [])]))
         evidence = [*supporting, *against]
-        references = [*evidence, *([decision_id] if decision_id else [])]
+        support_families = list(
+            dict.fromkeys(
+                [
+                    *edge["data"].get("supporting_evidence_family_ids", []),
+                    *(supporting_evidence_family_ids or []),
+                ]
+            )
+        )
+        against_families = list(
+            dict.fromkeys(
+                [
+                    *edge["data"].get("contradicting_evidence_family_ids", []),
+                    *(contradicting_evidence_family_ids or []),
+                ]
+            )
+        )
+        references = [
+            *evidence,
+            *support_families,
+            *against_families,
+            *([decision_id] if decision_id else []),
+        ]
         self._validate_references(model["project_id"], references)
+        for family_id in [*support_families, *against_families]:
+            self._expect(family_id, "EvidenceFamily")
         if decision_id:
             self._expect(decision_id, "ResearchDecision")
         if (
@@ -295,6 +354,28 @@ class ResearchBrain:
             and not evidence
         ):
             raise GPUError("CAUSAL_EDGE_EVIDENCE_REQUIRED", status)
+        normalized_scope = normalize_scientific_scope(
+            scope if scope is not None else edge["data"].get("scope")
+        )
+        if status == "INTERVENTION_SUPPORTED":
+            if not support_families or not scope_is_empirically_bounded(normalized_scope):
+                raise GPUError(
+                    "CAUSAL_PROMOTION_SCOPE_OR_FAMILY_REQUIRED",
+                    "Intervention support requires an EvidenceFamily and explicit bounded scope",
+                )
+            if against_families:
+                raise GPUError(
+                    "WORLD_MODEL_CONSISTENCY_ERROR",
+                    "Resolve contradicting EvidenceFamilies before causal promotion",
+                )
+        support_count = len(support_families)
+        support_level = (
+            "NONE"
+            if support_count == 0
+            else "SINGLE_INTERVENTION"
+            if support_count == 1
+            else "REPLICATED_WITHIN_SCOPE"
+        )
         return self.store.causal_edge_update_atomic(
             edge_id,
             {
@@ -303,6 +384,13 @@ class ResearchBrain:
                 "against_ids": against,
                 "decision_id": decision_id,
                 "last_update_rationale": rationale,
+                "scope": normalized_scope,
+                "support_level": support_level,
+                "supporting_evidence_family_ids": support_families,
+                "contradicting_evidence_family_ids": against_families,
+                "independent_support_family_count": support_count,
+                "independent_contradicting_family_count": len(against_families),
+                "replication_count": max(support_count - 1, 0),
             },
             "VERIFIED_REAL" if status == "INTERVENTION_SUPPORTED" else "RESULT_INSPECTED",
             {
@@ -804,7 +892,7 @@ class ResearchBrain:
         evidence_against: list[str],
         unexpected_observations: list[str],
         alternative_explanations: list[str],
-        scope: str,
+        scope: str | dict[str, Any],
         hypothesis_transition: str,
         rationale: str,
         causal_edge_id: str | None = None,
@@ -905,6 +993,14 @@ class ResearchBrain:
             edge = self._expect(causal_edge_id, "CausalEdge")
             if str(edge["project_id"]) != project_id:
                 raise GPUError("RESEARCH_PROJECT_MISMATCH", causal_edge_id)
+        normalized_scope = normalize_scientific_scope(scope)
+        if causal_edge_status == "INTERVENTION_SUPPORTED" and not scope_is_empirically_bounded(
+            normalized_scope
+        ):
+            raise GPUError(
+                "CAUSAL_PROMOTION_SCOPE_REQUIRED",
+                "Intervention support requires explicit model/architecture, intervention, and metric scope",
+            )
         evidence_data = {
             "source_type": "ExperimentRun",
             "run_id": run_id,
@@ -919,7 +1015,8 @@ class ResearchBrain:
             "against_observations": evidence_against,
             "unexpected_observations": unexpected_observations,
             "alternative_explanations": alternative_explanations,
-            "scope": scope,
+            "scope": normalized_scope,
+            "matched_control_present": bool(experiment["data"].get("plan", {}).get("control")),
             "artifacts": run["data"].get("artifacts", []),
             "exit_code": run["data"].get("exit_code"),
             "extraction_method": "explicit_result_assessment",
@@ -940,7 +1037,7 @@ class ResearchBrain:
                 "frozen_pass_condition": pass_condition,
                 "condition_evaluations": condition_evaluations,
                 "guard_passed": guard_passed,
-                "scope": scope,
+                "scope": normalized_scope,
             },
             agenda_status=(
                 "ACTIVE"

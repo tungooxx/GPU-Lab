@@ -160,7 +160,9 @@ class BenchmarkDecision(BaseModel):
     realized_information_gain: float | None = Field(default=None, ge=0.0)
     decision_relevance: float | None = Field(default=None, ge=0.0)
     gpu_hours: float | None = Field(default=None, ge=0.0)
-    cross_project_transfer: str = Field(default="NONE", pattern="^(NONE|POSITIVE|NEGATIVE)$")
+    cross_project_transfer: str | None = Field(
+        default=None, pattern="^(NONE|POSITIVE|NEGATIVE)$"
+    )
     strategy_reused: bool = False
     strategy_reuse_succeeded: bool | None = None
 
@@ -427,12 +429,20 @@ class ResearchBrainBench:
                 "only meaningful after outcome assessment",
             ),
             "cross_project_positive_transfer": metric(
-                float(decision.cross_project_transfer == "POSITIVE"),
+                (
+                    float(decision.cross_project_transfer == "POSITIVE")
+                    if decision.cross_project_transfer is not None
+                    else None
+                ),
                 None,
                 "positive transfer must be established by a held-out transfer test",
             ),
             "cross_project_negative_transfer": metric(
-                float(decision.cross_project_transfer == "NEGATIVE"),
+                (
+                    float(decision.cross_project_transfer == "NEGATIVE")
+                    if decision.cross_project_transfer is not None
+                    else None
+                ),
                 None,
                 "negative transfer must be preserved rather than averaged away",
             ),

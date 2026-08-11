@@ -176,6 +176,58 @@ def test_migration_stamps_a_legacy_embedding_at_the_migration_boundary():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_upgrade_places_preexisting_unfinalized_history_at_a_conservative_boundary():
+    store = ResearchStore(TEST_DATABASE_URL)
+    project = store.project_create(f"upgrade-{time.time_ns()}", "Can old history leak?")
+    hypothesis = store.object_create(
+        project["project_id"],
+        "Hypothesis",
+        {"mechanism": "pre-upgrade state"},
+        "HYPOTHESIS_CREATED",
+    )
+    with psycopg.connect(TEST_DATABASE_URL) as connection, connection.cursor() as cursor:
+        for table in (
+            "research_object_versions",
+            "research_project_versions",
+            "research_events",
+        ):
+            cursor.execute(
+                f"ALTER TABLE {table} ALTER COLUMN commit_token DROP NOT NULL"
+            )
+        cursor.execute(
+            "UPDATE research_object_versions SET committed_at=NULL,commit_token=NULL "
+            "WHERE object_id=%s",
+            (hypothesis["id"],),
+        )
+        cursor.execute(
+            "UPDATE research_project_versions SET committed_at=NULL,commit_token=NULL "
+            "WHERE project_id=%s",
+            (project["project_id"],),
+        )
+        cursor.execute(
+            "UPDATE research_events SET committed_at=NULL,commit_token=NULL "
+            "WHERE project_id=%s",
+            (project["project_id"],),
+        )
+    before_upgrade = datetime.now(UTC)
+    time.sleep(0.01)
+
+    store._migrate()
+    after_upgrade = datetime.now(UTC)
+
+    with pytest.raises(GPUError) as error:
+        store.object_get(hypothesis["id"], as_of=before_upgrade)
+    assert error.value.error_type == "TEMPORAL_OBJECT_NOT_VISIBLE"
+    visible = store.object_get(hypothesis["id"], as_of=after_upgrade)
+    assert visible["legacy_backfill"] is True
+    assert visible["data"]["mechanism"] == "pre-upgrade state"
+    assert any(
+        event["event_type"] == "HYPOTHESIS_CREATED"
+        for event in store.events(project["project_id"], as_of=after_upgrade)
+    )
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_historical_brain_step_is_non_mutating_and_cannot_see_future_run():
     store = ResearchStore(TEST_DATABASE_URL)
     brain = ResearchBrain(store)

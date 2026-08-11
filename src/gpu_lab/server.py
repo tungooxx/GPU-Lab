@@ -89,6 +89,8 @@ _READ_ONLY_TOOLS = {
     "supporting_evidence_families",
     "contradicting_evidence_families",
     "group_evidence_by_origin",
+    "belief_audit",
+    "world_model_consistency_check",
     "world_model_get",
     "hypothesis_portfolio_get",
     "literature_provider_status",
@@ -807,6 +809,18 @@ async def group_evidence_by_origin(entity_id: str, as_of: str | None = None):
 
 
 @mcp.tool()
+async def belief_audit(entity_id: str, as_of: str | None = None):
+    """Explain independent support, contradictions, scope, and promotion risks for one belief."""
+    return await call(epistemics().belief_audit, entity_id, as_of)
+
+
+@mcp.tool()
+async def world_model_consistency_check(project_id: str, as_of: str | None = None):
+    """Report typed scientific graph inconsistencies without deleting or promoting state."""
+    return await call(epistemics().world_model_consistency_check, project_id, as_of)
+
+
+@mcp.tool()
 async def research_state_update(project_id: str, update: dict):
     """Persist the evidence-backed research focus that guides the next discriminating test."""
     return await call(research().project_state_update, project_id, update)
@@ -854,6 +868,9 @@ async def causal_edge_create(
     against_ids: list[str] | None = None,
     unresolved_prediction_ids: list[str] | None = None,
     decision_id: str | None = None,
+    scope: str | dict | None = None,
+    supporting_evidence_family_ids: list[str] | None = None,
+    contradicting_evidence_family_ids: list[str] | None = None,
 ):
     """Create a provenance-bearing causal edge and version the WorldModel."""
     return await call(
@@ -867,6 +884,9 @@ async def causal_edge_create(
         against_ids,
         unresolved_prediction_ids,
         decision_id,
+        scope,
+        supporting_evidence_family_ids,
+        contradicting_evidence_family_ids,
     )
 
 
@@ -878,6 +898,9 @@ async def causal_edge_update(
     supporting_ids: list[str] | None = None,
     against_ids: list[str] | None = None,
     decision_id: str | None = None,
+    scope: str | dict | None = None,
+    supporting_evidence_family_ids: list[str] | None = None,
+    contradicting_evidence_family_ids: list[str] | None = None,
 ):
     """Apply an evidence-linked causal-edge transition and preserve its model version delta."""
     return await call(
@@ -888,6 +911,9 @@ async def causal_edge_update(
         supporting_ids,
         against_ids,
         decision_id,
+        scope,
+        supporting_evidence_family_ids,
+        contradicting_evidence_family_ids,
     )
 
 
@@ -1053,7 +1079,7 @@ async def brain_result_assess(
     evidence_against: list[str],
     unexpected_observations: list[str],
     alternative_explanations: list[str],
-    scope: str,
+    scope: str | dict,
     hypothesis_transition: str,
     rationale: str,
     causal_edge_id: str | None = None,
