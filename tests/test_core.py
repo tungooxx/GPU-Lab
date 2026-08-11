@@ -119,6 +119,11 @@ async def test_artifact_path_traversal_is_rejected(tmp_path):
 
 @pytest.mark.asyncio
 async def test_remote_exec_is_disabled(tmp_path):
-    service = GPUService(Settings(gpu_lab_database_url=f"sqlite:///{tmp_path / 'db.sqlite'}"))
+    service = GPUService(
+        Settings(
+            gpu_lab_database_url=f"sqlite:///{tmp_path / 'db.sqlite'}",
+            gpu_lab_enable_remote_exec=False,
+        )
+    )
     with pytest.raises(GPUError, match="REMOTE_EXEC"):
         await service.remote_exec("vast_1", "id")
