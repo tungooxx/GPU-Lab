@@ -54,7 +54,10 @@ integration tests, and real execution.
 - PaperQA 2026.3.18 is integrated behind an optional isolated HTTP worker and typed
   `LiteratureProvider`. Its contract, real import/API shape, container health, gateway-to-worker
   connectivity, and credential isolation are verified; a paid/local-model evidence query is not.
-- Reproduction execution exists, but Paper2Agent is not integrated.
+- Paper2Agent is integrated behind an optional isolated `ExecutablePaperProvider` worker. Its HTTP
+  contract, repository validation, canonical-state boundary, idempotent import, generated-tool
+  inspection, verification cap, and authorization behavior are unit tested. A real multi-hour
+  Paper2Agent generation is not yet verified because no task-scoped Claude credential was supplied.
 - Hypothesis similarity uses lexical structure unless callers provide embeddings.
 - Brain v1 critics are deterministic advisory checks; LLM-backed typed ResearchOperators are not
   integrated.

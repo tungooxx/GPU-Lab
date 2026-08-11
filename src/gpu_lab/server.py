@@ -21,6 +21,7 @@ from .brain import ResearchBrain
 from .config import Settings
 from .dashboard import DASHBOARD_HTML
 from .errors import GPUError
+from .executable_papers import ExecutablePaperService, HttpExecutablePaperProvider
 from .literature import HttpLiteratureProvider, LiteratureService
 from .local_runner import LocalRunner
 from .research import ResearchStore
@@ -29,8 +30,9 @@ from .terminal import TERMINAL_HTML
 
 logger = logging.getLogger(__name__)
 
-settings, service, research_store, research_brain, literature_service = (
+settings, service, research_store, research_brain, literature_service, executable_paper_service = (
     Settings(),
+    None,
     None,
     None,
     None,
@@ -69,6 +71,7 @@ _READ_ONLY_TOOLS = {
     "literature_provider_status",
     "literature_search",
     "literature_ask",
+    "executable_paper_provider_status",
     "claim_search",
     "claim_get_evidence",
     "claim_compare",
@@ -90,7 +93,11 @@ _READ_ONLY_TOOLS = {
     "local_artifact_list",
     "local_artifact_read",
 }
-_DESTRUCTIVE_TOOLS = {"gpu_destroy"}
+_DESTRUCTIVE_TOOLS = {
+    "gpu_destroy",
+    "executable_paper_build",
+    "executable_paper_invoke",
+}
 _OPEN_WORLD_TOOLS = {
     "gpu_list",
     "gpu_status",
@@ -114,6 +121,10 @@ _OPEN_WORLD_TOOLS = {
     "literature_ask",
     "literature_gather",
     "brain_literature_resolve",
+    "executable_paper_build",
+    "executable_paper_inspect_tools",
+    "executable_paper_verify",
+    "executable_paper_invoke",
 }
 _ACRONYMS = {"api": "API", "gpu": "GPU", "id": "ID", "ssh": "SSH", "url": "URL", "vlm": "VLM"}
 
@@ -253,6 +264,26 @@ def literature() -> LiteratureService:
                     ),
                 )
     return literature_service
+
+
+def executable_papers() -> ExecutablePaperService:
+    global executable_paper_service
+    if settings.gpu_lab_executable_paper_provider != "paper2agent-http":
+        raise GPUError(
+            "EXECUTABLE_PAPER_PROVIDER_UNAVAILABLE",
+            "Start the isolated paper-agents profile and set provider=paper2agent-http.",
+        )
+    if executable_paper_service is None:
+        with _singleton_lock:
+            if executable_paper_service is None:
+                executable_paper_service = ExecutablePaperService(
+                    research(),
+                    HttpExecutablePaperProvider(
+                        settings.gpu_lab_executable_paper_worker_url,
+                        settings.gpu_lab_executable_paper_worker_token or "",
+                    ),
+                )
+    return executable_paper_service
 
 
 async def call(fn, *args, **kwargs):
@@ -1057,6 +1088,92 @@ async def brain_literature_resolve(
         claim_statement,
         claim_scope,
     )
+
+
+@mcp.tool()
+async def executable_paper_provider_status():
+    """Report isolated Paper2Agent worker health without exposing coding-agent credentials."""
+    result = {
+        "configured_provider": settings.gpu_lab_executable_paper_provider,
+        "worker_url": settings.gpu_lab_executable_paper_worker_url,
+        "canonical_truth_owner": "PostgreSQL Research OS",
+    }
+    if settings.gpu_lab_executable_paper_provider != "paper2agent-http":
+        return {**result, "status": "disabled"}
+    try:
+        provider = executable_papers().provider
+    except GPUError as exc:
+        return exc.response()
+    worker = await call(provider.health)
+    if "error" in worker:
+        return {**result, "status": "unavailable", "error": worker["error"]}
+    return {**result, "status": worker.get("status", "ready"), "worker": worker}
+
+
+@mcp.tool()
+async def executable_paper_build(
+    project_id: str,
+    paper_id: str,
+    repository: str,
+    commit: str,
+    tutorials: str | None = None,
+    confirm_external_cost: bool = False,
+):
+    """Build an executable-paper candidate in isolated Paper2Agent; may use paid model access."""
+    if not confirm_external_cost:
+        return {
+            "error": {
+                "type": "HUMAN_APPROVAL_REQUIRED",
+                "message": "Paper2Agent may run for hours and incur external model cost. Re-submit with confirm_external_cost=true after explicit human approval.",
+            }
+        }
+    try:
+        service = executable_papers()
+    except GPUError as exc:
+        return exc.response()
+    return await call(service.build, project_id, paper_id, repository, commit, tutorials)
+
+
+@mcp.tool()
+async def executable_paper_inspect_tools(executable_paper_id: str):
+    """Initialize a generated paper MCP and persist its advertised tool schemas."""
+    try:
+        service = executable_papers()
+    except GPUError as exc:
+        return exc.response()
+    return await call(service.inspect_tools, executable_paper_id)
+
+
+@mcp.tool()
+async def executable_paper_verify(executable_paper_id: str):
+    """Run integration checks without allowing a generated worker to claim real verification."""
+    try:
+        service = executable_papers()
+    except GPUError as exc:
+        return exc.response()
+    return await call(service.verify, executable_paper_id)
+
+
+@mcp.tool()
+async def executable_paper_invoke(
+    executable_paper_id: str,
+    tool: str,
+    args: dict,
+    confirm_generated_code_execution: bool = False,
+):
+    """Invoke a verified generated tool; its output remains unassessed and non-canonical."""
+    if not confirm_generated_code_execution:
+        return {
+            "error": {
+                "type": "HUMAN_APPROVAL_REQUIRED",
+                "message": "Generated paper tools execute third-party code. Re-submit with confirm_generated_code_execution=true after explicit human approval.",
+            }
+        }
+    try:
+        service = executable_papers()
+    except GPUError as exc:
+        return exc.response()
+    return await call(service.invoke, executable_paper_id, tool, args)
 
 
 @mcp.tool()

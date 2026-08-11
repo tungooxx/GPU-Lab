@@ -21,14 +21,22 @@ They must be revisited before adding or upgrading an external dependency.
 ## Paper2Agent
 
 - Upstream source: <https://github.com/jmiao24/Paper2Agent>
+- Audited upstream commit: `e573687e15f345e3f375cd0851373d588e436be3` (default branch HEAD
+  at audit time).
 - Architecture: long-running coding-agent workflow that inspects paper repositories and generates
-  tested MCP servers; it depends on an external coding-agent runtime and creates its own outputs.
-- License: no clear repository license was confirmed during this audit.
-- Decision: **DO NOT IMPORT OR COPY SOURCE** until licensing is explicit. Keep an
-  `ExecutablePaperProvider` boundary and later evaluate a subprocess/container integration using
-  only authorized public interfaces.
+  tested MCP servers; it depends on Claude Code, external model authentication, Python/FastMCP,
+  and creates an isolated environment, reports, tests, generated code, and replaceable worker state.
+  Upstream estimates 30 minutes to 3+ hours and about USD 15 for a complex repository.
+- License: MIT for Paper2Agent. Claude Code is a separately licensed external runtime and is only
+  installed in the optional worker image; no upstream Paper2Agent source is copied into our package.
+- Decision: **SUBPROCESS WORKER in a SEPARATE SERVICE** behind `ExecutablePaperProvider`.
+- Implementation: the `paper-agents` Compose profile checks out the exact audited upstream commit,
+  pins its Claude Code runtime, accepts only public GitHub repositories, and receives only its
+  scoped token plus Anthropic credential. PostgreSQL, Vast, SSH, GPU, and literature credentials are
+  absent. Network policy prevents the worker subnet from calling GPU-Lab's MCP endpoint directly.
 - Boundary: generated tools are unverified executable-paper candidates until GPU-Lab smoke and
-  reproduction gates pass. They cannot become scientific truth themselves.
+  reproduction gates pass. Worker verification is capped at `VERIFIED_INTEGRATION`; it cannot
+  claim `VERIFIED_REAL` or mutate canonical claims, hypotheses, experiments, or WorldModel state.
 
 ## Kaimen Co-Scientist
 

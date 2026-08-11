@@ -26,7 +26,10 @@ services:
       GPU_LAB_LITERATURE_PROVIDER: ${GPU_LAB_LITERATURE_PROVIDER:-disabled}
       GPU_LAB_LITERATURE_WORKER_URL: http://literature:8010
       GPU_LAB_LITERATURE_WORKER_TOKEN: ${GPU_LAB_LITERATURE_WORKER_TOKEN:-}
-      GPU_LAB_DENIED_MCP_CLIENT_CIDRS: 172.29.0.0/24
+      GPU_LAB_EXECUTABLE_PAPER_PROVIDER: ${GPU_LAB_EXECUTABLE_PAPER_PROVIDER:-disabled}
+      GPU_LAB_EXECUTABLE_PAPER_WORKER_URL: http://paper2agent:8020
+      GPU_LAB_EXECUTABLE_PAPER_WORKER_TOKEN: ${GPU_LAB_EXECUTABLE_PAPER_WORKER_TOKEN:-}
+      GPU_LAB_DENIED_MCP_CLIENT_CIDRS: 172.29.0.0/24,172.30.0.0/24
     ports: ["127.0.0.1:8000:8000"]
     volumes: ["./data:/data", "gpu-lab-envs:/opt/gpu-lab/envs", "${GPU_LAB_SSH_PRIVATE_KEY_PATH:-/dev/null}:/run/ssh-key:ro", "${GPU_LAB_LOCAL_WORKSPACE_HOST:-F:/Newgeneration/VLM}:/workspace/local-vlm"]
     gpus: all
@@ -34,7 +37,7 @@ services:
       postgres:
         condition: service_healthy
     restart: unless-stopped
-    networks: [backend, literature]
+    networks: [backend, literature, paper-agents]
   literature:
     profiles: ["literature"]
     build:
@@ -58,10 +61,33 @@ services:
       retries: 12
     restart: unless-stopped
     networks: [literature]
+  paper2agent:
+    profiles: ["paper-agents"]
+    build:
+      context: .
+      dockerfile: paper2agent.Dockerfile
+    environment:
+      GPU_LAB_EXECUTABLE_PAPER_WORKER_TOKEN: ${GPU_LAB_EXECUTABLE_PAPER_WORKER_TOKEN:-}
+      PAPER2AGENT_ROOT: /opt/paper2agent
+      PAPER2AGENT_UPSTREAM_COMMIT: e573687e15f345e3f375cd0851373d588e436be3
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    volumes: ["paper2agent-projects:/opt/paper2agent/projects", "paper2agent-claude:/home/paperagent/.claude"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 8g
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8020/health', data=b'{}')).read()"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+    networks: [paper-agents]
 
 volumes:
   gpu-lab-envs:
   literature-papers:
+  paper2agent-projects:
+  paper2agent-claude:
 
 networks:
   backend:
@@ -70,3 +96,6 @@ networks:
   literature:
     ipam:
       config: [{subnet: 172.29.0.0/24}]
+  paper-agents:
+    ipam:
+      config: [{subnet: 172.30.0.0/24}]

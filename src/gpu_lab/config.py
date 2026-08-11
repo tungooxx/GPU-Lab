@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     gpu_lab_literature_worker_url: str = "http://literature:8010"
     gpu_lab_literature_worker_token: str | None = None
     gpu_lab_paperqa_directory: Path = Path("/opt/gpu-lab/papers")
+    gpu_lab_executable_paper_provider: str = "disabled"
+    gpu_lab_executable_paper_worker_url: str = "http://paper2agent:8020"
+    gpu_lab_executable_paper_worker_token: str | None = None
     gpu_lab_denied_mcp_client_cidrs: str = ""
     fastmcp_host: str = "127.0.0.1"
     fastmcp_port: int = 8000
@@ -43,6 +46,16 @@ class Settings(BaseSettings):
         normalized = value.strip().lower()
         if normalized not in {"disabled", "paperqa-http"}:
             raise ValueError("GPU_LAB_LITERATURE_PROVIDER must be disabled or paperqa-http")
+        return normalized
+
+    @field_validator("gpu_lab_executable_paper_provider")
+    @classmethod
+    def valid_executable_paper_provider(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"disabled", "paper2agent-http"}:
+            raise ValueError(
+                "GPU_LAB_EXECUTABLE_PAPER_PROVIDER must be disabled or paper2agent-http"
+            )
         return normalized
 
     @property

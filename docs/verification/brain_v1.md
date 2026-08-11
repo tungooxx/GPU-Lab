@@ -50,8 +50,14 @@ inspected run, five WorldModel versions, and continued with `GENERALIZATION`.
   authenticated gateway-to-worker connectivity, provenance normalization, canonical candidate
   import, unavailable-provider behavior, a non-root/capability-dropped worker with writable paper
   storage, and absence of Vast/SSH/PostgreSQL credentials in the worker environment.
+- **VERIFIED_INTEGRATION:** the Paper2Agent HTTP/provider contract, generated MCP initialization,
+  tool discovery and invocation against a real fixture MCP, exact upstream image checkout, pinned
+  Claude Code runtime, non-root worker health, retry survival after client disconnect, network
+  isolation, and absence of Vast/SSH/PostgreSQL/OpenAI credentials.
 - **UNVERIFIED:** scientific generality of HASI, real model-backed PaperQA answer quality,
-  Paper2Agent, quality-diversity operators, branch search, meta-review, and autonomous campaigns.
+  quality-diversity operators, branch search, meta-review, and autonomous campaigns. The isolated
+  Paper2Agent provider contract is implemented and unit-tested, but a model-backed build remains
+  `IMPLEMENTED_UNVERIFIED` until a scoped Claude credential is supplied for the multi-hour run.
 
 ## Known risks and next highest-value build step
 
@@ -59,5 +65,6 @@ Brain v1 uses deterministic heuristics and caller-authored candidate experiments
 integrated as an isolated optional provider, so the next literature task is a credentialed
 model-backed quality evaluation rather than another adapter. Its real smoke proves the scientific
 state machine learns from inspected evidence; it does not establish that one intervention
-generalizes across models or datasets. The next build step is executable-paper isolation only after
-license and dependency verification.
+generalizes across models or datasets. The next build step is native quality-diversity hypothesis
+niches and lineage/proximity critics; a real Paper2Agent conversion should run separately when a
+specific paper and task-scoped credential are approved.

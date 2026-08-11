@@ -126,5 +126,25 @@ provider integration checks before production use. Brain v1 has a native version
 ResearchAgenda, hypothesis portfolio, decision ledger, deterministic information-per-cost policy,
 unfinished-work recovery, and explicit result assessment. Its real smoke has exercised the vertical
 slice on PostgreSQL and a local GTX 1650. PaperQA is integrated as an optional isolated provider;
-its real model-backed answer quality is not yet verified. Paper2Agent, quality-diversity operators,
-experiment branching, and campaign automation remain later milestones.
+its real model-backed answer quality is not yet verified. Paper2Agent is also integrated behind an
+optional isolated executable-paper worker pinned to an audited upstream commit. Its provider,
+generated-MCP inspection/invocation, network isolation, and canonical-truth boundary are verified,
+but a paid model-backed paper conversion has not been run. Quality-diversity operators, experiment
+branching, and campaign automation remain later milestones.
+
+Enable the Paper2Agent worker only with a task-scoped Anthropic credential and explicit approval of
+the upstream model cost:
+
+```powershell
+$env:GPU_LAB_EXECUTABLE_PAPER_PROVIDER = "paper2agent-http"
+$env:GPU_LAB_EXECUTABLE_PAPER_WORKER_TOKEN = "<random-task-scoped-token>"
+$env:ANTHROPIC_API_KEY = "<task-scoped-key>"
+docker compose --profile paper-agents up -d --build
+```
+
+Instead of an API key, you may authenticate Claude Code interactively into its isolated persistent
+volume with `docker compose --profile paper-agents run --rm paper2agent claude`. The credential is
+not mounted into GPU-Lab or PostgreSQL.
+
+The worker accepts public GitHub repositories only. A generated tool remains non-evidentiary until
+it is used inside a preregistered GPU-Lab reproduction or experiment and the result is inspected.
