@@ -66,7 +66,7 @@ mcp = FastMCP(
 
 _READ_ONLY_TOOLS = {
     "gpu_list",
-    "gpu_status",
+    "vast_gpu_status",
     "gpu_search",
     "experiment_status",
     "experiment_logs",
@@ -114,7 +114,7 @@ _DESTRUCTIVE_TOOLS = {
 }
 _OPEN_WORLD_TOOLS = {
     "gpu_list",
-    "gpu_status",
+    "vast_gpu_status",
     "gpu_search",
     "gpu_create",
     "gpu_stop",
@@ -392,7 +392,7 @@ async def gpu_list():
 
 
 @mcp.tool()
-async def gpu_status(instance_id: str):
+async def vast_gpu_status(instance_id: str):
     """Return provider and nvidia-smi runtime state."""
     return await call(svc().gpu_status, instance_id)
 

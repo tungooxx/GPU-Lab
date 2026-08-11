@@ -1,6 +1,13 @@
 from gpu_lab.server import mcp
 
 
+def test_vast_status_tool_has_provider_specific_name():
+    names = set(mcp._tool_manager._tools)
+
+    assert "vast_gpu_status" in names
+    assert "gpu_status" not in names
+
+
 def test_every_mcp_tool_has_chatgpt_metadata():
     for tool in mcp._tool_manager._tools.values():
         assert tool.title
