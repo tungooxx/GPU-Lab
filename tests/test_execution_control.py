@@ -91,6 +91,19 @@ class LegacyReservedResearch:
         }
 
 
+class LegacyAbandonedResearch(LegacyReservedResearch):
+    def object_get(self, _run_id):
+        return {
+            "id": "run-id",
+            "kind": "ExperimentRun",
+            "status": "cancelled",
+            "data": {
+                "job_id": "missing-job",
+                "legacy_abandonment": {"verified_missing_backing_job": True},
+            },
+        }
+
+
 class LegacyAbandonBrain:
     def __init__(self):
         self.args = None
@@ -221,3 +234,17 @@ async def test_legacy_reserved_run_abandon_refuses_when_job_exists(monkeypatch):
 
     assert result["error"]["type"] == "LEGACY_RUN_BACKING_JOB_NOT_PROVEN_ABSENT"
     assert brain.args is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_reserved_run_abandon_allows_only_verified_abandonment_replay(monkeypatch):
+    brain = LegacyAbandonBrain()
+    monkeypatch.setattr(server.settings, "gpu_lab_enable_local_runner", True)
+    monkeypatch.setattr(server, "research", lambda: LegacyAbandonedResearch())
+    monkeypatch.setattr(server, "brain", lambda: brain)
+    monkeypatch.setattr(server, "local", MissingLocal())
+
+    result = await server.legacy_reserved_run_abandon("run-id", "No local job was submitted")
+
+    assert result["status"] == "cancelled"
+    assert brain.args == ("run-id", "missing-job", "No local job was submitted")

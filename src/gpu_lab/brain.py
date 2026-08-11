@@ -630,7 +630,11 @@ class ResearchBrain:
     def legacy_reserved_run_abandon(self, run_id: str, job_id: str, rationale: str) -> dict:
         """Cancel an unsubmitted pre-decision reservation without creating execution evidence."""
         run = self._expect(run_id, "ExperimentRun")
-        if run["status"] != "RESERVED":
+        is_abandoned_replay = (
+            run["status"] == "cancelled"
+            and run["data"].get("legacy_abandonment", {}).get("verified_missing_backing_job") is True
+        )
+        if run["status"] != "RESERVED" and not is_abandoned_replay:
             raise GPUError("LEGACY_RUN_NOT_ABANDONABLE", run["status"])
         if run["data"].get("job_id") != job_id:
             raise GPUError("LEGACY_RUN_JOB_MISMATCH", job_id)

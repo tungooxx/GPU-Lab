@@ -867,7 +867,14 @@ async def legacy_reserved_run_abandon(run_id: str, rationale: str):
     run = await call(research().object_get, run_id)
     if "error" in run:
         return run
-    if run.get("kind") != "ExperimentRun" or run.get("status") != "RESERVED":
+    is_abandoned_replay = (
+        run.get("status") == "cancelled"
+        and run.get("data", {}).get("legacy_abandonment", {}).get("verified_missing_backing_job")
+        is True
+    )
+    if run.get("kind") != "ExperimentRun" or (
+        run.get("status") != "RESERVED" and not is_abandoned_replay
+    ):
         return {"error": {"type": "LEGACY_RUN_NOT_ABANDONABLE", "message": run.get("status")}}
     job_id = run.get("data", {}).get("job_id")
     if not isinstance(job_id, str) or not job_id:
