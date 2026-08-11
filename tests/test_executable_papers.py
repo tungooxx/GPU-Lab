@@ -178,6 +178,33 @@ async def test_generated_worker_cannot_self_promote_to_verified_real():
 
 
 @pytest.mark.asyncio
+async def test_naive_approval_expiry_is_rejected_as_structured_error():
+    store = FakeStore()
+    paper = store.object_create("project", "Paper", {}, "PAPER_CREATED")
+    service = ExecutablePaperService(store, FakeProvider())
+    parameters = {
+        "project_id": "project",
+        "paper_id": paper["id"],
+        "repository": "https://github.com/owner/repo",
+        "commit": "1" * 40,
+        "tutorials": None,
+    }
+    approval = service.approve("project", "BUILD", parameters, "human", "test")
+    approval["data"]["expires_at"] = "2026-08-11T00:00:00"
+
+    with pytest.raises(GPUError) as error:
+        await service.build(
+            "project",
+            paper["id"],
+            parameters["repository"],
+            parameters["commit"],
+            approval_id=approval["id"],
+        )
+
+    assert error.value.error_type == "INVALID_ACTION_APPROVAL"
+
+
+@pytest.mark.asyncio
 async def test_repository_identity_accepts_trailing_slash_and_worker_git_suffix():
     store = FakeStore()
     paper = store.object_create("project", "Paper", {}, "PAPER_CREATED")

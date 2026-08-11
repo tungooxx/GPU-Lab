@@ -260,6 +260,8 @@ class ExecutablePaperService:
             )
         try:
             expires_at = datetime.fromisoformat(approval["data"]["expires_at"])
+            if expires_at.tzinfo is None:
+                raise ValueError("expires_at must be timezone-aware")
         except (KeyError, TypeError, ValueError) as exc:
             raise GPUError("INVALID_ACTION_APPROVAL", approval_id) from exc
         if expires_at <= datetime.now(UTC):
