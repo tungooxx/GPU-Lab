@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 import uuid
@@ -8,6 +9,84 @@ import psycopg
 from psycopg.rows import dict_row
 
 from .errors import GPUError
+
+RESEARCH_OBJECT_KINDS = (
+    "Paper",
+    "EvidenceUnit",
+    "ExecutablePaper",
+    "Claim",
+    "Mechanism",
+    "Anomaly",
+    "Contradiction",
+    "Hypothesis",
+    "Prediction",
+    "HypothesisLineage",
+    "Experiment",
+    "ExperimentRun",
+    "Artifact",
+    "Reproduction",
+    "NegativeResult",
+    "Lesson",
+    "ResearchState",
+    "ScientificVariable",
+    "Phenomenon",
+    "MechanismState",
+    "CausalEdge",
+    "InformationPath",
+    "Assumption",
+    "Scope",
+    "Intervention",
+    "ExpectedEffect",
+    "WorldModel",
+    "WorldModelVersion",
+    "ResearchAgenda",
+    "AgendaItem",
+    "HypothesisPortfolio",
+    "HypothesisNiche",
+    "ExperimentBranch",
+    "ExperimentNode",
+    "BranchRelation",
+    "ResearchDecision",
+    "ResearchActionCandidate",
+    "ActionApproval",
+    "ComparativeLesson",
+    "MetaLesson",
+)
+RESEARCH_OBJECT_STATUSES = {
+    "ACTIVE",
+    "APPROVED",
+    "BLOCKED",
+    "CANDIDATE",
+    "COMPLETED",
+    "DEFERRED",
+    "FAILED",
+    "IMPLEMENTED_UNVERIFIED",
+    "INCONCLUSIVE",
+    "OPEN",
+    "PARTIAL",
+    "PENDING_EVIDENCE_REVIEW",
+    "PREPARED",
+    "PROPOSED",
+    "REFUTED",
+    "REPRODUCED",
+    "RESERVED",
+    "RESOLVED",
+    "RESULT_INSPECTED",
+    "RESULT_NOT_INSPECTED",
+    "RUNNING",
+    "SELECTED",
+    "SUPPORTED",
+    "SURVIVES_INITIAL_TEST",
+    "VERIFIED_INTEGRATION",
+    "VERIFIED_REAL",
+    "VERIFIED_UNIT",
+    "WEAKENED",
+    "cancelled",
+    "completed",
+    "failed",
+    "running",
+    "unknown",
+}
 
 
 class ResearchStore:
@@ -23,11 +102,13 @@ class ResearchStore:
 
     def _migrate(self) -> None:
         with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext('gpu_lab_research_migration'))")
             try:
                 cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
                 self.vector_available = True
-            except psycopg.errors.UndefinedFile:
+            except (psycopg.errors.UndefinedFile, psycopg.errors.InsufficientPrivilege):
                 conn.rollback()
+                cur.execute("SELECT pg_advisory_xact_lock(hashtext('gpu_lab_research_migration'))")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS research_projects (
                     id UUID PRIMARY KEY, name TEXT UNIQUE NOT NULL, question TEXT NOT NULL,
@@ -35,7 +116,7 @@ class ResearchStore:
                 );
                 CREATE TABLE IF NOT EXISTS research_objects (
                     id UUID PRIMARY KEY, project_id UUID NOT NULL REFERENCES research_projects(id),
-                    kind TEXT NOT NULL CHECK(kind IN ('Paper','EvidenceUnit','Claim','Mechanism','Anomaly','Contradiction','Hypothesis','Prediction','HypothesisLineage','Experiment','ExperimentRun','Artifact','Reproduction','NegativeResult','Lesson','ResearchState')),
+                    kind TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'ACTIVE', data JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS research_edges (
@@ -60,9 +141,60 @@ class ResearchStore:
                     ON research_events(project_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS research_objects_project_kind_created_idx
                     ON research_objects(project_id, kind, created_at DESC);
+                CREATE INDEX IF NOT EXISTS research_objects_data_gin_idx
+                    ON research_objects USING GIN (data jsonb_path_ops);
                 CREATE INDEX IF NOT EXISTS research_execution_attempts_job_idx
                     ON research_execution_attempts(job_id);
             """)
+            allowed_kinds = ",".join("'" + kind + "'" for kind in RESEARCH_OBJECT_KINDS)
+            cur.execute(
+                "SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint "
+                "WHERE conrelid='research_objects'::regclass "
+                "AND conname='research_objects_kind_check'"
+            )
+            constraint = cur.fetchone()
+            definition = constraint["definition"] if constraint else ""
+            if not all(f"'{kind}'" in definition for kind in RESEARCH_OBJECT_KINDS):
+                cur.execute(
+                    "ALTER TABLE research_objects DROP CONSTRAINT IF EXISTS "
+                    "research_objects_kind_check"
+                )
+                cur.execute(
+                    "ALTER TABLE research_objects ADD CONSTRAINT research_objects_kind_check "
+                    f"CHECK(kind IN ({allowed_kinds}))"
+                )
+            cur.execute(
+                "SELECT project_id,data->>'name' AS name,"
+                "array_agg(id ORDER BY created_at,id) AS ids FROM research_objects "
+                "WHERE kind='HypothesisNiche' AND data ? 'name' "
+                "GROUP BY project_id,data->>'name' HAVING count(*)>1"
+            )
+            for duplicate_group in cur.fetchall():
+                canonical_id = str(duplicate_group["ids"][0])
+                for duplicate_id in duplicate_group["ids"][1:]:
+                    cur.execute("SELECT data FROM research_objects WHERE id=%s", (duplicate_id,))
+                    duplicate = cur.fetchone()
+                    renamed_data = {
+                        **duplicate["data"],
+                        "name": f"{duplicate_group['name']} [duplicate {duplicate_id}]",
+                        "duplicate_of": canonical_id,
+                    }
+                    cur.execute(
+                        "UPDATE research_objects SET data=%s WHERE id=%s",
+                        (json.dumps(renamed_data), duplicate_id),
+                    )
+                    self._event(
+                        cur,
+                        duplicate_group["project_id"],
+                        "HYPOTHESIS_NICHE_DUPLICATE_RENAMED",
+                        duplicate_id,
+                        {"canonical_id": canonical_id, "name": renamed_data["name"]},
+                    )
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS research_objects_hypothesis_niche_name_unique "
+                "ON research_objects(project_id, (data->>'name')) "
+                "WHERE kind='HypothesisNiche'"
+            )
             if self.vector_available:
                 cur.execute("ALTER TABLE research_objects ADD COLUMN IF NOT EXISTS embedding vector")
 
@@ -74,12 +206,1315 @@ class ResearchStore:
             self._event(cur, ident, "RESEARCH_PROJECT_CREATED", None, {"name": name, "question": question})
         return {"project_id": str(ident), "name": name, "state": state}
 
-    def object_create(self, project_id: str, kind: str, data: dict[str, Any], event_type: str) -> dict:
+    def project_get(self, project_id: str) -> dict:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,name,question,state,created_at FROM research_projects WHERE id=%s",
+                (project_id,),
+            )
+            project = cur.fetchone()
+        if not project:
+            raise GPUError("RESEARCH_PROJECT_NOT_FOUND", project_id)
+        return project
+
+    def object_create(
+        self,
+        project_id: str,
+        kind: str,
+        data: dict[str, Any],
+        event_type: str,
+        status: str = "ACTIVE",
+    ) -> dict:
+        if kind not in RESEARCH_OBJECT_KINDS:
+            raise GPUError("INVALID_RESEARCH_OBJECT_KIND", kind)
+        self._validate_status(status)
         ident, now = uuid.uuid4(), datetime.now(UTC)
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute("INSERT INTO research_objects VALUES(%s,%s,%s,%s,%s,%s)", (ident, project_id, kind, "ACTIVE", json.dumps(data), now))
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,%s,%s,%s,%s)",
+                (ident, project_id, kind, status, json.dumps(data), now),
+            )
             self._event(cur, project_id, event_type, ident, data)
-        return {"id": str(ident), "project_id": project_id, "kind": kind, "status": "ACTIVE", "data": data}
+        return {
+            "id": str(ident),
+            "project_id": project_id,
+            "kind": kind,
+            "status": status,
+            "data": data,
+        }
+
+    def hypothesis_create_with_edges(
+        self,
+        project_id: str,
+        data: dict[str, Any],
+        edges: list[tuple[str, str]],
+    ) -> dict:
+        """Atomically persist a QD hypothesis, its lineage, niche, and proximity edges."""
+        ident, now = uuid.uuid4(), datetime.now(UTC)
+        source_ids = sorted({source_id for source_id, _relation in edges})
+        with self._connect() as conn, conn.cursor() as cur:
+            if source_ids:
+                cur.execute(
+                    "SELECT id,project_id FROM research_objects WHERE id=ANY(%s::uuid[]) FOR SHARE",
+                    (source_ids,),
+                )
+                sources = cur.fetchall()
+                if len(sources) != len(source_ids):
+                    raise GPUError("RESEARCH_OBJECT_NOT_FOUND", "One or more QD edge sources")
+                if any(str(item["project_id"]) != str(project_id) for item in sources):
+                    raise GPUError("RESEARCH_PROJECT_MISMATCH", "QD edges must remain in one project")
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'Hypothesis','ACTIVE',%s,%s)",
+                (ident, project_id, json.dumps(data), now),
+            )
+            for source_id, relation in edges:
+                cur.execute(
+                    "INSERT INTO research_edges VALUES(%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                    (source_id, ident, relation, now),
+                )
+            self._event(cur, project_id, "QD_HYPOTHESIS_CREATED", ident, data)
+        return {
+            "id": str(ident),
+            "project_id": project_id,
+            "kind": "Hypothesis",
+            "status": "ACTIVE",
+            "data": data,
+        }
+
+    def hypothesis_niche_create(
+        self,
+        project_id: str,
+        name: str,
+        description: str,
+        diversity_signature: dict[str, Any],
+    ) -> dict:
+        """Serialize niche identity creation across gateway processes with an advisory lock."""
+        project_id = self._canonical_uuid(project_id)
+        ident, now = uuid.uuid4(), datetime.now(UTC)
+        data = {
+            "name": name,
+            "description": description,
+            "active_best_hypothesis_id": None,
+            "diversity_signature": diversity_signature,
+        }
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"hypothesis-niche:{project_id}:{name}",),
+            )
+            cur.execute(
+                "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
+                "WHERE project_id=%s AND kind='HypothesisNiche' AND data->>'name'=%s "
+                "ORDER BY created_at LIMIT 1",
+                (project_id, name),
+            )
+            existing = cur.fetchone()
+            if existing:
+                if (
+                    existing["data"].get("description") != description
+                    or existing["data"].get("diversity_signature") != diversity_signature
+                ):
+                    raise GPUError(
+                        "HYPOTHESIS_NICHE_CONFLICT",
+                        "A niche with this name already has a different definition",
+                    )
+                return {**existing, "idempotent_replay": True}
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'HypothesisNiche','ACTIVE',%s,%s)",
+                (ident, project_id, json.dumps(data), now),
+            )
+            self._event(cur, project_id, "HYPOTHESIS_NICHE_CREATED", ident, data)
+        return {
+            "id": str(ident),
+            "project_id": project_id,
+            "kind": "HypothesisNiche",
+            "status": "ACTIVE",
+            "data": data,
+        }
+
+    def hypothesis_niche_set_best(
+        self, niche_id: str, hypothesis_id: str, rationale: str
+    ) -> dict:
+        """Lock and revalidate niche membership before selecting its representative."""
+        niche_id = self._canonical_uuid(niche_id)
+        hypothesis_id = self._canonical_uuid(hypothesis_id)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
+                "WHERE id=ANY(%s::uuid[]) FOR UPDATE",
+                ([niche_id, hypothesis_id],),
+            )
+            items = {str(item["id"]): item for item in cur.fetchall()}
+            if len(items) != 2:
+                raise GPUError("RESEARCH_OBJECT_NOT_FOUND", "Niche or hypothesis")
+            niche, hypothesis = items[niche_id], items[hypothesis_id]
+            if niche["kind"] != "HypothesisNiche" or hypothesis["kind"] != "Hypothesis":
+                raise GPUError("INVALID_HYPOTHESIS_NICHE_MEMBER", hypothesis_id)
+            if str(niche["project_id"]) != str(hypothesis["project_id"]):
+                raise GPUError("RESEARCH_PROJECT_MISMATCH", hypothesis_id)
+            if str(hypothesis["data"].get("niche_id")) != niche_id:
+                raise GPUError("HYPOTHESIS_NOT_IN_NICHE", hypothesis_id)
+            if hypothesis["status"] not in {"ACTIVE", "SURVIVES_INITIAL_TEST", "SUPPORTED"}:
+                raise GPUError("HYPOTHESIS_NOT_ACTIVE", hypothesis["status"])
+            data = {
+                **niche["data"],
+                "active_best_hypothesis_id": hypothesis_id,
+                "selection_rationale": rationale,
+            }
+            cur.execute("UPDATE research_objects SET data=%s WHERE id=%s", (json.dumps(data), niche_id))
+            self._event(
+                cur,
+                niche["project_id"],
+                "HYPOTHESIS_NICHE_BEST_CHANGED",
+                niche_id,
+                {"active_best_hypothesis_id": hypothesis_id, "selection_rationale": rationale},
+            )
+        return {**niche, "data": data}
+
+    def experiment_branch_node_create(
+        self,
+        project_id: str,
+        branch_id: str,
+        data: dict[str, Any],
+        parent_node_id: str | None,
+        experiment_id: str | None,
+    ) -> dict:
+        """Atomically persist one branch node, its typed relation, edges, and events."""
+        project_id = self._canonical_uuid(project_id)
+        branch_id = self._canonical_uuid(branch_id)
+        parent_node_id = self._canonical_uuid(parent_node_id) if parent_node_id else None
+        experiment_id = self._canonical_uuid(experiment_id) if experiment_id else None
+        data = {
+            **data,
+            "branch_id": branch_id,
+            "parent_node_id": parent_node_id,
+            "experiment_id": experiment_id,
+        }
+        node_id, relation_id, now = uuid.uuid4(), uuid.uuid4(), datetime.now(UTC)
+        reference_ids = [branch_id, *([parent_node_id] if parent_node_id else []), *([experiment_id] if experiment_id else [])]
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,project_id,kind,data FROM research_objects "
+                "WHERE id=ANY(%s::uuid[]) FOR SHARE",
+                (reference_ids,),
+            )
+            references = {str(item["id"]): item for item in cur.fetchall()}
+            if len(references) != len(set(reference_ids)):
+                raise GPUError("RESEARCH_OBJECT_NOT_FOUND", "One or more branch references")
+            if any(str(item["project_id"]) != str(project_id) for item in references.values()):
+                raise GPUError("RESEARCH_PROJECT_MISMATCH", "Branch references must share a project")
+            if references[branch_id]["kind"] != "ExperimentBranch":
+                raise GPUError("NOT_AN_EXPERIMENT_BRANCH", branch_id)
+            if parent_node_id:
+                parent = references[parent_node_id]
+                if parent["kind"] != "ExperimentNode" or str(parent["data"].get("branch_id")) != branch_id:
+                    raise GPUError("INVALID_BRANCH_PARENT", parent_node_id)
+            if experiment_id:
+                experiment = references[experiment_id]
+                if experiment["kind"] != "Experiment" or not experiment["data"].get("frozen"):
+                    raise GPUError("EXPERIMENT_NOT_PREREGISTERED", experiment_id)
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'ExperimentNode','PLANNED',%s,%s)",
+                (node_id, project_id, json.dumps(data), now),
+            )
+            cur.execute(
+                "INSERT INTO research_edges VALUES(%s,%s,'CONTAINS_NODE',%s)",
+                (branch_id, node_id, now),
+            )
+            if experiment_id:
+                cur.execute(
+                    "INSERT INTO research_edges VALUES(%s,%s,'PLANNED_BY_NODE',%s)",
+                    (experiment_id, node_id, now),
+                )
+            relation = None
+            if parent_node_id:
+                relation = {
+                    "branch_id": branch_id,
+                    "source_node_id": parent_node_id,
+                    "target_node_id": str(node_id),
+                    "relation": "BRANCHES_TO",
+                }
+                cur.execute(
+                    "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                    "VALUES(%s,%s,'BranchRelation','ACTIVE',%s,%s)",
+                    (relation_id, project_id, json.dumps(relation), now),
+                )
+                cur.execute(
+                    "INSERT INTO research_edges VALUES(%s,%s,'BRANCHES_TO',%s)",
+                    (parent_node_id, node_id, now),
+                )
+                self._event(cur, project_id, "BRANCH_RELATION_CREATED", relation_id, relation)
+            self._event(cur, project_id, "EXPERIMENT_NODE_CREATED", node_id, data)
+        return {
+            "id": str(node_id),
+            "project_id": project_id,
+            "kind": "ExperimentNode",
+            "status": "PLANNED",
+            "data": data,
+            "relation_id": str(relation_id) if relation else None,
+        }
+
+    def comparative_lesson_create(
+        self,
+        project_id: str,
+        branch_id: str,
+        node_a_id: str,
+        node_b_id: str,
+        data: dict[str, Any],
+    ) -> dict:
+        """Atomically persist a comparative lesson, relation, graph edges, and events."""
+        project_id = self._canonical_uuid(project_id)
+        branch_id = self._canonical_uuid(branch_id)
+        node_a_id = self._canonical_uuid(node_a_id)
+        node_b_id = self._canonical_uuid(node_b_id)
+        data = {
+            **data,
+            "branch_id": branch_id,
+            "node_a_id": node_a_id,
+            "node_b_id": node_b_id,
+        }
+        lesson_id, relation_id, now = uuid.uuid4(), uuid.uuid4(), datetime.now(UTC)
+        reference_ids = [branch_id, node_a_id, node_b_id]
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"comparative-lesson:{branch_id}:{node_a_id}:{node_b_id}",),
+            )
+            cur.execute(
+                "SELECT id,project_id,kind,status,data FROM research_objects "
+                "WHERE id=ANY(%s::uuid[]) FOR SHARE",
+                (reference_ids,),
+            )
+            references = {str(item["id"]): item for item in cur.fetchall()}
+            if len(references) != 3:
+                raise GPUError("RESEARCH_OBJECT_NOT_FOUND", "One or more comparison references")
+            if any(str(item["project_id"]) != str(project_id) for item in references.values()):
+                raise GPUError("RESEARCH_PROJECT_MISMATCH", "Comparison references must share a project")
+            if references[branch_id]["kind"] != "ExperimentBranch":
+                raise GPUError("NOT_AN_EXPERIMENT_BRANCH", branch_id)
+            for node_id in (node_a_id, node_b_id):
+                node = references[node_id]
+                if (
+                    node["kind"] != "ExperimentNode"
+                    or node["status"] != "RESULT_INSPECTED"
+                    or str(node["data"].get("branch_id")) != branch_id
+                ):
+                    raise GPUError("INVALID_BRANCH_COMPARISON", node_id)
+            pair_filter = {
+                "branch_id": branch_id,
+                "node_a_id": node_a_id,
+                "node_b_id": node_b_id,
+            }
+            cur.execute(
+                "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
+                "WHERE project_id=%s AND kind='ComparativeLesson' AND data @> %s::jsonb "
+                "ORDER BY created_at LIMIT 1",
+                (project_id, json.dumps(pair_filter)),
+            )
+            existing = cur.fetchone()
+            if existing:
+                cur.execute(
+                    "SELECT id FROM research_objects WHERE project_id=%s "
+                    "AND kind='BranchRelation' AND data->>'comparative_lesson_id'=%s "
+                    "ORDER BY created_at LIMIT 1",
+                    (project_id, str(existing["id"])),
+                )
+                existing_relation = cur.fetchone()
+                return {
+                    **existing,
+                    "relation_id": (
+                        str(existing_relation["id"]) if existing_relation else None
+                    ),
+                    "idempotent_replay": True,
+                }
+            relation = {
+                "branch_id": branch_id,
+                "source_node_id": node_a_id,
+                "target_node_id": node_b_id,
+                "relation": "COMPARED_WITH",
+                "comparative_lesson_id": str(lesson_id),
+            }
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'ComparativeLesson','RESULT_INSPECTED',%s,%s)",
+                (lesson_id, project_id, json.dumps(data), now),
+            )
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'BranchRelation','ACTIVE',%s,%s)",
+                (relation_id, project_id, json.dumps(relation), now),
+            )
+            for node_id in (node_a_id, node_b_id):
+                cur.execute(
+                    "INSERT INTO research_edges VALUES(%s,%s,'INFORMS_COMPARISON',%s)",
+                    (node_id, lesson_id, now),
+                )
+            self._event(cur, project_id, "COMPARATIVE_LESSON_CREATED", lesson_id, data)
+            self._event(cur, project_id, "BRANCH_RELATION_CREATED", relation_id, relation)
+        return {
+            "id": str(lesson_id),
+            "project_id": project_id,
+            "kind": "ComparativeLesson",
+            "status": "RESULT_INSPECTED",
+            "data": data,
+            "relation_id": str(relation_id),
+        }
+
+    def meta_lesson_create(self, project_id: str, data: dict[str, Any]) -> dict:
+        """Idempotently persist one process lesson for an exact scientific-state basis."""
+        if not isinstance(data.get("basis"), dict):
+            raise GPUError("INVALID_META_LESSON", "A structured basis is required")
+        fingerprint = hashlib.sha256(
+            json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        payload = {**data, "basis_fingerprint": fingerprint}
+        ident, now = uuid.uuid4(), datetime.now(UTC)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"meta-lesson:{project_id}:{fingerprint}",),
+            )
+            cur.execute(
+                "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
+                "WHERE project_id=%s AND kind='MetaLesson' "
+                "AND data->>'basis_fingerprint'=%s ORDER BY created_at LIMIT 1",
+                (project_id, fingerprint),
+            )
+            existing = cur.fetchone()
+            if existing:
+                return {**existing, "idempotent_replay": True}
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'MetaLesson','RESULT_INSPECTED',%s,%s)",
+                (ident, project_id, json.dumps(payload), now),
+            )
+            self._event(cur, project_id, "META_REVIEW_COMPLETED", ident, payload)
+        return {
+            "id": str(ident),
+            "project_id": project_id,
+            "kind": "MetaLesson",
+            "status": "RESULT_INSPECTED",
+            "data": payload,
+        }
+
+    def world_model_child_create(
+        self,
+        world_model_id: str,
+        child_kind: str,
+        child_data: dict[str, Any],
+        child_event: str,
+        list_field: str,
+        changes: dict[str, Any],
+        evidence_ids: list[str] | None = None,
+        decision_id: str | None = None,
+        child_status: str = "IMPLEMENTED_UNVERIFIED",
+    ) -> dict:
+        """Atomically create a model child, append it, and advance the model version."""
+        if child_kind not in RESEARCH_OBJECT_KINDS or list_field not in {"node_ids", "edge_ids"}:
+            raise GPUError("INVALID_WORLD_MODEL_CHILD", child_kind)
+        self._validate_status(child_status)
+        now, child_id, version_id = datetime.now(UTC), uuid.uuid4(), uuid.uuid4()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT project_id,status,data FROM research_objects "
+                "WHERE id=%s AND kind='WorldModel' FOR UPDATE",
+                (world_model_id,),
+            )
+            model = cur.fetchone()
+            if not model:
+                raise GPUError("NOT_A_WORLDMODEL", world_model_id)
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,%s,%s,%s,%s)",
+                (
+                    child_id,
+                    model["project_id"],
+                    child_kind,
+                    child_status,
+                    json.dumps(child_data),
+                    now,
+                ),
+            )
+            self._event(cur, model["project_id"], child_event, child_id, child_data)
+            current_version = int(model["data"].get("version", 0))
+            change_key = "nodes_added" if list_field == "node_ids" else "edges_added"
+            version_data = {
+                "world_model_id": world_model_id,
+                "version": current_version + 1,
+                "parent_version_id": model["data"].get("current_version_id"),
+                "changes": {
+                    **changes,
+                    change_key: [*changes.get(change_key, []), str(child_id)],
+                },
+                "evidence_ids": evidence_ids or [],
+                "decision_id": decision_id,
+                "timestamp": now.isoformat(),
+            }
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'WorldModelVersion','IMPLEMENTED_UNVERIFIED',%s,%s)",
+                (version_id, model["project_id"], json.dumps(version_data), now),
+            )
+            self._event(
+                cur,
+                model["project_id"],
+                "WORLD_MODEL_VERSION_CREATED",
+                version_id,
+                version_data,
+            )
+            model_data = {
+                **model["data"],
+                list_field: [*model["data"].get(list_field, []), str(child_id)],
+                "current_version_id": str(version_id),
+                "version": current_version + 1,
+            }
+            cur.execute(
+                "UPDATE research_objects SET data=%s WHERE id=%s",
+                (json.dumps(model_data), world_model_id),
+            )
+            self._event(
+                cur,
+                model["project_id"],
+                "WORLD_MODEL_CHILD_ADDED",
+                world_model_id,
+                {"field": list_field, "child_id": str(child_id)},
+            )
+        return {
+            "child": {
+                "id": str(child_id),
+                "project_id": str(model["project_id"]),
+                "kind": child_kind,
+                "status": child_status,
+                "data": child_data,
+            },
+            "version": {
+                "id": str(version_id),
+                "project_id": str(model["project_id"]),
+                "kind": "WorldModelVersion",
+                "status": "IMPLEMENTED_UNVERIFIED",
+                "data": version_data,
+            },
+        }
+
+    def world_model_create_atomic(self, project_id: str, name: str, scope: str) -> dict:
+        """Create a WorldModel and its required initial version in one transaction."""
+        now, model_id, version_id = datetime.now(UTC), uuid.uuid4(), uuid.uuid4()
+        version_data = {
+            "world_model_id": str(model_id),
+            "version": 1,
+            "parent_version_id": None,
+            "changes": {"world_model_created": True},
+            "evidence_ids": [],
+            "decision_id": None,
+            "timestamp": now.isoformat(),
+        }
+        model_data = {
+            "name": name,
+            "scope": scope,
+            "node_ids": [],
+            "edge_ids": [],
+            "current_version_id": str(version_id),
+            "version": 1,
+        }
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'WorldModel','IMPLEMENTED_UNVERIFIED',%s,%s)",
+                (model_id, project_id, json.dumps(model_data), now),
+            )
+            self._event(cur, project_id, "WORLD_MODEL_CREATED", model_id, model_data)
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'WorldModelVersion','IMPLEMENTED_UNVERIFIED',%s,%s)",
+                (version_id, project_id, json.dumps(version_data), now),
+            )
+            self._event(
+                cur, project_id, "WORLD_MODEL_VERSION_CREATED", version_id, version_data
+            )
+            self._event(
+                cur,
+                project_id,
+                "WORLD_MODEL_VERSION_ADVANCED",
+                model_id,
+                {"version": 1},
+            )
+        return {
+            "world_model": {
+                "id": str(model_id),
+                "project_id": project_id,
+                "kind": "WorldModel",
+                "status": "IMPLEMENTED_UNVERIFIED",
+                "data": model_data,
+            },
+            "version": {
+                "id": str(version_id),
+                "project_id": project_id,
+                "kind": "WorldModelVersion",
+                "status": "IMPLEMENTED_UNVERIFIED",
+                "data": version_data,
+            },
+        }
+
+    def agenda_create_once(self, project_id: str, name: str) -> dict:
+        """Serialize creation so a project has at most one active research agenda."""
+        project_id = self._canonical_uuid(project_id)
+
+        def response(row: dict, *, idempotent_replay: bool) -> dict:
+            return {
+                "id": str(row["id"]),
+                "project_id": str(row["project_id"]),
+                "kind": row["kind"],
+                "status": row["status"],
+                "data": row["data"],
+                "created_at": row["created_at"],
+                "idempotent_replay": idempotent_replay,
+            }
+
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"agenda:{project_id}",))
+            cur.execute(
+                "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
+                "WHERE project_id=%s AND kind='ResearchAgenda' AND status='ACTIVE' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (project_id,),
+            )
+            existing = cur.fetchone()
+            if existing:
+                return response(existing, idempotent_replay=True)
+            ident, now = uuid.uuid4(), datetime.now(UTC)
+            data = {"name": name, "item_ids": []}
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'ResearchAgenda','ACTIVE',%s,%s)",
+                (ident, project_id, json.dumps(data), now),
+            )
+            self._event(cur, project_id, "RESEARCH_AGENDA_CREATED", ident, data)
+            return response(
+                {
+                    "id": ident,
+                    "project_id": project_id,
+                    "kind": "ResearchAgenda",
+                    "status": "ACTIVE",
+                    "data": data,
+                    "created_at": now,
+                },
+                idempotent_replay=False,
+            )
+
+    def agenda_item_create_atomic(self, agenda_id: str, data: dict[str, Any]) -> dict:
+        """Create an agenda item and append its ID without losing concurrent inserts."""
+        ident, now = uuid.uuid4(), datetime.now(UTC)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT project_id,status,data FROM research_objects "
+                "WHERE id=%s AND kind='ResearchAgenda' FOR UPDATE",
+                (agenda_id,),
+            )
+            agenda = cur.fetchone()
+            if not agenda:
+                raise GPUError("NOT_A_RESEARCHAGENDA", agenda_id)
+            if agenda["status"] != "ACTIVE":
+                raise GPUError("RESEARCH_AGENDA_NOT_ACTIVE", agenda["status"])
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'AgendaItem','OPEN',%s,%s)",
+                (ident, agenda["project_id"], json.dumps(data), now),
+            )
+            self._event(cur, agenda["project_id"], "AGENDA_ITEM_CREATED", ident, data)
+            agenda_data = {
+                **agenda["data"],
+                "item_ids": [*agenda["data"].get("item_ids", []), str(ident)],
+            }
+            cur.execute(
+                "UPDATE research_objects SET data=%s WHERE id=%s",
+                (json.dumps(agenda_data), agenda_id),
+            )
+            self._event(
+                cur,
+                agenda["project_id"],
+                "RESEARCH_AGENDA_ITEM_ADDED",
+                agenda_id,
+                {"item_id": str(ident)},
+            )
+        return {
+            "id": str(ident),
+            "project_id": str(agenda["project_id"]),
+            "kind": "AgendaItem",
+            "status": "OPEN",
+            "data": data,
+        }
+
+    def world_model_update_and_version(
+        self,
+        world_model_id: str,
+        model_update: dict[str, Any],
+        changes: dict[str, Any],
+        evidence_ids: list[str],
+        decision_id: str | None,
+        event_type: str,
+    ) -> dict:
+        """Lock a world model while applying a change and allocating its next version."""
+        now, version_id = datetime.now(UTC), uuid.uuid4()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT project_id,status,data FROM research_objects "
+                "WHERE id=%s AND kind='WorldModel' FOR UPDATE",
+                (world_model_id,),
+            )
+            model = cur.fetchone()
+            if not model:
+                raise GPUError("NOT_A_WORLDMODEL", world_model_id)
+            current_version = int(model["data"].get("version", 0))
+            version_data = {
+                "world_model_id": world_model_id,
+                "version": current_version + 1,
+                "parent_version_id": model["data"].get("current_version_id"),
+                "changes": changes,
+                "evidence_ids": evidence_ids,
+                "decision_id": decision_id,
+                "timestamp": now.isoformat(),
+            }
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'WorldModelVersion','IMPLEMENTED_UNVERIFIED',%s,%s)",
+                (version_id, model["project_id"], json.dumps(version_data), now),
+            )
+            self._event(
+                cur,
+                model["project_id"],
+                "WORLD_MODEL_VERSION_CREATED",
+                version_id,
+                version_data,
+            )
+            data = {
+                **model["data"],
+                **model_update,
+                "current_version_id": str(version_id),
+                "version": current_version + 1,
+            }
+            cur.execute(
+                "UPDATE research_objects SET data=%s WHERE id=%s",
+                (json.dumps(data), world_model_id),
+            )
+            self._event(
+                cur,
+                model["project_id"],
+                event_type,
+                world_model_id,
+                {"status": model["status"], **model_update},
+            )
+        return {
+            "model": {"id": world_model_id, "status": model["status"], "data": data},
+            "version": {
+                "id": str(version_id),
+                "project_id": str(model["project_id"]),
+                "kind": "WorldModelVersion",
+                "status": "IMPLEMENTED_UNVERIFIED",
+                "data": version_data,
+            },
+        }
+
+    def causal_edge_update_atomic(
+        self,
+        edge_id: str,
+        data_update: dict[str, Any],
+        object_status: str,
+        changes: dict[str, Any],
+        evidence_ids: list[str],
+        decision_id: str | None,
+    ) -> dict:
+        """Update a causal edge and advance its world model in one transaction."""
+        self._validate_status(object_status)
+        if "world_model_id" in data_update:
+            raise GPUError("CAUSAL_EDGE_WORLD_MODEL_IMMUTABLE", edge_id)
+        now, version_id = datetime.now(UTC), uuid.uuid4()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT project_id,status,data FROM research_objects "
+                "WHERE id=%s AND kind='CausalEdge' FOR UPDATE",
+                (edge_id,),
+            )
+            edge = cur.fetchone()
+            if not edge:
+                raise GPUError("NOT_A_CAUSALEDGE", edge_id)
+            model_id = edge["data"].get("world_model_id")
+            cur.execute(
+                "SELECT project_id,status,data FROM research_objects "
+                "WHERE id=%s AND kind='WorldModel' FOR UPDATE",
+                (model_id,),
+            )
+            model = cur.fetchone()
+            if not model:
+                raise GPUError("NOT_A_WORLDMODEL", str(model_id))
+            if str(model["project_id"]) != str(edge["project_id"]):
+                raise GPUError("RESEARCH_PROJECT_MISMATCH", edge_id)
+            edge_data = {**edge["data"], **data_update}
+            cur.execute(
+                "UPDATE research_objects SET status=%s,data=%s WHERE id=%s",
+                (object_status, json.dumps(edge_data), edge_id),
+            )
+            self._event(
+                cur,
+                edge["project_id"],
+                "CAUSAL_EDGE_STATUS_CHANGED",
+                edge_id,
+                {"status": object_status, **data_update},
+            )
+            version_number = int(model["data"].get("version", 0)) + 1
+            version_data = {
+                "world_model_id": str(model_id),
+                "version": version_number,
+                "parent_version_id": model["data"].get("current_version_id"),
+                "changes": changes,
+                "evidence_ids": evidence_ids,
+                "decision_id": decision_id,
+                "timestamp": now.isoformat(),
+            }
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'WorldModelVersion','IMPLEMENTED_UNVERIFIED',%s,%s)",
+                (version_id, edge["project_id"], json.dumps(version_data), now),
+            )
+            self._event(
+                cur,
+                edge["project_id"],
+                "WORLD_MODEL_VERSION_CREATED",
+                version_id,
+                version_data,
+            )
+            model_data = {
+                **model["data"],
+                "current_version_id": str(version_id),
+                "version": version_number,
+            }
+            cur.execute(
+                "UPDATE research_objects SET data=%s WHERE id=%s",
+                (json.dumps(model_data), model_id),
+            )
+            self._event(
+                cur,
+                edge["project_id"],
+                "WORLD_MODEL_VERSION_ADVANCED",
+                model_id,
+                {"version": version_number},
+            )
+        return {
+            "edge": {"id": edge_id, "status": object_status, "data": edge_data},
+            "version": {
+                "id": str(version_id),
+                "project_id": str(edge["project_id"]),
+                "kind": "WorldModelVersion",
+                "status": "IMPLEMENTED_UNVERIFIED",
+                "data": version_data,
+            },
+        }
+
+    def brain_decision_create(
+        self,
+        project_id: str,
+        candidates: list[dict[str, Any]],
+        selected_index: int,
+        decision_data: dict[str, Any],
+    ) -> dict:
+        """Persist one Brain step's candidates and decision in a single transaction."""
+        if not candidates or not 0 <= selected_index < len(candidates):
+            raise GPUError("INVALID_BRAIN_DECISION", "A selected candidate is required")
+        now = datetime.now(UTC)
+        candidate_ids = [uuid.uuid4() for _ in candidates]
+        decision_id = uuid.uuid4()
+        persisted = [
+            {**candidate, "id": str(candidate_id)}
+            for candidate, candidate_id in zip(candidates, candidate_ids, strict=True)
+        ]
+        materialized = {
+            **decision_data,
+            "candidate_action_ids": [str(item) for item in candidate_ids],
+            "candidate_actions": persisted,
+            "selected_action": persisted[selected_index],
+        }
+        with self._connect() as conn, conn.cursor() as cur:
+            for candidate, candidate_id in zip(candidates, candidate_ids, strict=True):
+                cur.execute(
+                    "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                    "VALUES(%s,%s,'ResearchActionCandidate','PROPOSED',%s,%s)",
+                    (candidate_id, project_id, json.dumps(candidate), now),
+                )
+                self._event(
+                    cur,
+                    project_id,
+                    "RESEARCH_ACTION_CANDIDATE_CREATED",
+                    candidate_id,
+                    candidate,
+                )
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'ResearchDecision','SELECTED',%s,%s)",
+                (decision_id, project_id, json.dumps(materialized), now),
+            )
+            self._event(
+                cur,
+                project_id,
+                "RESEARCH_DECISION_SELECTED",
+                decision_id,
+                materialized,
+            )
+        return {
+            "decision": {
+                "id": str(decision_id),
+                "project_id": project_id,
+                "kind": "ResearchDecision",
+                "status": "SELECTED",
+                "data": materialized,
+            },
+            "candidates": persisted,
+            "selected": persisted[selected_index],
+        }
+
+    def result_assessment_apply(
+        self,
+        *,
+        run_id: str,
+        decision_id: str,
+        hypothesis_id: str,
+        agenda_item_id: str,
+        evidence_data: dict[str, Any],
+        hypothesis_transition: str,
+        rationale: str,
+        inspection: dict[str, Any],
+        agenda_status: str,
+        actual_information_gain: str,
+        causal_edge_id: str | None = None,
+        causal_edge_status: str | None = None,
+    ) -> dict:
+        """Apply a complete scientific result assessment atomically."""
+        self._validate_status(hypothesis_transition)
+        self._validate_status(agenda_status)
+        now, evidence_id = datetime.now(UTC), uuid.uuid4()
+        try:
+            run_id = str(uuid.UUID(run_id))
+            decision_id = str(uuid.UUID(decision_id))
+            hypothesis_id = str(uuid.UUID(hypothesis_id))
+            agenda_item_id = str(uuid.UUID(agenda_item_id))
+            causal_edge_id = str(uuid.UUID(causal_edge_id)) if causal_edge_id else None
+        except (ValueError, AttributeError) as exc:
+            raise GPUError("INVALID_RESEARCH_OBJECT_ID", str(exc)) from exc
+        identifiers = [run_id, decision_id, hypothesis_id, agenda_item_id]
+        if causal_edge_id:
+            identifiers.append(causal_edge_id)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,project_id,kind,status,data FROM research_objects "
+                "WHERE id=ANY(%s::uuid[]) FOR UPDATE",
+                (identifiers,),
+            )
+            rows = {str(row["id"]): row for row in cur.fetchall()}
+            if len(rows) != len(set(identifiers)):
+                missing = next(item for item in identifiers if item not in rows)
+                raise GPUError("RESEARCH_OBJECT_NOT_FOUND", missing)
+            run, decision = rows[run_id], rows[decision_id]
+            hypothesis, agenda = rows[hypothesis_id], rows[agenda_item_id]
+            expected_kinds = (
+                (run, "ExperimentRun"),
+                (decision, "ResearchDecision"),
+                (hypothesis, "Hypothesis"),
+                (agenda, "AgendaItem"),
+            )
+            for row, kind in expected_kinds:
+                if row["kind"] != kind:
+                    raise GPUError(f"NOT_A_{kind.upper()}", str(row["id"]))
+            project_id = str(run["project_id"])
+            if any(str(row["project_id"]) != project_id for row, _ in expected_kinds):
+                raise GPUError("RESEARCH_PROJECT_MISMATCH", "Assessment inputs differ")
+            if run["status"] == "RESULT_INSPECTED":
+                prior = run["data"].get("inspection", {})
+                if self._assessment_replay_matches(prior, decision["data"], run_id, decision_id):
+                    return {
+                        "run": {"id": run_id, "status": run["status"], "data": run["data"]},
+                        "evidence": self._object_row(cur, prior["evidence_id"]),
+                        "hypothesis": {
+                            "id": hypothesis_id,
+                            "status": hypothesis["status"],
+                            "data": hypothesis["data"],
+                        },
+                        "agenda_item": {
+                            "id": agenda_item_id,
+                            "status": agenda["status"],
+                            "data": agenda["data"],
+                        },
+                        "decision": {
+                            "id": decision_id,
+                            "status": decision["status"],
+                            "data": decision["data"],
+                        },
+                        "world_model_update": None,
+                        "idempotent_replay": True,
+                    }
+                raise GPUError("EXPERIMENT_RESULT_ALREADY_INSPECTED", run_id)
+            if run["status"] not in {"completed", "RESULT_NOT_INSPECTED", "failed", "cancelled", "unknown"}:
+                raise GPUError("EXPERIMENT_RESULT_NOT_READY", run["status"])
+
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'EvidenceUnit','VERIFIED_REAL',%s,%s)",
+                (evidence_id, project_id, json.dumps(evidence_data), now),
+            )
+            self._event(
+                cur, project_id, "EXPERIMENT_EVIDENCE_INSPECTED", evidence_id, evidence_data
+            )
+            hypothesis_data = {**hypothesis["data"], "assessment_rationale": rationale}
+            cur.execute(
+                "UPDATE research_objects SET status=%s,data=%s WHERE id=%s",
+                (hypothesis_transition, json.dumps(hypothesis_data), hypothesis_id),
+            )
+            self._event(
+                cur,
+                project_id,
+                f"HYPOTHESIS_{hypothesis_transition}",
+                hypothesis_id,
+                {"rationale": rationale},
+            )
+            inspection_data = {
+                **inspection,
+                "evidence_id": str(evidence_id),
+                "decision_id": decision_id,
+            }
+            run_data = {**run["data"], "inspection": inspection_data}
+            cur.execute(
+                "UPDATE research_objects SET status='RESULT_INSPECTED',data=%s WHERE id=%s",
+                (json.dumps(run_data), run_id),
+            )
+            self._event(
+                cur,
+                project_id,
+                "EXPERIMENT_RESULT_INSPECTED",
+                run_id,
+                inspection_data,
+            )
+            agenda_data = {**agenda["data"], "status_rationale": rationale}
+            cur.execute(
+                "UPDATE research_objects SET status=%s,data=%s WHERE id=%s",
+                (agenda_status, json.dumps(agenda_data), agenda_item_id),
+            )
+            self._event(
+                cur,
+                project_id,
+                "AGENDA_ITEM_STATUS_CHANGED",
+                agenda_item_id,
+                {"status": agenda_status, "status_rationale": rationale},
+            )
+
+            edge_result = None
+            if causal_edge_id:
+                edge = rows[causal_edge_id]
+                if edge["kind"] != "CausalEdge":
+                    raise GPUError("NOT_A_CAUSALEDGE", causal_edge_id)
+                if str(edge["project_id"]) != project_id:
+                    raise GPUError("RESEARCH_PROJECT_MISMATCH", causal_edge_id)
+                supporting = list(edge["data"].get("supporting_ids", []))
+                against = list(edge["data"].get("against_ids", []))
+                evidence_targets = {
+                    "OBSERVED_ASSOCIATION": supporting,
+                    "HYPOTHESIZED_CAUSAL": supporting,
+                    "INTERVENTION_SUPPORTED": supporting,
+                    "WEAKENED": against,
+                    "REFUTED": against,
+                    "UNKNOWN": None,
+                }
+                target = evidence_targets.get(str(causal_edge_status))
+                if target is None and causal_edge_status != "UNKNOWN":
+                    raise GPUError("INVALID_CAUSAL_EDGE_STATUS", str(causal_edge_status))
+                if target is not None and str(evidence_id) not in target:
+                    target.append(str(evidence_id))
+                edge_data = {
+                    **edge["data"],
+                    "edge_status": causal_edge_status,
+                    "supporting_ids": supporting,
+                    "against_ids": against,
+                    "decision_id": decision_id,
+                    "last_update_rationale": rationale,
+                }
+                edge_status = (
+                    "VERIFIED_REAL"
+                    if causal_edge_status == "INTERVENTION_SUPPORTED"
+                    else "RESULT_INSPECTED"
+                )
+                cur.execute(
+                    "UPDATE research_objects SET status=%s,data=%s WHERE id=%s",
+                    (edge_status, json.dumps(edge_data), causal_edge_id),
+                )
+                self._event(
+                    cur,
+                    project_id,
+                    "CAUSAL_EDGE_STATUS_CHANGED",
+                    causal_edge_id,
+                    {"status": edge_status, "edge_status": causal_edge_status},
+                )
+                world_model_id = edge_data["world_model_id"]
+                cur.execute(
+                    "SELECT project_id,status,data FROM research_objects "
+                    "WHERE id=%s AND kind='WorldModel' FOR UPDATE",
+                    (world_model_id,),
+                )
+                model = cur.fetchone()
+                if not model:
+                    raise GPUError("NOT_A_WORLDMODEL", world_model_id)
+                if str(model["project_id"]) != project_id:
+                    raise GPUError("RESEARCH_PROJECT_MISMATCH", world_model_id)
+                version_id = uuid.uuid4()
+                version_number = int(model["data"].get("version", 0)) + 1
+                version_data = {
+                    "world_model_id": world_model_id,
+                    "version": version_number,
+                    "parent_version_id": model["data"].get("current_version_id"),
+                    "changes": {
+                        "edges_status_changed": [
+                            {
+                                "edge_id": causal_edge_id,
+                                "from": edge["data"].get("edge_status"),
+                                "to": causal_edge_status,
+                            }
+                        ]
+                    },
+                    "evidence_ids": [str(evidence_id)],
+                    "decision_id": decision_id,
+                    "timestamp": now.isoformat(),
+                }
+                cur.execute(
+                    "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                    "VALUES(%s,%s,'WorldModelVersion','IMPLEMENTED_UNVERIFIED',%s,%s)",
+                    (version_id, project_id, json.dumps(version_data), now),
+                )
+                self._event(
+                    cur,
+                    project_id,
+                    "WORLD_MODEL_VERSION_CREATED",
+                    version_id,
+                    version_data,
+                )
+                model_data = {
+                    **model["data"],
+                    "current_version_id": str(version_id),
+                    "version": version_number,
+                }
+                cur.execute(
+                    "UPDATE research_objects SET data=%s WHERE id=%s",
+                    (json.dumps(model_data), world_model_id),
+                )
+                self._event(
+                    cur,
+                    project_id,
+                    "WORLD_MODEL_VERSION_ADVANCED",
+                    world_model_id,
+                    {"version": version_number},
+                )
+                edge_result = {
+                    "edge": {"id": causal_edge_id, "status": edge_status, "data": edge_data},
+                    "version": {
+                        "id": str(version_id),
+                        "status": "IMPLEMENTED_UNVERIFIED",
+                        "data": version_data,
+                    },
+                }
+
+            decision_data = {
+                **decision["data"],
+                "actual_information_gain": actual_information_gain,
+                "outcome": {
+                    "run_id": run_id,
+                    "evidence_id": str(evidence_id),
+                    "hypothesis_transition": hypothesis_transition,
+                    "prediction_outcome": evidence_data["prediction_outcome"],
+                },
+                "hindsight_assessment": rationale,
+            }
+            cur.execute(
+                "UPDATE research_objects SET status='COMPLETED',data=%s WHERE id=%s",
+                (json.dumps(decision_data), decision_id),
+            )
+            self._event(
+                cur,
+                project_id,
+                "RESEARCH_DECISION_OUTCOME_RECORDED",
+                decision_id,
+                {"status": "COMPLETED", "outcome": decision_data["outcome"]},
+            )
+            cur.execute("SELECT state FROM research_projects WHERE id=%s FOR UPDATE", (project_id,))
+            project = cur.fetchone()
+            if not project:
+                raise GPUError("RESEARCH_PROJECT_NOT_FOUND", project_id)
+            fact = {
+                "evidence_id": str(evidence_id),
+                "statement": evidence_data["prediction_outcome"],
+                "scope": evidence_data["scope"],
+                "verification_status": "VERIFIED_REAL",
+            }
+            project_state = {
+                **project["state"],
+                "established_facts": [*project["state"].get("established_facts", []), fact],
+            }
+            cur.execute(
+                "UPDATE research_projects SET state=%s WHERE id=%s",
+                (json.dumps(project_state), project_id),
+            )
+            self._event(
+                cur,
+                project_id,
+                "RESEARCH_STATE_UPDATED",
+                None,
+                {"append": {"established_facts": [fact]}},
+            )
+        return {
+            "run": {"id": run_id, "status": "RESULT_INSPECTED", "data": run_data},
+            "evidence": {
+                "id": str(evidence_id),
+                "project_id": project_id,
+                "kind": "EvidenceUnit",
+                "status": "VERIFIED_REAL",
+                "data": evidence_data,
+            },
+            "hypothesis": {
+                "id": hypothesis_id,
+                "status": hypothesis_transition,
+                "data": hypothesis_data,
+            },
+            "agenda_item": {"id": agenda_item_id, "status": agenda_status, "data": agenda_data},
+            "world_model_update": edge_result,
+            "decision": {"id": decision_id, "status": "COMPLETED", "data": decision_data},
+        }
+
+    @staticmethod
+    def _object_row(cur, object_id: str) -> dict:
+        cur.execute(
+            "SELECT id,project_id,kind,status,data,created_at FROM research_objects WHERE id=%s",
+            (object_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise GPUError("RESEARCH_OBJECT_NOT_FOUND", object_id)
+        return row
+
+    @staticmethod
+    def _assessment_replay_matches(
+        inspection: dict[str, Any], decision_data: dict[str, Any], run_id: str, decision_id: str
+    ) -> bool:
+        """Match current snapshots and legacy inspected runs to their original decision."""
+        if inspection.get("decision_id") == decision_id:
+            return True
+        outcome = decision_data.get("outcome", {})
+        return (
+            "decision_id" not in inspection
+            and outcome.get("run_id") == run_id
+            and outcome.get("evidence_id") == inspection.get("evidence_id")
+        )
+
+    def objects_list(
+        self,
+        project_id: str,
+        kind: str | None = None,
+        statuses: set[str] | None = None,
+        limit: int | None = 500,
+        data_filters: dict[str, Any] | None = None,
+    ) -> list[dict]:
+        """List canonical research objects with typed filters for Brain services."""
+        with self._connect() as conn, conn.cursor() as cur:
+            sql = (
+                "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
+                "WHERE project_id=%s"
+            )
+            args: list[Any] = [project_id]
+            if kind:
+                sql += " AND kind=%s"
+                args.append(kind)
+            if statuses:
+                sql += " AND status=ANY(%s)"
+                args.append(list(statuses))
+            if data_filters:
+                sql += " AND data @> %s::jsonb"
+                args.append(json.dumps(data_filters))
+            sql += " ORDER BY created_at DESC"
+            if limit is not None:
+                sql += " LIMIT %s"
+                args.append(max(limit, 1))
+            cur.execute(sql, args)
+            return cur.fetchall()
+
+    def objects_count(
+        self,
+        project_id: str,
+        kind: str,
+        statuses: set[str] | None = None,
+        data_filters: dict[str, Any] | None = None,
+    ) -> int:
+        """Count fully filtered canonical objects without materializing a bounded page."""
+        sql = "SELECT count(*) AS count FROM research_objects WHERE project_id=%s AND kind=%s"
+        args: list[Any] = [project_id, kind]
+        if statuses:
+            sql += " AND status=ANY(%s)"
+            args.append(list(statuses))
+        if data_filters:
+            sql += " AND data @> %s::jsonb"
+            args.append(json.dumps(data_filters))
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(sql, args)
+            return int(cur.fetchone()["count"])
+
+    def objects_identifiers(
+        self,
+        project_id: str,
+        kind: str,
+        statuses: set[str] | None = None,
+    ) -> list[dict]:
+        """Return only identity and status fields for complete lightweight classifications."""
+        sql = "SELECT id,status FROM research_objects WHERE project_id=%s AND kind=%s"
+        args: list[Any] = [project_id, kind]
+        if statuses:
+            sql += " AND status=ANY(%s)"
+            args.append(list(statuses))
+        sql += " ORDER BY created_at DESC"
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(sql, args)
+            return cur.fetchall()
+
+    def experiment_run_first(
+        self,
+        project_id: str,
+        statuses: set[str],
+        inspected: bool | None = None,
+    ) -> dict | None:
+        """Return the newest matching run without loading its JSON payload."""
+        sql = (
+            "SELECT id,status,created_at FROM research_objects "
+            "WHERE project_id=%s AND kind='ExperimentRun' AND status=ANY(%s)"
+        )
+        args: list[Any] = [project_id, list(statuses)]
+        if inspected is not None:
+            comparison = "<>" if inspected else "="
+            sql += (
+                " AND coalesce(data->'inspection','null'::jsonb) "
+                f"{comparison} 'null'::jsonb"
+            )
+        sql += " ORDER BY created_at DESC LIMIT 1"
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(sql, args)
+            return cur.fetchone()
+
+    def references_get(self, identifiers: list[str]) -> dict[str, dict]:
+        """Fetch a bounded reference set with one database round trip."""
+        if len(identifiers) > 200:
+            raise GPUError("TOO_MANY_RESEARCH_REFERENCES", "At most 200 references are allowed")
+        if not identifiers:
+            return {}
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
+                "WHERE id=ANY(%s::uuid[])",
+                (identifiers,),
+            )
+            return {str(row["id"]): row for row in cur.fetchall()}
 
     def state_get(self, project_id: str) -> dict:
         with self._connect() as conn, conn.cursor() as cur:
@@ -102,27 +1537,39 @@ class ResearchStore:
                 "active_hypotheses": by_kind("Hypothesis", {"ACTIVE", "SURVIVES_INITIAL_TEST"}),
                 "refuted_lineages": by_kind("Hypothesis", {"REFUTED"}),
                 "completed_experiments": by_kind("ExperimentRun", {"completed"}),
-                "active_experiments": by_kind("ExperimentRun", {"ACTIVE", "running"}),
+                "active_experiments": by_kind(
+                    "ExperimentRun", {"ACTIVE", "RESERVED", "running", "unknown"}
+                ),
                 "terminal_non_success_experiments": by_kind(
-                    "ExperimentRun", {"failed", "cancelled", "unknown"}
+                    "ExperimentRun", {"failed", "cancelled"}
                 ),
                 "open_experiments": by_kind("Experiment", {"ACTIVE"}),
                 "reproduction_status": by_kind("Reproduction"),
                 "negative_results": by_kind("NegativeResult"),
+                "lessons": by_kind("Lesson"),
+                "comparative_lessons": by_kind("ComparativeLesson"),
+                "meta_lessons": by_kind("MetaLesson"),
+                "experiment_branches": by_kind("ExperimentBranch"),
                 "current_best_explanation": row["state"].get("current_best_explanation"),
                 "highest_value_unknown": row["state"].get("highest_value_unknown"),
                 "next_discriminating_experiments": row["state"].get("next_discriminating_experiments", []),
             }
             return {**row, "canonical_state": canonical, "objects": objects}
 
-    def project_state_update(self, project_id: str, update: dict[str, Any]) -> dict:
+    def project_state_update(
+        self,
+        project_id: str,
+        update: dict[str, Any],
+        append: dict[str, list[Any]] | None = None,
+    ) -> dict:
         allowed = {
             "established_facts",
             "current_best_explanation",
             "highest_value_unknown",
             "next_discriminating_experiments",
         }
-        unexpected = sorted(set(update) - allowed)
+        append = append or {}
+        unexpected = sorted((set(update) | set(append)) - allowed)
         if unexpected:
             raise GPUError("INVALID_RESEARCH_STATE_FIELDS", ", ".join(unexpected))
         for field in ("established_facts", "next_discriminating_experiments"):
@@ -133,9 +1580,22 @@ class ResearchStore:
             row = cur.fetchone()
             if not row:
                 raise GPUError("RESEARCH_PROJECT_NOT_FOUND", project_id)
-            state = {**row["state"], **update}
+            state = {**row["state"]}
+            for field, values in append.items():
+                if field not in {"established_facts", "next_discriminating_experiments"}:
+                    raise GPUError("INVALID_RESEARCH_STATE_FIELDS", f"{field} cannot be appended")
+                if not isinstance(values, list):
+                    raise GPUError("INVALID_RESEARCH_STATE_FIELDS", f"{field} append must be a list")
+                state[field] = [*state.get(field, []), *values]
+            state.update(update)
             cur.execute("UPDATE research_projects SET state=%s WHERE id=%s", (json.dumps(state), project_id))
-            self._event(cur, project_id, "RESEARCH_STATE_UPDATED", None, update)
+            self._event(
+                cur,
+                project_id,
+                "RESEARCH_STATE_UPDATED",
+                None,
+                {"update": update, "append": append},
+            )
         return state
 
     def object_get(self, object_id: str) -> dict:
@@ -260,7 +1720,7 @@ class ResearchStore:
             row = cur.fetchone()
             if not row:
                 raise GPUError("EXPERIMENT_RUN_NOT_FOUND", run_id)
-            if row["status"] == "RESERVED":
+            if row["status"] in {"RESERVED", "unknown"}:
                 data = {**row["data"], "submission_status": "SUBMITTED"}
                 now = datetime.now(UTC)
                 cur.execute(
@@ -275,7 +1735,9 @@ class ResearchStore:
                 self._event(
                     cur,
                     row["project_id"],
-                    "EXPERIMENT_STARTED",
+                    "EXPERIMENT_STARTED"
+                    if row["status"] == "RESERVED"
+                    else "EXPERIMENT_EXECUTION_RECOVERED",
                     run_id,
                     {
                         "experiment_id": str(row["experiment_id"]),
@@ -285,7 +1747,11 @@ class ResearchStore:
                     },
                 )
             return self._execution_mapping(
-                cur, run_id, row["job_id"], row["idempotency_key"], row["status"] != "RESERVED"
+                cur,
+                run_id,
+                row["job_id"],
+                row["idempotency_key"],
+                row["status"] not in {"RESERVED", "unknown"},
             )
 
     def run_resolve(self, identifier: str) -> dict:
@@ -336,18 +1802,33 @@ class ResearchStore:
         }
 
     def run_update(self, run_id: str, result: dict) -> dict:
-        run = self.object_get(run_id)
-        if run["status"] in {"completed", "failed", "cancelled"}:
-            return {"id": run_id, "status": run["status"], "data": run["data"], "already_final": True}
-        data = {**run["data"], **result}
-        status = result.get("status", run["status"])
-        if status == "completed":
-            event = "EXPERIMENT_COMPLETED"
-        elif status in {"failed", "cancelled", "unknown"}:
-            event = "EXPERIMENT_FAILED"
-        else:
-            event = "EXPERIMENT_PROGRESS_SYNCED"
         with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,project_id,kind,status,data FROM research_objects "
+                "WHERE id=%s FOR UPDATE",
+                (run_id,),
+            )
+            run = cur.fetchone()
+            if not run or run["kind"] != "ExperimentRun":
+                raise GPUError("EXPERIMENT_RUN_NOT_FOUND", run_id)
+            if run["status"] in {"completed", "failed", "cancelled", "RESULT_INSPECTED"}:
+                return {
+                    "id": run_id,
+                    "status": run["status"],
+                    "data": run["data"],
+                    "already_final": True,
+                }
+            data = {**run["data"], **result}
+            status = result.get("status", run["status"])
+            self._validate_status(status)
+            if status == "completed":
+                event = "EXPERIMENT_COMPLETED"
+            elif status in {"failed", "cancelled"}:
+                event = "EXPERIMENT_FAILED"
+            elif status == "unknown":
+                event = "EXPERIMENT_STATUS_UNKNOWN"
+            else:
+                event = "EXPERIMENT_PROGRESS_SYNCED"
             cur.execute("UPDATE research_objects SET status=%s,data=%s WHERE id=%s", (status, json.dumps(data), run_id))
             cur.execute(
                 "UPDATE research_execution_attempts SET status=%s,updated_at=%s WHERE run_id=%s",
@@ -355,6 +1836,57 @@ class ResearchStore:
             )
             self._event(cur, run["project_id"], event, run_id, result)
         return {"id": run_id, "status": status, "data": data}
+
+    def artifact_record(self, run_id: str, job_id: str, artifact: dict[str, Any]) -> dict:
+        """Idempotently persist one run artifact and its provenance edge."""
+        path = artifact.get("path")
+        if not isinstance(path, str) or not path:
+            raise GPUError("INVALID_ARTIFACT_PATH", "Artifact path is required")
+        now = datetime.now(UTC)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,project_id,kind,status,data FROM research_objects WHERE id=%s FOR UPDATE",
+                (run_id,),
+            )
+            run = cur.fetchone()
+            if not run or run["kind"] != "ExperimentRun":
+                raise GPUError("EXPERIMENT_RUN_NOT_FOUND", run_id)
+            cur.execute(
+                "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
+                "WHERE project_id=%s AND kind='Artifact' AND data->>'run_id'=%s "
+                "AND data->>'path'=%s ORDER BY created_at LIMIT 1",
+                (run["project_id"], run_id, path),
+            )
+            existing = cur.fetchone()
+            if existing:
+                return {**existing, "idempotent_replay": True}
+            artifact_id = uuid.uuid4()
+            data = {"run_id": run_id, "job_id": job_id, **artifact}
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'Artifact','VERIFIED_INTEGRATION',%s,%s)",
+                (artifact_id, run["project_id"], json.dumps(data), now),
+            )
+            cur.execute(
+                "INSERT INTO research_edges VALUES(%s,%s,'PRODUCED',%s) ON CONFLICT DO NOTHING",
+                (run_id, artifact_id, now),
+            )
+            self._event(
+                cur,
+                run["project_id"],
+                "ARTIFACT_RECORDED",
+                artifact_id,
+                data,
+            )
+            return {
+                "id": str(artifact_id),
+                "project_id": str(run["project_id"]),
+                "kind": "Artifact",
+                "status": "VERIFIED_INTEGRATION",
+                "data": data,
+                "created_at": now,
+                "idempotent_replay": False,
+            }
 
     def assess(self, object_id: str, status: str, rationale: str) -> dict:
         item = self.object_get(object_id)
@@ -369,6 +1901,7 @@ class ResearchStore:
 
     def object_update(self, object_id: str, data_update: dict[str, Any], status: str, event_type: str) -> dict:
         """Materialize a new current view while preserving the scientific change as an event."""
+        self._validate_status(status)
         item = self.object_get(object_id)
         data = {**item["data"], **data_update}
         with self._connect() as conn, conn.cursor() as cur:
@@ -397,9 +1930,22 @@ class ResearchStore:
             cur.execute(sql, args)
             return cur.fetchall()
 
+    def executable_paper_by_fingerprint(
+        self, project_id: str, build_fingerprint: str
+    ) -> dict | None:
+        """Look up a paid build by exact identity without lossy text-search limits."""
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
+                "WHERE project_id=%s AND kind='ExecutablePaper' "
+                "AND data->>'build_fingerprint'=%s ORDER BY created_at DESC LIMIT 1",
+                (project_id, build_fingerprint),
+            )
+            return cur.fetchone()
+
     def related_hypotheses(self, project_id: str, mechanism: str, limit: int = 10) -> list[dict]:
         """Lexically screen active and failed ideas until pgvector is available for semantic ranking."""
-        query_terms = self._terms(mechanism)
+        query_terms = self.terms(mechanism)
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT id,kind,status,data,created_at FROM research_objects "
@@ -409,7 +1955,7 @@ class ResearchStore:
             related = []
             for item in cur.fetchall():
                 text = item["data"].get("mechanism") or item["data"].get("proposal", "")
-                terms = self._terms(text)
+                terms = self.terms(text)
                 overlap = len(query_terms & terms) / len(query_terms | terms) if query_terms | terms else 0.0
                 containment = len(query_terms & terms) / len(query_terms) if query_terms else 0.0
                 if overlap:
@@ -450,8 +1996,20 @@ class ResearchStore:
             return cur.fetchall()
 
     @staticmethod
-    def _terms(value: str) -> set[str]:
+    def terms(value: str) -> set[str]:
         return {term for term in re.findall(r"[a-z0-9]{4,}", value.lower())}
+
+    @staticmethod
+    def _validate_status(status: str) -> None:
+        if status not in RESEARCH_OBJECT_STATUSES:
+            raise GPUError("INVALID_RESEARCH_OBJECT_STATUS", status)
+
+    @staticmethod
+    def _canonical_uuid(value: str) -> str:
+        try:
+            return str(uuid.UUID(str(value)))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise GPUError("INVALID_RESEARCH_OBJECT_ID", str(value)) from exc
 
     @staticmethod
     def _event(cur, project_id, event_type, subject_id, payload):

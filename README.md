@@ -17,7 +17,12 @@ For development, connect a local MCP client to the stdio process. For production
 
 ## Tools
 
-`gpu_list`, `gpu_status`, `gpu_search`, `gpu_create`, `gpu_stop`, `gpu_destroy`, `repo_checkout`, `env_prepare`, `experiment_submit`, `experiment_status`, `experiment_logs`, `experiment_cancel`, `experiment_list`, `artifact_list`, `artifact_read`, and disabled-by-default `remote_exec`.
+The MCP exposes GPU lifecycle, local and Vast execution, logs/artifacts, literature records,
+reproduction, canonical scientific state, and Brain v1 operations. Use MCP discovery for the full
+typed list. Brain tools include `world_model_create`, `world_model_get`, `world_entity_create`,
+`causal_edge_create`, `causal_edge_update`, `research_agenda_create`,
+`research_agenda_item_create`, `hypothesis_portfolio_get`, `brain_step`,
+`research_decision_create`, `brain_decision_approve`, and `brain_result_assess`.
 
 Use `gpu_search` before `gpu_create`; creation requires a specific offer rather than making an unbounded cost decision. `gpu_destroy` requires `confirmation="DESTROY"`.
 
@@ -32,6 +37,8 @@ research_project_create
 → paper_ingest / paper_evidence_create / claim_create
 → anomaly_create / hypothesis_related / hypothesis_create
 → experiment_plan_register
+→ research_decision_create
+→ brain_decision_approve (when approval is required)
 → research_experiment_execute / research_experiment_sync
 → research_assess / negative_result_create / lesson_create
 → research_state_update / research_state_get
@@ -39,14 +46,23 @@ research_project_create
 
 `experiment_plan_register` freezes the question, competing explanations, intervention and
 control, metrics, expected direction, pass/fail interpretations, and estimated time/cost before
-execution. `research_experiment_execute` first reserves a canonical PostgreSQL mapping of
+execution. Call `research_decision_create` with the experiment and exact command/environment that
+will be executed; only an executable Brain action can be bound, and execution rejects any request
+that differs from that binding. `research_experiment_execute` first reserves a canonical PostgreSQL mapping of
 `experiment_id`, `run_id`, and `job_id`, then submits a deterministic local job. Pass a stable
 `execution_attempt_uuid` when retrying a request; retries return the same mapping and do not launch
 a duplicate job. If no key is supplied, identical requests use an automatically derived key.
 `research_experiment_sync` accepts either `run_id` or `job_id` and always returns the complete
-canonical mapping. Commands, runtime, logs, exit code, and artifacts are preserved in the run and
-immutable event history. Do not assess a hypothesis from reasoning alone when a local or provider
-experiment is feasible.
+canonical mapping. A reserved attempt without a submitted job returns `RETRY_EXECUTION` rather
+than raising a missing-job exception. Sync preserves `RESULT_INSPECTED`, and artifact provenance is
+idempotent by run and path. Commands, runtime, logs, exit code, and artifacts are preserved in the
+run and immutable event history. Do not assess a hypothesis from reasoning alone when a local or
+provider experiment is feasible.
+
+The gateway reconciles non-final local jobs at startup. Exit-code files finalize jobs that finished
+before a gateway restart; jobs belonging to an earlier container without an exit code become
+`unknown` instead of trusting a potentially reused PID. Their command and logs remain available for
+inspection and an explicit retry decision.
 
 Local environments are persistent under `GPU_LAB_LOCAL_ENV_ROOT`. Docker Compose stores that root
 in the `gpu-lab-envs` named volume, so environments remain available across container rebuilds and
@@ -64,6 +80,37 @@ and requires `scientific_difference` when a proposed mechanism resembles stored 
 For a reproduction, use `reproduction_prepare`, `reproduction_run`, `reproduction_sync`, and
 `reproduction_compare`. A successful process is only `PARTIAL` until its observed metric is compared
 with the reported metric and tolerance; it becomes `REPRODUCED` only after that explicit comparison.
+
+## Optional PaperQA literature worker
+
+PaperQA is isolated from GPU/Vast/SSH/PostgreSQL credentials. Set a strong
+`GPU_LAB_LITERATURE_WORKER_TOKEN`, set `GPU_LAB_LITERATURE_PROVIDER=paperqa-http`, configure only
+the model/metadata credentials needed by PaperQA, and start:
+
+```bash
+docker compose --profile literature up -d --build
+```
+
+For an OpenAI-compatible model gateway, configure its base URL and model only in `.env`; these
+values are passed to the isolated literature worker, never the GPU-Lab gateway:
+
+```env
+GPU_LAB_PAPERQA_BASE_URL=https://api.example.com/v1
+GPU_LAB_PAPERQA_MODEL=provider/model-name
+GPU_LAB_PAPERQA_EMBEDDING_MODEL=provider/embedding-model
+GPU_LAB_PAPERQA_MAX_RETRIES=2
+OPENAI_API_KEY=<rotated-task-scoped-key>
+```
+
+PaperQA uses the chat model for answer, summary, and agent calls, and the embedding model for
+indexing. All three endpoint settings are required together so indexing cannot silently fall back
+to another provider. Retry failures remain provider
+failures and never mutate PostgreSQL scientific state.
+
+Use `literature_provider_status`, `literature_search`, and `literature_ask` for read-only candidates.
+`literature_gather` imports provenance-rich candidates into PostgreSQL and can create an unresolved
+scoped Claim, but it never marks a claim or hypothesis supported. The PaperQA index is a replaceable
+cache; PostgreSQL remains scientific truth.
 
 ## Local CLI
 
@@ -102,5 +149,36 @@ remote jobs, detached local jobs, and a compact CLI. Scientific Research OS stat
 scientific events are stored separately in PostgreSQL with optional pgvector retrieval.
 `artifact_download` and `experiment_summary` are intentionally not exposed yet; large remote files
 remain on the worker. Vast endpoint shapes are normalized defensively and still require live
-provider integration checks before production use. Brain v1 planning, WorldModel, and ResearchAgenda
-are under active implementation and are not yet claimed as verified capabilities.
+provider integration checks before production use. Brain v1 has a native versioned WorldModel,
+ResearchAgenda, hypothesis portfolio, decision ledger, deterministic information-per-cost policy,
+unfinished-work recovery, and explicit result assessment. Its real smoke has exercised the vertical
+slice on PostgreSQL and a local GTX 1650. PaperQA is integrated as an optional isolated provider;
+its real model-backed answer quality is not yet verified. Paper2Agent is also integrated behind an
+optional isolated executable-paper worker pinned to an audited upstream commit. Its provider,
+generated-MCP inspection/invocation, network isolation, and canonical-truth boundary are verified,
+but a paid model-backed paper conversion has not been run. Automatic embedding generation and
+campaign automation remain later milestones. Native QD niches, lineage, dead-idea proximity, and
+deterministic experiment branches are implemented; their longitudinal scientific value is not yet
+established, and no MCTS policy is present. Native progress metrics and `meta_review` currently mark
+campaign readiness `DO_NOT_BUILD_YET` because the inspected/hindsight evidence threshold is unmet.
+
+Enable the Paper2Agent worker only with a task-scoped Anthropic credential and explicit approval of
+the upstream model cost:
+
+```powershell
+$env:GPU_LAB_EXECUTABLE_PAPER_PROVIDER = "paper2agent-http"
+$env:GPU_LAB_EXECUTABLE_PAPER_WORKER_TOKEN = "<random-task-scoped-token>"
+$env:GPU_LAB_APPROVAL_SECRET = "<separate-human-approval-secret>"
+$env:ANTHROPIC_API_KEY = "<task-scoped-key>"
+docker compose --profile paper-agents up -d --build
+```
+
+Instead of an API key, you may authenticate Claude Code interactively into its isolated persistent
+volume with `docker compose --profile paper-agents run --rm paper2agent claude`. The credential is
+not mounted into GPU-Lab or PostgreSQL.
+
+The worker accepts public GitHub repositories only. A generated tool remains non-evidentiary until
+it is used inside a preregistered GPU-Lab reproduction or experiment and the result is inspected.
+Paid builds and generated-tool invocations require an `executable_paper_action_approve` record
+authenticated with `GPU_LAB_APPROVAL_SECRET`; the record binds the approver, exact action parameters,
+and an expiry of at most 60 minutes. A Boolean supplied by the calling agent is not approval.

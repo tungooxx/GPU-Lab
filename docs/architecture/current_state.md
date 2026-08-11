@@ -1,6 +1,6 @@
 # GPU-Lab / Research OS current state
 
-Audit date: 2026-08-10. Verification labels distinguish source inspection, unit tests,
+Audit date: 2026-08-11. Verification labels distinguish source inspection, unit tests,
 integration tests, and real execution.
 
 ## What exists
@@ -11,9 +11,10 @@ integration tests, and real execution.
   environments, streams logs, and exposes artifacts and GPU/runtime status.
 - `ResearchStore` owns PostgreSQL projects, typed scientific objects, graph edges, immutable events,
   lexical negative-memory retrieval, and optional pgvector embeddings.
-- Scientific objects already include papers, evidence, claims, mechanisms, anomalies,
-  contradictions, hypotheses, predictions, experiments/runs/artifacts, reproductions, negative
-  results, lessons, and ResearchState views.
+- Scientific objects include papers, evidence, claims, mechanisms, anomalies, contradictions,
+  hypotheses, predictions, experiments/runs/artifacts, reproductions, negative results, lessons,
+  WorldModel nodes/edges/versions, AgendaItems, portfolios, action candidates, decisions, and
+  ResearchState views.
 - MCP exposes the execution and scientific service layer through Streamable HTTP. Tool metadata,
   schemas, safety annotations, and structured output are present for every discovered tool.
 
@@ -25,33 +26,71 @@ integration tests, and real execution.
   process creation. Stable attempt keys make submission retry-safe, and sync accepts run or job ID.
 - `local_env_prepare` resolves either an exact requirements file or a project directory and accepts
   an explicit Python executable.
+- Brain v1 selects one agenda-driven action using inspect/recovery and reproduction gates followed
+  by a transparent information-per-cost heuristic. Every candidate and decision is stored with its
+  state snapshot, evidence references, critic advice, rationale, and costs.
+- Explicit result assessment records experiment evidence and updates the run, hypothesis,
+  AgendaItem, ResearchDecision, ResearchState, and optional causal edge/WorldModelVersion.
+- Native hypothesis QD stores mechanistic niches and lineage, combines optional pgvector retrieval
+  with structured mechanism comparison, retrieves related dead ideas, and requires an explicit
+  scientific difference before accepting a likely duplicate or descendant of a failed mechanism.
+- Deterministic experiment branches store scored nodes, typed parent/comparison relations,
+  inspected-run attachments, and confound-aware ComparativeLessons. The policy prioritizes result
+  inspection, then unfinished recovery, then information-per-cost execution, then comparison.
+- Research progress metrics count uncertainty resolution, falsification, negative-memory reuse,
+  inspected evidence, and information per recorded GPU-hour. `meta_review` persists idempotent
+  process-only MetaLessons and applies an explicit bounded-campaign readiness gate.
 
 ## What is verified
 
-- **VERIFIED_UNIT:** 15 tests cover provider normalization, path safety, structured output metadata,
-  local requirements resolution, environment command construction, and local job idempotency.
+- **VERIFIED_UNIT:** 78 tests cover provider normalization, malformed worker responses, audit
+  redaction, path safety, structured output metadata, local requirements resolution, environment
+  command construction, local job idempotency, action
+  scoring, the HASI reproduction gate, unavailable-provider fallback behavior, and QD niche,
+  lineage, dead-idea, vector/structured-proximity, operator, cache-failure behavior, branch scoring,
+  result-inspection gates, recovery priority, comparative lessons, progress metrics, MetaLesson
+  idempotency, and campaign-prematurity detection.
 - **VERIFIED_INTEGRATION:** Docker PostgreSQL migration, MCP discovery, atomic execution reservation,
   repeated submission, immutable `EXPERIMENT_STARTED` identity, job-ID sync, logs/artifacts, and
   completed-run persistence.
 - **VERIFIED_REAL:** Python 3.13 with PyTorch 2.6.0+cu124 reproduced saved VRCNet predictions exactly
   (`maxabs=0`). This runtime is canonical for VRC internal interventions.
+- **VERIFIED_REAL:** `scripts/brain_e2e_smoke.py` used PostgreSQL, MCP, the persistent canonical
+  environment, and a GTX 1650 to prove `brain_step before -> real evidence -> brain_step after`.
+- **VERIFIED_INTEGRATION:** after restarting PostgreSQL and GPU-Lab, the same project recovered its
+  decisions, inspected run, WorldModel history, and evidence-dependent next action.
+- **VERIFIED_INTEGRATION:** `scripts/qd_e2e_smoke.py` discovered all QD MCP tools, blocked an
+  unexplained descendant of a PostgreSQL negative result, persisted the differentiated lineage and
+  niche representative, restarted PostgreSQL/GPU-Lab, and recovered the same scientific objects.
+- **VERIFIED_INTEGRATION:** `scripts/branch_e2e_smoke.py` discovered all branch tools, persisted two
+  preregistered nodes and a typed relation, selected state substitution over a cheaper-to-score but
+  less discriminating correlation study, restarted services, and recovered the branch. It did not
+  execute either scientific experiment and reports `scientific_result=NOT_EXECUTED`. The same smoke
+  persisted/recovered a MetaLesson whose campaign gate is `DO_NOT_BUILD_YET`.
+- **VERIFIED_INTEGRATION:** repeated Compose restarts retain host MCP access on the backend network.
+  External workers use internal-only networks, fixed-target API relays, and a public-address-only
+  HTTP(S) proxy. Direct worker access to service DNS and host-gateway MCP endpoints is blocked with
+  403 while public GitHub and Crossref requests succeed.
 
 ## What is partial
 
 - pgvector storage/search exists, while automatic scientific embedding generation does not.
-- Literature records and retrieval exist, but PaperQA is not integrated.
-- Reproduction execution exists, but Paper2Agent is not integrated.
-- ResearchState is a canonical view; it is not yet a versioned mechanistic WorldModel.
+- PaperQA 2026.3.18 is integrated behind an optional isolated HTTP worker and typed
+  `LiteratureProvider`. Its contract, real import/API shape, container health, gateway-to-worker
+  connectivity, and credential isolation are verified; a paid/local-model evidence query is not.
+- Paper2Agent is integrated behind an optional isolated `ExecutablePaperProvider` worker. Its HTTP
+  contract, repository validation, canonical-state boundary, idempotent import, generated-tool
+  inspection, verification cap, and authorization behavior are unit tested. A real multi-hour
+  Paper2Agent generation is not yet verified because no task-scoped Claude credential was supplied.
 - Hypothesis similarity uses lexical structure unless callers provide embeddings.
+- Brain v1 and QD critics are deterministic advisory checks; QD candidate intake is typed but not
+  LLM-generated, and no LLM-backed ResearchOperator is integrated.
 
 ## What is missing
 
-- Native versioned WorldModel, ResearchAgenda, hypothesis portfolio/niches, ResearchDecision ledger,
-  typed action candidates, and `brain_step()`.
-- Result-analysis transitions that update predictions, hypotheses, world-model edges, and agenda
-  items from inspected evidence.
-- Brain benchmark episodes, evidence-dependent next-action regression, restart durability test, and
-  autonomous campaign runtime.
+- Automatic embedding generation and autonomous campaign runtime.
+- PaperQA's real model-backed answer quality remains unverified.
+- Additional historical benchmark episodes beyond the permanent HASI gate.
 
 ## What should be reused
 

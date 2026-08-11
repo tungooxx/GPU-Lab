@@ -1,9 +1,12 @@
 import argparse
 import hashlib
+import hmac
 import inspect
+import ipaddress
 import json
 import logging
 import re
+import threading
 import time
 from typing import Any
 
@@ -15,18 +18,39 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 from starlette.types import ASGIApp
 
+from .brain import ResearchBrain
+from .branches import ExperimentBranchService
 from .config import Settings
 from .dashboard import DASHBOARD_HTML
 from .errors import GPUError
+from .executable_papers import ExecutablePaperService, HttpExecutablePaperProvider
+from .literature import HttpLiteratureProvider, LiteratureService
 from .local_runner import LocalRunner
+from .meta_research import MetaResearchService
+from .qd import HypothesisQDService
 from .research import ResearchStore
 from .service import GPUService
 from .terminal import TERMINAL_HTML
 
 logger = logging.getLogger(__name__)
 
-settings, service, research_store = Settings(), None, None
-instructions = "Safe, structured remote GPU experiment control plane. Credentials are never returned."
+settings, service, research_store, research_brain, literature_service, executable_paper_service, qd_service, branch_service, meta_research_service = (
+    Settings(),
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+)
+_singleton_lock = threading.RLock()
+instructions = (
+    "Safe, structured remote GPU experiment control plane. Credentials are never returned. "
+    "Before research_experiment_execute, call research_decision_create and pass its decision_id; "
+    "approve the decision first when the returned action requires human approval."
+)
 if settings.gpu_lab_enable_local_runner:
     instructions += (
         " The local Linux research workspace is /workspace/local-vlm; use it as the base "
@@ -44,17 +68,29 @@ mcp = FastMCP(
 
 _READ_ONLY_TOOLS = {
     "gpu_list",
-    "gpu_status",
+    "vast_gpu_status",
     "gpu_search",
     "experiment_status",
     "experiment_logs",
     "experiment_list",
     "activity_recent",
     "research_state_get",
+    "world_model_get",
+    "hypothesis_portfolio_get",
+    "literature_provider_status",
+    "literature_search",
+    "literature_ask",
+    "executable_paper_provider_status",
     "claim_search",
     "claim_get_evidence",
     "claim_compare",
     "hypothesis_related",
+    "hypothesis_niche_list",
+    "hypothesis_qd_screen",
+    "experiment_branch_get",
+    "experiment_branch_next",
+    "research_progress",
+    "meta_lesson_list",
     "experiment_priority",
     "research_events",
     "paper_search",
@@ -72,10 +108,15 @@ _READ_ONLY_TOOLS = {
     "local_artifact_list",
     "local_artifact_read",
 }
-_DESTRUCTIVE_TOOLS = {"gpu_destroy"}
+_DESTRUCTIVE_TOOLS = {
+    "gpu_destroy",
+    "executable_paper_build",
+    "executable_paper_invoke",
+    "executable_paper_action_approve",
+}
 _OPEN_WORLD_TOOLS = {
     "gpu_list",
-    "gpu_status",
+    "vast_gpu_status",
     "gpu_search",
     "gpu_create",
     "gpu_stop",
@@ -92,6 +133,14 @@ _OPEN_WORLD_TOOLS = {
     "remote_exec",
     "local_experiment_submit",
     "local_env_prepare",
+    "literature_search",
+    "literature_ask",
+    "literature_gather",
+    "brain_literature_resolve",
+    "executable_paper_build",
+    "executable_paper_inspect_tools",
+    "executable_paper_verify",
+    "executable_paper_invoke",
 }
 _ACRONYMS = {"api": "API", "gpu": "GPU", "id": "ID", "ssh": "SSH", "url": "URL", "vlm": "VLM"}
 
@@ -114,7 +163,9 @@ def _normalise_mcp_accept_header(headers: list[tuple[bytes, bytes]]) -> list[tup
     Keep the normal MCP JSON body validation unchanged; this only expands a
     wildcard response preference for the ``/mcp`` route.
     """
-    accept = next((value.decode("latin-1") for name, value in headers if name.lower() == b"accept"), "")
+    accept = next(
+        (value.decode("latin-1") for name, value in headers if name.lower() == b"accept"), ""
+    )
     if "application/json" in accept.lower() or "*/*" not in accept:
         return headers
     return [
@@ -135,6 +186,33 @@ class McpAcceptCompatibilityMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+def _mcp_client_denied(host: str | None, cidrs: str) -> bool:
+    """Return whether a client belongs to an explicitly blocked internal network."""
+    if not host:
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+        return any(
+            address in ipaddress.ip_network(item.strip(), strict=False)
+            for item in cidrs.split(",")
+            if item.strip()
+        )
+    except ValueError:
+        return True
+
+
+class McpClientNetworkPolicyMiddleware(BaseHTTPMiddleware):
+    """Prevent isolated worker networks from calling the execution-bearing MCP endpoint."""
+
+    async def dispatch(self, request: Request, call_next):
+        client_host = request.client.host if request.client else None
+        if request.url.path == "/mcp" and _mcp_client_denied(
+            client_host, settings.gpu_lab_denied_mcp_client_cidrs
+        ):
+            return JSONResponse({"error": "MCP client network is not authorized"}, status_code=403)
+        return await call_next(request)
+
+
 def _tool_title(name: str) -> str:
     return " ".join(_ACRONYMS.get(word, word.capitalize()) for word in name.split("_"))
 
@@ -143,7 +221,9 @@ def _apply_tool_metadata() -> None:
     """Fill MCP metadata for every tool, including conditional local/remote tools."""
     for name, tool in mcp._tool_manager._tools.items():
         tool.title = tool.title or _tool_title(name)
-        tool.description = tool.description or f"Perform the GPU Lab {tool.title.lower()} operation."
+        tool.description = (
+            tool.description or f"Perform the GPU Lab {tool.title.lower()} operation."
+        )
         tool.annotations = ToolAnnotations(
             readOnlyHint=name in _READ_ONLY_TOOLS,
             destructiveHint=name in _DESTRUCTIVE_TOOLS,
@@ -167,8 +247,86 @@ def research() -> ResearchStore:
     if not settings.gpu_lab_research_database_url:
         raise GPUError("RESEARCH_DATABASE_NOT_CONFIGURED", "Set GPU_LAB_RESEARCH_DATABASE_URL")
     if research_store is None:
-        research_store = ResearchStore(settings.gpu_lab_research_database_url)
+        with _singleton_lock:
+            if research_store is None:
+                research_store = ResearchStore(settings.gpu_lab_research_database_url)
     return research_store
+
+
+def brain() -> ResearchBrain:
+    global research_brain
+    if research_brain is None:
+        with _singleton_lock:
+            if research_brain is None:
+                research_brain = ResearchBrain(research())
+    return research_brain
+
+
+def literature() -> LiteratureService:
+    global literature_service
+    if settings.gpu_lab_literature_provider != "paperqa-http":
+        raise GPUError(
+            "LITERATURE_PROVIDER_UNAVAILABLE",
+            "Start the isolated literature profile and set provider=paperqa-http.",
+        )
+    if literature_service is None:
+        with _singleton_lock:
+            if literature_service is None:
+                literature_service = LiteratureService(
+                    research(),
+                    HttpLiteratureProvider(
+                        settings.gpu_lab_literature_worker_url,
+                        settings.gpu_lab_literature_worker_token or "",
+                    ),
+                )
+    return literature_service
+
+
+def executable_papers() -> ExecutablePaperService:
+    global executable_paper_service
+    if settings.gpu_lab_executable_paper_provider != "paper2agent-http":
+        raise GPUError(
+            "EXECUTABLE_PAPER_PROVIDER_UNAVAILABLE",
+            "Start the isolated paper-agents profile and set provider=paper2agent-http.",
+        )
+    if executable_paper_service is None:
+        with _singleton_lock:
+            if executable_paper_service is None:
+                executable_paper_service = ExecutablePaperService(
+                    research(),
+                    HttpExecutablePaperProvider(
+                        settings.gpu_lab_executable_paper_worker_url,
+                        settings.gpu_lab_executable_paper_worker_token or "",
+                    ),
+                )
+    return executable_paper_service
+
+
+def qd() -> HypothesisQDService:
+    global qd_service
+    if qd_service is None:
+        with _singleton_lock:
+            if qd_service is None:
+                qd_service = HypothesisQDService(research())
+    return qd_service
+
+
+def branches() -> ExperimentBranchService:
+    global branch_service
+    if branch_service is None:
+        with _singleton_lock:
+            if branch_service is None:
+                branch_service = ExperimentBranchService(research())
+    return branch_service
+
+
+def meta_research() -> MetaResearchService:
+    global meta_research_service
+    if meta_research_service is None:
+        with _singleton_lock:
+            if meta_research_service is None:
+                meta_research_service = MetaResearchService(research())
+    return meta_research_service
 
 
 async def call(fn, *args, **kwargs):
@@ -178,7 +336,9 @@ async def call(fn, *args, **kwargs):
     try:
         result = fn(*args, **kwargs)
         result = await result if inspect.isawaitable(result) else result
-        svc().repo.audit(tool_name, arguments, "success", int((time.perf_counter() - started) * 1000))
+        svc().repo.audit(
+            tool_name, arguments, "success", int((time.perf_counter() - started) * 1000)
+        )
         return result
     except GPUError as exc:
         svc().repo.audit(
@@ -192,8 +352,20 @@ async def call(fn, *args, **kwargs):
     except Exception:
         # Do not expose implementation details or leave an MCP request without an audit record.
         logger.exception("Unexpected MCP tool failure: %s", tool_name)
-        svc().repo.audit(tool_name, arguments, "error", int((time.perf_counter() - started) * 1000), "Internal error")
-        return {"error": {"type": "INTERNAL_ERROR", "message": "Unexpected server error", "retryable": False}}
+        svc().repo.audit(
+            tool_name,
+            arguments,
+            "error",
+            int((time.perf_counter() - started) * 1000),
+            "Internal error",
+        )
+        return {
+            "error": {
+                "type": "INTERNAL_ERROR",
+                "message": "Unexpected server error",
+                "retryable": False,
+            }
+        }
 
 
 def scrub(value):
@@ -207,7 +379,11 @@ def scrub(value):
     if isinstance(value, (list, tuple)):
         return [scrub(item) for item in value]
     if isinstance(value, str):
-        return re.sub(r"(?i)(bearer|token|api[_-]?key|password)\\s*[=:]\\s*[^\\s'\\\"]+", r"\\1=[REDACTED]", value)[:4096]
+        return re.sub(
+            r"(?i)(bearer\s+|token\s*[=:]\s*|api[_-]?key\s*[=:]\s*|secret\s*[=:]\s*|password\s*[=:]\s*)[^\s'\"]+",
+            r"\1[REDACTED]",
+            value,
+        )[:4096]
     return value
 
 
@@ -218,7 +394,7 @@ async def gpu_list():
 
 
 @mcp.tool()
-async def gpu_status(instance_id: str):
+async def vast_gpu_status(instance_id: str):
     """Return provider and nvidia-smi runtime state."""
     return await call(svc().gpu_status, instance_id)
 
@@ -340,7 +516,241 @@ async def research_state_update(project_id: str, update: dict):
 
 
 @mcp.tool()
-async def claim_create(project_id: str, statement: str, scope: str, evidence_ids: list[str] | None = None):
+async def world_model_create(project_id: str, name: str, scope: str):
+    """Create the native versioned mechanistic model owned by Research OS."""
+    return await call(brain().world_model_create, project_id, name, scope)
+
+
+@mcp.tool()
+async def world_model_get(world_model_id: str):
+    """Retrieve a WorldModel with its typed nodes, causal edges, and version history."""
+    return await call(brain().world_model_get, world_model_id)
+
+
+@mcp.tool()
+async def world_entity_create(
+    world_model_id: str,
+    kind: str,
+    name: str,
+    description: str,
+    attributes: dict | None = None,
+):
+    """Add a typed scientific entity to a WorldModel and create a new model version."""
+    return await call(
+        brain().world_entity_create,
+        world_model_id,
+        kind,
+        name,
+        description,
+        attributes,
+    )
+
+
+@mcp.tool()
+async def causal_edge_create(
+    world_model_id: str,
+    source_id: str,
+    target_id: str,
+    relation: str,
+    status: str,
+    supporting_ids: list[str] | None = None,
+    against_ids: list[str] | None = None,
+    unresolved_prediction_ids: list[str] | None = None,
+    decision_id: str | None = None,
+):
+    """Create a provenance-bearing causal edge and version the WorldModel."""
+    return await call(
+        brain().causal_edge_create,
+        world_model_id,
+        source_id,
+        target_id,
+        relation,
+        status,
+        supporting_ids,
+        against_ids,
+        unresolved_prediction_ids,
+        decision_id,
+    )
+
+
+@mcp.tool()
+async def causal_edge_update(
+    edge_id: str,
+    status: str,
+    rationale: str,
+    supporting_ids: list[str] | None = None,
+    against_ids: list[str] | None = None,
+    decision_id: str | None = None,
+):
+    """Apply an evidence-linked causal-edge transition and preserve its model version delta."""
+    return await call(
+        brain().causal_edge_update,
+        edge_id,
+        status,
+        rationale,
+        supporting_ids,
+        against_ids,
+        decision_id,
+    )
+
+
+@mcp.tool()
+async def research_agenda_create(project_id: str, name: str):
+    """Create the project ResearchAgenda in canonical PostgreSQL state."""
+    return await call(brain().agenda_create, project_id, name)
+
+
+@mcp.tool()
+async def research_agenda_item_create(
+    agenda_id: str,
+    question: str,
+    importance: float,
+    uncertainty: float,
+    scientific_scope: str,
+    blocking_hypothesis_ids: list[str] | None = None,
+    related_anomaly_ids: list[str] | None = None,
+    related_contradiction_ids: list[str] | None = None,
+    candidate_experiments: list[dict] | None = None,
+    reproduction_required: bool = False,
+):
+    """Persist one scored scientific unknown and its candidate experiments."""
+    return await call(
+        brain().agenda_item_create,
+        agenda_id,
+        question,
+        importance,
+        uncertainty,
+        scientific_scope,
+        blocking_hypothesis_ids,
+        related_anomaly_ids,
+        related_contradiction_ids,
+        candidate_experiments,
+        reproduction_required,
+    )
+
+
+@mcp.tool()
+async def research_agenda_item_update(agenda_item_id: str, status: str, rationale: str):
+    """Apply an explicit provenance-bearing AgendaItem status transition."""
+    return await call(brain().agenda_item_update, agenda_item_id, status, rationale)
+
+
+@mcp.tool()
+async def hypothesis_portfolio_get(project_id: str):
+    """Read the durable portfolio, or preview its current contents before the first brain step."""
+    return await call(brain().portfolio_get, project_id)
+
+
+@mcp.tool()
+async def brain_step(project_id: str):
+    """Persist one evidence-aware scientific decision without executing an expensive action."""
+    return await call(brain().brain_step, project_id)
+
+
+def _execution_action_fingerprint(
+    experiment_id: str,
+    command: str,
+    working_directory: str,
+    env: dict[str, str] | None,
+    python_env: str | None,
+) -> str:
+    action = {
+        "experiment_id": experiment_id,
+        "command": command,
+        "working_directory": working_directory,
+        "env": env or {},
+        "python_env": python_env,
+    }
+    return hashlib.sha256(
+        json.dumps(action, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+@mcp.tool()
+async def research_decision_create(
+    project_id: str,
+    experiment_id: str,
+    command: str,
+    working_directory: str = ".",
+    env: dict[str, str] | None = None,
+    python_env: str | None = None,
+):
+    """Create the ResearchDecision required by research_experiment_execute.
+
+    Use this before executing a preregistered experiment. Pass the returned
+    decision_id to research_experiment_execute, after brain_decision_approve
+    when the selected action requires explicit human approval.
+    """
+    step = await call(brain().brain_step, project_id)
+    if "error" in step:
+        return step
+    fingerprint = _execution_action_fingerprint(
+        experiment_id, command, working_directory, env, python_env
+    )
+    binding = await call(
+        brain().execution_decision_bind,
+        experiment_id,
+        step["decision_id"],
+        fingerprint,
+    )
+    if "error" in binding:
+        return {**step, "execution_binding_error": binding["error"]}
+    return {**step, "execution_binding": binding["data"]["execution_binding"]}
+
+
+@mcp.tool()
+async def brain_decision_approve(decision_id: str, approver: str, rationale: str):
+    """Record explicit human approval for the exact selected Brain action."""
+    return await call(brain().decision_approve, decision_id, approver, rationale)
+
+
+@mcp.tool()
+async def brain_result_assess(
+    run_id: str,
+    decision_id: str,
+    hypothesis_id: str,
+    agenda_item_id: str,
+    prediction_outcome: str,
+    guard_condition_outcome: str,
+    condition_evaluations: dict[str, bool],
+    evidence_supporting: list[str],
+    evidence_against: list[str],
+    unexpected_observations: list[str],
+    alternative_explanations: list[str],
+    scope: str,
+    hypothesis_transition: str,
+    rationale: str,
+    causal_edge_id: str | None = None,
+    causal_edge_status: str | None = None,
+    actual_information_gain: str = "MEDIUM",
+):
+    """Inspect a real result and explicitly update evidence, belief, agenda, and WorldModel."""
+    return await call(
+        brain().result_assess,
+        run_id=run_id,
+        decision_id=decision_id,
+        hypothesis_id=hypothesis_id,
+        agenda_item_id=agenda_item_id,
+        prediction_outcome=prediction_outcome,
+        guard_condition_outcome=guard_condition_outcome,
+        condition_evaluations=condition_evaluations,
+        evidence_supporting=evidence_supporting,
+        evidence_against=evidence_against,
+        unexpected_observations=unexpected_observations,
+        alternative_explanations=alternative_explanations,
+        scope=scope,
+        hypothesis_transition=hypothesis_transition,
+        rationale=rationale,
+        causal_edge_id=causal_edge_id,
+        causal_edge_status=causal_edge_status,
+        actual_information_gain=actual_information_gain,
+    )
+
+
+@mcp.tool()
+async def claim_create(
+    project_id: str, statement: str, scope: str, evidence_ids: list[str] | None = None
+):
     evidence = evidence_ids or []
     for evidence_id in evidence:
         item = await call(research().object_get, evidence_id)
@@ -384,7 +794,9 @@ async def claim_compare(claim_id: str, other_claim_id: str):
     if first["kind"] != "Claim" or second["kind"] != "Claim":
         return {"error": {"type": "NOT_A_CLAIM", "message": "Both inputs must be Claim IDs"}}
     if first["project_id"] != second["project_id"]:
-        return {"error": {"type": "RESEARCH_PROJECT_MISMATCH", "message": "Claims must share a project"}}
+        return {
+            "error": {"type": "RESEARCH_PROJECT_MISMATCH", "message": "Claims must share a project"}
+        }
     first_evidence = set(first["data"].get("evidence_ids", []))
     second_evidence = set(second["data"].get("evidence_ids", []))
     return {
@@ -401,7 +813,12 @@ async def claim_compare(claim_id: str, other_claim_id: str):
 async def contradiction_create(project_id: str, claim_id: str, other_claim_id: str, rationale: str):
     """Record an explicit conflict between two scoped claims instead of silently averaging them."""
     if claim_id == other_claim_id:
-        return {"error": {"type": "INVALID_CONTRADICTION", "message": "A claim cannot contradict itself"}}
+        return {
+            "error": {
+                "type": "INVALID_CONTRADICTION",
+                "message": "A claim cannot contradict itself",
+            }
+        }
     claim, other_claim = research().object_get(claim_id), research().object_get(other_claim_id)
     if claim["kind"] != "Claim" or other_claim["kind"] != "Claim":
         return {"error": {"type": "NOT_A_CLAIM", "message": "Both inputs must be Claim IDs"}}
@@ -482,6 +899,113 @@ async def hypothesis_related(project_id: str, mechanism: str, limit: int = 10):
 
 
 @mcp.tool()
+async def hypothesis_niche_create(
+    project_id: str, name: str, description: str, diversity_signature: dict
+):
+    """Create a mechanistic hypothesis niche without assigning scientific truth or probability."""
+    return await call(qd().niche_create, project_id, name, description, diversity_signature)
+
+
+@mcp.tool()
+async def hypothesis_niche_list(project_id: str):
+    """List the project's mechanistic niches and explicitly selected active representatives."""
+    return await call(qd().niche_list, project_id)
+
+
+@mcp.tool()
+async def hypothesis_qd_screen(project_id: str, draft: dict):
+    """Compare a typed draft with active/dead ideas using retrieval and structured mechanisms."""
+    return await call(qd().screen, project_id, draft)
+
+
+@mcp.tool()
+async def hypothesis_qd_create(project_id: str, draft: dict):
+    """Persist a screened hypothesis with niche, ancestry, similarity, and scientific difference."""
+    return await call(qd().create, project_id, draft)
+
+
+@mcp.tool()
+async def hypothesis_niche_set_best(niche_id: str, hypothesis_id: str, rationale: str):
+    """Select a surviving niche representative for test priority, never as proof of truth."""
+    return await call(qd().niche_set_best, niche_id, hypothesis_id, rationale)
+
+
+@mcp.tool()
+async def experiment_branch_create(
+    project_id: str, hypothesis_id: str, objective: str, budget: dict
+):
+    """Create a deterministic experiment branch for one surviving hypothesis and explicit budget."""
+    return await call(branches().create, project_id, hypothesis_id, objective, budget)
+
+
+@mcp.tool()
+async def experiment_branch_node_add(
+    branch_id: str, draft: dict, parent_node_id: str | None = None
+):
+    """Add a scored, predicted branch action without executing or interpreting results."""
+    return await call(branches().node_add, branch_id, draft, parent_node_id)
+
+
+@mcp.tool()
+async def experiment_branch_get(branch_id: str):
+    """Retrieve the branch, nodes, typed relations, and comparative lessons."""
+    return await call(branches().get, branch_id)
+
+
+@mcp.tool()
+async def experiment_branch_next(branch_id: str):
+    """Select inspect, recover, execute, compare, or complete using a deterministic policy."""
+    return await call(branches().next_action, branch_id)
+
+
+@mcp.tool()
+async def experiment_branch_result_record(
+    node_id: str,
+    run_id: str,
+    result: dict,
+    scientific_interpretation: str,
+    actual_cost: dict,
+    information_gained: str,
+):
+    """Attach only an already-inspected canonical run result to its matching branch node."""
+    return await call(
+        branches().record_result,
+        node_id,
+        run_id,
+        result,
+        scientific_interpretation,
+        actual_cost,
+        information_gained,
+    )
+
+
+@mcp.tool()
+async def experiment_branch_compare(
+    branch_id: str, node_a_id: str, node_b_id: str, lesson: dict
+):
+    """Persist a confound-aware ComparativeLesson across two inspected branch results."""
+    return await call(branches().compare, branch_id, node_a_id, node_b_id, lesson)
+
+
+@mcp.tool()
+async def research_progress(project_id: str):
+    """Return transparent scientific-progress counts and information-per-GPU-hour when measurable."""
+    return await call(meta_research().progress, project_id)
+
+
+@mcp.tool()
+async def meta_review(project_id: str):
+    """Persist a process-only MetaLesson and assess readiness for bounded campaign automation."""
+    return await call(meta_research().meta_review, project_id)
+
+
+@mcp.tool()
+async def meta_lesson_list(project_id: str):
+    """List durable research-process lessons without treating them as scientific evidence."""
+    return await call(meta_research().list_lessons, project_id)
+
+
+@mcp.tool()
 async def experiment_plan_register(project_id: str, hypothesis_id: str, plan: dict):
     """Preregister a frozen experiment plan before results are inspected."""
     required = {
@@ -502,7 +1026,12 @@ async def experiment_plan_register(project_id: str, hypothesis_id: str, plan: di
     }
     missing = sorted(required - set(plan))
     if missing:
-        return {"error": {"type": "EXPERIMENT_PLAN_INCOMPLETE", "message": f"Missing: {', '.join(missing)}"}}
+        return {
+            "error": {
+                "type": "EXPERIMENT_PLAN_INCOMPLETE",
+                "message": f"Missing: {', '.join(missing)}",
+            }
+        }
     hypothesis = research().object_get(hypothesis_id)
     if str(hypothesis["project_id"]) != project_id or hypothesis["kind"] != "Hypothesis":
         return {"error": {"type": "INVALID_EXPERIMENT_HYPOTHESIS", "message": hypothesis_id}}
@@ -555,10 +1084,18 @@ async def experiment_priority(
         execution_risk,
     ]
     if any(value < 0 for value in values):
-        return {"error": {"type": "INVALID_EXPERIMENT_ECONOMICS", "message": "Inputs must be non-negative"}}
+        return {
+            "error": {
+                "type": "INVALID_EXPERIMENT_ECONOMICS",
+                "message": "Inputs must be non-negative",
+            }
+        }
     denominator = max(compute_cost * implementation_cost * max(execution_risk, 0.01), 0.01)
     return {
-        "priority": scientific_importance * hypothesis_discrimination * expected_information_gain / denominator,
+        "priority": scientific_importance
+        * hypothesis_discrimination
+        * expected_information_gain
+        / denominator,
         "formula": "importance * discrimination * information_gain / max(compute_cost * implementation_cost * max(execution_risk, 0.01), 0.01)",
         "recommendation": "Prefer the smallest discriminating test before additional training.",
     }
@@ -576,9 +1113,17 @@ async def research_assess(object_id: str, status: str, rationale: str):
 
 
 @mcp.tool()
-async def paper_ingest(project_id: str, title: str, url: str, card: dict, version: str | None = None):
+async def paper_ingest(
+    project_id: str, title: str, url: str, card: dict, version: str | None = None
+):
     """Persist a paper card; claims must remain separate evidence-backed objects."""
-    return await call(research().object_create, project_id, "Paper", {"title": title, "url": url, "version": version, "card": card}, "PAPER_INGESTED")
+    return await call(
+        research().object_create,
+        project_id,
+        "Paper",
+        {"title": title, "url": url, "version": version, "card": card},
+        "PAPER_INGESTED",
+    )
 
 
 @mcp.tool()
@@ -629,15 +1174,19 @@ async def research_semantic_search(
     project_id: str, embedding: list[float], kind: str | None = None, limit: int = 25
 ):
     """Use pgvector cosine distance over persisted research-object embeddings."""
-    return await call(research().semantic_search, project_id, embedding, kind, min(max(limit, 1), 100))
+    return await call(
+        research().semantic_search, project_id, embedding, kind, min(max(limit, 1), 100)
+    )
 
 
 @mcp.tool()
 async def paper_ask(project_id: str, question: str, limit: int = 8):
     """Return retrieved source passages for a question; this is evidence retrieval, not a conclusion."""
     evidence, seen = [], set()
-    for term in ResearchStore._terms(question):
-        matches = await call(research().search, project_id, term, "EvidenceUnit", min(max(limit, 1), 25))
+    for term in ResearchStore.terms(question):
+        matches = await call(
+            research().search, project_id, term, "EvidenceUnit", min(max(limit, 1), 25)
+        )
         if isinstance(matches, dict) and "error" in matches:
             return matches
         for match in matches:
@@ -651,6 +1200,205 @@ async def paper_ask(project_id: str, question: str, limit: int = 8):
         "evidence": evidence,
         "warning": "Retrieved passages are not canonical truth. Create a scoped Claim with explicit evidence IDs before drawing a conclusion.",
     }
+
+
+@mcp.tool()
+async def literature_provider_status():
+    """Report isolated PaperQA worker health without exposing model credentials."""
+    result = {
+        "configured_provider": settings.gpu_lab_literature_provider,
+        "worker_url": settings.gpu_lab_literature_worker_url,
+        "canonical_truth_owner": "PostgreSQL Research OS",
+    }
+    if settings.gpu_lab_literature_provider != "paperqa-http":
+        return {**result, "status": "disabled"}
+    worker = await call(literature().provider.health)
+    if "error" not in worker:
+        result["worker"] = worker
+        result["status"] = "ready"
+    else:
+        result["status"] = "unavailable"
+        result["error"] = worker["error"]
+    return result
+
+
+@mcp.tool()
+async def literature_search(query: str, filters: dict | None = None):
+    """Search through the optional literature engine without mutating scientific state."""
+    try:
+        provider = literature().provider
+    except GPUError as exc:
+        return exc.response()
+    result = await call(provider.search, query, filters)
+    return result.model_dump(mode="json") if isinstance(result, BaseModel) else result
+
+
+@mcp.tool()
+async def literature_ask(question: str, papers: list[str] | None = None):
+    """Ask PaperQA for citation candidates; its answer is never canonical scientific truth."""
+    try:
+        provider = literature().provider
+    except GPUError as exc:
+        return exc.response()
+    result = await call(provider.ask, question, papers)
+    return result.model_dump(mode="json") if isinstance(result, BaseModel) else result
+
+
+@mcp.tool()
+async def literature_gather(
+    project_id: str,
+    question: str,
+    papers: list[str] | None = None,
+    claim_statement: str | None = None,
+    claim_scope: str | None = None,
+):
+    """Validate and persist PaperQA evidence candidates, plus an optional unresolved Claim."""
+    try:
+        service = literature()
+    except GPUError as exc:
+        return exc.response()
+    return await call(
+        service.gather,
+        project_id,
+        question,
+        papers,
+        claim_statement,
+        claim_scope,
+    )
+
+
+@mcp.tool()
+async def brain_literature_resolve(
+    decision_id: str,
+    question: str,
+    papers: list[str] | None = None,
+    claim_statement: str | None = None,
+    claim_scope: str | None = None,
+):
+    """Execute a selected literature action, import candidates, and recompute the Brain decision."""
+    try:
+        service = literature()
+    except GPUError as exc:
+        return exc.response()
+    return await call(
+        service.resolve_decision,
+        brain(),
+        decision_id,
+        question,
+        papers,
+        claim_statement,
+        claim_scope,
+    )
+
+
+@mcp.tool()
+async def executable_paper_provider_status():
+    """Report isolated Paper2Agent worker health without exposing coding-agent credentials."""
+    result = {
+        "configured_provider": settings.gpu_lab_executable_paper_provider,
+        "worker_url": settings.gpu_lab_executable_paper_worker_url,
+        "canonical_truth_owner": "PostgreSQL Research OS",
+    }
+    if settings.gpu_lab_executable_paper_provider != "paper2agent-http":
+        return {**result, "status": "disabled"}
+    try:
+        provider = executable_papers().provider
+    except GPUError as exc:
+        return exc.response()
+    worker = await call(provider.health)
+    if "error" in worker:
+        return {**result, "status": "unavailable", "error": worker["error"]}
+    return {**result, "status": worker.get("status", "ready"), "worker": worker}
+
+
+@mcp.tool()
+async def executable_paper_action_approve(
+    project_id: str,
+    action: str,
+    parameters: dict,
+    approver: str,
+    rationale: str,
+    approval_secret: str,
+    ttl_minutes: int = 30,
+):
+    """Create a parameter-bound, expiring approval after authenticating the human approver."""
+    configured = settings.gpu_lab_approval_secret or ""
+    if not configured or not hmac.compare_digest(
+        approval_secret.encode("utf-8", "replace"), configured.encode("utf-8", "replace")
+    ):
+        return {
+            "error": {
+                "type": "APPROVAL_AUTHENTICATION_FAILED",
+                "message": "The server approval secret is missing or invalid",
+            }
+        }
+    try:
+        service = executable_papers()
+    except GPUError as exc:
+        return exc.response()
+    return await call(
+        service.approve,
+        project_id,
+        action,
+        parameters,
+        approver,
+        rationale,
+        ttl_minutes,
+    )
+
+
+@mcp.tool()
+async def executable_paper_build(
+    project_id: str,
+    paper_id: str,
+    repository: str,
+    commit: str,
+    tutorials: str | None = None,
+    approval_id: str | None = None,
+):
+    """Build an executable-paper candidate in isolated Paper2Agent; may use paid model access."""
+    try:
+        service = executable_papers()
+    except GPUError as exc:
+        return exc.response()
+    return await call(
+        service.build, project_id, paper_id, repository, commit, tutorials, approval_id
+    )
+
+
+@mcp.tool()
+async def executable_paper_inspect_tools(executable_paper_id: str):
+    """Initialize a generated paper MCP and persist its advertised tool schemas."""
+    try:
+        service = executable_papers()
+    except GPUError as exc:
+        return exc.response()
+    return await call(service.inspect_tools, executable_paper_id)
+
+
+@mcp.tool()
+async def executable_paper_verify(executable_paper_id: str):
+    """Run integration checks without allowing a generated worker to claim real verification."""
+    try:
+        service = executable_papers()
+    except GPUError as exc:
+        return exc.response()
+    return await call(service.verify, executable_paper_id)
+
+
+@mcp.tool()
+async def executable_paper_invoke(
+    executable_paper_id: str,
+    tool: str,
+    args: dict,
+    approval_id: str | None = None,
+):
+    """Invoke a verified generated tool; its output remains unassessed and non-canonical."""
+    try:
+        service = executable_papers()
+    except GPUError as exc:
+        return exc.response()
+    return await call(service.invoke, executable_paper_id, tool, args, approval_id)
 
 
 @mcp.tool()
@@ -712,7 +1460,9 @@ async def negative_result_create(
     for hypothesis_id in descendants:
         hypothesis = research().object_get(hypothesis_id)
         if str(hypothesis["project_id"]) != project_id or hypothesis["kind"] != "Hypothesis":
-            return {"error": {"type": "INVALID_NEGATIVE_RESULT_DESCENDANT", "message": hypothesis_id}}
+            return {
+                "error": {"type": "INVALID_NEGATIVE_RESULT_DESCENDANT", "message": hypothesis_id}
+            }
     result_object = await call(
         research().object_create,
         project_id,
@@ -736,8 +1486,16 @@ async def negative_result_create(
 
 
 @mcp.tool()
-async def lesson_create(project_id: str, statement: str, evidence_ids: list[str], confounds: list[str] | None = None):
-    return await call(research().object_create, project_id, "Lesson", {"statement": statement, "evidence_ids": evidence_ids, "confounds": confounds or []}, "LESSON_CREATED")
+async def lesson_create(
+    project_id: str, statement: str, evidence_ids: list[str], confounds: list[str] | None = None
+):
+    return await call(
+        research().object_create,
+        project_id,
+        "Lesson",
+        {"statement": statement, "evidence_ids": evidence_ids, "confounds": confounds or []},
+        "LESSON_CREATED",
+    )
 
 
 @mcp.tool()
@@ -767,7 +1525,9 @@ async def reproduction_prepare(
         "tolerance": tolerance,
         "status": "PREPARED",
     }
-    result = await call(research().object_create, project_id, "Reproduction", data, "REPRODUCTION_PREPARED")
+    result = await call(
+        research().object_create, project_id, "Reproduction", data, "REPRODUCTION_PREPARED"
+    )
     if "error" not in result:
         await call(research().edge_create, paper_id, result["id"], "HAS_REPRODUCTION")
     return result
@@ -806,13 +1566,27 @@ async def reproduction_run(
         return {"error": {"type": "NOT_A_REPRODUCTION", "message": reproduction_id}}
     if reproduction["status"] not in {"ACTIVE", "PREPARED", "BLOCKED"}:
         return {"error": {"type": "REPRODUCTION_NOT_RUNNABLE", "message": reproduction["status"]}}
-    job = await call(local.submit, command, working_directory, "reproduction-" + reproduction_id[:8], env, python_env)
+    job = await call(
+        local.submit,
+        command,
+        working_directory,
+        "reproduction-" + reproduction_id[:8],
+        env,
+        python_env,
+    )
     if "error" in job:
         return job
     return await call(
         research().object_update,
         reproduction_id,
-        {"status": "RUNNING", "job_id": job["job_id"], "command": command, "working_directory": working_directory, "environment": env or {}, "python_env": python_env},
+        {
+            "status": "RUNNING",
+            "job_id": job["job_id"],
+            "command": command,
+            "working_directory": working_directory,
+            "environment": env or {},
+            "python_env": python_env,
+        },
         "RUNNING",
         "REPRODUCTION_STARTED",
     )
@@ -825,11 +1599,20 @@ async def reproduction_sync(reproduction_id: str):
     if reproduction["kind"] != "Reproduction":
         return {"error": {"type": "NOT_A_REPRODUCTION", "message": reproduction_id}}
     if reproduction["status"] in {"PARTIAL", "FAILED", "REPRODUCED"}:
-        return {"id": reproduction_id, "status": reproduction["status"], "data": reproduction["data"], "already_final": True}
+        return {
+            "id": reproduction_id,
+            "status": reproduction["status"],
+            "data": reproduction["data"],
+            "already_final": True,
+        }
     job_id = reproduction["data"].get("job_id")
     if not job_id:
         return {"error": {"type": "REPRODUCTION_MISSING_JOB", "message": reproduction_id}}
-    outcome, artifacts, runtime = local.job_status(job_id), local.artifacts(job_id), await local.status()
+    outcome, artifacts, runtime = (
+        local.job_status(job_id),
+        local.artifacts(job_id),
+        await local.status(),
+    )
     if outcome["status"] == "running":
         return await call(
             research().object_update,
@@ -843,33 +1626,61 @@ async def reproduction_sync(reproduction_id: str):
     return await call(
         research().object_update,
         reproduction_id,
-        {"exit_code": outcome["exit_code"], "logs_tail": outcome["logs_tail"][-65536:], "artifacts": artifacts, "runtime": runtime},
+        {
+            "exit_code": outcome["exit_code"],
+            "logs_tail": outcome["logs_tail"][-65536:],
+            "artifacts": artifacts,
+            "runtime": runtime,
+        },
         status,
         event,
     )
 
 
 @mcp.tool()
-async def reproduction_compare(reproduction_id: str, observed_metric: float, metric_name: str | None = None):
+async def reproduction_compare(
+    reproduction_id: str, observed_metric: float, metric_name: str | None = None
+):
     """Compare a real observed metric against the prepared paper metric and tolerance."""
     reproduction = research().object_get(reproduction_id)
     if reproduction["kind"] != "Reproduction":
         return {"error": {"type": "NOT_A_REPRODUCTION", "message": reproduction_id}}
     if reproduction["status"] == "FAILED":
-        return {"error": {"type": "REPRODUCTION_EXECUTION_FAILED", "message": "A failed run cannot be metric-compared"}}
+        return {
+            "error": {
+                "type": "REPRODUCTION_EXECUTION_FAILED",
+                "message": "A failed run cannot be metric-compared",
+            }
+        }
     if reproduction["status"] != "PARTIAL":
-        return {"error": {"type": "REPRODUCTION_COMPARISON_UNAVAILABLE", "message": "Run reproduction_sync after execution before comparing metrics"}}
+        return {
+            "error": {
+                "type": "REPRODUCTION_COMPARISON_UNAVAILABLE",
+                "message": "Run reproduction_sync after execution before comparing metrics",
+            }
+        }
     reported = reproduction["data"].get("reported_metric") or {}
     expected = reported.get("value")
     tolerance = reproduction["data"].get("tolerance")
     if not isinstance(expected, (int, float)) or not isinstance(tolerance, (int, float)):
-        return {"error": {"type": "REPRODUCTION_COMPARISON_UNAVAILABLE", "message": "reported_metric.value and tolerance are required"}}
+        return {
+            "error": {
+                "type": "REPRODUCTION_COMPARISON_UNAVAILABLE",
+                "message": "reported_metric.value and tolerance are required",
+            }
+        }
     difference = abs(observed_metric - expected)
     status = "REPRODUCED" if difference <= tolerance else "PARTIAL"
     return await call(
         research().object_update,
         reproduction_id,
-        {"observed_metric": {"name": metric_name or reported.get("name"), "value": observed_metric}, "difference": difference},
+        {
+            "observed_metric": {
+                "name": metric_name or reported.get("name"),
+                "value": observed_metric,
+            },
+            "difference": difference,
+        },
         status,
         "REPRODUCTION_COMPLETED",
     )
@@ -878,17 +1689,23 @@ async def reproduction_compare(reproduction_id: str, observed_metric: float, met
 @mcp.tool()
 async def research_experiment_execute(
     experiment_id: str,
+    decision_id: str,
     command: str,
     working_directory: str = ".",
     env: dict[str, str] | None = None,
     python_env: str | None = None,
     execution_attempt_uuid: str | None = None,
 ):
-    """Idempotently run a preregistered experiment and return canonical run/job IDs."""
+    """Run a preregistered experiment with a ResearchDecision created by research_decision_create.
+
+    Retries must reuse execution_attempt_uuid. Every response returns the
+    canonical experiment_id, run_id, and job_id after identity reservation.
+    """
     if not settings.gpu_lab_enable_local_runner:
         return {"error": {"type": "LOCAL_RUNNER_DISABLED"}}
     request = {
         "experiment_id": experiment_id,
+        "decision_id": decision_id,
         "command": command,
         "working_directory": working_directory,
         "env": env or {},
@@ -898,9 +1715,12 @@ async def research_experiment_execute(
         json.dumps(request, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     idempotency_key = execution_attempt_uuid or f"auto:{fingerprint}"
-    job_id = "local_" + hashlib.sha256(
-        f"{experiment_id}:{idempotency_key}".encode()
-    ).hexdigest()[:24]
+    action_fingerprint = _execution_action_fingerprint(
+        experiment_id, command, working_directory, env, python_env
+    )
+    job_id = (
+        "local_" + hashlib.sha256(f"{experiment_id}:{idempotency_key}".encode()).hexdigest()[:24]
+    )
     reservation = await call(
         research().run_reserve,
         experiment_id,
@@ -909,6 +1729,7 @@ async def research_experiment_execute(
         fingerprint,
         {
             "executor": "local",
+            "decision_id": decision_id,
             "command": command,
             "working_directory": working_directory,
             "environment": env or {},
@@ -917,6 +1738,22 @@ async def research_experiment_execute(
     )
     if "error" in reservation:
         return reservation
+    authorization = await call(
+        brain().authorize_execution,
+        experiment_id,
+        decision_id,
+        action_fingerprint,
+    )
+    if "error" in authorization:
+        return {
+            "experiment_id": reservation["experiment_id"],
+            "run_id": reservation["run_id"],
+            "job_id": reservation["job_id"],
+            "idempotency_key": reservation["idempotency_key"],
+            "status": "RESERVED",
+            "authorization_error": authorization["error"],
+            "retry_safe": True,
+        }
     job = await call(
         local.submit,
         command,
@@ -935,6 +1772,15 @@ async def research_experiment_execute(
             "status": "RESERVED",
             "submission_error": job["error"],
             "retry_safe": True,
+        }
+    if job.get("status") not in {"running", "completed", "failed", "cancelled"}:
+        return {
+            **reservation,
+            "status": "RESERVED",
+            "runner_status": job.get("status", "unknown"),
+            "job": job,
+            "retry_safe": True,
+            "recovery_action": "RETRY_EXECUTION",
         }
     mapping = await call(research().run_mark_submitted, reservation["run_id"])
     if "error" in mapping:
@@ -966,11 +1812,83 @@ async def research_experiment_sync(run_id: str | None = None, job_id: str | None
         if job_mapping["run_id"] != mapping["run_id"]:
             return {"error": {"type": "EXECUTION_IDENTIFIER_MISMATCH"}}
     canonical_run_id, canonical_job_id = mapping["run_id"], mapping["job_id"]
-    run = mapping["run"]
-    outcome = local.job_status(canonical_job_id)
-    artifacts, runtime = local.artifacts(canonical_job_id), await local.status()
+    outcome = None
+    if mapping["status"] == "RESERVED":
+        outcome = await call(local.job_status, canonical_job_id)
+        if "error" in outcome:
+            return {
+                **mapping,
+                "retry_safe": True,
+                "recovery_action": "RETRY_EXECUTION",
+                "message": (
+                    "No local process was submitted. Retry research_experiment_execute with the "
+                    "same experiment_id, decision_id, command, and execution_attempt_uuid."
+                ),
+            }
+        if outcome.get("status") not in {"running", "completed", "failed", "cancelled"}:
+            return {
+                **mapping,
+                "runner_status": outcome.get("status", "unknown"),
+                "retry_safe": True,
+                "recovery_action": "RETRY_EXECUTION",
+                "message": (
+                    "The local job does not prove that a process launched. Retry "
+                    "research_experiment_execute with the original execution arguments."
+                ),
+            }
+        promoted = await call(research().run_mark_submitted, canonical_run_id)
+        if "error" in promoted:
+            return {
+                **mapping,
+                "retry_safe": True,
+                "recovery_action": "RETRY_SYNC",
+                "mapping_error": promoted["error"],
+            }
+        mapping = promoted
+    if mapping["status"] == "RESULT_INSPECTED":
+        return {**mapping, "retry_safe": True, "recovery_action": "NONE"}
+    outcome = outcome or await call(local.job_status, canonical_job_id)
+    if "error" in outcome:
+        return {
+            **mapping,
+            "status": "UNKNOWN",
+            "runner_status": "missing",
+            "retry_safe": True,
+            "recovery_action": "INSPECT_OR_RETRY",
+            "runner_error": outcome["error"],
+        }
+    artifacts = await call(local.artifacts, canonical_job_id)
+    if isinstance(artifacts, dict) and "error" in artifacts:
+        return {
+            **mapping,
+            "status": "UNKNOWN",
+            "runner_status": outcome["status"],
+            "retry_safe": True,
+            "recovery_action": "INSPECT_OR_RETRY",
+            "artifact_error": artifacts["error"],
+        }
+    runtime = await call(local.status)
+    if "error" in runtime:
+        runtime = {"error": runtime["error"]}
     runner_status = outcome["status"]
-    research_status = "failed" if runner_status == "unknown" else runner_status
+    research_status = runner_status
+    if runner_status in {"completed", "failed"}:
+        for artifact in artifacts:
+            recorded = await call(
+                research().artifact_record,
+                canonical_run_id,
+                canonical_job_id,
+                artifact,
+            )
+            if "error" in recorded:
+                return {
+                    **mapping,
+                    "status": "UNKNOWN",
+                    "runner_status": runner_status,
+                    "retry_safe": True,
+                    "recovery_action": "RETRY_SYNC",
+                    "artifact_record_error": recorded["error"],
+                }
     updated = await call(
         research().run_update,
         canonical_run_id,
@@ -991,18 +1909,6 @@ async def research_experiment_sync(run_id: str | None = None, job_id: str | None
         "status": updated.get("status", research_status),
         "run": updated,
     }
-    if "error" in updated or updated.get("already_final") or research_status not in {"completed", "failed"}:
-        return response
-    for artifact in artifacts:
-        recorded = await call(
-            research().object_create,
-            str(run["project_id"]),
-            "Artifact",
-            {"run_id": canonical_run_id, "job_id": canonical_job_id, **artifact},
-            "ARTIFACT_RECORDED",
-        )
-        if "error" not in recorded:
-            await call(research().edge_create, canonical_run_id, recorded["id"], "PRODUCED")
     return response
 
 
@@ -1144,6 +2050,7 @@ def http_app():
     """Build the streamable HTTP app with connector header compatibility."""
     app = mcp.streamable_http_app()
     app.add_middleware(McpAcceptCompatibilityMiddleware)
+    app.add_middleware(McpClientNetworkPolicyMiddleware)
     return app
 
 
@@ -1151,6 +2058,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--transport", choices=["stdio", "sse", "streamable-http"], default="stdio")
     args = parser.parse_args()
+    reconciliation = local.reconcile_jobs()
+    if reconciliation["reconciled"]:
+        logger.info("Reconciled persisted local jobs at startup: %s", reconciliation)
     if args.transport == "streamable-http":
         import uvicorn
 

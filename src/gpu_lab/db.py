@@ -47,6 +47,44 @@ class Repository:
         )
         self.conn.commit()
 
+    def claim_job(self, item: Job) -> tuple[str, Job]:
+        """Atomically claim a job ID across gateway processes.
+
+        ``claimed`` means this caller owns submission. ``existing`` means another
+        caller already owns or launched the identical request. An ``unknown`` job
+        is reclaimable because startup reconciliation has established that its
+        prior submitter cannot prove a live process.
+        """
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            row = self.conn.execute(
+                "SELECT data FROM jobs WHERE job_id=?", (item.job_id,)
+            ).fetchone()
+            if row:
+                existing = Job.model_validate_json(row["data"])
+                if existing.metadata.get("request_fingerprint") != item.metadata.get(
+                    "request_fingerprint"
+                ):
+                    self.conn.rollback()
+                    return "conflict", existing
+                if existing.status != "unknown":
+                    self.conn.commit()
+                    return "existing", existing
+                self.conn.execute(
+                    "UPDATE jobs SET data=?,updated_at=? WHERE job_id=?",
+                    (item.model_dump_json(), self._now(), item.job_id),
+                )
+            else:
+                self.conn.execute(
+                    "INSERT INTO jobs VALUES (?,?,?)",
+                    (item.job_id, item.model_dump_json(), self._now()),
+                )
+            self.conn.commit()
+            return "claimed", item
+        except Exception:
+            self.conn.rollback()
+            raise
+
     def get_job(self, job_id: str) -> Job | None:
         row = self.conn.execute("SELECT data FROM jobs WHERE job_id=?", (job_id,)).fetchone()
         return Job.model_validate_json(row["data"]) if row else None

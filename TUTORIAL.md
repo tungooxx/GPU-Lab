@@ -121,7 +121,7 @@ Do not expose the gateway without authentication and HTTPS. The current MVP does
 
 ## Connect ChatGPT
 
-In ChatGPT web, enable Developer Mode, then go to **Settings or Workspace Settings → Apps → Create**. Enter the public HTTPS endpoint, use **Scan Tools**, and create the app. Start a new chat, select the GPU Lab app, and first call `gpu_list` or `gpu_status`.
+In ChatGPT web, enable Developer Mode, then go to **Settings or Workspace Settings → Apps → Create**. Enter the public HTTPS endpoint, use **Scan Tools**, and create the app. Start a new chat, select the GPU Lab app, and first call `gpu_list` or `vast_gpu_status`.
 
 Custom write-capable MCP apps currently require an eligible ChatGPT workspace plan and appropriate administrator/developer-mode permissions. See [OpenAI’s Developer Mode and MCP apps guide](https://help.openai.com/en/articles/12584461-developer-mode-and-full-mcp-connectors-in-chatgpt).
 
@@ -131,7 +131,7 @@ Use these low-risk checks first:
 
 ```text
 gpu_list()
-gpu_status(instance_id="vast_47350073")
+vast_gpu_status(instance_id="vast_47350073")
 ```
 
 Only after they work should you use `repo_checkout`, `env_prepare`, and `experiment_submit`. Always require `confirmation="DESTROY"` for `gpu_destroy`.

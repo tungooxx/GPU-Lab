@@ -1,29 +1,45 @@
 # External research-engine decisions
 
-Audit date: 2026-08-10. These decisions protect PostgreSQL as the only canonical scientific memory.
+Audit date: 2026-08-11. These decisions protect PostgreSQL as the only canonical scientific memory.
 They must be revisited before adding or upgrading an external dependency.
 
 ## PaperQA
 
 - Official source: <https://github.com/Future-House/paper-qa>
 - License: Apache-2.0.
-- Runtime: Python 3.11+, LiteLLM-compatible model access, optional Crossref/Semantic Scholar keys,
-  and potentially a large local document/index state.
-- Decision: **OPTIONAL DEPENDENCY or SEPARATE WORKER**, behind `LiteratureProvider`.
+- Audited API family: `paper-qa>=2026.3.18,<2027`, Python 3.11+, Apache-2.0. PaperQA's CalVer
+  policy does not guarantee compatibility across releases, so the upper bound is intentional.
+- Runtime: LiteLLM-compatible model access, optional Crossref/Semantic Scholar keys, and a large
+  replaceable local document/index cache.
+- Decision: **OPTIONAL DEPENDENCY in a SEPARATE WORKER**, behind `LiteratureProvider`.
+- Implementation: the base gateway contains only `HttpLiteratureProvider`; the Compose
+  `literature` profile installs PaperQA. The worker receives only its scoped token, paper volume,
+  and optional literature/model credentials—not Vast, SSH, PostgreSQL, or repository secrets.
 - Boundary: results become provenance-rich evidence candidates. PaperQA never updates canonical
   claims, hypotheses, WorldModel edges, or scientific statuses directly.
 
 ## Paper2Agent
 
 - Upstream source: <https://github.com/jmiao24/Paper2Agent>
+- Audited upstream commit: `e573687e15f345e3f375cd0851373d588e436be3` (default branch HEAD
+  at audit time).
 - Architecture: long-running coding-agent workflow that inspects paper repositories and generates
-  tested MCP servers; it depends on an external coding-agent runtime and creates its own outputs.
-- License: no clear repository license was confirmed during this audit.
-- Decision: **DO NOT IMPORT OR COPY SOURCE** until licensing is explicit. Keep an
-  `ExecutablePaperProvider` boundary and later evaluate a subprocess/container integration using
-  only authorized public interfaces.
+  tested MCP servers; it depends on Claude Code, external model authentication, Python/FastMCP,
+  and creates an isolated environment, reports, tests, generated code, and replaceable worker state.
+  Upstream estimates 30 minutes to 3+ hours and about USD 15 for a complex repository.
+- License: MIT for Paper2Agent. Claude Code is a separately licensed external runtime and is only
+  installed in the optional worker image; no upstream Paper2Agent source is copied into our package.
+- Decision: **SUBPROCESS WORKER in a SEPARATE SERVICE** behind `ExecutablePaperProvider`.
+- Implementation: the `paper-agents` Compose profile checks out the exact audited upstream commit,
+  pins its Claude Code runtime, accepts only public GitHub repositories, and receives only its
+  scoped token plus Anthropic credential. PostgreSQL, Vast, SSH, GPU, and literature credentials are
+  absent. Network policy prevents the worker subnet from calling GPU-Lab's MCP endpoint directly.
+- Paid builds and generated-code invocation require a separate server-authenticated `ActionApproval`
+  record bound to an approver label, exact parameter hash, rationale, and expiry. Approval parameters
+  themselves are not persisted, avoiding storage of tool arguments that may contain secrets.
 - Boundary: generated tools are unverified executable-paper candidates until GPU-Lab smoke and
-  reproduction gates pass. They cannot become scientific truth themselves.
+  reproduction gates pass. Worker verification is capped at `VERIFIED_INTEGRATION`; it cannot
+  claim `VERIFIED_REAL` or mutate canonical claims, hypotheses, experiments, or WorldModel state.
 
 ## Kaimen Co-Scientist
 
@@ -38,10 +54,16 @@ They must be revisited before adding or upgrading an external dependency.
 ## IDEAgent
 
 - Official source identified by the paper: <https://github.com/declare-lab/IDEAgent>
+- Audited upstream commit: `121376126a4864ee5436ea5a23ffc8dc0f7842c5` (default branch HEAD
+  at audit time).
+- License: the repository has no standalone LICENSE file, while its `pyproject.toml` package
+  metadata declares MIT. No upstream source is copied into GPU-Lab.
 - Architecture: quality-diversity idea evolution using lineages, completed/rejected idea comparison,
-  repair, and refinement.
-- Decision: **DESIGN INSPIRATION ONLY** until the repository license and dependency surface are
-  verified directly. Port only the abstract niche/lineage/search policy into native typed services.
+  repair, and refinement. Its Python 3.10+ environment directly includes OpenAI, Google GenAI,
+  Anthropic, scikit-learn, and matplotlib, and it keeps run artifacts outside our scientific store.
+- Decision: **DESIGN INSPIRATION / ALGORITHM PORT ONLY**, not a runtime dependency. The native QD
+  service ports the abstract niche, lineage, proximity, and reflection policy into typed services
+  backed by our PostgreSQL state.
 - Boundary: QD scores affect which hypothesis to test, never which hypothesis is scientifically true.
 
 ## MARS reflective search
@@ -50,8 +72,9 @@ They must be revisited before adding or upgrading an external dependency.
 - Relevant concepts: budget-aware branch search, modular experiment construction, and comparative
   reflective memory.
 - No authoritative implementation/license was identified in this audit.
-- Decision: **PAPER / DESIGN INSPIRATION ONLY**. Brain v1 will use deterministic heuristic action
-  scoring and branch records; it will not implement MCTS yet.
+- Decision: **PAPER / DESIGN INSPIRATION ONLY**. Native deterministic heuristic branch records and
+  comparative lessons are implemented; MCTS/UCB remain intentionally absent until measured use
+  demonstrates that the simpler policy is insufficient.
 
 ## Dependency policy
 
