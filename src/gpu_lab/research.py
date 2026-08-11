@@ -1535,7 +1535,7 @@ class ResearchStore:
             row = cur.fetchone()
             if not row:
                 raise GPUError("EXPERIMENT_RUN_NOT_FOUND", run_id)
-            if row["status"] == "RESERVED":
+            if row["status"] in {"RESERVED", "unknown"}:
                 data = {**row["data"], "submission_status": "SUBMITTED"}
                 now = datetime.now(UTC)
                 cur.execute(
@@ -1550,7 +1550,9 @@ class ResearchStore:
                 self._event(
                     cur,
                     row["project_id"],
-                    "EXPERIMENT_STARTED",
+                    "EXPERIMENT_STARTED"
+                    if row["status"] == "RESERVED"
+                    else "EXPERIMENT_EXECUTION_RECOVERED",
                     run_id,
                     {
                         "experiment_id": str(row["experiment_id"]),
@@ -1560,7 +1562,11 @@ class ResearchStore:
                     },
                 )
             return self._execution_mapping(
-                cur, run_id, row["job_id"], row["idempotency_key"], row["status"] != "RESERVED"
+                cur,
+                run_id,
+                row["job_id"],
+                row["idempotency_key"],
+                row["status"] not in {"RESERVED", "unknown"},
             )
 
     def run_resolve(self, identifier: str) -> dict:
@@ -1618,8 +1624,10 @@ class ResearchStore:
         status = result.get("status", run["status"])
         if status == "completed":
             event = "EXPERIMENT_COMPLETED"
-        elif status in {"failed", "cancelled", "unknown"}:
+        elif status in {"failed", "cancelled"}:
             event = "EXPERIMENT_FAILED"
+        elif status == "unknown":
+            event = "EXPERIMENT_STATUS_UNKNOWN"
         else:
             event = "EXPERIMENT_PROGRESS_SYNCED"
         with self._connect() as conn, conn.cursor() as cur:

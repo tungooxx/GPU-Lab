@@ -20,10 +20,24 @@ class LocalRunner:
     def __init__(self, settings: Settings, repo: Repository):
         self.settings, self.repo = settings, repo
         self.workspace = settings.gpu_lab_local_workspace.resolve()
-        # A PID is meaningful only inside the container/process namespace that
-        # launched it.  Persisting this marker prevents a restarted gateway from
-        # mistaking a reused PID for the original research process.
-        self.runner_instance_id = uuid.uuid4().hex
+        # Docker's HOSTNAME is stable across a Python worker restart but changes
+        # when the container/process namespace is replaced.
+        self.runner_instance_id = (
+            os.environ.get("GPU_LAB_RUNNER_INSTANCE_ID")
+            or os.environ.get("HOSTNAME")
+            or os.environ.get("COMPUTERNAME")
+            or "local-host"
+        )
+        self._submission_lock = asyncio.Lock()
+
+    @staticmethod
+    def _process_identity(pid: int) -> str | None:
+        """Return Linux process start ticks so PID reuse cannot impersonate a job."""
+        try:
+            fields = Path(f"/proc/{pid}/stat").read_text().split()
+            return fields[21]
+        except (OSError, IndexError):
+            return None
 
     def _require_enabled(self) -> None:
         if not self.settings.gpu_lab_enable_local_runner:
@@ -101,6 +115,20 @@ class LocalRunner:
         python_env: str | None = None,
         job_id: str | None = None,
     ) -> dict:
+        async with self._submission_lock:
+            return await self._submit_locked(
+                command, working_directory, name, env, python_env, job_id
+            )
+
+    async def _submit_locked(
+        self,
+        command: str,
+        working_directory: str,
+        name: str | None,
+        env: dict[str, str] | None,
+        python_env: str | None,
+        job_id: str | None,
+    ) -> dict:
         self._require_enabled()
         workdir = self._path(working_directory)
         job_id = job_id or "local_" + uuid.uuid4().hex[:16]
@@ -173,6 +201,7 @@ class LocalRunner:
             )
         job.status = "running"
         job.remote_pid = process.pid
+        job.metadata["process_identity"] = self._process_identity(process.pid)
         self.repo.save_job(job)
         return {"job_id": job_id, "status": "running", "logs": str(jobdir)}
 
@@ -248,7 +277,16 @@ class LocalRunner:
             launched_by_current_runner = (
                 job.metadata.get("runner_instance_id") == self.runner_instance_id
             )
-            if not launched_by_current_runner or not job.remote_pid or job.remote_pid <= 0:
+            current_identity = (
+                self._process_identity(job.remote_pid)
+                if job.remote_pid and job.remote_pid > 0
+                else None
+            )
+            if (
+                not launched_by_current_runner
+                or not current_identity
+                or current_identity != job.metadata.get("process_identity")
+            ):
                 job.status = "unknown"
             else:
                 try:

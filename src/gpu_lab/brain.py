@@ -51,6 +51,12 @@ ACTION_TYPES = {
     "CODE_INSPECTION",
 }
 APPROVAL_REQUIRED_ACTIONS = {"TRAINING_RUN", "CAUSAL_INTERVENTION", "ABLATION"}
+EXECUTABLE_ACTIONS = APPROVAL_REQUIRED_ACTIONS | {
+    "REPRODUCTION",
+    "FROZEN_DIAGNOSTIC",
+    "REPLICATION",
+    "GENERALIZATION",
+}
 
 
 class ActionScore(BaseModel):
@@ -547,7 +553,50 @@ class ResearchBrain:
             "RESEARCH_DECISION_APPROVED",
         )
 
-    def authorize_execution(self, experiment_id: str, decision_id: str) -> dict:
+    def execution_decision_bind(
+        self, experiment_id: str, decision_id: str, request_fingerprint: str
+    ) -> dict:
+        """Bind an executable Brain decision to one exact preregistered request."""
+        experiment = self._expect(experiment_id, "Experiment")
+        decision = self._expect(decision_id, "ResearchDecision")
+        if str(experiment["project_id"]) != str(decision["project_id"]):
+            raise GPUError("RESEARCH_PROJECT_MISMATCH", "Experiment and decision differ")
+        selected = decision["data"].get("selected_action", {})
+        if selected.get("action_type") not in EXECUTABLE_ACTIONS:
+            raise GPUError(
+                "RESEARCH_DECISION_NOT_EXECUTABLE",
+                selected.get("action_type", "UNKNOWN"),
+            )
+        hypothesis_id = str(experiment["data"].get("hypothesis_id"))
+        if hypothesis_id not in {
+            str(item) for item in decision["data"].get("hypotheses_affected", [])
+        }:
+            raise GPUError("RESEARCH_DECISION_MISMATCH", "Decision does not cover the hypothesis")
+        plan = experiment["data"].get("plan", {})
+        if selected.get("question_addressed") != plan.get("research_question"):
+            raise GPUError("RESEARCH_DECISION_MISMATCH", "Decision question differs from the plan")
+        binding = {
+            "experiment_id": experiment_id,
+            "request_fingerprint": request_fingerprint,
+        }
+        prior = decision["data"].get("execution_binding")
+        if prior:
+            if prior != binding:
+                raise GPUError(
+                    "RESEARCH_DECISION_ALREADY_BOUND",
+                    "Decision is already bound to another execution request",
+                )
+            return {**decision, "idempotent_replay": True}
+        return self.store.object_update(
+            decision_id,
+            {"execution_binding": binding},
+            decision["status"],
+            "RESEARCH_DECISION_BOUND_TO_EXPERIMENT",
+        )
+
+    def authorize_execution(
+        self, experiment_id: str, decision_id: str, request_fingerprint: str
+    ) -> dict:
         """Verify that an execution matches its decision and has required human approval."""
         experiment = self._expect(experiment_id, "Experiment")
         decision = self._expect(decision_id, "ResearchDecision")
@@ -557,9 +606,22 @@ class ResearchBrain:
         if hypothesis_id not in {str(item) for item in decision["data"].get("hypotheses_affected", [])}:
             raise GPUError("RESEARCH_DECISION_MISMATCH", "Decision does not cover the hypothesis")
         selected = decision["data"].get("selected_action", {})
+        if selected.get("action_type") not in EXECUTABLE_ACTIONS:
+            raise GPUError(
+                "RESEARCH_DECISION_NOT_EXECUTABLE",
+                selected.get("action_type", "UNKNOWN"),
+            )
         plan = experiment["data"].get("plan", {})
         if selected.get("question_addressed") != plan.get("research_question"):
             raise GPUError("RESEARCH_DECISION_MISMATCH", "Decision question differs from the plan")
+        binding = decision["data"].get("execution_binding", {})
+        if binding.get("experiment_id") != experiment_id or binding.get(
+            "request_fingerprint"
+        ) != request_fingerprint:
+            raise GPUError(
+                "RESEARCH_EXECUTION_NOT_BOUND",
+                "Create a decision bound to this exact experiment command before execution",
+            )
         requires_approval = selected.get("action_type") in APPROVAL_REQUIRED_ACTIONS
         approval = decision["data"].get("approval")
         if requires_approval and (

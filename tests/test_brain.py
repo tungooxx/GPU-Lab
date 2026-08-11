@@ -133,3 +133,60 @@ def test_literature_candidates_change_next_action_to_evidence_review():
 
     assert selected.action_type == "EVIDENCE_REVIEW"
     assert selected.payload["evidence_ids"] == ["evidence-1"]
+
+
+class AuthorizationStore:
+    def __init__(self, action_type="FROZEN_DIAGNOSTIC", fingerprint="bound-request"):
+        self.objects = {
+            "experiment": {
+                "id": "experiment",
+                "project_id": "project",
+                "kind": "Experiment",
+                "status": "PREREGISTERED",
+                "data": {
+                    "hypothesis_id": "hypothesis",
+                    "plan": {"research_question": "Does the intervention discriminate?"},
+                },
+            },
+            "decision": {
+                "id": "decision",
+                "project_id": "project",
+                "kind": "ResearchDecision",
+                "status": "SELECTED",
+                "data": {
+                    "hypotheses_affected": ["hypothesis"],
+                    "selected_action": {
+                        "id": "action",
+                        "action_type": action_type,
+                        "question_addressed": "Does the intervention discriminate?",
+                    },
+                    "execution_binding": {
+                        "experiment_id": "experiment",
+                        "request_fingerprint": fingerprint,
+                    },
+                },
+            },
+        }
+
+    def object_get(self, object_id):
+        return self.objects[object_id]
+
+
+def test_non_execution_decision_cannot_authorize_command():
+    brain = ResearchBrain(AuthorizationStore(action_type="LITERATURE_SEARCH"))
+
+    with pytest.raises(GPUError) as error:
+        brain.authorize_execution("experiment", "decision", "bound-request")
+
+    assert error.value.error_type == "RESEARCH_DECISION_NOT_EXECUTABLE"
+
+
+def test_execution_decision_requires_exact_bound_command():
+    brain = ResearchBrain(AuthorizationStore())
+
+    with pytest.raises(GPUError) as error:
+        brain.authorize_execution("experiment", "decision", "different-request")
+
+    assert error.value.error_type == "RESEARCH_EXECUTION_NOT_BOUND"
+    authorized = brain.authorize_execution("experiment", "decision", "bound-request")
+    assert authorized["action_type"] == "FROZEN_DIAGNOSTIC"

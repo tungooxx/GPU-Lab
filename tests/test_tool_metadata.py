@@ -11,7 +11,11 @@ def test_vast_status_tool_has_provider_specific_name():
 def test_research_decision_creation_is_explicitly_discoverable():
     tool = mcp._tool_manager._tools["research_decision_create"]
 
-    assert tool.fn_metadata.arg_model.model_json_schema()["required"] == ["project_id"]
+    assert tool.fn_metadata.arg_model.model_json_schema()["required"] == [
+        "project_id",
+        "experiment_id",
+        "command",
+    ]
     assert "research_experiment_execute" in tool.description
 
 

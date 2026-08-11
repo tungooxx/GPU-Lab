@@ -46,7 +46,9 @@ research_project_create
 
 `experiment_plan_register` freezes the question, competing explanations, intervention and
 control, metrics, expected direction, pass/fail interpretations, and estimated time/cost before
-execution. `research_experiment_execute` first reserves a canonical PostgreSQL mapping of
+execution. Call `research_decision_create` with the experiment and exact command/environment that
+will be executed; only an executable Brain action can be bound, and execution rejects any request
+that differs from that binding. `research_experiment_execute` first reserves a canonical PostgreSQL mapping of
 `experiment_id`, `run_id`, and `job_id`, then submits a deterministic local job. Pass a stable
 `execution_attempt_uuid` when retrying a request; retries return the same mapping and do not launch
 a duplicate job. If no key is supplied, identical requests use an automatically derived key.

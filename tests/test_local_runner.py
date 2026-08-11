@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -92,6 +93,34 @@ async def test_local_submit_replays_reserved_job_id(monkeypatch, tmp_path):
         lambda job_id: {"job_id": job_id, "status": "running", "exit_code": None},
     )
     second = await runner.submit("echo ok", job_id="local_execution_attempt_1")
+
+    assert first["job_id"] == second["job_id"]
+    assert second["idempotent_replay"] is True
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_local_submit_spawns_canonical_job_once(monkeypatch, tmp_path):
+    runner = _runner(tmp_path)
+    calls = 0
+
+    async def fake_subprocess(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return _Process()
+
+    monkeypatch.setattr("gpu_lab.local_runner.asyncio.create_subprocess_shell", fake_subprocess)
+    monkeypatch.setattr(runner, "_process_identity", lambda _pid: "start-ticks")
+    monkeypatch.setattr(
+        runner,
+        "job_status",
+        lambda job_id: {"job_id": job_id, "status": "running", "exit_code": None},
+    )
+
+    first, second = await asyncio.gather(
+        runner.submit("echo ok", job_id="local_concurrent_attempt"),
+        runner.submit("echo ok", job_id="local_concurrent_attempt"),
+    )
 
     assert first["job_id"] == second["job_id"]
     assert second["idempotent_replay"] is True

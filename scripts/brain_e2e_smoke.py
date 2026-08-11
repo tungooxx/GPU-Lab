@@ -382,9 +382,22 @@ def main() -> None:
         "print(json.dumps(result))\n"
         "PY"
     )
+    execution_decision = call_tool(
+        "research_decision_create",
+        {
+            "project_id": project_id,
+            "experiment_id": plan["id"],
+            "command": experiment_command,
+            "working_directory": "/workspace/local-vlm",
+            "env": {"PYTHONPATH": "/opt/gpu-lab/envs/vrc-analysis-deps"},
+            "python_env": "vrc-py313-torch260-cu124",
+        },
+    )
+    if execution_decision.get("execution_binding_error"):
+        raise AssertionError(execution_decision)
     execution_arguments = {
         "experiment_id": plan["id"],
-        "decision_id": before["decision_id"],
+        "decision_id": execution_decision["decision_id"],
         "execution_attempt_uuid": attempt,
         "python_env": "vrc-py313-torch260-cu124",
         "working_directory": "/workspace/local-vlm",
@@ -397,7 +410,7 @@ def main() -> None:
     call_tool(
         "brain_decision_approve",
         {
-            "decision_id": before["decision_id"],
+            "decision_id": execution_decision["decision_id"],
             "approver": "brain-e2e-smoke",
             "rationale": "Authorize the preregistered low-cost frozen VRCNet intervention.",
         },
@@ -433,7 +446,7 @@ def main() -> None:
         "brain_result_assess",
         {
             "run_id": execution["run_id"],
-            "decision_id": before["decision_id"],
+            "decision_id": execution_decision["decision_id"],
             "hypothesis_id": hypothesis["id"],
             "agenda_item_id": causal_item["id"],
             "prediction_outcome": "Frozen HASI state substitution changed the recipient output",

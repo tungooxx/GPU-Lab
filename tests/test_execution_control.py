@@ -16,6 +16,14 @@ class FakeResearch:
         self.updates.append((run_id, result))
         return {"id": run_id, "status": result["status"], "data": result}
 
+    def run_mark_submitted(self, _run_id):
+        self.mapping = {
+            **self.mapping,
+            "status": "running",
+            "run": {**self.mapping["run"], "status": "running"},
+        }
+        return self.mapping
+
     def object_create(self, *args):
         self.artifacts.append(args)
         return {"id": "artifact"}
@@ -39,6 +47,22 @@ class LocalMustNotRun:
         raise AssertionError("reserved or inspected executions must not query runtime status")
 
 
+class MissingLocal:
+    def job_status(self, _job_id):
+        return {"error": {"type": "JOB_NOT_FOUND", "message": "missing"}}
+
+
+class RunningLocal:
+    def job_status(self, job_id):
+        return {"job_id": job_id, "status": "running", "exit_code": None, "logs_tail": ""}
+
+    def artifacts(self, _job_id):
+        return []
+
+    async def status(self):
+        return {"instance_id": "local"}
+
+
 def _mapping(status):
     return {
         "experiment_id": "experiment-id",
@@ -59,7 +83,7 @@ def _mapping(status):
 async def test_sync_returns_reserved_mapping_without_missing_job_exception(monkeypatch):
     research = FakeResearch(_mapping("RESERVED"))
     monkeypatch.setattr(server, "research", lambda: research)
-    monkeypatch.setattr(server, "local", LocalMustNotRun())
+    monkeypatch.setattr(server, "local", MissingLocal())
 
     result = await server.research_experiment_sync(run_id="run-id")
 
@@ -69,6 +93,19 @@ async def test_sync_returns_reserved_mapping_without_missing_job_exception(monke
     assert result["retry_safe"] is True
     assert result["recovery_action"] == "RETRY_EXECUTION"
     assert research.updates == []
+
+
+@pytest.mark.asyncio
+async def test_sync_promotes_reserved_mapping_when_local_job_exists(monkeypatch):
+    research = FakeResearch(_mapping("RESERVED"))
+    monkeypatch.setattr(server, "research", lambda: research)
+    monkeypatch.setattr(server, "local", RunningLocal())
+
+    result = await server.research_experiment_sync(run_id="run-id")
+
+    assert result["status"] == "running"
+    assert result["run_id"] == "run-id"
+    assert research.updates[0][1]["status"] == "running"
 
 
 @pytest.mark.asyncio

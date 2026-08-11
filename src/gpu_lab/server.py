@@ -647,15 +647,55 @@ async def brain_step(project_id: str):
     return await call(brain().brain_step, project_id)
 
 
+def _execution_action_fingerprint(
+    experiment_id: str,
+    command: str,
+    working_directory: str,
+    env: dict[str, str] | None,
+    python_env: str | None,
+) -> str:
+    action = {
+        "experiment_id": experiment_id,
+        "command": command,
+        "working_directory": working_directory,
+        "env": env or {},
+        "python_env": python_env,
+    }
+    return hashlib.sha256(
+        json.dumps(action, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
 @mcp.tool()
-async def research_decision_create(project_id: str):
+async def research_decision_create(
+    project_id: str,
+    experiment_id: str,
+    command: str,
+    working_directory: str = ".",
+    env: dict[str, str] | None = None,
+    python_env: str | None = None,
+):
     """Create the ResearchDecision required by research_experiment_execute.
 
     Use this before executing a preregistered experiment. Pass the returned
     decision_id to research_experiment_execute, after brain_decision_approve
     when the selected action requires explicit human approval.
     """
-    return await call(brain().brain_step, project_id)
+    step = await call(brain().brain_step, project_id)
+    if "error" in step:
+        return step
+    fingerprint = _execution_action_fingerprint(
+        experiment_id, command, working_directory, env, python_env
+    )
+    binding = await call(
+        brain().execution_decision_bind,
+        experiment_id,
+        step["decision_id"],
+        fingerprint,
+    )
+    if "error" in binding:
+        return {**step, "execution_binding_error": binding["error"]}
+    return {**step, "execution_binding": binding["data"]["execution_binding"]}
 
 
 @mcp.tool()
@@ -1675,6 +1715,9 @@ async def research_experiment_execute(
         json.dumps(request, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     idempotency_key = execution_attempt_uuid or f"auto:{fingerprint}"
+    action_fingerprint = _execution_action_fingerprint(
+        experiment_id, command, working_directory, env, python_env
+    )
     job_id = (
         "local_" + hashlib.sha256(f"{experiment_id}:{idempotency_key}".encode()).hexdigest()[:24]
     )
@@ -1695,7 +1738,12 @@ async def research_experiment_execute(
     )
     if "error" in reservation:
         return reservation
-    authorization = await call(brain().authorize_execution, experiment_id, decision_id)
+    authorization = await call(
+        brain().authorize_execution,
+        experiment_id,
+        decision_id,
+        action_fingerprint,
+    )
     if "error" in authorization:
         return {
             "experiment_id": reservation["experiment_id"],
@@ -1755,19 +1803,31 @@ async def research_experiment_sync(run_id: str | None = None, job_id: str | None
         if job_mapping["run_id"] != mapping["run_id"]:
             return {"error": {"type": "EXECUTION_IDENTIFIER_MISMATCH"}}
     canonical_run_id, canonical_job_id = mapping["run_id"], mapping["job_id"]
+    outcome = None
     if mapping["status"] == "RESERVED":
-        return {
-            **mapping,
-            "retry_safe": True,
-            "recovery_action": "RETRY_EXECUTION",
-            "message": (
-                "No local process was submitted. Retry research_experiment_execute with the "
-                "same experiment_id, decision_id, command, and execution_attempt_uuid."
-            ),
-        }
+        outcome = await call(local.job_status, canonical_job_id)
+        if "error" in outcome:
+            return {
+                **mapping,
+                "retry_safe": True,
+                "recovery_action": "RETRY_EXECUTION",
+                "message": (
+                    "No local process was submitted. Retry research_experiment_execute with the "
+                    "same experiment_id, decision_id, command, and execution_attempt_uuid."
+                ),
+            }
+        promoted = await call(research().run_mark_submitted, canonical_run_id)
+        if "error" in promoted:
+            return {
+                **mapping,
+                "retry_safe": True,
+                "recovery_action": "RETRY_SYNC",
+                "mapping_error": promoted["error"],
+            }
+        mapping = promoted
     if mapping["status"] == "RESULT_INSPECTED":
         return {**mapping, "retry_safe": True, "recovery_action": "NONE"}
-    outcome = await call(local.job_status, canonical_job_id)
+    outcome = outcome or await call(local.job_status, canonical_job_id)
     if "error" in outcome:
         return {
             **mapping,
@@ -1791,23 +1851,24 @@ async def research_experiment_sync(run_id: str | None = None, job_id: str | None
     if "error" in runtime:
         runtime = {"error": runtime["error"]}
     runner_status = outcome["status"]
-    research_status = "failed" if runner_status == "unknown" else runner_status
-    for artifact in artifacts:
-        recorded = await call(
-            research().artifact_record,
-            canonical_run_id,
-            canonical_job_id,
-            artifact,
-        )
-        if "error" in recorded:
-            return {
-                **mapping,
-                "status": "UNKNOWN",
-                "runner_status": runner_status,
-                "retry_safe": True,
-                "recovery_action": "RETRY_SYNC",
-                "artifact_record_error": recorded["error"],
-            }
+    research_status = runner_status
+    if runner_status in {"completed", "failed"}:
+        for artifact in artifacts:
+            recorded = await call(
+                research().artifact_record,
+                canonical_run_id,
+                canonical_job_id,
+                artifact,
+            )
+            if "error" in recorded:
+                return {
+                    **mapping,
+                    "status": "UNKNOWN",
+                    "runner_status": runner_status,
+                    "retry_safe": True,
+                    "recovery_action": "RETRY_SYNC",
+                    "artifact_record_error": recorded["error"],
+                }
     updated = await call(
         research().run_update,
         canonical_run_id,
