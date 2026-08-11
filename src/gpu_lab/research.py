@@ -89,6 +89,11 @@ RESEARCH_OBJECT_STATUSES = {
 }
 
 
+def _json_document(value: Any) -> Any:
+    """Convert PostgreSQL-native values to a JSON document before persistence."""
+    return json.loads(json.dumps(value, default=str))
+
+
 class ResearchStore:
     """PostgreSQL canonical scientific state with immutable event history."""
 
@@ -1026,16 +1031,20 @@ class ResearchStore:
         now = datetime.now(UTC)
         candidate_ids = [uuid.uuid4() for _ in candidates]
         decision_id = uuid.uuid4()
-        persisted = [
-            {**candidate, "id": str(candidate_id)}
-            for candidate, candidate_id in zip(candidates, candidate_ids, strict=True)
-        ]
-        materialized = {
-            **decision_data,
-            "candidate_action_ids": [str(item) for item in candidate_ids],
-            "candidate_actions": persisted,
-            "selected_action": persisted[selected_index],
-        }
+        persisted = _json_document(
+            [
+                {**candidate, "id": str(candidate_id)}
+                for candidate, candidate_id in zip(candidates, candidate_ids, strict=True)
+            ]
+        )
+        materialized = _json_document(
+            {
+                **decision_data,
+                "candidate_action_ids": [str(item) for item in candidate_ids],
+                "candidate_actions": persisted,
+                "selected_action": persisted[selected_index],
+            }
+        )
         with self._connect() as conn, conn.cursor() as cur:
             for candidate, candidate_id in zip(candidates, candidate_ids, strict=True):
                 cur.execute(

@@ -5,6 +5,7 @@ import pytest
 
 from gpu_lab.brain import ActionScore, ResearchBrain
 from gpu_lab.errors import GPUError
+from gpu_lab.research import _json_document
 
 
 def test_action_score_rewards_information_and_penalizes_cost():
@@ -28,6 +29,17 @@ def test_action_score_rewards_information_and_penalizes_cost():
     )
 
     assert cheap_discriminator.priority > expensive_training.priority
+
+
+def test_research_json_document_normalizes_postgres_uuid_values():
+    from uuid import uuid4
+
+    identifier = uuid4()
+
+    assert _json_document({"id": identifier, "nested": [identifier]}) == {
+        "id": str(identifier),
+        "nested": [str(identifier)],
+    }
 
 
 def test_configured_action_rejects_unknown_action_type():
