@@ -1,0 +1,4 @@
+services:
+  gpu-lab:
+    # Emergency control-plane mode when the host NVIDIA runtime cannot create GPU containers.
+    gpus: !reset []
