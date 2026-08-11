@@ -25,14 +25,16 @@ from .errors import GPUError
 from .executable_papers import ExecutablePaperService, HttpExecutablePaperProvider
 from .literature import HttpLiteratureProvider, LiteratureService
 from .local_runner import LocalRunner
+from .qd import HypothesisQDService
 from .research import ResearchStore
 from .service import GPUService
 from .terminal import TERMINAL_HTML
 
 logger = logging.getLogger(__name__)
 
-settings, service, research_store, research_brain, literature_service, executable_paper_service = (
+settings, service, research_store, research_brain, literature_service, executable_paper_service, qd_service = (
     Settings(),
+    None,
     None,
     None,
     None,
@@ -77,6 +79,8 @@ _READ_ONLY_TOOLS = {
     "claim_get_evidence",
     "claim_compare",
     "hypothesis_related",
+    "hypothesis_niche_list",
+    "hypothesis_qd_screen",
     "experiment_priority",
     "research_events",
     "paper_search",
@@ -286,6 +290,15 @@ def executable_papers() -> ExecutablePaperService:
                     ),
                 )
     return executable_paper_service
+
+
+def qd() -> HypothesisQDService:
+    global qd_service
+    if qd_service is None:
+        with _singleton_lock:
+            if qd_service is None:
+                qd_service = HypothesisQDService(research())
+    return qd_service
 
 
 async def call(fn, *args, **kwargs):
@@ -804,6 +817,38 @@ async def hypothesis_create(
 async def hypothesis_related(project_id: str, mechanism: str, limit: int = 10):
     """Retrieve related active and failed mechanisms before proposing a new descendant."""
     return await call(research().related_hypotheses, project_id, mechanism, min(max(limit, 1), 50))
+
+
+@mcp.tool()
+async def hypothesis_niche_create(
+    project_id: str, name: str, description: str, diversity_signature: dict
+):
+    """Create a mechanistic hypothesis niche without assigning scientific truth or probability."""
+    return await call(qd().niche_create, project_id, name, description, diversity_signature)
+
+
+@mcp.tool()
+async def hypothesis_niche_list(project_id: str):
+    """List the project's mechanistic niches and explicitly selected active representatives."""
+    return await call(qd().niche_list, project_id)
+
+
+@mcp.tool()
+async def hypothesis_qd_screen(project_id: str, draft: dict):
+    """Compare a typed draft with active/dead ideas using retrieval and structured mechanisms."""
+    return await call(qd().screen, project_id, draft)
+
+
+@mcp.tool()
+async def hypothesis_qd_create(project_id: str, draft: dict):
+    """Persist a screened hypothesis with niche, ancestry, similarity, and scientific difference."""
+    return await call(qd().create, project_id, draft)
+
+
+@mcp.tool()
+async def hypothesis_niche_set_best(niche_id: str, hypothesis_id: str, rationale: str):
+    """Select a surviving niche representative for test priority, never as proof of truth."""
+    return await call(qd().niche_set_best, niche_id, hypothesis_id, rationale)
 
 
 @mcp.tool()

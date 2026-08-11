@@ -40,6 +40,7 @@ RESEARCH_OBJECT_KINDS = (
     "ResearchAgenda",
     "AgendaItem",
     "HypothesisPortfolio",
+    "HypothesisNiche",
     "ResearchDecision",
     "ResearchActionCandidate",
     "ActionApproval",
@@ -201,6 +202,45 @@ class ResearchStore:
             "project_id": project_id,
             "kind": kind,
             "status": status,
+            "data": data,
+        }
+
+    def hypothesis_create_with_edges(
+        self,
+        project_id: str,
+        data: dict[str, Any],
+        edges: list[tuple[str, str]],
+    ) -> dict:
+        """Atomically persist a QD hypothesis, its lineage, niche, and proximity edges."""
+        ident, now = uuid.uuid4(), datetime.now(UTC)
+        source_ids = sorted({source_id for source_id, _relation in edges})
+        with self._connect() as conn, conn.cursor() as cur:
+            if source_ids:
+                cur.execute(
+                    "SELECT id,project_id FROM research_objects WHERE id=ANY(%s::uuid[]) FOR SHARE",
+                    (source_ids,),
+                )
+                sources = cur.fetchall()
+                if len(sources) != len(source_ids):
+                    raise GPUError("RESEARCH_OBJECT_NOT_FOUND", "One or more QD edge sources")
+                if any(str(item["project_id"]) != str(project_id) for item in sources):
+                    raise GPUError("RESEARCH_PROJECT_MISMATCH", "QD edges must remain in one project")
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'Hypothesis','ACTIVE',%s,%s)",
+                (ident, project_id, json.dumps(data), now),
+            )
+            for source_id, relation in edges:
+                cur.execute(
+                    "INSERT INTO research_edges VALUES(%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                    (source_id, ident, relation, now),
+                )
+            self._event(cur, project_id, "QD_HYPOTHESIS_CREATED", ident, data)
+        return {
+            "id": str(ident),
+            "project_id": project_id,
+            "kind": "Hypothesis",
+            "status": "ACTIVE",
             "data": data,
         }
 

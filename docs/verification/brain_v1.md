@@ -17,6 +17,8 @@ evidence. A successful tool call or unit test is not treated as proof of a mecha
   retrieval, advisory critics, and explicit information/cost/risk components.
 - `brain_result_assess` for inspected evidence and provenance-bearing state transitions.
 - HASI historical benchmark fixture and a real Brain E2E smoke.
+- Native mechanistic niches, ancestry, active/dead proximity retrieval, typed advisory QD
+  operators, and explicit-difference gates for related failed ideas.
 
 ## Real MCP, database, GPU, and learning tests
 
@@ -43,9 +45,11 @@ inspected run, five WorldModel versions, and continued with `GENERALIZATION`.
 - **VERIFIED_REAL:** local GPU experiment execution, inspected experiment evidence, evidence-driven
   hypothesis/edge/state update, and changed next Brain action.
 - **VERIFIED_INTEGRATION:** PostgreSQL/MCP persistence, WorldModel version recovery, decision/run
-  recovery, and continuation after restart.
+  recovery, continuation after restart, and live QD discovery/dead-memory screening/lineage/niche
+  recovery through `scripts/qd_e2e_smoke.py`.
 - **VERIFIED_UNIT:** policy scoring, invalid action handling, finite agenda validation, the HASI
-  reproduction-before-intervention gate, and unavailable-provider alternative action.
+  reproduction-before-intervention gate, unavailable-provider alternative action, and QD niche,
+  lineage, dead-idea, vector/structured-proximity, and noncanonical embedding-cache behavior.
 - **VERIFIED_INTEGRATION:** PaperQA 2026.3.18 import/API compatibility, isolated worker health,
   authenticated gateway-to-worker connectivity, provenance normalization, canonical candidate
   import, unavailable-provider behavior, a non-root/capability-dropped worker with writable paper
@@ -56,7 +60,7 @@ inspected run, five WorldModel versions, and continued with `GENERALIZATION`.
   isolation, server-verified parameter-bound approval records, and absence of
   Vast/SSH/PostgreSQL/OpenAI credentials.
 - **UNVERIFIED:** scientific generality of HASI, real model-backed PaperQA answer quality,
-  quality-diversity operators, branch search, meta-review, and autonomous campaigns. The isolated
+  longitudinal scientific value of QD, branch search, meta-review, and autonomous campaigns. The isolated
   Paper2Agent provider contract is implemented and unit-tested, but a model-backed build remains
   `IMPLEMENTED_UNVERIFIED` until a scoped Claude credential is supplied for the multi-hour run.
 
@@ -66,6 +70,6 @@ Brain v1 uses deterministic heuristics and caller-authored candidate experiments
 integrated as an isolated optional provider, so the next literature task is a credentialed
 model-backed quality evaluation rather than another adapter. Its real smoke proves the scientific
 state machine learns from inspected evidence; it does not establish that one intervention
-generalizes across models or datasets. The next build step is native quality-diversity hypothesis
-niches and lineage/proximity critics; a real Paper2Agent conversion should run separately when a
+generalizes across models or datasets. The next build step is deterministic experiment branch
+records and comparative lessons; a real Paper2Agent conversion should run separately when a
 specific paper and task-scoped credential are approved.

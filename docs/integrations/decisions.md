@@ -54,10 +54,16 @@ They must be revisited before adding or upgrading an external dependency.
 ## IDEAgent
 
 - Official source identified by the paper: <https://github.com/declare-lab/IDEAgent>
+- Audited upstream commit: `121376126a4864ee5436ea5a23ffc8dc0f7842c5` (default branch HEAD
+  at audit time).
+- License: the repository has no standalone LICENSE file, while its `pyproject.toml` package
+  metadata declares MIT. No upstream source is copied into GPU-Lab.
 - Architecture: quality-diversity idea evolution using lineages, completed/rejected idea comparison,
-  repair, and refinement.
-- Decision: **DESIGN INSPIRATION ONLY** until the repository license and dependency surface are
-  verified directly. Port only the abstract niche/lineage/search policy into native typed services.
+  repair, and refinement. Its Python 3.10+ environment directly includes OpenAI, Google GenAI,
+  Anthropic, scikit-learn, and matplotlib, and it keeps run artifacts outside our scientific store.
+- Decision: **DESIGN INSPIRATION / ALGORITHM PORT ONLY**, not a runtime dependency. The native QD
+  service ports the abstract niche, lineage, proximity, and reflection policy into typed services
+  backed by our PostgreSQL state.
 - Boundary: QD scores affect which hypothesis to test, never which hypothesis is scientifically true.
 
 ## MARS reflective search

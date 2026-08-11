@@ -31,13 +31,17 @@ integration tests, and real execution.
   state snapshot, evidence references, critic advice, rationale, and costs.
 - Explicit result assessment records experiment evidence and updates the run, hypothesis,
   AgendaItem, ResearchDecision, ResearchState, and optional causal edge/WorldModelVersion.
+- Native hypothesis QD stores mechanistic niches and lineage, combines optional pgvector retrieval
+  with structured mechanism comparison, retrieves related dead ideas, and requires an explicit
+  scientific difference before accepting a likely duplicate or descendant of a failed mechanism.
 
 ## What is verified
 
-- **VERIFIED_UNIT:** 37 tests cover provider normalization, malformed worker responses, audit
+- **VERIFIED_UNIT:** 62 tests cover provider normalization, malformed worker responses, audit
   redaction, path safety, structured output metadata, local requirements resolution, environment
   command construction, local job idempotency, action
-  scoring, the HASI reproduction gate, and unavailable-provider fallback behavior.
+  scoring, the HASI reproduction gate, unavailable-provider fallback behavior, and QD niche,
+  lineage, dead-idea, vector/structured-proximity, operator, and cache-failure behavior.
 - **VERIFIED_INTEGRATION:** Docker PostgreSQL migration, MCP discovery, atomic execution reservation,
   repeated submission, immutable `EXPERIMENT_STARTED` identity, job-ID sync, logs/artifacts, and
   completed-run persistence.
@@ -47,6 +51,9 @@ integration tests, and real execution.
   environment, and a GTX 1650 to prove `brain_step before -> real evidence -> brain_step after`.
 - **VERIFIED_INTEGRATION:** after restarting PostgreSQL and GPU-Lab, the same project recovered its
   decisions, inspected run, WorldModel history, and evidence-dependent next action.
+- **VERIFIED_INTEGRATION:** `scripts/qd_e2e_smoke.py` discovered all QD MCP tools, blocked an
+  unexplained descendant of a PostgreSQL negative result, persisted the differentiated lineage and
+  niche representative, restarted PostgreSQL/GPU-Lab, and recovered the same scientific objects.
 
 ## What is partial
 
@@ -59,14 +66,14 @@ integration tests, and real execution.
   inspection, verification cap, and authorization behavior are unit tested. A real multi-hour
   Paper2Agent generation is not yet verified because no task-scoped Claude credential was supplied.
 - Hypothesis similarity uses lexical structure unless callers provide embeddings.
-- Brain v1 critics are deterministic advisory checks; LLM-backed typed ResearchOperators are not
-  integrated.
+- Brain v1 and QD critics are deterministic advisory checks; QD candidate intake is typed but not
+  LLM-generated, and no LLM-backed ResearchOperator is integrated.
 
 ## What is missing
 
-- Automatic embedding generation, hypothesis niches/lineages, full comparative/meta-research
-  memory, experiment branches, and autonomous campaign runtime.
-- Executable-paper provider adapters; PaperQA's real model-backed answer quality remains unverified.
+- Automatic embedding generation, full comparative/meta-research memory, experiment branches, and
+  autonomous campaign runtime.
+- PaperQA's real model-backed answer quality remains unverified.
 - Additional historical benchmark episodes beyond the permanent HASI gate.
 
 ## What should be reused

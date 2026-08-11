@@ -360,6 +360,7 @@ class ResearchBrain:
     def _portfolio_data(self, project_id: str) -> dict:
         hypotheses = self.store.objects_list(project_id, "Hypothesis", limit=None)
         negative = self.store.objects_list(project_id, "NegativeResult", limit=None)
+        niches = self.store.objects_list(project_id, "HypothesisNiche", limit=None)
         return {
             "active_hypothesis_ids": [
                 str(item["id"])
@@ -370,6 +371,16 @@ class ResearchBrain:
                 str(item["id"]) for item in hypotheses if item["status"] == "REFUTED"
             ],
             "negative_result_ids": [str(item["id"]) for item in negative],
+            "niches": [
+                {
+                    "niche_id": str(item["id"]),
+                    "name": item["data"].get("name"),
+                    "active_best_hypothesis_id": item["data"].get(
+                        "active_best_hypothesis_id"
+                    ),
+                }
+                for item in niches
+            ],
             "updated_at": datetime.now(UTC).isoformat(),
         }
 
