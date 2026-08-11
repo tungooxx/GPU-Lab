@@ -150,6 +150,38 @@ class ResearchStore:
                     ON research_objects USING GIN (data jsonb_path_ops);
                 CREATE INDEX IF NOT EXISTS research_execution_attempts_job_idx
                     ON research_execution_attempts(job_id);
+                ALTER TABLE research_objects
+                    ADD COLUMN IF NOT EXISTS embedding_updated_at TIMESTAMPTZ;
+                ALTER TABLE research_objects
+                    ADD COLUMN IF NOT EXISTS embedding_metadata JSONB;
+                CREATE TABLE IF NOT EXISTS research_object_versions (
+                    revision_id BIGSERIAL PRIMARY KEY,
+                    object_id UUID NOT NULL REFERENCES research_objects(id),
+                    project_id UUID NOT NULL REFERENCES research_projects(id),
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    data JSONB NOT NULL,
+                    object_created_at TIMESTAMPTZ NOT NULL,
+                    valid_from TIMESTAMPTZ NOT NULL,
+                    embedding_text TEXT,
+                    embedding_updated_at TIMESTAMPTZ,
+                    embedding_metadata JSONB,
+                    legacy_backfill BOOLEAN NOT NULL DEFAULT FALSE
+                );
+                CREATE INDEX IF NOT EXISTS research_object_versions_temporal_idx
+                    ON research_object_versions(project_id, valid_from, object_id, revision_id DESC);
+                CREATE TABLE IF NOT EXISTS research_project_versions (
+                    revision_id BIGSERIAL PRIMARY KEY,
+                    project_id UUID NOT NULL REFERENCES research_projects(id),
+                    name TEXT NOT NULL,
+                    question TEXT NOT NULL,
+                    state JSONB NOT NULL,
+                    project_created_at TIMESTAMPTZ NOT NULL,
+                    valid_from TIMESTAMPTZ NOT NULL,
+                    legacy_backfill BOOLEAN NOT NULL DEFAULT FALSE
+                );
+                CREATE INDEX IF NOT EXISTS research_project_versions_temporal_idx
+                    ON research_project_versions(project_id, valid_from, revision_id DESC);
             """)
             allowed_kinds = ",".join("'" + kind + "'" for kind in RESEARCH_OBJECT_KINDS)
             cur.execute(
@@ -202,6 +234,63 @@ class ResearchStore:
             )
             if self.vector_available:
                 cur.execute("ALTER TABLE research_objects ADD COLUMN IF NOT EXISTS embedding vector")
+            cur.execute("""
+                CREATE OR REPLACE FUNCTION gpu_lab_capture_research_object_version()
+                RETURNS trigger AS $$
+                BEGIN
+                    INSERT INTO research_object_versions(
+                        object_id,project_id,kind,status,data,object_created_at,valid_from,
+                        embedding_text,embedding_updated_at,embedding_metadata,legacy_backfill
+                    ) VALUES(
+                        NEW.id,NEW.project_id,NEW.kind,NEW.status,NEW.data,NEW.created_at,
+                        clock_timestamp(),to_jsonb(NEW)->>'embedding',NEW.embedding_updated_at,
+                        NEW.embedding_metadata,FALSE
+                    );
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+                DROP TRIGGER IF EXISTS research_objects_capture_version ON research_objects;
+                CREATE TRIGGER research_objects_capture_version
+                    AFTER INSERT OR UPDATE ON research_objects
+                    FOR EACH ROW EXECUTE FUNCTION gpu_lab_capture_research_object_version();
+
+                CREATE OR REPLACE FUNCTION gpu_lab_capture_research_project_version()
+                RETURNS trigger AS $$
+                BEGIN
+                    INSERT INTO research_project_versions(
+                        project_id,name,question,state,project_created_at,valid_from,legacy_backfill
+                    ) VALUES(
+                        NEW.id,NEW.name,NEW.question,NEW.state,NEW.created_at,
+                        clock_timestamp(),FALSE
+                    );
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+                DROP TRIGGER IF EXISTS research_projects_capture_version ON research_projects;
+                CREATE TRIGGER research_projects_capture_version
+                    AFTER INSERT OR UPDATE ON research_projects
+                    FOR EACH ROW EXECUTE FUNCTION gpu_lab_capture_research_project_version();
+            """)
+            cur.execute("""
+                INSERT INTO research_object_versions(
+                    object_id,project_id,kind,status,data,object_created_at,valid_from,
+                    embedding_text,embedding_updated_at,embedding_metadata,legacy_backfill
+                )
+                SELECT o.id,o.project_id,o.kind,o.status,o.data,o.created_at,clock_timestamp(),
+                       to_jsonb(o)->>'embedding',o.embedding_updated_at,o.embedding_metadata,TRUE
+                FROM research_objects o
+                WHERE NOT EXISTS(
+                    SELECT 1 FROM research_object_versions v WHERE v.object_id=o.id
+                );
+                INSERT INTO research_project_versions(
+                    project_id,name,question,state,project_created_at,valid_from,legacy_backfill
+                )
+                SELECT p.id,p.name,p.question,p.state,p.created_at,clock_timestamp(),TRUE
+                FROM research_projects p
+                WHERE NOT EXISTS(
+                    SELECT 1 FROM research_project_versions v WHERE v.project_id=p.id
+                );
+            """)
 
     def project_create(self, name: str, question: str) -> dict:
         ident, now = uuid.uuid4(), datetime.now(UTC)
@@ -211,14 +300,40 @@ class ResearchStore:
             self._event(cur, ident, "RESEARCH_PROJECT_CREATED", None, {"name": name, "question": question})
         return {"project_id": str(ident), "name": name, "state": state}
 
-    def project_get(self, project_id: str) -> dict:
-        with self._connect() as conn, conn.cursor() as cur:
-            cur.execute(
-                "SELECT id,name,question,state,created_at FROM research_projects WHERE id=%s",
-                (project_id,),
+    @staticmethod
+    def _normalize_as_of(as_of: datetime | str | None) -> datetime | None:
+        if as_of is None:
+            return None
+        try:
+            value = datetime.fromisoformat(as_of) if isinstance(as_of, str) else as_of
+        except (TypeError, ValueError) as exc:
+            raise GPUError("INVALID_TEMPORAL_CUTOFF", str(as_of)) from exc
+        if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+            raise GPUError(
+                "INVALID_TEMPORAL_CUTOFF", "Temporal cutoff must be an ISO timestamp with UTC offset"
             )
+        return value.astimezone(UTC)
+
+    def project_get(self, project_id: str, as_of: datetime | str | None = None) -> dict:
+        cutoff = self._normalize_as_of(as_of)
+        with self._connect() as conn, conn.cursor() as cur:
+            if cutoff is None:
+                cur.execute(
+                    "SELECT id,name,question,state,created_at FROM research_projects WHERE id=%s",
+                    (project_id,),
+                )
+            else:
+                cur.execute(
+                    "SELECT project_id AS id,name,question,state,project_created_at AS created_at,"
+                    "valid_from,legacy_backfill FROM research_project_versions "
+                    "WHERE project_id=%s AND valid_from<=%s "
+                    "ORDER BY valid_from DESC,revision_id DESC LIMIT 1",
+                    (project_id, cutoff),
+                )
             project = cur.fetchone()
         if not project:
+            if cutoff is not None:
+                raise GPUError("TEMPORAL_SNAPSHOT_UNAVAILABLE", f"{project_id} at {cutoff.isoformat()}")
             raise GPUError("RESEARCH_PROJECT_NOT_FOUND", project_id)
         return project
 
@@ -1427,14 +1542,27 @@ class ResearchStore:
         statuses: set[str] | None = None,
         limit: int | None = 500,
         data_filters: dict[str, Any] | None = None,
+        as_of: datetime | str | None = None,
     ) -> list[dict]:
         """List canonical research objects with typed filters for Brain services."""
+        cutoff = self._normalize_as_of(as_of)
         with self._connect() as conn, conn.cursor() as cur:
-            sql = (
-                "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
-                "WHERE project_id=%s"
-            )
-            args: list[Any] = [project_id]
+            if cutoff is None:
+                sql = (
+                    "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
+                    "WHERE project_id=%s"
+                )
+                args: list[Any] = [project_id]
+            else:
+                sql = (
+                    "WITH latest AS ("
+                    "SELECT DISTINCT ON (v.object_id) v.object_id AS id,v.project_id,v.kind,"
+                    "v.status,v.data,v.object_created_at AS created_at "
+                    "FROM research_object_versions v WHERE v.project_id=%s AND v.valid_from<=%s "
+                    "ORDER BY v.object_id,v.valid_from DESC,v.revision_id DESC) "
+                    "SELECT id,project_id,kind,status,data,created_at FROM latest WHERE TRUE"
+                )
+                args = [project_id, cutoff]
             if kind:
                 sql += " AND kind=%s"
                 args.append(kind)
@@ -1457,10 +1585,22 @@ class ResearchStore:
         kind: str,
         statuses: set[str] | None = None,
         data_filters: dict[str, Any] | None = None,
+        as_of: datetime | str | None = None,
     ) -> int:
         """Count fully filtered canonical objects without materializing a bounded page."""
-        sql = "SELECT count(*) AS count FROM research_objects WHERE project_id=%s AND kind=%s"
-        args: list[Any] = [project_id, kind]
+        cutoff = self._normalize_as_of(as_of)
+        if cutoff is None:
+            sql = "SELECT count(*) AS count FROM research_objects WHERE project_id=%s AND kind=%s"
+            args: list[Any] = [project_id, kind]
+        else:
+            sql = (
+                "WITH latest AS ("
+                "SELECT DISTINCT ON (v.object_id) v.object_id,v.kind,v.status,v.data "
+                "FROM research_object_versions v WHERE v.project_id=%s AND v.valid_from<=%s "
+                "ORDER BY v.object_id,v.valid_from DESC,v.revision_id DESC) "
+                "SELECT count(*) AS count FROM latest WHERE kind=%s"
+            )
+            args = [project_id, cutoff, kind]
         if statuses:
             sql += " AND status=ANY(%s)"
             args.append(list(statuses))
@@ -1476,10 +1616,23 @@ class ResearchStore:
         project_id: str,
         kind: str,
         statuses: set[str] | None = None,
+        as_of: datetime | str | None = None,
     ) -> list[dict]:
         """Return only identity and status fields for complete lightweight classifications."""
-        sql = "SELECT id,status FROM research_objects WHERE project_id=%s AND kind=%s"
-        args: list[Any] = [project_id, kind]
+        cutoff = self._normalize_as_of(as_of)
+        if cutoff is None:
+            sql = "SELECT id,status FROM research_objects WHERE project_id=%s AND kind=%s"
+            args: list[Any] = [project_id, kind]
+        else:
+            sql = (
+                "WITH latest AS ("
+                "SELECT DISTINCT ON (v.object_id) v.object_id AS id,v.kind,v.status,"
+                "v.object_created_at AS created_at FROM research_object_versions v "
+                "WHERE v.project_id=%s AND v.valid_from<=%s "
+                "ORDER BY v.object_id,v.valid_from DESC,v.revision_id DESC) "
+                "SELECT id,status FROM latest WHERE kind=%s"
+            )
+            args = [project_id, cutoff, kind]
         if statuses:
             sql += " AND status=ANY(%s)"
             args.append(list(statuses))
@@ -1493,13 +1646,27 @@ class ResearchStore:
         project_id: str,
         statuses: set[str],
         inspected: bool | None = None,
+        as_of: datetime | str | None = None,
     ) -> dict | None:
         """Return the newest matching run without loading its JSON payload."""
-        sql = (
-            "SELECT id,status,created_at FROM research_objects "
-            "WHERE project_id=%s AND kind='ExperimentRun' AND status=ANY(%s)"
-        )
-        args: list[Any] = [project_id, list(statuses)]
+        cutoff = self._normalize_as_of(as_of)
+        if cutoff is None:
+            sql = (
+                "SELECT id,status,created_at FROM research_objects "
+                "WHERE project_id=%s AND kind='ExperimentRun' AND status=ANY(%s)"
+            )
+            args: list[Any] = [project_id, list(statuses)]
+        else:
+            sql = (
+                "WITH latest AS ("
+                "SELECT DISTINCT ON (v.object_id) v.object_id AS id,v.kind,v.status,v.data,"
+                "v.object_created_at AS created_at FROM research_object_versions v "
+                "WHERE v.project_id=%s AND v.valid_from<=%s "
+                "ORDER BY v.object_id,v.valid_from DESC,v.revision_id DESC) "
+                "SELECT id,status,created_at FROM latest "
+                "WHERE kind='ExperimentRun' AND status=ANY(%s)"
+            )
+            args = [project_id, cutoff, list(statuses)]
         if inspected is not None:
             comparison = "<>" if inspected else "="
             sql += (
@@ -1511,27 +1678,71 @@ class ResearchStore:
             cur.execute(sql, args)
             return cur.fetchone()
 
-    def references_get(self, identifiers: list[str]) -> dict[str, dict]:
+    def references_get(
+        self, identifiers: list[str], as_of: datetime | str | None = None
+    ) -> dict[str, dict]:
         """Fetch a bounded reference set with one database round trip."""
         if len(identifiers) > 200:
             raise GPUError("TOO_MANY_RESEARCH_REFERENCES", "At most 200 references are allowed")
         if not identifiers:
             return {}
+        cutoff = self._normalize_as_of(as_of)
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute(
-                "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
-                "WHERE id=ANY(%s::uuid[])",
-                (identifiers,),
-            )
+            if cutoff is None:
+                cur.execute(
+                    "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
+                    "WHERE id=ANY(%s::uuid[])",
+                    (identifiers,),
+                )
+            else:
+                cur.execute(
+                    "SELECT DISTINCT ON (v.object_id) v.object_id AS id,v.project_id,v.kind,"
+                    "v.status,v.data,v.object_created_at AS created_at "
+                    "FROM research_object_versions v "
+                    "WHERE v.object_id=ANY(%s::uuid[]) AND v.valid_from<=%s "
+                    "ORDER BY v.object_id,v.valid_from DESC,v.revision_id DESC",
+                    (identifiers, cutoff),
+                )
             return {str(row["id"]): row for row in cur.fetchall()}
 
-    def state_get(self, project_id: str) -> dict:
+    def state_get(self, project_id: str, as_of: datetime | str | None = None) -> dict:
+        cutoff = self._normalize_as_of(as_of)
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT name,question,state FROM research_projects WHERE id=%s", (project_id,))
+            if cutoff is None:
+                cur.execute(
+                    "SELECT name,question,state FROM research_projects WHERE id=%s", (project_id,)
+                )
+            else:
+                cur.execute(
+                    "SELECT name,question,state,valid_from,legacy_backfill "
+                    "FROM research_project_versions "
+                    "WHERE project_id=%s AND valid_from<=%s "
+                    "ORDER BY valid_from DESC,revision_id DESC LIMIT 1",
+                    (project_id, cutoff),
+                )
             row = cur.fetchone()
             if not row:
+                if cutoff is not None:
+                    raise GPUError(
+                        "TEMPORAL_SNAPSHOT_UNAVAILABLE", f"{project_id} at {cutoff.isoformat()}"
+                    )
                 raise GPUError("RESEARCH_PROJECT_NOT_FOUND", project_id)
-            cur.execute("SELECT id,kind,status,data,created_at FROM research_objects WHERE project_id=%s ORDER BY created_at DESC", (project_id,))
+            if cutoff is None:
+                cur.execute(
+                    "SELECT id,kind,status,data,created_at FROM research_objects "
+                    "WHERE project_id=%s ORDER BY created_at DESC",
+                    (project_id,),
+                )
+            else:
+                cur.execute(
+                    "WITH latest AS ("
+                    "SELECT DISTINCT ON (v.object_id) v.object_id AS id,v.kind,v.status,v.data,"
+                    "v.object_created_at AS created_at FROM research_object_versions v "
+                    "WHERE v.project_id=%s AND v.valid_from<=%s "
+                    "ORDER BY v.object_id,v.valid_from DESC,v.revision_id DESC) "
+                    "SELECT id,kind,status,data,created_at FROM latest ORDER BY created_at DESC",
+                    (project_id, cutoff),
+                )
             objects = cur.fetchall()
             by_kind = lambda kind, statuses=None: [item for item in objects if item["kind"] == kind and (not statuses or item["status"] in statuses)]
             canonical = {
@@ -1563,7 +1774,12 @@ class ResearchStore:
                 "highest_value_unknown": row["state"].get("highest_value_unknown"),
                 "next_discriminating_experiments": row["state"].get("next_discriminating_experiments", []),
             }
-            return {**row, "canonical_state": canonical, "objects": objects}
+            return {
+                **row,
+                "canonical_state": canonical,
+                "objects": objects,
+                "as_of": cutoff.isoformat() if cutoff is not None else None,
+            }
 
     def project_state_update(
         self,
@@ -1607,11 +1823,29 @@ class ResearchStore:
             )
         return state
 
-    def object_get(self, object_id: str) -> dict:
+    def object_get(self, object_id: str, as_of: datetime | str | None = None) -> dict:
+        cutoff = self._normalize_as_of(as_of)
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT id,project_id,kind,status,data,created_at FROM research_objects WHERE id=%s", (object_id,))
+            if cutoff is None:
+                cur.execute(
+                    "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
+                    "WHERE id=%s",
+                    (object_id,),
+                )
+            else:
+                cur.execute(
+                    "SELECT object_id AS id,project_id,kind,status,data,"
+                    "object_created_at AS created_at,valid_from,legacy_backfill "
+                    "FROM research_object_versions WHERE object_id=%s AND valid_from<=%s "
+                    "ORDER BY valid_from DESC,revision_id DESC LIMIT 1",
+                    (object_id, cutoff),
+                )
             row = cur.fetchone()
             if not row:
+                if cutoff is not None:
+                    raise GPUError(
+                        "TEMPORAL_OBJECT_NOT_VISIBLE", f"{object_id} at {cutoff.isoformat()}"
+                    )
                 raise GPUError("RESEARCH_OBJECT_NOT_FOUND", object_id)
             return row
 
@@ -2018,15 +2252,50 @@ class ResearchStore:
             self._event(cur, item["project_id"], event_type, object_id, {"status": status, **event_update})
         return {"id": object_id, "status": status, "data": data}
 
-    def events(self, project_id: str, limit: int = 100) -> list[dict]:
+    def events(
+        self, project_id: str, limit: int = 100, as_of: datetime | str | None = None
+    ) -> list[dict]:
+        cutoff = self._normalize_as_of(as_of)
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT event_type,subject_id,payload,created_at FROM research_events WHERE project_id=%s ORDER BY created_at DESC LIMIT %s", (project_id, limit))
+            sql = (
+                "SELECT event_type,subject_id,payload,created_at FROM research_events "
+                "WHERE project_id=%s"
+            )
+            args: list[Any] = [project_id]
+            if cutoff is not None:
+                sql += " AND created_at<=%s"
+                args.append(cutoff)
+            sql += " ORDER BY created_at DESC LIMIT %s"
+            args.append(limit)
+            cur.execute(sql, args)
             return cur.fetchall()
 
-    def search(self, project_id: str, query: str, kind: str | None = None, limit: int = 25) -> list[dict]:
+    def search(
+        self,
+        project_id: str,
+        query: str,
+        kind: str | None = None,
+        limit: int = 25,
+        as_of: datetime | str | None = None,
+    ) -> list[dict]:
+        cutoff = self._normalize_as_of(as_of)
         with self._connect() as conn, conn.cursor() as cur:
-            sql = "SELECT id,kind,status,data,created_at FROM research_objects WHERE project_id=%s"
-            args: list[Any] = [project_id]
+            if cutoff is None:
+                sql = (
+                    "SELECT id,kind,status,data,created_at FROM research_objects "
+                    "WHERE project_id=%s"
+                )
+                args: list[Any] = [project_id]
+            else:
+                sql = (
+                    "WITH latest AS ("
+                    "SELECT DISTINCT ON (v.object_id) v.object_id AS id,v.kind,v.status,v.data,"
+                    "v.object_created_at AS created_at FROM research_object_versions v "
+                    "WHERE v.project_id=%s AND v.valid_from<=%s "
+                    "ORDER BY v.object_id,v.valid_from DESC,v.revision_id DESC) "
+                    "SELECT id,kind,status,data,created_at FROM latest WHERE TRUE"
+                )
+                args = [project_id, cutoff]
             if kind:
                 sql += " AND kind=%s"
                 args.append(kind)
@@ -2049,26 +2318,36 @@ class ResearchStore:
             )
             return cur.fetchone()
 
-    def related_hypotheses(self, project_id: str, mechanism: str, limit: int = 10) -> list[dict]:
+    def related_hypotheses(
+        self,
+        project_id: str,
+        mechanism: str,
+        limit: int = 10,
+        as_of: datetime | str | None = None,
+    ) -> list[dict]:
         """Lexically screen active and failed ideas until pgvector is available for semantic ranking."""
         query_terms = self.terms(mechanism)
-        with self._connect() as conn, conn.cursor() as cur:
-            cur.execute(
-                "SELECT id,kind,status,data,created_at FROM research_objects "
-                "WHERE project_id=%s AND kind IN ('Hypothesis','NegativeResult')",
-                (project_id,),
+        candidates = [
+            *self.objects_list(project_id, "Hypothesis", limit=None, as_of=as_of),
+            *self.objects_list(project_id, "NegativeResult", limit=None, as_of=as_of),
+        ]
+        related = []
+        for item in candidates:
+            text = item["data"].get("mechanism") or item["data"].get("proposal", "")
+            terms = self.terms(text)
+            overlap = (
+                len(query_terms & terms) / len(query_terms | terms) if query_terms | terms else 0.0
             )
-            related = []
-            for item in cur.fetchall():
-                text = item["data"].get("mechanism") or item["data"].get("proposal", "")
-                terms = self.terms(text)
-                overlap = len(query_terms & terms) / len(query_terms | terms) if query_terms | terms else 0.0
-                containment = len(query_terms & terms) / len(query_terms) if query_terms else 0.0
-                if overlap:
-                    related.append(
-                        {**item, "lexical_similarity": round(overlap, 3), "containment_similarity": round(containment, 3)}
-                    )
-            return sorted(related, key=lambda item: item["lexical_similarity"], reverse=True)[:limit]
+            containment = len(query_terms & terms) / len(query_terms) if query_terms else 0.0
+            if overlap:
+                related.append(
+                    {
+                        **item,
+                        "lexical_similarity": round(overlap, 3),
+                        "containment_similarity": round(containment, 3),
+                    }
+                )
+        return sorted(related, key=lambda item: item["lexical_similarity"], reverse=True)[:limit]
 
     def embedding_set(self, object_id: str, embedding: list[float]) -> dict:
         if not self.vector_available:
@@ -2079,25 +2358,57 @@ class ResearchStore:
             raise GPUError("INVALID_EMBEDDING", "Embedding values must be numeric")
         item = self.object_get(object_id)
         literal = "[" + ",".join(str(float(value)) for value in embedding) + "]"
+        now = datetime.now(UTC)
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute("UPDATE research_objects SET embedding=%s::vector WHERE id=%s", (literal, object_id))
+            cur.execute(
+                "UPDATE research_objects SET embedding=%s::vector,embedding_updated_at=%s "
+                "WHERE id=%s",
+                (literal, now, object_id),
+            )
             self._event(cur, item["project_id"], "EMBEDDING_STORED", object_id, {"dimensions": len(embedding)})
-        return {"id": object_id, "dimensions": len(embedding)}
+        return {"id": object_id, "dimensions": len(embedding), "updated_at": now}
 
     def semantic_search(
-        self, project_id: str, embedding: list[float], kind: str | None = None, limit: int = 25
+        self,
+        project_id: str,
+        embedding: list[float],
+        kind: str | None = None,
+        limit: int = 25,
+        as_of: datetime | str | None = None,
     ) -> list[dict]:
         if not self.vector_available:
             raise GPUError("PGVECTOR_UNAVAILABLE", "The database does not have the vector extension")
         literal = "[" + ",".join(str(float(value)) for value in embedding) + "]"
+        cutoff = self._normalize_as_of(as_of)
         with self._connect() as conn, conn.cursor() as cur:
-            sql = "SELECT id,kind,status,data,created_at,embedding <=> %s::vector AS distance FROM research_objects WHERE project_id=%s AND embedding IS NOT NULL"
-            args: list[Any] = [literal, project_id]
+            if cutoff is None:
+                sql = (
+                    "SELECT id,kind,status,data,created_at,embedding <=> %s::vector AS distance "
+                    "FROM research_objects WHERE project_id=%s AND embedding IS NOT NULL"
+                )
+                args: list[Any] = [literal, project_id]
+            else:
+                sql = (
+                    "WITH latest AS ("
+                    "SELECT DISTINCT ON (v.object_id) v.object_id AS id,v.kind,v.status,v.data,"
+                    "v.object_created_at AS created_at,v.embedding_text,v.embedding_updated_at "
+                    "FROM research_object_versions v "
+                    "WHERE v.project_id=%s AND v.valid_from<=%s "
+                    "ORDER BY v.object_id,v.valid_from DESC,v.revision_id DESC) "
+                    "SELECT id,kind,status,data,created_at,"
+                    "embedding_text::vector <=> %s::vector AS distance FROM latest "
+                    "WHERE embedding_text IS NOT NULL AND embedding_updated_at<=%s"
+                )
+                args = [project_id, cutoff, literal, cutoff]
             if kind:
                 sql += " AND kind=%s"
                 args.append(kind)
-            sql += " ORDER BY embedding <=> %s::vector LIMIT %s"
-            args.extend((literal, limit))
+            if cutoff is None:
+                sql += " ORDER BY embedding <=> %s::vector LIMIT %s"
+                args.extend((literal, limit))
+            else:
+                sql += " ORDER BY embedding_text::vector <=> %s::vector LIMIT %s"
+                args.extend((literal, limit))
             cur.execute(sql, args)
             return cur.fetchall()
 

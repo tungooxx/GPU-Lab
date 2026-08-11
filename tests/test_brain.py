@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from gpu_lab.brain import ActionScore, ResearchBrain
+from gpu_lab.brain_bench import BenchmarkEpisode
 from gpu_lab.errors import GPUError
 from gpu_lab.research import _json_document
 
@@ -119,13 +120,40 @@ class CandidateStore:
 
 def _hasi_episode():
     path = Path(__file__).parents[1] / "research_bench" / "hasi_before_intervention.json"
-    return json.loads(path.read_text(encoding="utf-8"))
+    return BenchmarkEpisode.model_validate(json.loads(path.read_text(encoding="utf-8")))
 
 
 def test_hasi_benchmark_enforces_reproduction_then_causal_intervention():
     episode = _hasi_episode()
-    agenda = {"data": episode["historical_state"]["agenda_item"]}
-    hypotheses = episode["historical_state"]["active_hypotheses"]
+    state_substitution = next(
+        action for action in episode.candidate_actions if action.action_id == "state-substitution"
+    )
+    agenda = {
+        "data": {
+            "question": episode.scientific_question,
+            "reproduction_required": True,
+            "candidate_experiments": [
+                {
+                    "action_type": state_substitution.action_type,
+                    "predicted_outcomes": [state_substitution.prediction],
+                    "payload": {"benchmark_action_id": state_substitution.action_id},
+                    "score": {
+                        "scientific_importance": 5,
+                        "expected_discrimination": 5,
+                        "expected_information_gain": state_substitution.expected_information_gain,
+                        "feasibility": 5,
+                        "compute_cost": state_substitution.compute_cost,
+                        "engineering_cost": state_substitution.engineering_cost,
+                        "execution_risk": state_substitution.execution_risk,
+                    },
+                }
+            ],
+        }
+    }
+    hypotheses = [
+        {"id": hypothesis_id, "status": "ACTIVE", "data": {"mechanism": hypothesis_id}}
+        for hypothesis_id in episode.known_active_hypotheses
+    ]
     brain = ResearchBrain(CandidateStore(reproductions=[{"id": "baseline", "status": "PARTIAL"}]))
 
     before = brain._candidate_actions("project", agenda, hypotheses)
@@ -135,8 +163,7 @@ def test_hasi_benchmark_enforces_reproduction_then_causal_intervention():
     after = brain._candidate_actions("project", agenda, hypotheses)
     selected = max(after, key=lambda candidate: candidate.score.priority)
     assert selected.action_type == "CAUSAL_INTERVENTION"
-    assert selected.action_type in episode["known_good_next_tests"]
-    assert selected.action_type not in episode["known_bad_decisions"]
+    assert selected.payload["benchmark_action_id"] == "state-substitution"
 
 
 def test_provider_failure_selects_an_alternative_action():

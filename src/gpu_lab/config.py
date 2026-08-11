@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     gpu_lab_canonical_vrc_env: str = "vrc-py313-torch260-cu124"
     gpu_lab_terminal_password: str | None = None
     gpu_lab_research_database_url: str | None = None
+    gpu_lab_research_bench_dir: Path = Path("./research_bench")
     gpu_lab_literature_provider: str = "disabled"
     gpu_lab_literature_worker_url: str = "http://literature:8010"
     gpu_lab_literature_worker_token: str | None = None

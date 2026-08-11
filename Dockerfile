@@ -6,6 +6,7 @@ RUN uv python install 3.13 \
 COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --locked --no-dev --no-install-project
 COPY src ./src
+COPY research_bench ./research_bench
 RUN uv sync --locked --no-dev
 ENV GPU_LAB_DATA_DIR=/data
 ENV FASTMCP_HOST=0.0.0.0

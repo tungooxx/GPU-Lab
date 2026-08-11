@@ -144,15 +144,21 @@ class ResearchBrain:
     def world_model_create(self, project_id: str, name: str, scope: str) -> dict:
         return self.store.world_model_create_atomic(project_id, name, scope)
 
-    def world_model_get(self, world_model_id: str) -> dict:
-        model = self._expect(world_model_id, "WorldModel")
-        nodes = [self.store.object_get(item) for item in model["data"].get("node_ids", [])]
-        edges = [self.store.object_get(item) for item in model["data"].get("edge_ids", [])]
+    def world_model_get(self, world_model_id: str, as_of: str | None = None) -> dict:
+        temporal = {"as_of": as_of} if as_of is not None else {}
+        model = self._expect(world_model_id, "WorldModel", as_of)
+        nodes = [
+            self.store.object_get(item, **temporal) for item in model["data"].get("node_ids", [])
+        ]
+        edges = [
+            self.store.object_get(item, **temporal) for item in model["data"].get("edge_ids", [])
+        ]
         versions = self.store.objects_list(
             model["project_id"],
             "WorldModelVersion",
             limit=None,
             data_filters={"world_model_id": world_model_id},
+            **temporal,
         )
         return {"world_model": model, "nodes": nodes, "edges": edges, "versions": versions}
 
@@ -363,10 +369,11 @@ class ResearchBrain:
             "AGENDA_ITEM_STATUS_CHANGED",
         )
 
-    def _portfolio_data(self, project_id: str) -> dict:
-        hypotheses = self.store.objects_identifiers(project_id, "Hypothesis")
-        negative = self.store.objects_identifiers(project_id, "NegativeResult")
-        niches = self.store.objects_list(project_id, "HypothesisNiche", limit=None)
+    def _portfolio_data(self, project_id: str, as_of: str | None = None) -> dict:
+        temporal = {"as_of": as_of} if as_of is not None else {}
+        hypotheses = self.store.objects_identifiers(project_id, "Hypothesis", **temporal)
+        negative = self.store.objects_identifiers(project_id, "NegativeResult", **temporal)
+        niches = self.store.objects_list(project_id, "HypothesisNiche", limit=None, **temporal)
         return {
             "active_hypothesis_ids": [
                 str(item["id"])
@@ -419,12 +426,22 @@ class ResearchBrain:
             "HYPOTHESIS_PORTFOLIO_CREATED",
         )
 
-    def brain_step(self, project_id: str) -> dict:
+    def brain_step(
+        self, project_id: str, as_of: str | None = None, persist: bool = True
+    ) -> dict:
+        if as_of is not None and persist:
+            raise GPUError(
+                "TEMPORAL_DECISION_MUST_BE_DRY_RUN",
+                "Historical Brain evaluation cannot mutate canonical scientific state",
+            )
+        temporal = {"as_of": as_of} if as_of is not None else {}
         started = datetime.now(UTC)
         brain_step_id, request_id = str(uuid.uuid4()), str(uuid.uuid4())
-        state = self.store.state_get(project_id)
-        models = self.store.objects_list(project_id, "WorldModel", limit=1)
-        agendas = self.store.objects_list(project_id, "ResearchAgenda", {"ACTIVE"}, 1)
+        state = self.store.state_get(project_id, **temporal)
+        models = self.store.objects_list(project_id, "WorldModel", limit=1, **temporal)
+        agendas = self.store.objects_list(
+            project_id, "ResearchAgenda", {"ACTIVE"}, 1, **temporal
+        )
         if not models or not agendas:
             missing = [
                 name
@@ -439,6 +456,7 @@ class ResearchBrain:
             {"OPEN", "ACTIVE", "BLOCKED"},
             limit=None,
             data_filters={"agenda_id": str(agenda["id"])},
+            **temporal,
         )
         if not items:
             raise GPUError("RESEARCH_AGENDA_EMPTY", str(agenda["id"]))
@@ -446,16 +464,31 @@ class ResearchBrain:
             items,
             key=lambda item: item["data"].get("importance", 1) * item["data"].get("uncertainty", 1),
         )
-        portfolio = self._portfolio_refresh(project_id)
+        portfolio = (
+            self._portfolio_refresh(project_id)
+            if persist
+            else {
+                "id": None,
+                "kind": "HypothesisPortfolio",
+                "status": "TEMPORAL_PREVIEW",
+                "data": self._portfolio_data(project_id, as_of),
+            }
+        )
         hypotheses = self.store.objects_list(
-            project_id, "Hypothesis", {"ACTIVE", "SURVIVES_INITIAL_TEST"}, limit=None
+            project_id,
+            "Hypothesis",
+            {"ACTIVE", "SURVIVES_INITIAL_TEST"},
+            limit=None,
+            **temporal,
         )
         comparative_lessons = self.store.objects_list(
-            project_id, "ComparativeLesson", limit=None
+            project_id, "ComparativeLesson", limit=None, **temporal
         )
-        meta_lessons = self.store.objects_list(project_id, "MetaLesson", limit=None)
-        related_dead = self._related_dead_ideas(project_id, hypotheses)
-        candidates = self._candidate_actions(project_id, agenda_item, hypotheses)
+        meta_lessons = self.store.objects_list(
+            project_id, "MetaLesson", limit=None, **temporal
+        )
+        related_dead = self._related_dead_ideas(project_id, hypotheses, as_of)
+        candidates = self._candidate_actions(project_id, agenda_item, hypotheses, as_of)
         candidate_data = [
             {
                 **candidate.persisted_data(),
@@ -475,7 +508,7 @@ class ResearchBrain:
                 "world_model_id": str(model["id"]),
                 "world_model_version_id": model["data"].get("current_version_id"),
                 "agenda_id": str(agenda["id"]),
-                "portfolio_id": str(portfolio["id"]),
+                "portfolio_id": str(portfolio["id"]) if portfolio["id"] else None,
                 "research_state": self._state_snapshot(state),
                 "comparative_lesson_ids": [str(item["id"]) for item in comparative_lessons],
                 "meta_lesson_ids": [str(item["id"]) for item in meta_lessons],
@@ -502,6 +535,25 @@ class ResearchBrain:
             "duration_ms": 0,
         }
         decision_data["duration_ms"] = int((datetime.now(UTC) - started).total_seconds() * 1000)
+        if not persist:
+            return {
+                "brain_step_id": brain_step_id,
+                "decision_id": None,
+                "agenda_item": agenda_item,
+                "question": agenda_item["data"]["question"],
+                "scientific_state": state["canonical_state"],
+                "world_model": model,
+                "competing_hypotheses": hypotheses,
+                "dead_ideas_retrieved": related_dead,
+                "candidate_actions": candidate_data,
+                "selected_action": selected,
+                "reason": decision_data["rationale"],
+                "expected_information_gain": decision_data["expected_information_gain"],
+                "estimated_cost": decision_data["estimated_cost"],
+                "requires_human_approval": False,
+                "verification_status": "TEMPORAL_DRY_RUN",
+                "as_of": as_of,
+            }
         persisted_step = self.store.brain_decision_create(
             project_id,
             candidate_data,
@@ -902,16 +954,24 @@ class ResearchBrain:
         return {**result, "verification_status": "RESULT_INSPECTED"}
 
     def _candidate_actions(
-        self, project_id: str, agenda_item: dict, hypotheses: list[dict]
+        self,
+        project_id: str,
+        agenda_item: dict,
+        hypotheses: list[dict],
+        as_of: str | None = None,
     ) -> list[ActionCandidate]:
+        temporal = {"as_of": as_of} if as_of is not None else {}
         uninspected = self.store.experiment_run_first(
-            project_id, {"completed", "RESULT_NOT_INSPECTED"}, inspected=False
+            project_id,
+            {"completed", "RESULT_NOT_INSPECTED"},
+            inspected=False,
+            **temporal,
         )
         unfinished = self.store.experiment_run_first(
-            project_id, {"RESERVED", "running", "unknown"}
+            project_id, {"RESERVED", "running", "unknown"}, **temporal
         )
         failed_uninspected = self.store.experiment_run_first(
-            project_id, {"failed", "cancelled"}, inspected=False
+            project_id, {"failed", "cancelled"}, inspected=False, **temporal
         )
         question = agenda_item["data"]["question"]
         hypothesis_ids = [str(item["id"]) for item in hypotheses]
@@ -978,7 +1038,9 @@ class ResearchBrain:
                     ),
                 ).checked()
             ]
-        reproductions = self.store.objects_list(project_id, "Reproduction", limit=None)
+        reproductions = self.store.objects_list(
+            project_id, "Reproduction", limit=None, **temporal
+        )
         baseline_reproduced = any(item["status"] == "REPRODUCED" for item in reproductions)
         needs_reproduction = (
             bool(agenda_item["data"].get("reproduction_required")) and not baseline_reproduced
@@ -1008,7 +1070,7 @@ class ResearchBrain:
             item.get("action_type") == "LITERATURE_SEARCH" for item in configured
         )
         candidate_evidence = self.store.objects_list(
-            project_id, "EvidenceUnit", {"CANDIDATE"}, limit=None
+            project_id, "EvidenceUnit", {"CANDIDATE"}, limit=None, **temporal
         )
         if literature_requested and candidate_evidence:
             return [
@@ -1135,11 +1197,14 @@ class ResearchBrain:
         except (KeyError, ValidationError) as exc:
             raise GPUError("INVALID_RESEARCH_ACTION", str(exc)) from exc
 
-    def _related_dead_ideas(self, project_id: str, hypotheses: list[dict]) -> list[dict]:
+    def _related_dead_ideas(
+        self, project_id: str, hypotheses: list[dict], as_of: str | None = None
+    ) -> list[dict]:
+        temporal = {"as_of": as_of} if as_of is not None else {}
         found: dict[str, dict] = {}
         candidates = [
-            *self.store.objects_list(project_id, "Hypothesis", limit=None),
-            *self.store.objects_list(project_id, "NegativeResult", limit=None),
+            *self.store.objects_list(project_id, "Hypothesis", limit=None, **temporal),
+            *self.store.objects_list(project_id, "NegativeResult", limit=None, **temporal),
         ]
         for hypothesis in hypotheses:
             mechanism = hypothesis["data"].get("mechanism", "")
@@ -1186,8 +1251,9 @@ class ResearchBrain:
             if str(item["project_id"]) != str(project_id):
                 raise GPUError("RESEARCH_PROJECT_MISMATCH", identifier)
 
-    def _expect(self, object_id: str, kind: str) -> dict:
-        item = self.store.object_get(object_id)
+    def _expect(self, object_id: str, kind: str, as_of: str | None = None) -> dict:
+        temporal = {"as_of": as_of} if as_of is not None else {}
+        item = self.store.object_get(object_id, **temporal)
         if item["kind"] != kind:
             raise GPUError(f"NOT_A_{kind.upper()}", object_id)
         return item

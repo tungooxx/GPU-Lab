@@ -1,0 +1,88 @@
+{
+  "schema_version": "1.0",
+  "episode_id": "pointcloud-after-stage4",
+  "project_id": "historical-vlm-pointcloud",
+  "domain": "point-cloud completion",
+  "cutoff_timestamp": "2026-08-09T11:12:40+07:00",
+  "scientific_question": "What should happen after Stage 4 weakened the universal MaterialCell explanation?",
+  "visible_state": {
+    "reproduction_status": "REPRODUCED",
+    "observations": [
+      "good-good cross-view failures are real but sparse",
+      "partial-evidence change is an important confound and driver",
+      "VRCNet shows controlled feature/output sensitivity",
+      "SymmCompletion does not reproduce the same global feature signature"
+    ],
+    "scope": "selected MVP objects and frozen VRCNet/SymmCompletion checkpoints"
+  },
+  "hidden_future_state": {
+    "stage5": "Evidence-Refinement Sets later became the leading candidate",
+    "materialcell": "MaterialCell was later demoted to a possible implementation substrate"
+  },
+  "known_dead_lineages": ["materialcell-universal-token-defect"],
+  "known_active_hypotheses": ["evidence-conditioned-instability", "architecture-specific-sensitivity"],
+  "known_unknowns": [
+    "whether sensitivity is unnecessary instability or rational ambiguity",
+    "which mechanistically distinct representation principle best explains the phenotype"
+  ],
+  "candidate_actions": [
+    {
+      "action_id": "derive-competing-mechanisms",
+      "action_type": "HYPOTHESIS_GENERATION",
+      "hypothesis_ids": ["representation-formation:evidence-conditioned-instability", "inference-dynamics:architecture-specific-sensitivity"],
+      "expected_information_gain": 4.0,
+      "compute_cost": 0.1,
+      "engineering_cost": 0.5,
+      "execution_risk": 0.2,
+      "tags": ["CHEAP_FALSIFIER"],
+      "prediction": "Mechanistically distinct candidates will imply different frozen-model falsification tests."
+    },
+    {
+      "action_id": "novelty-check",
+      "action_type": "LITERATURE_SEARCH",
+      "expected_information_gain": 3.0,
+      "compute_cost": 0.0,
+      "engineering_cost": 0.2,
+      "execution_risk": 0.1,
+      "prediction": "Prior work will eliminate superficial variants before implementation."
+    },
+    {
+      "action_id": "build-materialcell",
+      "action_type": "TRAINING_RUN",
+      "hypothesis_ids": ["materialcell-universal-token-defect"],
+      "expected_information_gain": 1.0,
+      "compute_cost": 5.0,
+      "engineering_cost": 5.0,
+      "execution_risk": 3.0,
+      "tags": ["SCOPE_VIOLATION"]
+    },
+    {
+      "action_id": "declare-universal-latent-defect",
+      "action_type": "CLAIM_PROMOTION",
+      "hypothesis_ids": ["materialcell-universal-token-defect"],
+      "expected_information_gain": 0.0,
+      "tags": ["PROMOTE_WITHOUT_EVIDENCE", "SCOPE_VIOLATION"]
+    }
+  ],
+  "strong_next_actions": ["derive-competing-mechanisms"],
+  "acceptable_next_actions": ["novelty-check"],
+  "bad_next_actions": ["build-materialcell", "declare-universal-latent-defect"],
+  "forbidden_future_records": ["stage5-ers", "stage6-ers-result", "ejc-candidate", "hasi-result"],
+  "source_provenance": [
+    {
+      "kind": "HISTORICAL_FACT",
+      "source": "F:/Newgeneration/VLM/report_stage4_detail.md",
+      "locator": "sections 16-20",
+      "captured_at": "2026-08-09T11:12:40+07:00",
+      "note": "Stage-4 decision, prohibited claims, and Stage-5 handoff"
+    }
+  ],
+  "evaluation_rubric": {
+    "require_negative_memory": true,
+    "require_scope_preservation": true,
+    "require_reproduction_gate": true,
+    "require_null_model": true,
+    "minimum_hypothesis_niches": 2,
+    "architecture_action_types": ["ARCHITECTURE_DESIGN", "TRAINING_RUN"]
+  }
+}

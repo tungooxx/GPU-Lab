@@ -9,6 +9,7 @@ import re
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -20,6 +21,7 @@ from starlette.responses import HTMLResponse, JSONResponse
 from starlette.types import ASGIApp
 
 from .brain import ResearchBrain
+from .brain_bench import BenchmarkDecision, BenchmarkPolicy, ResearchBrainBench
 from .branches import ExperimentBranchService
 from .config import Settings
 from .dashboard import DASHBOARD_HTML
@@ -35,8 +37,9 @@ from .terminal import TERMINAL_HTML
 
 logger = logging.getLogger(__name__)
 
-settings, service, research_store, research_brain, literature_service, executable_paper_service, qd_service, branch_service, meta_research_service = (
+settings, service, research_store, research_brain, brain_bench_service, literature_service, executable_paper_service, qd_service, branch_service, meta_research_service = (
     Settings(),
+    None,
     None,
     None,
     None,
@@ -77,6 +80,9 @@ _READ_ONLY_TOOLS = {
     "activity_recent",
     "research_state_get",
     "research_object_get",
+    "research_benchmark_list",
+    "research_benchmark_baseline",
+    "research_benchmark_evaluate",
     "world_model_get",
     "hypothesis_portfolio_get",
     "literature_provider_status",
@@ -300,6 +306,17 @@ def brain() -> ResearchBrain:
     return research_brain
 
 
+def brain_bench() -> ResearchBrainBench:
+    global brain_bench_service
+    if brain_bench_service is None:
+        with _singleton_lock:
+            if brain_bench_service is None:
+                brain_bench_service = ResearchBrainBench(
+                    Path(settings.gpu_lab_research_bench_dir)
+                )
+    return brain_bench_service
+
+
 def literature() -> LiteratureService:
     global literature_service
     if settings.gpu_lab_literature_provider != "paperqa-http":
@@ -486,6 +503,11 @@ def _compact_research_state(state: dict[str, Any], limit: int = 10) -> dict[str,
         },
         "canonical_state": canonical_state,
         "object_counts": dict(sorted(object_counts.items())),
+        "temporal_snapshot": {
+            "as_of": state.get("as_of"),
+            "valid_from": state.get("valid_from"),
+            "legacy_backfill": state.get("legacy_backfill", False),
+        },
         "detail_hint": "Use research_object_get with an object ID for its complete persisted record.",
     }
 
@@ -523,7 +545,12 @@ def _compact_brain_step(result: dict[str, Any], limit: int = 10) -> dict[str, An
         "estimated_cost": result.get("estimated_cost"),
         "requires_human_approval": result.get("requires_human_approval", False),
         "verification_status": result.get("verification_status"),
-        "detail_hint": "Use research_object_get with the decision ID for its complete persisted trace.",
+        "as_of": result.get("as_of"),
+        "detail_hint": (
+            "Historical dry run; no ResearchDecision was persisted."
+            if result.get("decision_id") is None
+            else "Use research_object_get with the decision ID for its complete persisted trace."
+        ),
     }
 
 
@@ -644,18 +671,83 @@ async def research_project_create(name: str, question: str):
 
 
 @mcp.tool()
-async def research_state_get(project_id: str, limit: int = 10):
+async def research_state_get(project_id: str, limit: int = 10, as_of: str | None = None):
     """Retrieve compact canonical scientific state; fetch complete records individually by ID."""
-    state = await call(research().state_get, project_id)
+    state = await call(research().state_get, project_id, as_of)
     if "error" in state:
         return state
     return _compact_research_state(state, limit)
 
 
 @mcp.tool()
-async def research_object_get(object_id: str):
+async def research_object_get(object_id: str, as_of: str | None = None):
     """Retrieve one complete persisted research record by its ID."""
-    return await call(research().object_get, object_id)
+    return await call(research().object_get, object_id, as_of)
+
+
+@mcp.tool()
+async def research_benchmark_list():
+    """List frozen benchmark checkpoints without exposing hidden future evidence or answer keys."""
+    episodes = await call(brain_bench().load_all)
+    if isinstance(episodes, dict) and "error" in episodes:
+        return episodes
+    return [
+        {
+            "episode_id": episode.episode_id,
+            "project_id": episode.project_id,
+            "domain": episode.domain,
+            "cutoff_timestamp": episode.cutoff_timestamp.isoformat(),
+            "scientific_question": episode.scientific_question,
+            "provenance_kinds": sorted(
+                {item.kind.value for item in episode.source_provenance}
+            ),
+        }
+        for episode in episodes
+    ]
+
+
+@mcp.tool()
+async def research_benchmark_baseline(episode_id: str, policy: str):
+    """Run a deterministic benchmark baseline against only the frozen visible episode state."""
+    episode = await call(brain_bench().get_episode, episode_id)
+    if isinstance(episode, dict) and "error" in episode:
+        return episode
+    try:
+        policy_name = BenchmarkPolicy(policy)
+    except ValueError:
+        return {
+            "error": {
+                "type": "BRAIN_BENCH_INVALID_POLICY",
+                "message": policy,
+                "retryable": False,
+            }
+        }
+    decision = await call(brain_bench().baseline_decision, episode, policy_name)
+    if isinstance(decision, dict) and "error" in decision:
+        return decision
+    result = await call(brain_bench().score, episode, policy_name, decision)
+    return result if isinstance(result, dict) else result.model_dump(mode="json")
+
+
+@mcp.tool()
+async def research_benchmark_evaluate(episode_id: str, policy: str, decision: dict):
+    """Score a policy decision with separate leakage, gate, memory, cost, and information metrics."""
+    episode = await call(brain_bench().get_episode, episode_id)
+    if isinstance(episode, dict) and "error" in episode:
+        return episode
+    try:
+        policy_name = BenchmarkPolicy(policy)
+        typed_decision = BenchmarkDecision.model_validate(decision)
+    except ValueError as exc:
+        return {
+            "error": {
+                "type": "BRAIN_BENCH_INVALID_DECISION",
+                "message": str(exc),
+                "retryable": False,
+            }
+        }
+    result = await call(brain_bench().score, episode, policy_name, typed_decision)
+    return result if isinstance(result, dict) else result.model_dump(mode="json")
 
 
 @mcp.tool()
@@ -671,9 +763,9 @@ async def world_model_create(project_id: str, name: str, scope: str):
 
 
 @mcp.tool()
-async def world_model_get(world_model_id: str):
+async def world_model_get(world_model_id: str, as_of: str | None = None):
     """Retrieve a WorldModel with its typed nodes, causal edges, and version history."""
-    return await call(brain().world_model_get, world_model_id)
+    return await call(brain().world_model_get, world_model_id, as_of)
 
 
 @mcp.tool()
@@ -791,9 +883,9 @@ async def hypothesis_portfolio_get(project_id: str):
 
 
 @mcp.tool()
-async def brain_step(project_id: str):
-    """Persist one evidence-aware scientific decision for immediate execution when it is preregistered."""
-    result = await call(brain().brain_step, project_id)
+async def brain_step(project_id: str, as_of: str | None = None):
+    """Persist a current decision, or return a non-mutating decision at historical cutoff as_of."""
+    result = await call(brain().brain_step, project_id, as_of, as_of is None)
     if "error" in result:
         return result
     return _compact_brain_step(result)
@@ -962,25 +1054,34 @@ async def claim_create(
 
 
 @mcp.tool()
-async def claim_search(project_id: str, query: str, limit: int = 25):
+async def claim_search(
+    project_id: str, query: str, limit: int = 25, as_of: str | None = None
+):
     """Find claims by their persisted statement, scope, or attached evidence identifiers."""
-    return await call(research().search, project_id, query, "Claim", min(max(limit, 1), 100))
+    return await call(
+        research().search, project_id, query, "Claim", min(max(limit, 1), 100), as_of
+    )
 
 
 @mcp.tool()
-async def claim_get_evidence(claim_id: str):
+async def claim_get_evidence(claim_id: str, as_of: str | None = None):
     """Retrieve the exact evidence units cited by a claim, never an uncited summary."""
-    claim = research().object_get(claim_id)
+    claim = research().object_get(claim_id, as_of)
     if claim["kind"] != "Claim":
         return {"error": {"type": "NOT_A_CLAIM", "message": claim_id}}
-    units = [research().object_get(item) for item in claim["data"].get("evidence_ids", [])]
+    units = [
+        research().object_get(item, as_of) for item in claim["data"].get("evidence_ids", [])
+    ]
     return {"claim": claim, "evidence": units}
 
 
 @mcp.tool()
-async def claim_compare(claim_id: str, other_claim_id: str):
+async def claim_compare(
+    claim_id: str, other_claim_id: str, as_of: str | None = None
+):
     """Compare scope and evidence overlap without inferring agreement from prose alone."""
-    first, second = research().object_get(claim_id), research().object_get(other_claim_id)
+    first = research().object_get(claim_id, as_of)
+    second = research().object_get(other_claim_id, as_of)
     if first["kind"] != "Claim" or second["kind"] != "Claim":
         return {"error": {"type": "NOT_A_CLAIM", "message": "Both inputs must be Claim IDs"}}
     if first["project_id"] != second["project_id"]:
@@ -1292,8 +1393,9 @@ async def experiment_priority(
 
 
 @mcp.tool()
-async def research_events(project_id: str, limit: int = 100):
-    return await call(research().events, project_id, min(max(limit, 1), 100))
+async def research_events(project_id: str, limit: int = 100, as_of: str | None = None):
+    """Retrieve immutable events, optionally bounded at an inclusive historical cutoff."""
+    return await call(research().events, project_id, min(max(limit, 1), 100), as_of)
 
 
 @mcp.tool()
@@ -1317,14 +1419,18 @@ async def paper_ingest(
 
 
 @mcp.tool()
-async def paper_search(project_id: str, query: str, limit: int = 25):
-    return await call(research().search, project_id, query, "Paper", min(max(limit, 1), 100))
+async def paper_search(
+    project_id: str, query: str, limit: int = 25, as_of: str | None = None
+):
+    return await call(
+        research().search, project_id, query, "Paper", min(max(limit, 1), 100), as_of
+    )
 
 
 @mcp.tool()
-async def paper_get(paper_id: str):
+async def paper_get(paper_id: str, as_of: str | None = None):
     """Return the persisted paper card and provenance URL/version."""
-    paper = research().object_get(paper_id)
+    paper = research().object_get(paper_id, as_of)
     if paper["kind"] != "Paper":
         return {"error": {"type": "NOT_A_PAPER", "message": paper_id}}
     return paper
@@ -1349,8 +1455,17 @@ async def paper_evidence_create(project_id: str, paper_id: str, text: str, locat
 
 
 @mcp.tool()
-async def paper_evidence_search(project_id: str, query: str, limit: int = 25):
-    return await call(research().search, project_id, query, "EvidenceUnit", min(max(limit, 1), 100))
+async def paper_evidence_search(
+    project_id: str, query: str, limit: int = 25, as_of: str | None = None
+):
+    return await call(
+        research().search,
+        project_id,
+        query,
+        "EvidenceUnit",
+        min(max(limit, 1), 100),
+        as_of,
+    )
 
 
 @mcp.tool()
@@ -1361,11 +1476,20 @@ async def research_embedding_store(object_id: str, embedding: list[float]):
 
 @mcp.tool()
 async def research_semantic_search(
-    project_id: str, embedding: list[float], kind: str | None = None, limit: int = 25
+    project_id: str,
+    embedding: list[float],
+    kind: str | None = None,
+    limit: int = 25,
+    as_of: str | None = None,
 ):
-    """Use pgvector cosine distance over persisted research-object embeddings."""
+    """Use pgvector retrieval, excluding object revisions and embeddings newer than as_of."""
     return await call(
-        research().semantic_search, project_id, embedding, kind, min(max(limit, 1), 100)
+        research().semantic_search,
+        project_id,
+        embedding,
+        kind,
+        min(max(limit, 1), 100),
+        as_of,
     )
 
 
