@@ -26,7 +26,9 @@ The live database contains 58 projects. Canonical tables are `research_projects`
 Scientific types are constrained in `RESEARCH_OBJECT_KINDS`; current objects include WorldModels,
 versions, agendas, hypotheses/niches/portfolios, decisions/candidates, experiments/runs/artifacts,
 branches/nodes/relations, ComparativeLessons, and MetaLessons. pgvector is an optional column on
-`research_objects`. Migrations run transactionally under a PostgreSQL advisory lock.
+`research_objects`. Migrations run transactionally under a PostgreSQL advisory lock. Brain v2
+temporal snapshots require PostgreSQL `track_commit_timestamp=on`; Compose configures this explicitly
+so historical reads use commit visibility rather than pre-commit statement timestamps.
 
 There is no object-revision table, evidence-family representation, embedding metadata table, or
 strategy-memory type. `created_at` can bound object creation, but later in-place updates cannot be

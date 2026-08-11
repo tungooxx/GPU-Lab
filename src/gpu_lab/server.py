@@ -21,10 +21,11 @@ from starlette.responses import HTMLResponse, JSONResponse
 from starlette.types import ASGIApp
 
 from .brain import ResearchBrain
-from .brain_bench import BenchmarkDecision, BenchmarkPolicy, ResearchBrainBench
+from .brain_bench import BenchmarkPolicy, ResearchBrainBench
 from .branches import ExperimentBranchService
 from .config import Settings
 from .dashboard import DASHBOARD_HTML
+from .epistemics import EpistemicService
 from .errors import GPUError
 from .executable_papers import ExecutablePaperService, HttpExecutablePaperProvider
 from .literature import HttpLiteratureProvider, LiteratureService
@@ -37,8 +38,9 @@ from .terminal import TERMINAL_HTML
 
 logger = logging.getLogger(__name__)
 
-settings, service, research_store, research_brain, brain_bench_service, literature_service, executable_paper_service, qd_service, branch_service, meta_research_service = (
+settings, service, research_store, research_brain, brain_bench_service, epistemic_service, literature_service, executable_paper_service, qd_service, branch_service, meta_research_service = (
     Settings(),
+    None,
     None,
     None,
     None,
@@ -81,8 +83,12 @@ _READ_ONLY_TOOLS = {
     "research_state_get",
     "research_object_get",
     "research_benchmark_list",
-    "research_benchmark_baseline",
-    "research_benchmark_evaluate",
+    "research_benchmark_episode_get",
+    "research_benchmark_policy_run",
+    "independent_evidence_count",
+    "supporting_evidence_families",
+    "contradicting_evidence_families",
+    "group_evidence_by_origin",
     "world_model_get",
     "hypothesis_portfolio_get",
     "literature_provider_status",
@@ -317,6 +323,15 @@ def brain_bench() -> ResearchBrainBench:
     return brain_bench_service
 
 
+def epistemics() -> EpistemicService:
+    global epistemic_service
+    if epistemic_service is None:
+        with _singleton_lock:
+            if epistemic_service is None:
+                epistemic_service = EpistemicService(research())
+    return epistemic_service
+
+
 def literature() -> LiteratureService:
     global literature_service
     if settings.gpu_lab_literature_provider != "paperqa-http":
@@ -506,6 +521,7 @@ def _compact_research_state(state: dict[str, Any], limit: int = 10) -> dict[str,
         "temporal_snapshot": {
             "as_of": state.get("as_of"),
             "valid_from": state.get("valid_from"),
+            "committed_at": state.get("committed_at"),
             "legacy_backfill": state.get("legacy_backfill", False),
         },
         "detail_hint": "Use research_object_get with an object ID for its complete persisted record.",
@@ -707,8 +723,17 @@ async def research_benchmark_list():
 
 
 @mcp.tool()
-async def research_benchmark_baseline(episode_id: str, policy: str):
-    """Run a deterministic benchmark baseline against only the frozen visible episode state."""
+async def research_benchmark_episode_get(episode_id: str):
+    """Return the blinded policy input without hidden future state, rubric, tags, or scores."""
+    episode = await call(brain_bench().get_episode, episode_id)
+    if isinstance(episode, dict) and "error" in episode:
+        return episode
+    return episode.visible_payload()
+
+
+@mcp.tool()
+async def research_benchmark_policy_run(episode_id: str, policy: str):
+    """Run an algorithmic baseline and return its choice without revealing held-out scoring."""
     episode = await call(brain_bench().get_episode, episode_id)
     if isinstance(episode, dict) and "error" in episode:
         return episode
@@ -725,29 +750,60 @@ async def research_benchmark_baseline(episode_id: str, policy: str):
     decision = await call(brain_bench().baseline_decision, episode, policy_name)
     if isinstance(decision, dict) and "error" in decision:
         return decision
-    result = await call(brain_bench().score, episode, policy_name, decision)
-    return result if isinstance(result, dict) else result.model_dump(mode="json")
+    return decision.model_dump(mode="json")
 
 
 @mcp.tool()
-async def research_benchmark_evaluate(episode_id: str, policy: str, decision: dict):
-    """Score a policy decision with separate leakage, gate, memory, cost, and information metrics."""
-    episode = await call(brain_bench().get_episode, episode_id)
-    if isinstance(episode, dict) and "error" in episode:
-        return episode
-    try:
-        policy_name = BenchmarkPolicy(policy)
-        typed_decision = BenchmarkDecision.model_validate(decision)
-    except ValueError as exc:
-        return {
-            "error": {
-                "type": "BRAIN_BENCH_INVALID_DECISION",
-                "message": str(exc),
-                "retryable": False,
-            }
-        }
-    result = await call(brain_bench().score, episode, policy_name, typed_decision)
-    return result if isinstance(result, dict) else result.model_dump(mode="json")
+async def evidence_family_create(
+    project_id: str,
+    origin_type: str,
+    origin_id: str,
+    description: str,
+    derived_from_evidence_family_id: str | None = None,
+    dependency_note: str | None = None,
+):
+    """Create one empirical-origin family; derived database records remain one confirmation."""
+    return await call(
+        epistemics().evidence_family_create,
+        project_id,
+        origin_type,
+        origin_id,
+        description,
+        derived_from_evidence_family_id,
+        dependency_note,
+    )
+
+
+@mcp.tool()
+async def evidence_family_link(
+    family_id: str, entity_id: str, relationship: str = "DERIVED"
+):
+    """Link a derived, supporting, or contradicting record to its empirical EvidenceFamily."""
+    return await call(epistemics().evidence_family_link, family_id, entity_id, relationship)
+
+
+@mcp.tool()
+async def independent_evidence_count(entity_id: str, as_of: str | None = None):
+    """Count independent empirical roots, not the number of derived database records."""
+    return await call(epistemics().independent_evidence_count, entity_id, as_of)
+
+
+@mcp.tool()
+async def supporting_evidence_families(entity_id: str, as_of: str | None = None):
+    """List independent families explicitly linked as support for an entity."""
+    return await call(epistemics().supporting_evidence_families, entity_id, as_of)
+
+
+@mcp.tool()
+async def contradicting_evidence_families(entity_id: str, as_of: str | None = None):
+    """List independent families explicitly linked against an entity."""
+    return await call(epistemics().contradicting_evidence_families, entity_id, as_of)
+
+
+@mcp.tool()
+async def group_evidence_by_origin(entity_id: str, as_of: str | None = None):
+    """Group linked families under their dependency roots for transparent anti-double-counting."""
+    return await call(epistemics().group_evidence_by_origin, entity_id, as_of)
 
 
 @mcp.tool()

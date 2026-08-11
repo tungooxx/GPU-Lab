@@ -132,7 +132,16 @@ class BenchmarkEpisode(BaseModel):
             "known_active_hypotheses": self.known_active_hypotheses,
             "known_unknowns": self.known_unknowns,
             "candidate_actions": [
-                action.model_dump(mode="json", exclude={"tags"})
+                action.model_dump(
+                    mode="json",
+                    exclude={
+                        "tags",
+                        "expected_information_gain",
+                        "compute_cost",
+                        "engineering_cost",
+                        "execution_risk",
+                    },
+                )
                 for action in self.candidate_actions
             ],
         }
@@ -159,7 +168,7 @@ class BenchmarkDecision(BaseModel):
 class MetricResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    value: float
+    value: float | None
     passed: bool | None = None
     details: str
 
@@ -176,7 +185,7 @@ class BenchmarkScorecard(BaseModel):
 class AggregateMetric(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    mean: float
+    mean: float | None
     observations: int
 
 
@@ -325,14 +334,16 @@ class ResearchBrainBench:
             if decision.expected_information_gain is not None
             else selected.expected_information_gain
         )
-        realized_information = decision.realized_information_gain or 0.0
-        relevance = decision.decision_relevance or 0.0
-        gpu_hours = decision.gpu_hours or 0.0
+        realized_information = decision.realized_information_gain
+        relevance = decision.decision_relevance
+        gpu_hours = decision.gpu_hours
         information_per_gpu_hour = (
-            realized_information / gpu_hours if gpu_hours > 0 else realized_information
+            realized_information / gpu_hours
+            if realized_information is not None and gpu_hours is not None and gpu_hours > 0
+            else None
         )
 
-        def metric(value: float, passed: bool | None, details: str) -> MetricResult:
+        def metric(value: float | None, passed: bool | None, details: str) -> MetricResult:
             return MetricResult(value=value, passed=passed, details=details)
 
         metrics = {
@@ -407,7 +418,11 @@ class ResearchBrainBench:
                 information_per_gpu_hour, None, "realized information divided by GPU hours"
             ),
             "zero_information_decision_rate": metric(
-                float(decision.realized_information_gain == 0.0),
+                (
+                    float(decision.realized_information_gain == 0.0)
+                    if decision.realized_information_gain is not None
+                    else None
+                ),
                 None,
                 "only meaningful after outcome assessment",
             ),
@@ -422,7 +437,12 @@ class ResearchBrainBench:
                 "negative transfer must be preserved rather than averaged away",
             ),
             "strategy_reuse_success_rate": metric(
-                float(decision.strategy_reuse_succeeded is True),
+                (
+                    float(decision.strategy_reuse_succeeded)
+                    if decision.strategy_reused
+                    and decision.strategy_reuse_succeeded is not None
+                    else None
+                ),
                 None,
                 "only meaningful when a strategy was reused and its outcome inspected",
             ),
@@ -443,11 +463,15 @@ class ResearchBrainBench:
                 retryable=False,
             )
         metric_names = set.intersection(*(set(card.metrics) for card in scorecards))
-        metrics = {
-            name: AggregateMetric(
-                mean=sum(card.metrics[name].value for card in scorecards) / len(scorecards),
-                observations=len(scorecards),
+        metrics = {}
+        for name in sorted(metric_names):
+            values = [
+                card.metrics[name].value
+                for card in scorecards
+                if card.metrics[name].value is not None
+            ]
+            metrics[name] = AggregateMetric(
+                mean=sum(values) / len(values) if values else None,
+                observations=len(values),
             )
-            for name in sorted(metric_names)
-        }
         return BenchmarkAggregate(scorecards=len(scorecards), metrics=metrics)

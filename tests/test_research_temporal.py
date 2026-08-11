@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os
 import time
+import uuid
 from datetime import UTC, datetime
 
+import psycopg
 import pytest
 
 from gpu_lab.brain import ResearchBrain
@@ -58,6 +60,41 @@ def test_future_objects_updates_events_and_lexical_hits_do_not_leak():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_revision_and_event_are_invisible_before_their_transaction_commits():
+    store = ResearchStore(TEST_DATABASE_URL)
+    project = store.project_create(f"commit-time-{time.time_ns()}", "When is state visible?")
+    hypothesis = store.object_create(
+        project["project_id"],
+        "Hypothesis",
+        {"mechanism": "committed old state"},
+        "HYPOTHESIS_CREATED",
+    )
+    event_id = str(uuid.uuid4())
+    with psycopg.connect(TEST_DATABASE_URL) as connection, connection.cursor() as cursor:
+        cursor.execute(
+            "UPDATE research_objects SET status='WEAKENED',data=%s::jsonb WHERE id=%s",
+            ('{"mechanism":"not committed at cutoff"}', hypothesis["id"]),
+        )
+        cursor.execute(
+            "INSERT INTO research_events(id,project_id,event_type,subject_id,payload,created_at) "
+            "VALUES(%s,%s,'FUTURE_TRANSACTION_EVENT',%s,'{}'::jsonb,clock_timestamp())",
+            (event_id, project["project_id"], hypothesis["id"]),
+        )
+        cutoff_before_commit = datetime.now(UTC)
+        time.sleep(0.01)
+
+    historical = store.object_get(hypothesis["id"], as_of=cutoff_before_commit)
+    event_types = {
+        event["event_type"]
+        for event in store.events(project["project_id"], as_of=cutoff_before_commit)
+    }
+
+    assert historical["status"] == "ACTIVE"
+    assert historical["data"]["mechanism"] == "committed old state"
+    assert "FUTURE_TRANSACTION_EVENT" not in event_types
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_embedding_created_after_cutoff_does_not_leak():
     store = ResearchStore(TEST_DATABASE_URL)
     if not store.vector_available:
@@ -84,6 +121,58 @@ def test_embedding_created_after_cutoff_does_not_leak():
         project["project_id"], [1.0, 0.0], as_of=after_embedding
     )
     assert [str(item["id"]) for item in hits] == [hypothesis["id"]]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_migration_stamps_a_legacy_embedding_at_the_migration_boundary():
+    store = ResearchStore(TEST_DATABASE_URL)
+    if not store.vector_available:
+        pytest.skip("pgvector is unavailable")
+    project = store.project_create(
+        f"legacy-vector-{time.time_ns()}", "When did the legacy vector become visible?"
+    )
+    hypothesis = store.object_create(
+        project["project_id"],
+        "Hypothesis",
+        {"mechanism": "legacy bounded vector"},
+        "HYPOTHESIS_CREATED",
+    )
+    store.embedding_set(hypothesis["id"], [1.0, 0.0])
+    with psycopg.connect(TEST_DATABASE_URL) as connection, connection.cursor() as cursor:
+        cursor.execute(
+            "UPDATE research_objects SET embedding_updated_at=NULL WHERE id=%s",
+            (hypothesis["id"],),
+        )
+        cursor.execute(
+            "DELETE FROM research_object_versions WHERE object_id=%s", (hypothesis["id"],)
+        )
+
+    before_migration = datetime.now(UTC)
+    time.sleep(0.01)
+    store._migrate()
+    after_migration = datetime.now(UTC)
+
+    with psycopg.connect(TEST_DATABASE_URL) as connection, connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT embedding_updated_at,legacy_backfill FROM research_object_versions "
+            "WHERE object_id=%s",
+            (hypothesis["id"],),
+        )
+        revision = cursor.fetchone()
+    assert revision[0] is not None
+    assert revision[1] is True
+    assert (
+        store.semantic_search(
+            project["project_id"], [1.0, 0.0], as_of=before_migration
+        )
+        == []
+    )
+    assert [
+        str(item["id"])
+        for item in store.semantic_search(
+            project["project_id"], [1.0, 0.0], as_of=after_migration
+        )
+    ] == [hypothesis["id"]]
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")

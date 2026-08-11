@@ -44,6 +44,8 @@ def test_visible_payload_excludes_hidden_future_and_benchmark_answers():
     assert "HASI was later killed" not in serialized
     assert "SCOPE_VIOLATION" not in serialized
     assert "PROMOTE_WITHOUT_EVIDENCE" not in serialized
+    assert "expected_information_gain" not in serialized
+    assert "compute_cost" not in serialized
 
 
 def test_episode_rejects_naive_cutoff_timestamp():
@@ -151,6 +153,8 @@ def test_aggregate_keeps_every_metric_separate():
     assert aggregate.scorecards == len(cards)
     assert aggregate.metrics["future_information_leakage_rate"].mean == 0
     assert aggregate.metrics["strong_next_action_recall"].observations == len(cards)
+    assert aggregate.metrics["realized_information_gain"].mean is None
+    assert aggregate.metrics["realized_information_gain"].observations == 0
     assert not hasattr(aggregate, "total_score")
 
 
@@ -168,11 +172,13 @@ async def test_mcp_benchmark_tools_do_not_expose_hidden_state(monkeypatch):
     monkeypatch.setattr(server, "brain_bench_service", ResearchBrainBench(BENCH_ROOT))
 
     listed = await server.research_benchmark_list()
-    baseline = await server.research_benchmark_baseline(
+    visible = await server.research_benchmark_episode_get("pointcloud-after-stage4")
+    baseline = await server.research_benchmark_policy_run(
         "pointcloud-after-stage4", "MAX_EXPECTED_INFORMATION_ACTION"
     )
 
     assert len(listed) >= 3
     assert "hidden_future_state" not in json.dumps(listed)
+    assert "expected_information_gain" not in json.dumps(visible)
     assert baseline["selected_action_id"] == "derive-competing-mechanisms"
-    assert "total_score" not in baseline
+    assert "metrics" not in baseline

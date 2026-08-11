@@ -13,6 +13,7 @@ from .errors import GPUError
 RESEARCH_OBJECT_KINDS = (
     "Paper",
     "EvidenceUnit",
+    "EvidenceFamily",
     "ExecutablePaper",
     "Claim",
     "Mechanism",
@@ -107,6 +108,12 @@ class ResearchStore:
 
     def _migrate(self) -> None:
         with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SHOW track_commit_timestamp")
+            if cur.fetchone()["track_commit_timestamp"] != "on":
+                raise GPUError(
+                    "TEMPORAL_COMMIT_TRACKING_REQUIRED",
+                    "PostgreSQL must run with track_commit_timestamp=on",
+                )
             cur.execute("SELECT pg_advisory_xact_lock(hashtext('gpu_lab_research_migration'))")
             try:
                 cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
@@ -232,6 +239,11 @@ class ResearchStore:
                 "ON research_objects(project_id, (data->>'name')) "
                 "WHERE kind='HypothesisNiche'"
             )
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS research_objects_evidence_family_key_unique "
+                "ON research_objects(project_id, (data->>'independence_key')) "
+                "WHERE kind='EvidenceFamily'"
+            )
             if self.vector_available:
                 cur.execute("ALTER TABLE research_objects ADD COLUMN IF NOT EXISTS embedding vector")
             cur.execute("""
@@ -277,7 +289,10 @@ class ResearchStore:
                     embedding_text,embedding_updated_at,embedding_metadata,legacy_backfill
                 )
                 SELECT o.id,o.project_id,o.kind,o.status,o.data,o.created_at,clock_timestamp(),
-                       to_jsonb(o)->>'embedding',o.embedding_updated_at,o.embedding_metadata,TRUE
+                       to_jsonb(o)->>'embedding',
+                       CASE WHEN to_jsonb(o)->>'embedding' IS NOT NULL
+                            THEN clock_timestamp() ELSE o.embedding_updated_at END,
+                       o.embedding_metadata,TRUE
                 FROM research_objects o
                 WHERE NOT EXISTS(
                     SELECT 1 FROM research_object_versions v WHERE v.object_id=o.id
@@ -325,9 +340,10 @@ class ResearchStore:
             else:
                 cur.execute(
                     "SELECT project_id AS id,name,question,state,project_created_at AS created_at,"
-                    "valid_from,legacy_backfill FROM research_project_versions "
-                    "WHERE project_id=%s AND valid_from<=%s "
-                    "ORDER BY valid_from DESC,revision_id DESC LIMIT 1",
+                    "valid_from,pg_xact_commit_timestamp(xmin) AS committed_at,legacy_backfill "
+                    "FROM research_project_versions WHERE project_id=%s "
+                    "AND pg_xact_commit_timestamp(xmin)<=%s "
+                    "ORDER BY pg_xact_commit_timestamp(xmin) DESC,revision_id DESC LIMIT 1",
                     (project_id, cutoff),
                 )
             project = cur.fetchone()
@@ -362,6 +378,149 @@ class ResearchStore:
             "kind": kind,
             "status": status,
             "data": data,
+        }
+
+    def evidence_family_create_atomic(
+        self,
+        project_id: str,
+        data: dict[str, Any],
+    ) -> dict:
+        """Create one empirical-origin family, idempotently keyed within a project."""
+        project_id = self._canonical_uuid(project_id)
+        independence_key = str(data["independence_key"])
+        ident, now = uuid.uuid4(), datetime.now(UTC)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"evidence-family:{project_id}:{independence_key}",),
+            )
+            cur.execute(
+                "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
+                "WHERE project_id=%s AND kind='EvidenceFamily' "
+                "AND data->>'independence_key'=%s LIMIT 1 FOR UPDATE",
+                (project_id, independence_key),
+            )
+            existing = cur.fetchone()
+            if existing:
+                comparable = {
+                    key: existing["data"].get(key)
+                    for key in (
+                        "origin_type",
+                        "origin_id",
+                        "independence_key",
+                        "description",
+                        "derived_from_evidence_family_id",
+                        "dependency_note",
+                    )
+                }
+                if comparable != data:
+                    raise GPUError(
+                        "EVIDENCE_FAMILY_KEY_CONFLICT",
+                        "The independence key is already bound to a different empirical origin",
+                    )
+                return {**existing, "idempotent_replay": True}
+            stored = {
+                **data,
+                "supporting_entity_ids": [],
+                "contradicting_entity_ids": [],
+                "derived_record_ids": [],
+            }
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'EvidenceFamily','ACTIVE',%s,%s)",
+                (ident, project_id, json.dumps(stored), now),
+            )
+            self._event(cur, project_id, "EVIDENCE_FAMILY_CREATED", ident, data)
+        return {
+            "id": str(ident),
+            "project_id": project_id,
+            "kind": "EvidenceFamily",
+            "status": "ACTIVE",
+            "data": stored,
+        }
+
+    def evidence_family_link_atomic(
+        self, family_id: str, entity_id: str, relationship: str
+    ) -> dict:
+        """Attach one derived record without manufacturing a second empirical origin."""
+        family_id = self._canonical_uuid(family_id)
+        entity_id = self._canonical_uuid(entity_id)
+        fields = {
+            "SUPPORTS": ("supporting_entity_ids", "supporting_evidence_family_ids"),
+            "CONTRADICTS": (
+                "contradicting_entity_ids",
+                "contradicting_evidence_family_ids",
+            ),
+            "DERIVED": ("derived_record_ids", "evidence_family_ids"),
+        }
+        if relationship not in fields:
+            raise GPUError("INVALID_EVIDENCE_FAMILY_RELATIONSHIP", relationship)
+        family_field, entity_field = fields[relationship]
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
+                "WHERE id=ANY(%s::uuid[]) FOR UPDATE",
+                ([family_id, entity_id],),
+            )
+            records = {str(item["id"]): item for item in cur.fetchall()}
+            if len(records) != 2:
+                raise GPUError("RESEARCH_OBJECT_NOT_FOUND", "EvidenceFamily or linked entity")
+            family, entity = records[family_id], records[entity_id]
+            if family["kind"] != "EvidenceFamily":
+                raise GPUError("NOT_AN_EVIDENCEFAMILY", family_id)
+            if family["project_id"] != entity["project_id"]:
+                raise GPUError("RESEARCH_PROJECT_MISMATCH", entity_id)
+            family_data = {**family["data"]}
+            entity_data = {**entity["data"]}
+            already_linked = (
+                entity_id in family_data.get(family_field, [])
+                and family_id in entity_data.get(entity_field, [])
+                and entity_id in family_data.get("derived_record_ids", [])
+                and family_id in entity_data.get("evidence_family_ids", [])
+            )
+            if already_linked:
+                return {
+                    "family": family,
+                    "entity": entity,
+                    "relationship": relationship,
+                    "idempotent_replay": True,
+                }
+            family_data[family_field] = list(
+                dict.fromkeys([*family_data.get(family_field, []), entity_id])
+            )
+            family_data["derived_record_ids"] = list(
+                dict.fromkeys([*family_data.get("derived_record_ids", []), entity_id])
+            )
+            entity_data[entity_field] = list(
+                dict.fromkeys([*entity_data.get(entity_field, []), family_id])
+            )
+            entity_data["evidence_family_ids"] = list(
+                dict.fromkeys([*entity_data.get("evidence_family_ids", []), family_id])
+            )
+            cur.execute(
+                "UPDATE research_objects SET data=%s WHERE id=%s",
+                (json.dumps(family_data), family_id),
+            )
+            cur.execute(
+                "UPDATE research_objects SET data=%s WHERE id=%s",
+                (json.dumps(entity_data), entity_id),
+            )
+            cur.execute(
+                "INSERT INTO research_edges VALUES(%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                (family_id, entity_id, relationship, datetime.now(UTC)),
+            )
+            self._event(
+                cur,
+                family["project_id"],
+                "EVIDENCE_FAMILY_RECORD_LINKED",
+                family_id,
+                {"entity_id": entity_id, "relationship": relationship},
+            )
+        return {
+            "family": {**family, "data": family_data},
+            "entity": {**entity, "data": entity_data},
+            "relationship": relationship,
+            "idempotent_replay": False,
         }
 
     def hypothesis_create_with_edges(
@@ -1558,8 +1717,10 @@ class ResearchStore:
                     "WITH latest AS ("
                     "SELECT DISTINCT ON (v.object_id) v.object_id AS id,v.project_id,v.kind,"
                     "v.status,v.data,v.object_created_at AS created_at "
-                    "FROM research_object_versions v WHERE v.project_id=%s AND v.valid_from<=%s "
-                    "ORDER BY v.object_id,v.valid_from DESC,v.revision_id DESC) "
+                    "FROM research_object_versions v WHERE v.project_id=%s "
+                    "AND pg_xact_commit_timestamp(v.xmin)<=%s "
+                    "ORDER BY v.object_id,pg_xact_commit_timestamp(v.xmin) DESC,"
+                    "v.revision_id DESC) "
                     "SELECT id,project_id,kind,status,data,created_at FROM latest WHERE TRUE"
                 )
                 args = [project_id, cutoff]
@@ -1596,8 +1757,10 @@ class ResearchStore:
             sql = (
                 "WITH latest AS ("
                 "SELECT DISTINCT ON (v.object_id) v.object_id,v.kind,v.status,v.data "
-                "FROM research_object_versions v WHERE v.project_id=%s AND v.valid_from<=%s "
-                "ORDER BY v.object_id,v.valid_from DESC,v.revision_id DESC) "
+                "FROM research_object_versions v WHERE v.project_id=%s "
+                "AND pg_xact_commit_timestamp(v.xmin)<=%s "
+                "ORDER BY v.object_id,pg_xact_commit_timestamp(v.xmin) DESC,"
+                "v.revision_id DESC) "
                 "SELECT count(*) AS count FROM latest WHERE kind=%s"
             )
             args = [project_id, cutoff, kind]
@@ -1628,8 +1791,9 @@ class ResearchStore:
                 "WITH latest AS ("
                 "SELECT DISTINCT ON (v.object_id) v.object_id AS id,v.kind,v.status,"
                 "v.object_created_at AS created_at FROM research_object_versions v "
-                "WHERE v.project_id=%s AND v.valid_from<=%s "
-                "ORDER BY v.object_id,v.valid_from DESC,v.revision_id DESC) "
+                "WHERE v.project_id=%s AND pg_xact_commit_timestamp(v.xmin)<=%s "
+                "ORDER BY v.object_id,pg_xact_commit_timestamp(v.xmin) DESC,"
+                "v.revision_id DESC) "
                 "SELECT id,status FROM latest WHERE kind=%s"
             )
             args = [project_id, cutoff, kind]
@@ -1661,8 +1825,9 @@ class ResearchStore:
                 "WITH latest AS ("
                 "SELECT DISTINCT ON (v.object_id) v.object_id AS id,v.kind,v.status,v.data,"
                 "v.object_created_at AS created_at FROM research_object_versions v "
-                "WHERE v.project_id=%s AND v.valid_from<=%s "
-                "ORDER BY v.object_id,v.valid_from DESC,v.revision_id DESC) "
+                "WHERE v.project_id=%s AND pg_xact_commit_timestamp(v.xmin)<=%s "
+                "ORDER BY v.object_id,pg_xact_commit_timestamp(v.xmin) DESC,"
+                "v.revision_id DESC) "
                 "SELECT id,status,created_at FROM latest "
                 "WHERE kind='ExperimentRun' AND status=ANY(%s)"
             )
@@ -1699,8 +1864,10 @@ class ResearchStore:
                     "SELECT DISTINCT ON (v.object_id) v.object_id AS id,v.project_id,v.kind,"
                     "v.status,v.data,v.object_created_at AS created_at "
                     "FROM research_object_versions v "
-                    "WHERE v.object_id=ANY(%s::uuid[]) AND v.valid_from<=%s "
-                    "ORDER BY v.object_id,v.valid_from DESC,v.revision_id DESC",
+                    "WHERE v.object_id=ANY(%s::uuid[]) "
+                    "AND pg_xact_commit_timestamp(v.xmin)<=%s "
+                    "ORDER BY v.object_id,pg_xact_commit_timestamp(v.xmin) DESC,"
+                    "v.revision_id DESC",
                     (identifiers, cutoff),
                 )
             return {str(row["id"]): row for row in cur.fetchall()}
@@ -1714,10 +1881,11 @@ class ResearchStore:
                 )
             else:
                 cur.execute(
-                    "SELECT name,question,state,valid_from,legacy_backfill "
+                    "SELECT name,question,state,valid_from,"
+                    "pg_xact_commit_timestamp(xmin) AS committed_at,legacy_backfill "
                     "FROM research_project_versions "
-                    "WHERE project_id=%s AND valid_from<=%s "
-                    "ORDER BY valid_from DESC,revision_id DESC LIMIT 1",
+                    "WHERE project_id=%s AND pg_xact_commit_timestamp(xmin)<=%s "
+                    "ORDER BY pg_xact_commit_timestamp(xmin) DESC,revision_id DESC LIMIT 1",
                     (project_id, cutoff),
                 )
             row = cur.fetchone()
@@ -1738,8 +1906,9 @@ class ResearchStore:
                     "WITH latest AS ("
                     "SELECT DISTINCT ON (v.object_id) v.object_id AS id,v.kind,v.status,v.data,"
                     "v.object_created_at AS created_at FROM research_object_versions v "
-                    "WHERE v.project_id=%s AND v.valid_from<=%s "
-                    "ORDER BY v.object_id,v.valid_from DESC,v.revision_id DESC) "
+                    "WHERE v.project_id=%s AND pg_xact_commit_timestamp(v.xmin)<=%s "
+                    "ORDER BY v.object_id,pg_xact_commit_timestamp(v.xmin) DESC,"
+                    "v.revision_id DESC) "
                     "SELECT id,kind,status,data,created_at FROM latest ORDER BY created_at DESC",
                     (project_id, cutoff),
                 )
@@ -1835,9 +2004,11 @@ class ResearchStore:
             else:
                 cur.execute(
                     "SELECT object_id AS id,project_id,kind,status,data,"
-                    "object_created_at AS created_at,valid_from,legacy_backfill "
-                    "FROM research_object_versions WHERE object_id=%s AND valid_from<=%s "
-                    "ORDER BY valid_from DESC,revision_id DESC LIMIT 1",
+                    "object_created_at AS created_at,valid_from,"
+                    "pg_xact_commit_timestamp(xmin) AS committed_at,legacy_backfill "
+                    "FROM research_object_versions WHERE object_id=%s "
+                    "AND pg_xact_commit_timestamp(xmin)<=%s "
+                    "ORDER BY pg_xact_commit_timestamp(xmin) DESC,revision_id DESC LIMIT 1",
                     (object_id, cutoff),
                 )
             row = cur.fetchone()
@@ -2263,7 +2434,7 @@ class ResearchStore:
             )
             args: list[Any] = [project_id]
             if cutoff is not None:
-                sql += " AND created_at<=%s"
+                sql += " AND pg_xact_commit_timestamp(xmin)<=%s"
                 args.append(cutoff)
             sql += " ORDER BY created_at DESC LIMIT %s"
             args.append(limit)
@@ -2291,8 +2462,9 @@ class ResearchStore:
                     "WITH latest AS ("
                     "SELECT DISTINCT ON (v.object_id) v.object_id AS id,v.kind,v.status,v.data,"
                     "v.object_created_at AS created_at FROM research_object_versions v "
-                    "WHERE v.project_id=%s AND v.valid_from<=%s "
-                    "ORDER BY v.object_id,v.valid_from DESC,v.revision_id DESC) "
+                    "WHERE v.project_id=%s AND pg_xact_commit_timestamp(v.xmin)<=%s "
+                    "ORDER BY v.object_id,pg_xact_commit_timestamp(v.xmin) DESC,"
+                    "v.revision_id DESC) "
                     "SELECT id,kind,status,data,created_at FROM latest WHERE TRUE"
                 )
                 args = [project_id, cutoff]
@@ -2393,8 +2565,9 @@ class ResearchStore:
                     "SELECT DISTINCT ON (v.object_id) v.object_id AS id,v.kind,v.status,v.data,"
                     "v.object_created_at AS created_at,v.embedding_text,v.embedding_updated_at "
                     "FROM research_object_versions v "
-                    "WHERE v.project_id=%s AND v.valid_from<=%s "
-                    "ORDER BY v.object_id,v.valid_from DESC,v.revision_id DESC) "
+                    "WHERE v.project_id=%s AND pg_xact_commit_timestamp(v.xmin)<=%s "
+                    "ORDER BY v.object_id,pg_xact_commit_timestamp(v.xmin) DESC,"
+                    "v.revision_id DESC) "
                     "SELECT id,kind,status,data,created_at,"
                     "embedding_text::vector <=> %s::vector AS distance FROM latest "
                     "WHERE embedding_text IS NOT NULL AND embedding_updated_at<=%s"
