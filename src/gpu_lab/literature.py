@@ -315,7 +315,9 @@ class HttpLiteratureProvider:
                 message
                 if isinstance(message, str) and message
                 else "Literature worker error",
-                retryable if isinstance(retryable, bool) else False,
+                retryable
+                if isinstance(retryable, bool)
+                else response.status_code >= 500,
             )
         if response.is_error:
             raise GPUError(
