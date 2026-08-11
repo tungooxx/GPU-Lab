@@ -81,6 +81,25 @@ class AuthorizingBrain:
         return {"authorized": True}
 
 
+class LegacyReservedResearch:
+    def object_get(self, _run_id):
+        return {
+            "id": "run-id",
+            "kind": "ExperimentRun",
+            "status": "RESERVED",
+            "data": {"job_id": "missing-job"},
+        }
+
+
+class LegacyAbandonBrain:
+    def __init__(self):
+        self.args = None
+
+    def legacy_reserved_run_abandon(self, *args):
+        self.args = args
+        return {"id": args[0], "status": "cancelled"}
+
+
 def _mapping(status):
     return {
         "experiment_id": "experiment-id",
@@ -174,3 +193,31 @@ async def test_sync_preserves_inspected_run_and_does_not_duplicate_artifacts(mon
     assert result["run"]["status"] == "RESULT_INSPECTED"
     assert research.updates == []
     assert research.artifacts == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_reserved_run_abandon_requires_server_verified_missing_job(monkeypatch):
+    brain = LegacyAbandonBrain()
+    monkeypatch.setattr(server.settings, "gpu_lab_enable_local_runner", True)
+    monkeypatch.setattr(server, "research", lambda: LegacyReservedResearch())
+    monkeypatch.setattr(server, "brain", lambda: brain)
+    monkeypatch.setattr(server, "local", MissingLocal())
+
+    result = await server.legacy_reserved_run_abandon("run-id", "No local job was submitted")
+
+    assert result["status"] == "cancelled"
+    assert brain.args == ("run-id", "missing-job", "No local job was submitted")
+
+
+@pytest.mark.asyncio
+async def test_legacy_reserved_run_abandon_refuses_when_job_exists(monkeypatch):
+    brain = LegacyAbandonBrain()
+    monkeypatch.setattr(server.settings, "gpu_lab_enable_local_runner", True)
+    monkeypatch.setattr(server, "research", lambda: LegacyReservedResearch())
+    monkeypatch.setattr(server, "brain", lambda: brain)
+    monkeypatch.setattr(server, "local", RunningLocal())
+
+    result = await server.legacy_reserved_run_abandon("run-id", "No local job was submitted")
+
+    assert result["error"]["type"] == "LEGACY_RUN_BACKING_JOB_NOT_PROVEN_ABSENT"
+    assert brain.args is None

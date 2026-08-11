@@ -313,6 +313,74 @@ def test_legacy_run_provenance_repair_reconstructs_inspection_decision_once():
     assert replay["idempotent_replay"] is True
 
 
+class LegacyAbandonStore(LegacyRepairStore):
+    def __init__(self):
+        super().__init__()
+        self.objects["run"]["status"] = "RESERVED"
+        self.objects["run"]["data"].update(
+            {"job_id": "missing-job", "decision_id": "prediction"}
+        )
+        self.objects["prediction"] = {
+            "id": "prediction",
+            "project_id": "project",
+            "kind": "Prediction",
+            "status": "ACTIVE",
+            "data": {},
+        }
+        self.abandon_args = None
+
+    def legacy_reserved_run_abandon(self, run_id, job_id, rationale, provenance):
+        self.abandon_args = (run_id, job_id, rationale, provenance)
+        self.objects[run_id]["status"] = "cancelled"
+        self.objects[run_id]["data"]["legacy_abandonment"] = {
+            "verified_missing_backing_job": True,
+            "job_id": job_id,
+        }
+        return {"id": run_id, "status": "cancelled"}
+
+
+def test_legacy_reserved_run_abandon_preserves_pre_decision_provenance():
+    store = LegacyAbandonStore()
+    result = ResearchBrain(store).legacy_reserved_run_abandon(
+        "run", "missing-job", "No local job was ever submitted"
+    )
+
+    assert result["status"] == "cancelled"
+    assert store.abandon_args == (
+        "run",
+        "missing-job",
+        "No local job was ever submitted",
+        {
+            "pre_research_decision": True,
+            "original_decision_id": "prediction",
+            "original_decision_kind": "Prediction",
+        },
+    )
+
+
+def test_legacy_repair_replaces_only_abandoned_pre_decision_provenance():
+    store = LegacyAbandonStore()
+    store.objects["run"]["status"] = "cancelled"
+    store.objects["run"]["data"]["legacy_abandonment"] = {
+        "verified_missing_backing_job": True
+    }
+
+    repaired = ResearchBrain(store).legacy_run_provenance_repair(
+        "run", "agenda", "Repair a pre-ResearchDecision reservation"
+    )
+
+    assert repaired["decision"]["data"]["legacy_provenance"]["superseded_pre_decision_id"] == "prediction"
+    assert repaired["decision"]["data"]["legacy_provenance"]["superseded_pre_decision_kind"] == "Prediction"
+
+
+def test_legacy_repair_rejects_unabandoned_pre_decision_provenance():
+    store = LegacyAbandonStore()
+    store.objects["run"]["status"] = "cancelled"
+
+    with pytest.raises(GPUError, match="prediction"):
+        ResearchBrain(store).legacy_run_provenance_repair("run", "agenda", "No proof")
+
+
 class AssessmentStore:
     def __init__(self):
         self.applied = None

@@ -568,11 +568,15 @@ class ResearchBrain:
             raise GPUError("RESEARCH_PROJECT_MISMATCH", "Legacy repair inputs must share a project")
         existing_id = run["data"].get("decision_id")
         if existing_id:
-            decision = self._expect(str(existing_id), "ResearchDecision")
-            legacy = decision["data"].get("legacy_provenance", {})
-            if legacy.get("run_id") == run_id and legacy.get("reconstructed") is True:
-                return {"run": run, "decision": decision, "idempotent_replay": True}
-            raise GPUError("LEGACY_RUN_ALREADY_HAS_DECISION", run_id)
+            existing = self.store.object_get(str(existing_id))
+            if existing["kind"] == "ResearchDecision":
+                legacy = existing["data"].get("legacy_provenance", {})
+                if legacy.get("run_id") == run_id and legacy.get("reconstructed") is True:
+                    return {"run": run, "decision": existing, "idempotent_replay": True}
+                raise GPUError("LEGACY_RUN_ALREADY_HAS_DECISION", run_id)
+            abandonment = run["data"].get("legacy_abandonment", {})
+            if abandonment.get("verified_missing_backing_job") is not True:
+                raise GPUError("LEGACY_RUN_INVALID_DECISION_PROVENANCE", str(existing_id))
         if not rationale.strip():
             raise GPUError("LEGACY_REPAIR_RATIONALE_REQUIRED", "Provide the provenance reconstruction reason")
         question = agenda_item["data"].get("question") or experiment["data"].get("plan", {}).get(
@@ -596,6 +600,8 @@ class ResearchBrain:
                     "run_id": run_id,
                     "experiment_id": str(experiment["id"]),
                     "artifact_count": len(run["data"].get("artifacts", [])),
+                    "superseded_pre_decision_id": str(existing_id) if existing_id else None,
+                    "superseded_pre_decision_kind": existing["kind"] if existing_id else None,
                     "rationale": rationale.strip(),
                     "limitations": [
                         "Decision was reconstructed after execution.",
@@ -610,12 +616,48 @@ class ResearchBrain:
             run_id,
             {
                 "decision_id": str(decision["id"]),
-                "legacy_provenance": {"reconstructed": True, "decision_id": str(decision["id"])},
+                "legacy_provenance": {
+                    "reconstructed": True,
+                    "decision_id": str(decision["id"]),
+                    "superseded_pre_decision_id": str(existing_id) if existing_id else None,
+                },
             },
             run["status"],
             "EXPERIMENT_RUN_LEGACY_PROVENANCE_REPAIRED",
         )
         return {"run": repaired_run, "decision": decision, "idempotent_replay": False}
+
+    def legacy_reserved_run_abandon(self, run_id: str, job_id: str, rationale: str) -> dict:
+        """Cancel an unsubmitted pre-decision reservation without creating execution evidence."""
+        run = self._expect(run_id, "ExperimentRun")
+        if run["status"] != "RESERVED":
+            raise GPUError("LEGACY_RUN_NOT_ABANDONABLE", run["status"])
+        if run["data"].get("job_id") != job_id:
+            raise GPUError("LEGACY_RUN_JOB_MISMATCH", job_id)
+        if not rationale.strip():
+            raise GPUError("LEGACY_ABANDON_RATIONALE_REQUIRED", "Provide the missing-job rationale")
+        decision_id = run["data"].get("decision_id")
+        decision_kind = None
+        if decision_id:
+            try:
+                decision = self.store.object_get(str(decision_id))
+            except GPUError as exc:
+                if exc.error_type != "RESEARCH_OBJECT_NOT_FOUND":
+                    raise
+            else:
+                decision_kind = decision["kind"]
+                if decision_kind == "ResearchDecision":
+                    raise GPUError("LEGACY_RUN_HAS_RESEARCH_DECISION", str(decision_id))
+        return self.store.legacy_reserved_run_abandon(
+            run_id,
+            job_id,
+            rationale.strip(),
+            {
+                "pre_research_decision": decision_kind != "ResearchDecision",
+                "original_decision_id": str(decision_id) if decision_id else None,
+                "original_decision_kind": decision_kind,
+            },
+        )
 
     def execution_decision_bind(
         self, experiment_id: str, decision_id: str, request_fingerprint: str

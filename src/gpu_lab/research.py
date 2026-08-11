@@ -1837,6 +1837,61 @@ class ResearchStore:
             self._event(cur, run["project_id"], event, run_id, result)
         return {"id": run_id, "status": status, "data": data}
 
+    def legacy_reserved_run_abandon(
+        self, run_id: str, job_id: str, rationale: str, provenance: dict[str, Any]
+    ) -> dict:
+        """Terminally cancel one server-verified legacy reservation with no submitted job."""
+        now = datetime.now(UTC)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,project_id,kind,status,data FROM research_objects WHERE id=%s FOR UPDATE",
+                (run_id,),
+            )
+            run = cur.fetchone()
+            if not run or run["kind"] != "ExperimentRun":
+                raise GPUError("EXPERIMENT_RUN_NOT_FOUND", run_id)
+            if run["status"] == "cancelled":
+                abandoned = run["data"].get("legacy_abandonment", {})
+                if abandoned.get("job_id") == job_id:
+                    return {"id": run_id, "status": "cancelled", "data": run["data"], "idempotent_replay": True}
+                raise GPUError("LEGACY_RUN_ALREADY_FINAL", run_id)
+            if run["status"] != "RESERVED":
+                raise GPUError("LEGACY_RUN_NOT_ABANDONABLE", run["status"])
+            if run["data"].get("job_id") != job_id:
+                raise GPUError("LEGACY_RUN_JOB_MISMATCH", job_id)
+            if run["data"].get("submission_status"):
+                raise GPUError("LEGACY_RUN_SUBMISSION_RECORDED", run_id)
+            data = {
+                **run["data"],
+                "legacy_abandonment": {
+                    "job_id": job_id,
+                    "verified_missing_backing_job": True,
+                    "rationale": rationale,
+                    "provenance": provenance,
+                    "abandoned_at": now.isoformat(),
+                    "limitations": [
+                        "No backing local job record existed at abandonment.",
+                        "Cancellation is execution bookkeeping, not scientific evidence.",
+                    ],
+                },
+            }
+            cur.execute(
+                "UPDATE research_objects SET status='cancelled',data=%s WHERE id=%s",
+                (json.dumps(data), run_id),
+            )
+            cur.execute(
+                "UPDATE research_execution_attempts SET status='cancelled',updated_at=%s WHERE run_id=%s",
+                (now, run_id),
+            )
+            self._event(
+                cur,
+                run["project_id"],
+                "EXPERIMENT_RUN_LEGACY_ABANDONED",
+                run_id,
+                {"job_id": job_id, "rationale": rationale, "provenance": provenance},
+            )
+        return {"id": run_id, "status": "cancelled", "data": data, "idempotent_replay": False}
+
     def artifact_record(self, run_id: str, job_id: str, artifact: dict[str, Any]) -> dict:
         """Idempotently persist one run artifact and its provenance edge."""
         path = artifact.get("path")

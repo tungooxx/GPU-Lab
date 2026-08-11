@@ -862,6 +862,30 @@ async def legacy_run_provenance_repair(run_id: str, agenda_item_id: str, rationa
 
 
 @mcp.tool()
+async def legacy_reserved_run_abandon(run_id: str, rationale: str):
+    """Cancel one unsubmitted legacy reservation only after verifying its local job is absent."""
+    run = await call(research().object_get, run_id)
+    if "error" in run:
+        return run
+    if run.get("kind") != "ExperimentRun" or run.get("status") != "RESERVED":
+        return {"error": {"type": "LEGACY_RUN_NOT_ABANDONABLE", "message": run.get("status")}}
+    job_id = run.get("data", {}).get("job_id")
+    if not isinstance(job_id, str) or not job_id:
+        return {"error": {"type": "LEGACY_RUN_JOB_MISSING", "message": run_id}}
+    if not settings.gpu_lab_enable_local_runner:
+        return {"error": {"type": "LOCAL_RUNNER_REQUIRED", "message": "Cannot verify the backing job"}}
+    job = await call(local.job_status, job_id)
+    if "error" not in job or job["error"].get("type") != "JOB_NOT_FOUND":
+        return {
+            "error": {
+                "type": "LEGACY_RUN_BACKING_JOB_NOT_PROVEN_ABSENT",
+                "message": "The local job exists or could not be verified absent",
+            }
+        }
+    return await call(brain().legacy_reserved_run_abandon, run_id, job_id, rationale)
+
+
+@mcp.tool()
 async def brain_result_assess(
     run_id: str,
     decision_id: str,
