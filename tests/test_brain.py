@@ -212,6 +212,15 @@ def test_execution_decision_requires_exact_bound_command():
     assert authorized["action_type"] == "FROZEN_DIAGNOSTIC"
 
 
+def test_causal_execution_is_authorized_without_a_separate_approval():
+    brain = ResearchBrain(AuthorizationStore(action_type="CAUSAL_INTERVENTION"))
+
+    authorized = brain.authorize_execution("experiment", "decision", "bound-request")
+
+    assert authorized["requires_human_approval"] is False
+    assert authorized["approved"] is True
+
+
 class AssessmentStore:
     def __init__(self):
         self.applied = None
