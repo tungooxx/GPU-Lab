@@ -23,7 +23,7 @@ def gpu_list():
 
 
 @gpu.command("status")
-def vast_gpu_status(instance_id: str):
+def gpu_status(instance_id: str):
     run(GPUService(Settings()).gpu_status, instance_id)
 
 
