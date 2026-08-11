@@ -142,3 +142,18 @@ def test_result_assessment_rejects_invalid_status_before_persistence(
         )
 
     assert error.value.error_type == "INVALID_RESEARCH_OBJECT_STATUS"
+
+
+def test_legacy_result_assessment_replay_matches_its_recorded_decision_outcome():
+    assert ResearchStore._assessment_replay_matches(
+        {"evidence_id": "evidence"},
+        {"outcome": {"run_id": "run", "evidence_id": "evidence"}},
+        "run",
+        "decision",
+    )
+    assert not ResearchStore._assessment_replay_matches(
+        {"evidence_id": "other"},
+        {"outcome": {"run_id": "run", "evidence_id": "evidence"}},
+        "run",
+        "decision",
+    )

@@ -145,9 +145,6 @@ class ResearchStore:
                     ON research_objects USING GIN (data jsonb_path_ops);
                 CREATE INDEX IF NOT EXISTS research_execution_attempts_job_idx
                     ON research_execution_attempts(job_id);
-                CREATE UNIQUE INDEX IF NOT EXISTS research_objects_hypothesis_niche_name_unique
-                    ON research_objects(project_id, (data->>'name'))
-                    WHERE kind='HypothesisNiche';
             """)
             allowed_kinds = ",".join("'" + kind + "'" for kind in RESEARCH_OBJECT_KINDS)
             cur.execute(
@@ -166,6 +163,38 @@ class ResearchStore:
                     "ALTER TABLE research_objects ADD CONSTRAINT research_objects_kind_check "
                     f"CHECK(kind IN ({allowed_kinds}))"
                 )
+            cur.execute(
+                "SELECT project_id,data->>'name' AS name,"
+                "array_agg(id ORDER BY created_at,id) AS ids FROM research_objects "
+                "WHERE kind='HypothesisNiche' AND data ? 'name' "
+                "GROUP BY project_id,data->>'name' HAVING count(*)>1"
+            )
+            for duplicate_group in cur.fetchall():
+                canonical_id = str(duplicate_group["ids"][0])
+                for duplicate_id in duplicate_group["ids"][1:]:
+                    cur.execute("SELECT data FROM research_objects WHERE id=%s", (duplicate_id,))
+                    duplicate = cur.fetchone()
+                    renamed_data = {
+                        **duplicate["data"],
+                        "name": f"{duplicate_group['name']} [duplicate {duplicate_id}]",
+                        "duplicate_of": canonical_id,
+                    }
+                    cur.execute(
+                        "UPDATE research_objects SET data=%s WHERE id=%s",
+                        (json.dumps(renamed_data), duplicate_id),
+                    )
+                    self._event(
+                        cur,
+                        duplicate_group["project_id"],
+                        "HYPOTHESIS_NICHE_DUPLICATE_RENAMED",
+                        duplicate_id,
+                        {"canonical_id": canonical_id, "name": renamed_data["name"]},
+                    )
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS research_objects_hypothesis_niche_name_unique "
+                "ON research_objects(project_id, (data->>'name')) "
+                "WHERE kind='HypothesisNiche'"
+            )
             if self.vector_available:
                 cur.execute("ALTER TABLE research_objects ADD COLUMN IF NOT EXISTS embedding vector")
 
@@ -1102,7 +1131,7 @@ class ResearchStore:
                 raise GPUError("RESEARCH_PROJECT_MISMATCH", "Assessment inputs differ")
             if run["status"] == "RESULT_INSPECTED":
                 prior = run["data"].get("inspection", {})
-                if prior.get("decision_id") == decision_id:
+                if self._assessment_replay_matches(prior, decision["data"], run_id, decision_id):
                     return {
                         "run": {"id": run_id, "status": run["status"], "data": run["data"]},
                         "evidence": self._object_row(cur, prior["evidence_id"]),
@@ -1367,6 +1396,20 @@ class ResearchStore:
         if not row:
             raise GPUError("RESEARCH_OBJECT_NOT_FOUND", object_id)
         return row
+
+    @staticmethod
+    def _assessment_replay_matches(
+        inspection: dict[str, Any], decision_data: dict[str, Any], run_id: str, decision_id: str
+    ) -> bool:
+        """Match current snapshots and legacy inspected runs to their original decision."""
+        if inspection.get("decision_id") == decision_id:
+            return True
+        outcome = decision_data.get("outcome", {})
+        return (
+            "decision_id" not in inspection
+            and outcome.get("run_id") == run_id
+            and outcome.get("evidence_id") == inspection.get("evidence_id")
+        )
 
     def objects_list(
         self,
