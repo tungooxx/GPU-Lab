@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import hmac
 import inspect
 import ipaddress
 import json
@@ -97,6 +98,7 @@ _DESTRUCTIVE_TOOLS = {
     "gpu_destroy",
     "executable_paper_build",
     "executable_paper_invoke",
+    "executable_paper_action_approve",
 }
 _OPEN_WORLD_TOOLS = {
     "gpu_list",
@@ -1111,27 +1113,58 @@ async def executable_paper_provider_status():
 
 
 @mcp.tool()
-async def executable_paper_build(
+async def executable_paper_action_approve(
     project_id: str,
-    paper_id: str,
-    repository: str,
-    commit: str,
-    tutorials: str | None = None,
-    confirm_external_cost: bool = False,
+    action: str,
+    parameters: dict,
+    approver: str,
+    rationale: str,
+    approval_secret: str,
+    ttl_minutes: int = 30,
 ):
-    """Build an executable-paper candidate in isolated Paper2Agent; may use paid model access."""
-    if not confirm_external_cost:
+    """Create a parameter-bound, expiring approval after authenticating the human approver."""
+    configured = settings.gpu_lab_approval_secret or ""
+    if not configured or not hmac.compare_digest(
+        approval_secret.encode("utf-8", "replace"), configured.encode("utf-8", "replace")
+    ):
         return {
             "error": {
-                "type": "HUMAN_APPROVAL_REQUIRED",
-                "message": "Paper2Agent may run for hours and incur external model cost. Re-submit with confirm_external_cost=true after explicit human approval.",
+                "type": "APPROVAL_AUTHENTICATION_FAILED",
+                "message": "The server approval secret is missing or invalid",
             }
         }
     try:
         service = executable_papers()
     except GPUError as exc:
         return exc.response()
-    return await call(service.build, project_id, paper_id, repository, commit, tutorials)
+    return await call(
+        service.approve,
+        project_id,
+        action,
+        parameters,
+        approver,
+        rationale,
+        ttl_minutes,
+    )
+
+
+@mcp.tool()
+async def executable_paper_build(
+    project_id: str,
+    paper_id: str,
+    repository: str,
+    commit: str,
+    tutorials: str | None = None,
+    approval_id: str | None = None,
+):
+    """Build an executable-paper candidate in isolated Paper2Agent; may use paid model access."""
+    try:
+        service = executable_papers()
+    except GPUError as exc:
+        return exc.response()
+    return await call(
+        service.build, project_id, paper_id, repository, commit, tutorials, approval_id
+    )
 
 
 @mcp.tool()
@@ -1159,21 +1192,14 @@ async def executable_paper_invoke(
     executable_paper_id: str,
     tool: str,
     args: dict,
-    confirm_generated_code_execution: bool = False,
+    approval_id: str | None = None,
 ):
     """Invoke a verified generated tool; its output remains unassessed and non-canonical."""
-    if not confirm_generated_code_execution:
-        return {
-            "error": {
-                "type": "HUMAN_APPROVAL_REQUIRED",
-                "message": "Generated paper tools execute third-party code. Re-submit with confirm_generated_code_execution=true after explicit human approval.",
-            }
-        }
     try:
         service = executable_papers()
     except GPUError as exc:
         return exc.response()
-    return await call(service.invoke, executable_paper_id, tool, args)
+    return await call(service.invoke, executable_paper_id, tool, args, approval_id)
 
 
 @mcp.tool()

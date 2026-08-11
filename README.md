@@ -138,6 +138,7 @@ the upstream model cost:
 ```powershell
 $env:GPU_LAB_EXECUTABLE_PAPER_PROVIDER = "paper2agent-http"
 $env:GPU_LAB_EXECUTABLE_PAPER_WORKER_TOKEN = "<random-task-scoped-token>"
+$env:GPU_LAB_APPROVAL_SECRET = "<separate-human-approval-secret>"
 $env:ANTHROPIC_API_KEY = "<task-scoped-key>"
 docker compose --profile paper-agents up -d --build
 ```
@@ -148,3 +149,6 @@ not mounted into GPU-Lab or PostgreSQL.
 
 The worker accepts public GitHub repositories only. A generated tool remains non-evidentiary until
 it is used inside a preregistered GPU-Lab reproduction or experiment and the result is inspected.
+Paid builds and generated-tool invocations require an `executable_paper_action_approve` record
+authenticated with `GPU_LAB_APPROVAL_SECRET`; the record binds the approver, exact action parameters,
+and an expiry of at most 60 minutes. A Boolean supplied by the calling agent is not approval.

@@ -34,6 +34,9 @@ They must be revisited before adding or upgrading an external dependency.
   pins its Claude Code runtime, accepts only public GitHub repositories, and receives only its
   scoped token plus Anthropic credential. PostgreSQL, Vast, SSH, GPU, and literature credentials are
   absent. Network policy prevents the worker subnet from calling GPU-Lab's MCP endpoint directly.
+- Paid builds and generated-code invocation require a separate server-authenticated `ActionApproval`
+  record bound to an approver label, exact parameter hash, rationale, and expiry. Approval parameters
+  themselves are not persisted, avoiding storage of tool arguments that may contain secrets.
 - Boundary: generated tools are unverified executable-paper candidates until GPU-Lab smoke and
   reproduction gates pass. Worker verification is capped at `VERIFIED_INTEGRATION`; it cannot
   claim `VERIFIED_REAL` or mutate canonical claims, hypotheses, experiments, or WorldModel state.

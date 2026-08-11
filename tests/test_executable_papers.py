@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sys
+import uuid
 
 import httpx
 import pytest
@@ -21,7 +22,7 @@ class FakeStore:
 
     def object_create(self, project_id, kind, data, event_type, status="ACTIVE"):
         item = {
-            "id": f"{kind.lower()}-{len(self.created)}",
+            "id": str(uuid.uuid4()),
             "project_id": project_id,
             "kind": kind,
             "status": status,
@@ -50,20 +51,36 @@ class FakeStore:
             and query in json.dumps(item["data"])
         ]
 
+    def executable_paper_by_fingerprint(self, project_id, fingerprint):
+        return next(
+            (
+                item
+                for item in reversed(self.created)
+                if item["project_id"] == project_id
+                and item["kind"] == "ExecutablePaper"
+                and item["data"].get("build_fingerprint") == fingerprint
+            ),
+            None,
+        )
+
+    def project_get(self, project_id):
+        return {"id": project_id}
+
     def edge_create(self, source, target, relation):
         self.edges.append((source, target, relation))
 
 
 class FakeProvider:
-    def __init__(self, verification_status="VERIFIED_INTEGRATION"):
+    def __init__(self, verification_status="VERIFIED_INTEGRATION", canonical_git=False):
         self.verification_status = verification_status
+        self.canonical_git = canonical_git
         self.build_calls = 0
 
     async def build(self, paper_id, repository, commit, tutorials=None):
         self.build_calls += 1
         return ExecutablePaperCandidate(
             provider_build_id="a" * 64,
-            repository=repository,
+            repository=repository.rstrip("/") + (".git" if self.canonical_git else ""),
             commit=commit,
             generated_mcp="/isolated/generated_mcp.py",
         )
@@ -85,16 +102,44 @@ async def test_executable_paper_service_keeps_generated_state_noncanonical_and_i
     paper = store.object_create("project", "Paper", {"title": "Paper"}, "PAPER_CREATED")
     provider = FakeProvider()
     service = ExecutablePaperService(store, provider)
+    build_parameters = {
+        "project_id": "project",
+        "paper_id": paper["id"],
+        "repository": "https://github.com/owner/repo",
+        "commit": "1" * 40,
+        "tutorials": None,
+    }
+    build_approval = service.approve(
+        "project", "BUILD", build_parameters, "human", "Approved test build"
+    )
 
     built = await service.build(
-        "project", paper["id"], "https://github.com/owner/repo", "1" * 40
+        "project",
+        paper["id"],
+        "https://github.com/owner/repo",
+        "1" * 40,
+        approval_id=build_approval["id"],
     )
     replay = await service.build(
-        "project", paper["id"], "https://github.com/owner/repo", "1" * 40
+        "project",
+        paper["id"],
+        "https://github.com/owner/repo",
+        "1" * 40,
+        approval_id=build_approval["id"],
     )
     inspected = await service.inspect_tools(built["id"])
     verified = await service.verify(built["id"])
-    invoked = await service.invoke(built["id"], "reproduce_baseline", {"seed": 7})
+    invoke_parameters = {
+        "executable_paper_id": built["id"],
+        "tool": "reproduce_baseline",
+        "args": {"seed": 7},
+    }
+    invoke_approval = service.approve(
+        "project", "INVOKE", invoke_parameters, "human", "Approved fixture invocation"
+    )
+    invoked = await service.invoke(
+        built["id"], "reproduce_baseline", {"seed": 7}, invoke_approval["id"]
+    )
 
     assert provider.build_calls == 1
     assert replay["idempotent_replay"] is True
@@ -110,14 +155,51 @@ async def test_generated_worker_cannot_self_promote_to_verified_real():
     store = FakeStore()
     paper = store.object_create("project", "Paper", {}, "PAPER_CREATED")
     service = ExecutablePaperService(store, FakeProvider("VERIFIED_REAL"))
+    parameters = {
+        "project_id": "project",
+        "paper_id": paper["id"],
+        "repository": "https://github.com/owner/repo",
+        "commit": "1" * 40,
+        "tutorials": None,
+    }
+    approval = service.approve("project", "BUILD", parameters, "human", "test")
     built = await service.build(
-        "project", paper["id"], "https://github.com/owner/repo", "1" * 40
+        "project",
+        paper["id"],
+        "https://github.com/owner/repo",
+        "1" * 40,
+        approval_id=approval["id"],
     )
 
     with pytest.raises(GPUError) as error:
         await service.verify(built["id"])
 
     assert error.value.error_type == "INVALID_EXECUTABLE_PAPER_VERIFICATION"
+
+
+@pytest.mark.asyncio
+async def test_repository_identity_accepts_trailing_slash_and_worker_git_suffix():
+    store = FakeStore()
+    paper = store.object_create("project", "Paper", {}, "PAPER_CREATED")
+    service = ExecutablePaperService(store, FakeProvider(canonical_git=True))
+    parameters = {
+        "project_id": "project",
+        "paper_id": paper["id"],
+        "repository": "https://github.com/owner/repo/",
+        "commit": "1" * 40,
+        "tutorials": None,
+    }
+    approval = service.approve("project", "BUILD", parameters, "human", "test")
+
+    built = await service.build(
+        "project",
+        paper["id"],
+        "https://github.com/owner/repo/",
+        "1" * 40,
+        approval_id=approval["id"],
+    )
+
+    assert built["kind"] == "ExecutablePaper"
 
 
 @pytest.mark.asyncio
@@ -175,6 +257,39 @@ async def test_http_executable_paper_preserves_structured_worker_error():
     assert error.value.retryable is False
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", [["not", "an", "object"], "bad-health"])
+async def test_http_executable_paper_rejects_non_object_health(result):
+    provider = HttpExecutablePaperProvider(
+        "http://paper2agent:8020",
+        "scoped-token",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"result": result})
+        ),
+    )
+
+    with pytest.raises(GPUError) as error:
+        await provider.health()
+
+    assert error.value.error_type == "EXECUTABLE_PAPER_PROVIDER_INVALID_RESPONSE"
+
+
+@pytest.mark.asyncio
+async def test_http_executable_paper_rejects_non_object_nested_error():
+    provider = HttpExecutablePaperProvider(
+        "http://paper2agent:8020",
+        "scoped-token",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(400, json={"error": "build failed"})
+        ),
+    )
+
+    with pytest.raises(GPUError) as error:
+        await provider.health()
+
+    assert error.value.error_type == "EXECUTABLE_PAPER_PROVIDER_INVALID_RESPONSE"
+
+
 @pytest.mark.parametrize(
     "repository",
     [
@@ -193,6 +308,17 @@ def test_paper2agent_worker_accepts_only_public_github_repositories(tmp_path, re
         provider._repository(repository)
 
     assert error.value.error_type == "INVALID_EXECUTABLE_PAPER_REPOSITORY"
+
+
+def test_paper2agent_worker_canonicalizes_public_github_repositories(tmp_path):
+    provider = Paper2AgentSubprocessProvider(tmp_path)
+
+    assert provider._repository("https://github.com/owner/repo") == (
+        "https://github.com/owner/repo.git"
+    )
+    assert provider._repository("https://github.com/owner/repo.git") == (
+        "https://github.com/owner/repo.git"
+    )
 
 
 @pytest.mark.asyncio
@@ -303,3 +429,20 @@ async def test_paper2agent_worker_health_is_secret_free_and_routes_require_auth(
     assert health.json()["result"]["status"] in {"ready", "needs_credentials"}
     assert "token" not in json.dumps(health.json()).lower()
     assert unauthorized.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_paper2agent_worker_malformed_json_is_nonretryable_client_error(monkeypatch):
+    from gpu_lab import paper2agent_worker
+
+    monkeypatch.setattr(paper2agent_worker, "WORKER_TOKEN", "scoped-token")
+    transport = httpx.ASGITransport(app=paper2agent_worker.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://worker") as client:
+        response = await client.post(
+            "/verify",
+            content=b"{bad-json",
+            headers={"Authorization": "Bearer scoped-token", "Content-Type": "application/json"},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "INVALID_EXECUTABLE_PAPER_REQUEST"

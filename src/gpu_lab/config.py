@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     gpu_lab_executable_paper_provider: str = "disabled"
     gpu_lab_executable_paper_worker_url: str = "http://paper2agent:8020"
     gpu_lab_executable_paper_worker_token: str | None = None
+    gpu_lab_approval_secret: str | None = None
     gpu_lab_denied_mcp_client_cidrs: str = ""
     fastmcp_host: str = "127.0.0.1"
     fastmcp_port: int = 8000

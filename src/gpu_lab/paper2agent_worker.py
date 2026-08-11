@@ -242,6 +242,12 @@ class Paper2AgentSubprocessProvider:
                 retryable=False,
             )
         clone = project / "repo" / repository.rsplit("/", 1)[-1].removesuffix(".git")
+        if not clone.is_dir():
+            raise GPUError(
+                "EXECUTABLE_PAPER_BUILD_INCOMPLETE",
+                "Paper2Agent did not produce the expected repository checkout",
+                retryable=False,
+            )
         check_code, actual, _ = await self._run("git", "rev-parse", "HEAD", cwd=clone.resolve())
         if check_code or actual.strip().lower() != commit:
             raise GPUError(
@@ -346,7 +352,7 @@ async def dispatch(request: Request) -> JSONResponse:
         if isinstance(result, BaseModel):
             result = result.model_dump(mode="json")
         return JSONResponse({"result": result})
-    except (GPUError, ValidationError) as exc:
+    except (GPUError, ValidationError, ValueError) as exc:
         error = exc.response()["error"] if isinstance(exc, GPUError) else {
             "type": "INVALID_EXECUTABLE_PAPER_REQUEST",
             "message": str(exc),

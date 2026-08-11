@@ -42,6 +42,7 @@ RESEARCH_OBJECT_KINDS = (
     "HypothesisPortfolio",
     "ResearchDecision",
     "ResearchActionCandidate",
+    "ActionApproval",
     "ComparativeLesson",
     "MetaLesson",
 )
@@ -164,6 +165,17 @@ class ResearchStore:
             cur.execute("INSERT INTO research_projects VALUES(%s,%s,%s,%s,%s)", (ident, name, question, json.dumps(state), now))
             self._event(cur, ident, "RESEARCH_PROJECT_CREATED", None, {"name": name, "question": question})
         return {"project_id": str(ident), "name": name, "state": state}
+
+    def project_get(self, project_id: str) -> dict:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,name,question,state,created_at FROM research_projects WHERE id=%s",
+                (project_id,),
+            )
+            project = cur.fetchone()
+        if not project:
+            raise GPUError("RESEARCH_PROJECT_NOT_FOUND", project_id)
+        return project
 
     def object_create(
         self,
@@ -1293,6 +1305,19 @@ class ResearchStore:
             args.extend((f"%{escaped}%", limit))
             cur.execute(sql, args)
             return cur.fetchall()
+
+    def executable_paper_by_fingerprint(
+        self, project_id: str, build_fingerprint: str
+    ) -> dict | None:
+        """Look up a paid build by exact identity without lossy text-search limits."""
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
+                "WHERE project_id=%s AND kind='ExecutablePaper' "
+                "AND data->>'build_fingerprint'=%s ORDER BY created_at DESC LIMIT 1",
+                (project_id, build_fingerprint),
+            )
+            return cur.fetchone()
 
     def related_hypotheses(self, project_id: str, mechanism: str, limit: int = 10) -> list[dict]:
         """Lexically screen active and failed ideas until pgvector is available for semantic ranking."""

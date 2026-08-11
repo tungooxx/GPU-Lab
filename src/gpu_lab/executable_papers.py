@@ -1,5 +1,7 @@
 import hashlib
 import json
+import uuid
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, runtime_checkable
 
 import httpx
@@ -97,6 +99,12 @@ class HttpExecutablePaperProvider:
             )
         if data.get("error"):
             error = data["error"]
+            if not isinstance(error, dict):
+                raise GPUError(
+                    "EXECUTABLE_PAPER_PROVIDER_INVALID_RESPONSE",
+                    "The isolated worker returned a non-object error",
+                    retryable=response.status_code >= 500,
+                )
             raise GPUError(
                 error.get("type", "EXECUTABLE_PAPER_PROVIDER_ERROR"),
                 error.get("message", "Executable-paper worker error"),
@@ -111,7 +119,13 @@ class HttpExecutablePaperProvider:
         return data["result"]
 
     async def health(self) -> dict[str, Any]:
-        return await self._call("health", {})
+        result = await self._call("health", {})
+        if not isinstance(result, dict):
+            raise GPUError(
+                "EXECUTABLE_PAPER_PROVIDER_INVALID_RESPONSE",
+                "The isolated worker returned a non-object health result",
+            )
+        return result
 
     async def build(
         self,
@@ -170,6 +184,93 @@ class ExecutablePaperService:
         self.store = store
         self.provider = provider
 
+    @staticmethod
+    def _approval_hash(action: str, parameters: dict[str, Any]) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                {"action": action, "parameters": parameters},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+
+    def approve(
+        self,
+        project_id: str,
+        action: str,
+        parameters: dict[str, Any],
+        approver: str,
+        rationale: str,
+        ttl_minutes: int = 30,
+    ) -> dict[str, Any]:
+        action = action.upper()
+        if action not in {"BUILD", "INVOKE"}:
+            raise GPUError("INVALID_EXECUTABLE_PAPER_APPROVAL_ACTION", action)
+        if not approver.strip() or not rationale.strip():
+            raise GPUError("RESEARCH_APPROVAL_INCOMPLETE", "Approver and rationale are required")
+        if not 1 <= ttl_minutes <= 60:
+            raise GPUError("INVALID_APPROVAL_TTL", "Approval TTL must be between 1 and 60 minutes")
+        self.store.project_get(project_id)
+        approved_at = datetime.now(UTC)
+        return self.store.object_create(
+            project_id,
+            "ActionApproval",
+            {
+                "action": action,
+                "parameter_hash": self._approval_hash(action, parameters),
+                "approver": approver.strip(),
+                "rationale": rationale.strip(),
+                "approved_at": approved_at.isoformat(),
+                "expires_at": (approved_at + timedelta(minutes=ttl_minutes)).isoformat(),
+            },
+            "EXECUTABLE_PAPER_ACTION_APPROVED",
+            "APPROVED",
+        )
+
+    def _require_approval(
+        self,
+        approval_id: str,
+        project_id: str,
+        action: str,
+        parameters: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not approval_id:
+            raise GPUError(
+                "HUMAN_APPROVAL_REQUIRED",
+                "A matching server-verified approval is required for this exact action",
+            )
+        try:
+            approval_id = str(uuid.UUID(approval_id))
+        except ValueError as exc:
+            raise GPUError(
+                "HUMAN_APPROVAL_REQUIRED",
+                "A matching server-verified approval is required for this exact action",
+            ) from exc
+        approval = self.store.object_get(approval_id)
+        if (
+            approval["kind"] != "ActionApproval"
+            or approval["status"] != "APPROVED"
+            or str(approval["project_id"]) != str(project_id)
+            or approval["data"].get("action") != action
+            or approval["data"].get("parameter_hash") != self._approval_hash(action, parameters)
+        ):
+            raise GPUError(
+                "HUMAN_APPROVAL_REQUIRED",
+                "A matching server-verified approval is required for this exact action",
+            )
+        try:
+            expires_at = datetime.fromisoformat(approval["data"]["expires_at"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GPUError("INVALID_ACTION_APPROVAL", approval_id) from exc
+        if expires_at <= datetime.now(UTC):
+            raise GPUError("ACTION_APPROVAL_EXPIRED", approval_id)
+        return self.store.object_update(
+            approval_id,
+            {"last_used_at": datetime.now(UTC).isoformat()},
+            "APPROVED",
+            "EXECUTABLE_PAPER_APPROVAL_USED",
+        )
+
     async def build(
         self,
         project_id: str,
@@ -177,10 +278,19 @@ class ExecutablePaperService:
         repository: str,
         commit: str,
         tutorials: str | None = None,
+        approval_id: str | None = None,
     ) -> dict[str, Any]:
         paper = self.store.object_get(paper_id)
         if str(paper["project_id"]) != project_id or paper["kind"] != "Paper":
             raise GPUError("INVALID_EXECUTABLE_PAPER_SOURCE", paper_id)
+        parameters = {
+            "project_id": project_id,
+            "paper_id": paper_id,
+            "repository": repository,
+            "commit": commit,
+            "tutorials": tutorials,
+        }
+        self._require_approval(approval_id or "", project_id, "BUILD", parameters)
         fingerprint = hashlib.sha256(
             json.dumps(
                 {
@@ -192,20 +302,14 @@ class ExecutablePaperService:
                 sort_keys=True,
             ).encode()
         ).hexdigest()
-        existing = self.store.search(project_id, fingerprint, "ExecutablePaper", 10)
-        exact = next(
-            (
-                item
-                for item in existing
-                if item["data"].get("build_fingerprint") == fingerprint
-            ),
-            None,
-        )
+        exact = self.store.executable_paper_by_fingerprint(project_id, fingerprint)
         if exact:
             return {**exact, "idempotent_replay": True}
         candidate = await self.provider.build(paper_id, repository, commit, tutorials)
-        expected_repository = repository.lower().removesuffix(".git").rstrip("/")
-        actual_repository = candidate.repository.lower().removesuffix(".git").rstrip("/")
+        expected_repository = repository.lower().rstrip("/").removesuffix(".git").rstrip("/")
+        actual_repository = (
+            candidate.repository.lower().rstrip("/").removesuffix(".git").rstrip("/")
+        )
         if candidate.commit.lower() != commit.lower() or actual_repository != expected_repository:
             raise GPUError(
                 "EXECUTABLE_PAPER_BUILD_IDENTITY_MISMATCH",
@@ -253,9 +357,21 @@ class ExecutablePaperService:
         )
 
     async def invoke(
-        self, executable_paper_id: str, tool: str, args: dict[str, Any]
+        self,
+        executable_paper_id: str,
+        tool: str,
+        args: dict[str, Any],
+        approval_id: str | None = None,
     ) -> dict[str, Any]:
         record = self._record(executable_paper_id)
+        parameters = {
+            "executable_paper_id": executable_paper_id,
+            "tool": tool,
+            "args": args,
+        }
+        self._require_approval(
+            approval_id or "", str(record["project_id"]), "INVOKE", parameters
+        )
         if record["status"] not in {"VERIFIED_UNIT", "VERIFIED_INTEGRATION"}:
             raise GPUError(
                 "EXECUTABLE_PAPER_NOT_VERIFIED",

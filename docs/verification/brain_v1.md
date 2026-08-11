@@ -53,7 +53,8 @@ inspected run, five WorldModel versions, and continued with `GENERALIZATION`.
 - **VERIFIED_INTEGRATION:** the Paper2Agent HTTP/provider contract, generated MCP initialization,
   tool discovery and invocation against a real fixture MCP, exact upstream image checkout, pinned
   Claude Code runtime, non-root worker health, retry survival after client disconnect, network
-  isolation, and absence of Vast/SSH/PostgreSQL/OpenAI credentials.
+  isolation, server-verified parameter-bound approval records, and absence of
+  Vast/SSH/PostgreSQL/OpenAI credentials.
 - **UNVERIFIED:** scientific generality of HASI, real model-backed PaperQA answer quality,
   quality-diversity operators, branch search, meta-review, and autonomous campaigns. The isolated
   Paper2Agent provider contract is implemented and unit-tested, but a model-backed build remains
