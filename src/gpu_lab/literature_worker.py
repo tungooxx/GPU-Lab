@@ -24,7 +24,12 @@ class WorkerRequest(BaseModel):
 
 
 WORKER_TOKEN = os.environ.get("GPU_LAB_LITERATURE_WORKER_TOKEN", "")
-provider = PaperQALiteratureProvider(Path(os.environ.get("GPU_LAB_PAPERQA_DIRECTORY", "/papers")))
+provider = PaperQALiteratureProvider(
+    Path(os.environ.get("GPU_LAB_PAPERQA_DIRECTORY", "/papers")),
+    model=os.environ.get("GPU_LAB_PAPERQA_MODEL"),
+    base_url=os.environ.get("GPU_LAB_PAPERQA_BASE_URL"),
+    max_retries=int(os.environ.get("GPU_LAB_PAPERQA_MAX_RETRIES", "2")),
+)
 
 
 def _required(value, field: str):
@@ -36,7 +41,19 @@ def _required(value, field: str):
 async def dispatch(request: Request) -> JSONResponse:
     operation = request.path_params["operation"]
     if operation == "health":
-        return JSONResponse({"result": {"provider": "paperqa", "status": "ready"}})
+        api_key_configured = bool(os.environ.get("OPENAI_API_KEY"))
+        return JSONResponse(
+            {
+                "result": {
+                    "provider": "paperqa",
+                    "status": "ready" if api_key_configured else "needs_credentials",
+                    "api_key_configured": api_key_configured,
+                    "custom_endpoint": bool(provider.model or provider.base_url),
+                    "model": provider.model,
+                    "max_retries": provider.max_retries,
+                }
+            }
+        )
     authorization = request.headers.get("authorization", "")
     supplied = authorization.removeprefix("Bearer ").encode("utf-8", "replace")
     if not WORKER_TOKEN or not hmac.compare_digest(supplied, WORKER_TOKEN.encode()):

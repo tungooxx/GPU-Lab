@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -63,12 +64,18 @@ class PaperQALiteratureProvider:
         settings_factory=None,
         agent_query=None,
         docs_factory=None,
+        model: str | None = None,
+        base_url: str | None = None,
+        max_retries: int = 2,
     ):
         self.paper_directory = paper_directory.resolve()
         self._settings_factory = settings_factory
         self._agent_query = agent_query
         self._docs_factory = docs_factory
         self._docs = None
+        self.model = model.strip() if model else None
+        self.base_url = base_url.rstrip("/") if base_url else None
+        self.max_retries = max_retries
 
     def _load(self) -> None:
         if self._settings_factory and self._agent_query and self._docs_factory:
@@ -86,9 +93,39 @@ class PaperQALiteratureProvider:
 
     def _settings(self):
         self._load()
-        return self._settings_factory(
-            agent={"index": {"paper_directory": str(self.paper_directory)}}
-        )
+        settings: dict[str, Any] = {
+            "agent": {"index": {"paper_directory": str(self.paper_directory)}}
+        }
+        if self.model or self.base_url:
+            if not self.model or not self.base_url.startswith(("http://", "https://")):
+                raise GPUError(
+                    "INVALID_LITERATURE_MODEL_CONFIGURATION",
+                    "Configure both GPU_LAB_PAPERQA_MODEL and an HTTP(S) GPU_LAB_PAPERQA_BASE_URL",
+                )
+            config = {
+                "model_list": [
+                    {
+                        "model_name": self.model,
+                        "litellm_params": {
+                            "model": self.model,
+                            "api_base": self.base_url,
+                            "api_key": os.environ.get("OPENAI_API_KEY", ""),
+                            "num_retries": self.max_retries,
+                        },
+                    }
+                ]
+            }
+            settings.update(
+                {
+                    "llm": self.model,
+                    "summary_llm": self.model,
+                    "agent_llm": self.model,
+                    "llm_config": config,
+                    "summary_llm_config": config,
+                    "agent_llm_config": config,
+                }
+            )
+        return self._settings_factory(**settings)
 
     async def ingest(self, source: str) -> dict[str, Any]:
         self._load()

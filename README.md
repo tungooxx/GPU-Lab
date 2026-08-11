@@ -91,6 +91,19 @@ the model/metadata credentials needed by PaperQA, and start:
 docker compose --profile literature up -d --build
 ```
 
+For an OpenAI-compatible model gateway, configure its base URL and model only in `.env`; these
+values are passed to the isolated literature worker, never the GPU-Lab gateway:
+
+```env
+GPU_LAB_PAPERQA_BASE_URL=https://api.example.com/v1
+GPU_LAB_PAPERQA_MODEL=provider/model-name
+GPU_LAB_PAPERQA_MAX_RETRIES=2
+OPENAI_API_KEY=<rotated-task-scoped-key>
+```
+
+PaperQA uses that model for answer, summary, and agent calls. Retry failures remain provider
+failures and never mutate PostgreSQL scientific state.
+
 Use `literature_provider_status`, `literature_search`, and `literature_ask` for read-only candidates.
 `literature_gather` imports provenance-rich candidates into PostgreSQL and can create an unresolved
 scoped Claim, but it never marks a claim or hypothesis supported. The PaperQA index is a replaceable

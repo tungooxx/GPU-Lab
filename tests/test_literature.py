@@ -66,6 +66,30 @@ async def test_paperqa_contract_normalizes_answer_and_provenance(tmp_path):
     assert evidence.extraction_method == "paperqa"
 
 
+def test_paperqa_custom_openai_compatible_endpoint_configures_all_llms(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "task-scoped-test-key")
+    provider = PaperQALiteratureProvider(
+        tmp_path,
+        settings_factory=FakeSettings,
+        agent_query=fake_agent_query,
+        docs_factory=fake_docs_factory,
+        model="nghi/gpt-5.5",
+        base_url="https://api.example.test/v1/",
+        max_retries=3,
+    )
+
+    settings = provider._settings().kwargs
+
+    assert settings["llm"] == settings["summary_llm"] == settings["agent_llm"] == "nghi/gpt-5.5"
+    params = settings["llm_config"]["model_list"][0]["litellm_params"]
+    assert params == {
+        "model": "nghi/gpt-5.5",
+        "api_base": "https://api.example.test/v1",
+        "api_key": "task-scoped-test-key",
+        "num_retries": 3,
+    }
+
+
 def test_paperqa_normalizes_current_nested_pqa_session_shape(tmp_path):
     provider = PaperQALiteratureProvider(
         tmp_path,
@@ -380,6 +404,7 @@ async def test_worker_health_is_secret_free_and_other_routes_require_auth(monkey
     from gpu_lab import literature_worker
 
     monkeypatch.setattr(literature_worker, "WORKER_TOKEN", "scoped-token")
+    monkeypatch.setenv("OPENAI_API_KEY", "task-scoped-test-key")
     transport = httpx.ASGITransport(app=literature_worker.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://worker") as client:
         health = await client.post("/health", json={})
@@ -399,7 +424,14 @@ async def test_worker_health_is_secret_free_and_other_routes_require_auth(monkey
             headers={b"Authorization": b"Bearer t\xc3\xa9st"},
         )
 
-    assert health.json() == {"result": {"provider": "paperqa", "status": "ready"}}
+    assert health.json()["result"] == {
+        "provider": "paperqa",
+        "status": "ready",
+        "api_key_configured": True,
+        "custom_endpoint": False,
+        "model": None,
+        "max_retries": 2,
+    }
     assert all(response.status_code == 401 for response in unauthorized)
     assert all(response.json()["error"]["type"] == "UNAUTHORIZED" for response in unauthorized)
     assert non_ascii.status_code == 401
