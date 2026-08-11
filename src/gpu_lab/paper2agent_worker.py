@@ -78,6 +78,15 @@ class Paper2AgentSubprocessProvider:
             ):
                 self._locks.pop(build_id, None)
 
+    def _build_done(
+        self, build_id: str, lock: asyncio.Lock, task: asyncio.Task[None]
+    ) -> None:
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
+        asyncio.create_task(self._cleanup_build(build_id, lock, task))
+
     @staticmethod
     def _build_id(paper_id: str, repository: str, commit: str, tutorials: str | None) -> str:
         return hashlib.sha256(
@@ -213,8 +222,8 @@ class Paper2AgentSubprocessProvider:
                         )
                         self._build_tasks[build_id] = task
                         task.add_done_callback(
-                            lambda finished, build_id=build_id, lock=lock: asyncio.create_task(
-                                self._cleanup_build(build_id, lock, finished)
+                            lambda finished, build_id=build_id, lock=lock: self._build_done(
+                                build_id, lock, finished
                             )
                         )
                 else:
