@@ -6,21 +6,24 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROBE = r'''
 import urllib.request
+import urllib.error
 
 checks = [
-    ("public", "https://github.com/", True),
-    ("service_mcp", "http://gpu-lab:8000/mcp", False),
-    ("host_mcp", "http://host.docker.internal:8000/mcp", False),
+    ("public", "https://github.com/", 200),
+    ("service_mcp", "http://gpu-lab:8000/mcp", 403),
+    ("host_mcp", "http://host.docker.internal:8000/mcp", 403),
 ]
-for name, target, should_succeed in checks:
+for name, target, expected_status in checks:
     try:
         with urllib.request.urlopen(target, timeout=10) as response:
-            succeeded = response.status == 200
-    except Exception:
-        succeeded = False
-    print(f"{name}={'REACHABLE' if succeeded else 'BLOCKED'}")
-    if succeeded != should_succeed:
-        raise SystemExit(f"unexpected worker route: {name}")
+            status = response.status
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+    except Exception as exc:
+        raise SystemExit(f"{name} failed without an HTTP policy response: {type(exc).__name__}") from exc
+    print(f"{name}=HTTP_{status}")
+    if status != expected_status:
+        raise SystemExit(f"unexpected worker route status: {name}={status}")
 '''
 
 
