@@ -2201,7 +2201,7 @@ def _research_map_payload(project_id: str) -> dict[str, Any]:
     if not models:
         raise GPUError("WORLD_MODEL_NOT_FOUND", f"No WorldModel exists for project {project_id}")
     graph = brain().world_model_get(str(models[0]["id"]))
-    return {
+    payload = {
         "world_model": _state_object_summary(graph["world_model"]),
         "nodes": [
             {
@@ -2238,6 +2238,7 @@ def _research_map_payload(project_id: str) -> dict[str, Any]:
             for edge in graph["edges"][:300]
         ],
     }
+    return ResearchBrain._json_safe(payload)
 
 
 @mcp.custom_route("/research-map", methods=["GET"], include_in_schema=False)

@@ -1,3 +1,5 @@
+import uuid
+
 from gpu_lab import server
 from gpu_lab.server import _compact_brain_step, _compact_research_state, _safe_request_id, mcp
 
@@ -127,7 +129,7 @@ def test_research_map_payload_contains_only_graph_rendering_fields(monkeypatch):
                         "data": {
                             "name": "Anchor state",
                             "description": "Carrier",
-                            "attributes": {"layer": 8},
+                            "attributes": {"layer": 8, "evidence_id": uuid.UUID(int=1)},
                             "secret": "never render",
                         },
                     }
@@ -158,7 +160,7 @@ def test_research_map_payload_contains_only_graph_rendering_fields(monkeypatch):
     assert payload["nodes"][0]["data"] == {
         "name": "Anchor state",
         "description": "Carrier",
-        "attributes": {"layer": 8},
+        "attributes": {"layer": 8, "evidence_id": "00000000-0000-0000-0000-000000000001"},
     }
     assert payload["edges"][0]["data"] == {
         "source_id": "node-1",
