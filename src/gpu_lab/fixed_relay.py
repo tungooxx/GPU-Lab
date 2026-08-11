@@ -4,9 +4,10 @@ import http.client
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-TARGET_HOST = os.environ["RELAY_TARGET_HOST"]
-TARGET_PORT = int(os.environ["RELAY_TARGET_PORT"])
-LISTEN_PORT = int(os.environ["RELAY_LISTEN_PORT"])
+TARGET_HOST = os.environ.get("RELAY_TARGET_HOST", "")
+TARGET_PORT = int(os.environ.get("RELAY_TARGET_PORT", "0"))
+LISTEN_PORT = int(os.environ.get("RELAY_LISTEN_PORT", "0"))
+MAX_REQUEST_BODY = 1_048_576
 _HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -37,6 +38,9 @@ class RelayHandler(BaseHTTPRequestHandler):
         if length < 0:
             self.send_error(400, "invalid Content-Length")
             return
+        if length > MAX_REQUEST_BODY:
+            self.send_error(413, "request body exceeds 1 MiB relay limit")
+            return
         body = self.rfile.read(length) if length else None
         headers = {
             name: value
@@ -65,4 +69,6 @@ class RelayHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    if not TARGET_HOST or TARGET_PORT <= 0 or LISTEN_PORT <= 0:
+        raise RuntimeError("relay target and listen environment variables are required")
     ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), RelayHandler).serve_forever()

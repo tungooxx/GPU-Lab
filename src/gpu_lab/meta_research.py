@@ -1,3 +1,5 @@
+import hashlib
+import json
 import math
 from collections import Counter, defaultdict
 from typing import Any
@@ -133,12 +135,29 @@ class MetaResearchService:
         if metrics["information_gained_per_gpu_hour"] is None:
             campaign_reasons.append("information-per-GPU-hour is not measurable")
         campaign_readiness = "DO_NOT_BUILD_YET" if campaign_reasons else "EVALUATE_BOUNDED_PILOT"
+        review_payload_fingerprint = hashlib.sha256(
+            json.dumps(
+                sorted(
+                    (
+                        str(item["id"]),
+                        item["kind"],
+                        item["status"],
+                        item["data"],
+                    )
+                    for item in objects
+                    if item["kind"] != "MetaLesson"
+                ),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
         basis = {
             "object_versions": sorted(
                 (str(item["id"]), item["kind"], item["status"])
                 for item in objects
                 if item["kind"] != "MetaLesson"
             ),
+            "review_payload_fingerprint": review_payload_fingerprint,
             "metrics": metrics,
         }
         lesson = self.store.meta_lesson_create(

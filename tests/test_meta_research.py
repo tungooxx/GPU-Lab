@@ -124,3 +124,20 @@ def test_meta_review_prioritizes_existing_work_and_rejects_campaign_prematurity(
     assert any("Inspect available" in item for item in review["data"]["recommendations"])
     assert replay["id"] == review["id"]
     assert replay["idempotent_replay"] is True
+
+
+def test_meta_review_payload_change_creates_new_lesson():
+    store = populated_store()
+    service = MetaResearchService(store)
+    first = service.meta_review("project")
+    negative = next(item for item in store.items if item["kind"] == "NegativeResult")
+
+    negative["data"]["failed_assumption"] = "decoder amplification is causal"
+    second = service.meta_review("project")
+
+    assert second["id"] != first["id"]
+    assert second.get("idempotent_replay") is not True
+    assert (
+        second["data"]["basis"]["review_payload_fingerprint"]
+        != first["data"]["basis"]["review_payload_fingerprint"]
+    )

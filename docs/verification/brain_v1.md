@@ -60,6 +60,8 @@ inspected run, five WorldModel versions, and continued with `GENERALIZATION`.
   worker calls to both `gpu-lab:8000/mcp` and `host.docker.internal:8000/mcp` receive 403, while
   GitHub and Crossref remain reachable. Restart readiness proves `tools/list` instead of trusting
   public health.
+  This is reproducible with `uv run python scripts/worker_isolation_smoke.py` while both optional
+  worker profiles are running.
 - **VERIFIED_UNIT:** policy scoring, invalid action handling, finite agenda validation, the HASI
   reproduction-before-intervention gate, unavailable-provider alternative action, and QD niche,
   lineage, dead-idea, vector/structured-proximity, noncanonical embedding-cache behavior, branch
