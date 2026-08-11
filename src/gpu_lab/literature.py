@@ -66,6 +66,7 @@ class PaperQALiteratureProvider:
         docs_factory=None,
         model: str | None = None,
         base_url: str | None = None,
+        embedding_model: str | None = None,
         max_retries: int = 2,
     ):
         self.paper_directory = paper_directory.resolve()
@@ -75,7 +76,23 @@ class PaperQALiteratureProvider:
         self._docs = None
         self.model = model.strip() if model else None
         self.base_url = base_url.rstrip("/") if base_url else None
+        self.embedding_model = embedding_model.strip() if embedding_model else None
         self.max_retries = max_retries
+
+    def configuration_error(self) -> str | None:
+        """Return a safe configuration error without contacting the provider."""
+        if not 0 <= self.max_retries <= 5:
+            return "GPU_LAB_PAPERQA_MAX_RETRIES must be an integer from 0 through 5"
+        if not any((self.model, self.base_url, self.embedding_model)):
+            return None
+        if not self.model or not self.embedding_model or not self.base_url:
+            return (
+                "Configure GPU_LAB_PAPERQA_MODEL, GPU_LAB_PAPERQA_EMBEDDING_MODEL, "
+                "and an HTTP(S) GPU_LAB_PAPERQA_BASE_URL together"
+            )
+        if not self.base_url.startswith(("http://", "https://")):
+            return "GPU_LAB_PAPERQA_BASE_URL must use HTTP(S)"
+        return None
 
     def _load(self) -> None:
         if self._settings_factory and self._agent_query and self._docs_factory:
@@ -93,21 +110,22 @@ class PaperQALiteratureProvider:
 
     def _settings(self):
         self._load()
-        settings: dict[str, Any] = {
-            "agent": {"index": {"paper_directory": str(self.paper_directory)}}
-        }
-        if self.model or self.base_url:
-            if not self.model or not self.base_url.startswith(("http://", "https://")):
-                raise GPUError(
-                    "INVALID_LITERATURE_MODEL_CONFIGURATION",
-                    "Configure both GPU_LAB_PAPERQA_MODEL and an HTTP(S) GPU_LAB_PAPERQA_BASE_URL",
-                )
-            config = {
+        error = self.configuration_error()
+        if error:
+            raise GPUError("INVALID_LITERATURE_MODEL_CONFIGURATION", error)
+        agent: dict[str, Any] = {"index": {"paper_directory": str(self.paper_directory)}}
+        settings: dict[str, Any] = {"agent": agent}
+        if self.model:
+
+            def router_config(alias: str) -> dict[str, Any]:
+                return {
                 "model_list": [
                     {
-                        "model_name": self.model,
+                        "model_name": alias,
                         "litellm_params": {
-                            "model": self.model,
+                            # The alias remains provider-facing, while LiteLLM needs the
+                            # explicit OpenAI-compatible provider prefix to route correctly.
+                            "model": f"openai/{alias}",
                             "api_base": self.base_url,
                             "api_key": os.environ.get("OPENAI_API_KEY", ""),
                             "num_retries": self.max_retries,
@@ -115,16 +133,19 @@ class PaperQALiteratureProvider:
                     }
                 ]
             }
+            llm_config = router_config(self.model)
+            embedding_config = router_config(self.embedding_model or "")
             settings.update(
                 {
                     "llm": self.model,
                     "summary_llm": self.model,
-                    "agent_llm": self.model,
-                    "llm_config": config,
-                    "summary_llm_config": config,
-                    "agent_llm_config": config,
+                    "embedding": self.embedding_model,
+                    "llm_config": llm_config,
+                    "summary_llm_config": llm_config,
+                    "embedding_config": embedding_config,
                 }
             )
+            agent.update({"agent_llm": self.model, "agent_llm_config": llm_config})
         return self._settings_factory(**settings)
 
     async def ingest(self, source: str) -> dict[str, Any]:

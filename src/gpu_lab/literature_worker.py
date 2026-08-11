@@ -24,11 +24,21 @@ class WorkerRequest(BaseModel):
 
 
 WORKER_TOKEN = os.environ.get("GPU_LAB_LITERATURE_WORKER_TOKEN", "")
+
+
+def _configured_retries() -> int:
+    try:
+        return int(os.environ.get("GPU_LAB_PAPERQA_MAX_RETRIES", "2"))
+    except ValueError:
+        return -1
+
+
 provider = PaperQALiteratureProvider(
     Path(os.environ.get("GPU_LAB_PAPERQA_DIRECTORY", "/papers")),
     model=os.environ.get("GPU_LAB_PAPERQA_MODEL"),
     base_url=os.environ.get("GPU_LAB_PAPERQA_BASE_URL"),
-    max_retries=int(os.environ.get("GPU_LAB_PAPERQA_MAX_RETRIES", "2")),
+    embedding_model=os.environ.get("GPU_LAB_PAPERQA_EMBEDDING_MODEL"),
+    max_retries=_configured_retries(),
 )
 
 
@@ -42,15 +52,24 @@ async def dispatch(request: Request) -> JSONResponse:
     operation = request.path_params["operation"]
     if operation == "health":
         api_key_configured = bool(os.environ.get("OPENAI_API_KEY"))
+        configuration_error = provider.configuration_error()
         return JSONResponse(
             {
                 "result": {
                     "provider": "paperqa",
-                    "status": "ready" if api_key_configured else "needs_credentials",
+                    "status": (
+                        "invalid_configuration"
+                        if configuration_error
+                        else "ready"
+                        if api_key_configured
+                        else "needs_credentials"
+                    ),
                     "api_key_configured": api_key_configured,
                     "custom_endpoint": bool(provider.model or provider.base_url),
                     "model": provider.model,
+                    "embedding_model": provider.embedding_model,
                     "max_retries": provider.max_retries,
+                    "configuration_error": configuration_error,
                 }
             }
         )

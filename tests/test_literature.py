@@ -75,19 +75,67 @@ def test_paperqa_custom_openai_compatible_endpoint_configures_all_llms(tmp_path,
         docs_factory=fake_docs_factory,
         model="nghi/gpt-5.5",
         base_url="https://api.example.test/v1/",
+        embedding_model="nghi/text-embedding-3-small",
         max_retries=3,
     )
 
     settings = provider._settings().kwargs
 
-    assert settings["llm"] == settings["summary_llm"] == settings["agent_llm"] == "nghi/gpt-5.5"
+    assert settings["llm"] == settings["summary_llm"] == "nghi/gpt-5.5"
+    assert settings["agent"]["agent_llm"] == "nghi/gpt-5.5"
+    assert settings["embedding"] == "nghi/text-embedding-3-small"
     params = settings["llm_config"]["model_list"][0]["litellm_params"]
     assert params == {
-        "model": "nghi/gpt-5.5",
+        "model": "openai/nghi/gpt-5.5",
         "api_base": "https://api.example.test/v1",
         "api_key": "task-scoped-test-key",
         "num_retries": 3,
     }
+    assert settings["agent"]["agent_llm_config"] == settings["llm_config"]
+    assert settings["embedding_config"]["model_list"][0]["litellm_params"]["model"] == (
+        "openai/nghi/text-embedding-3-small"
+    )
+
+
+def test_paperqa_custom_endpoint_requires_embedding_model(tmp_path):
+    provider = PaperQALiteratureProvider(
+        tmp_path,
+        settings_factory=FakeSettings,
+        agent_query=fake_agent_query,
+        docs_factory=fake_docs_factory,
+        model="nghi/gpt-5.5",
+        base_url="https://api.example.test/v1",
+    )
+
+    with pytest.raises(GPUError, match="EMBEDDING_MODEL") as error:
+        provider._settings()
+
+    assert error.value.error_type == "INVALID_LITERATURE_MODEL_CONFIGURATION"
+
+
+def test_paperqa_settings_places_agent_and_embedding_configuration_correctly(
+    tmp_path, monkeypatch
+):
+    pytest.importorskip("paperqa")
+    monkeypatch.setenv("OPENAI_API_KEY", "task-scoped-test-key")
+    provider = PaperQALiteratureProvider(
+        tmp_path,
+        model="nghi/gpt-5.5",
+        base_url="https://api.example.test/v1",
+        embedding_model="nghi/text-embedding-3-small",
+    )
+
+    settings = provider._settings()
+
+    assert settings.llm == settings.summary_llm == "nghi/gpt-5.5"
+    assert settings.embedding == "nghi/text-embedding-3-small"
+    assert settings.agent.agent_llm == "nghi/gpt-5.5"
+    assert settings.agent.agent_llm_config["model_list"][0]["litellm_params"]["model"] == (
+        "openai/nghi/gpt-5.5"
+    )
+    assert settings.embedding_config["model_list"][0]["litellm_params"]["model"] == (
+        "openai/nghi/text-embedding-3-small"
+    )
 
 
 def test_paperqa_normalizes_current_nested_pqa_session_shape(tmp_path):
@@ -430,7 +478,9 @@ async def test_worker_health_is_secret_free_and_other_routes_require_auth(monkey
         "api_key_configured": True,
         "custom_endpoint": False,
         "model": None,
+        "embedding_model": None,
         "max_retries": 2,
+        "configuration_error": None,
     }
     assert all(response.status_code == 401 for response in unauthorized)
     assert all(response.json()["error"]["type"] == "UNAUTHORIZED" for response in unauthorized)

@@ -97,11 +97,14 @@ values are passed to the isolated literature worker, never the GPU-Lab gateway:
 ```env
 GPU_LAB_PAPERQA_BASE_URL=https://api.example.com/v1
 GPU_LAB_PAPERQA_MODEL=provider/model-name
+GPU_LAB_PAPERQA_EMBEDDING_MODEL=provider/embedding-model
 GPU_LAB_PAPERQA_MAX_RETRIES=2
 OPENAI_API_KEY=<rotated-task-scoped-key>
 ```
 
-PaperQA uses that model for answer, summary, and agent calls. Retry failures remain provider
+PaperQA uses the chat model for answer, summary, and agent calls, and the embedding model for
+indexing. All three endpoint settings are required together so indexing cannot silently fall back
+to another provider. Retry failures remain provider
 failures and never mutate PostgreSQL scientific state.
 
 Use `literature_provider_status`, `literature_search`, and `literature_ask` for read-only candidates.

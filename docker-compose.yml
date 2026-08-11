@@ -30,6 +30,8 @@ services:
       GPU_LAB_EXECUTABLE_PAPER_WORKER_URL: http://paper2agent-relay:8020
       GPU_LAB_EXECUTABLE_PAPER_WORKER_TOKEN: ${GPU_LAB_EXECUTABLE_PAPER_WORKER_TOKEN:-}
       GPU_LAB_APPROVAL_SECRET: ${GPU_LAB_APPROVAL_SECRET:-}
+      # Override env_file inheritance: task-scoped literature credentials stay in the worker.
+      OPENAI_API_KEY: ""
       GPU_LAB_DENIED_MCP_CLIENT_CIDRS: 172.29.0.0/24,172.30.0.0/24
     ports: ["127.0.0.1:8000:8000"]
     volumes: ["./data:/data", "gpu-lab-envs:/opt/gpu-lab/envs", "${GPU_LAB_SSH_PRIVATE_KEY_PATH:-/dev/null}:/run/ssh-key:ro", "${GPU_LAB_LOCAL_WORKSPACE_HOST:-F:/Newgeneration/VLM}:/workspace/local-vlm"]
@@ -53,6 +55,7 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       GPU_LAB_PAPERQA_BASE_URL: ${GPU_LAB_PAPERQA_BASE_URL:-}
       GPU_LAB_PAPERQA_MODEL: ${GPU_LAB_PAPERQA_MODEL:-}
+      GPU_LAB_PAPERQA_EMBEDDING_MODEL: ${GPU_LAB_PAPERQA_EMBEDDING_MODEL:-}
       GPU_LAB_PAPERQA_MAX_RETRIES: ${GPU_LAB_PAPERQA_MAX_RETRIES:-2}
       CROSSREF_API_KEY: ${CROSSREF_API_KEY:-}
       SEMANTIC_SCHOLAR_API_KEY: ${SEMANTIC_SCHOLAR_API_KEY:-}
