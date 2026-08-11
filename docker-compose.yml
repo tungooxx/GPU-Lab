@@ -32,6 +32,9 @@ services:
       GPU_LAB_APPROVAL_SECRET: ${GPU_LAB_APPROVAL_SECRET:-}
       # Override env_file inheritance: task-scoped literature credentials stay in the worker.
       OPENAI_API_KEY: ""
+      ANTHROPIC_API_KEY: ""
+      CROSSREF_API_KEY: ""
+      SEMANTIC_SCHOLAR_API_KEY: ""
       GPU_LAB_DENIED_MCP_CLIENT_CIDRS: 172.29.0.0/24,172.30.0.0/24
     ports: ["127.0.0.1:8000:8000"]
     volumes: ["./data:/data", "gpu-lab-envs:/opt/gpu-lab/envs", "${GPU_LAB_SSH_PRIVATE_KEY_PATH:-/dev/null}:/run/ssh-key:ro", "${GPU_LAB_LOCAL_WORKSPACE_HOST:-F:/Newgeneration/VLM}:/workspace/local-vlm"]
@@ -67,7 +70,7 @@ services:
     security_opt: ["no-new-privileges:true"]
     mem_limit: 4g
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8010/health', data=b'{}')).read()"]
+      test: ["CMD", "python", "-c", "import json,urllib.request; data=json.load(urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8010/health', data=b'{}'))); assert data.get('result', {}).get('status') == 'ready'"]
       interval: 5s
       timeout: 5s
       retries: 12
