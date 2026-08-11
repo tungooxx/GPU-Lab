@@ -448,6 +448,24 @@ async def test_paper2agent_build_cleanup_survives_cancelled_only_waiter(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_paper2agent_detached_failure_is_logged_without_exception_message(caplog, tmp_path):
+    provider = Paper2AgentSubprocessProvider(tmp_path)
+    lock = asyncio.Lock()
+
+    async def fail():
+        raise RuntimeError("sensitive generated output")
+
+    task = asyncio.create_task(fail())
+    await asyncio.sleep(0)
+    with caplog.at_level("ERROR", logger="gpu_lab.paper2agent_worker"):
+        provider._build_done("build-id", lock, task)
+        await asyncio.sleep(0)
+
+    assert "Detached Paper2Agent build failed" in caplog.text
+    assert "sensitive generated output" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_paper2agent_generated_mcp_inspect_verify_and_invoke(monkeypatch, tmp_path):
     provider = Paper2AgentSubprocessProvider(tmp_path)
     build_id = "a" * 64

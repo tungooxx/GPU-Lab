@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 from contextlib import asynccontextmanager
@@ -21,6 +22,8 @@ from starlette.routing import Route
 
 from .errors import GPUError
 from .executable_papers import ExecutablePaperCandidate
+
+logger = logging.getLogger(__name__)
 
 
 class WorkerRequest(BaseModel):
@@ -82,9 +85,14 @@ class Paper2AgentSubprocessProvider:
         self, build_id: str, lock: asyncio.Lock, task: asyncio.Task[None]
     ) -> None:
         try:
-            task.exception()
+            error = task.exception()
         except asyncio.CancelledError:
-            pass
+            error = None
+        if error is not None:
+            logger.error(
+                "Detached Paper2Agent build failed",
+                extra={"build_id": build_id, "error_type": type(error).__name__},
+            )
         asyncio.create_task(self._cleanup_build(build_id, lock, task))
 
     @staticmethod
