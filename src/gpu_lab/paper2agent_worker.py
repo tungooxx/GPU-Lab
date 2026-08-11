@@ -90,8 +90,9 @@ class Paper2AgentSubprocessProvider:
             error = None
         if error is not None:
             logger.error(
-                "Detached Paper2Agent build failed",
-                extra={"build_id": build_id, "error_type": type(error).__name__},
+                "Paper2Agent build task failed build_id=%s error_type=%s",
+                build_id,
+                type(error).__name__,
             )
         asyncio.create_task(self._cleanup_build(build_id, lock, task))
 

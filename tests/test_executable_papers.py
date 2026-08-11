@@ -461,7 +461,9 @@ async def test_paper2agent_detached_failure_is_logged_without_exception_message(
         provider._build_done("build-id", lock, task)
         await asyncio.sleep(0)
 
-    assert "Detached Paper2Agent build failed" in caplog.text
+    assert "Paper2Agent build task failed" in caplog.text
+    assert "build_id=build-id" in caplog.text
+    assert "error_type=RuntimeError" in caplog.text
     assert "sensitive generated output" not in caplog.text
 
 
