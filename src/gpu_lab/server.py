@@ -2195,6 +2195,62 @@ async def activity(_: Request):
     return JSONResponse(svc().repo.list_audit(100))
 
 
+def _research_map_payload(project_id: str) -> dict[str, Any]:
+    """Return the smallest evidence-bearing WorldModel view needed by the dashboard."""
+    models = research().objects_list(project_id, "WorldModel", limit=1)
+    if not models:
+        raise GPUError("WORLD_MODEL_NOT_FOUND", f"No WorldModel exists for project {project_id}")
+    graph = brain().world_model_get(str(models[0]["id"]))
+    return {
+        "world_model": _state_object_summary(graph["world_model"]),
+        "nodes": [
+            {
+                "id": str(node["id"]),
+                "kind": node["kind"],
+                "status": node["status"],
+                "data": {
+                    key: node["data"].get(key)
+                    for key in ("name", "description", "attributes")
+                    if key in node["data"]
+                },
+            }
+            for node in graph["nodes"][:200]
+        ],
+        "edges": [
+            {
+                "id": str(edge["id"]),
+                "kind": edge["kind"],
+                "status": edge["status"],
+                "data": {
+                    key: edge["data"].get(key)
+                    for key in (
+                        "source_id",
+                        "target_id",
+                        "relation",
+                        "edge_status",
+                        "supporting_ids",
+                        "against_ids",
+                        "unresolved_prediction_ids",
+                    )
+                    if key in edge["data"]
+                },
+            }
+            for edge in graph["edges"][:300]
+        ],
+    }
+
+
+@mcp.custom_route("/research-map", methods=["GET"], include_in_schema=False)
+async def research_map(request: Request):
+    project_id = request.query_params.get("project_id", "").strip()
+    if not project_id:
+        return JSONResponse({"error": "project_id is required"}, status_code=400)
+    try:
+        return JSONResponse(_research_map_payload(project_id))
+    except GPUError as error:
+        return JSONResponse({"error": error.message}, status_code=404)
+
+
 @mcp.custom_route("/terminal", methods=["GET"], include_in_schema=False)
 async def terminal(_: Request):
     return HTMLResponse(TERMINAL_HTML)

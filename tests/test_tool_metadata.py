@@ -1,3 +1,4 @@
+from gpu_lab import server
 from gpu_lab.server import _compact_brain_step, _compact_research_state, _safe_request_id, mcp
 
 
@@ -100,3 +101,68 @@ def test_request_ids_are_safe_to_reflect_in_mcp_logs_and_headers():
     assert _safe_request_id("trace-42.request") == "trace-42.request"
     assert _safe_request_id("bad\r\nlog-forgery") != "bad\r\nlog-forgery"
     assert _safe_request_id("x" * 129) != "x" * 129
+
+
+def test_research_map_payload_contains_only_graph_rendering_fields(monkeypatch):
+    class FakeStore:
+        def objects_list(self, *_args, **_kwargs):
+            return [{"id": "model-1"}]
+
+    class FakeBrain:
+        def world_model_get(self, _model_id):
+            return {
+                "world_model": {
+                    "id": "model-1",
+                    "project_id": "project-1",
+                    "kind": "WorldModel",
+                    "status": "ACTIVE",
+                    "created_at": "now",
+                    "data": {"name": "Mechanism map", "secret": "never render"},
+                },
+                "nodes": [
+                    {
+                        "id": "node-1",
+                        "kind": "Mechanism",
+                        "status": "ACTIVE",
+                        "data": {
+                            "name": "Anchor state",
+                            "description": "Carrier",
+                            "attributes": {"layer": 8},
+                            "secret": "never render",
+                        },
+                    }
+                ],
+                "edges": [
+                    {
+                        "id": "edge-1",
+                        "kind": "CausalEdge",
+                        "status": "ACTIVE",
+                        "data": {
+                            "source_id": "node-1",
+                            "target_id": "node-1",
+                            "relation": "CAUSES",
+                            "edge_status": "HYPOTHESIZED_CAUSAL",
+                            "secret": "never render",
+                        },
+                    }
+                ],
+                "versions": [],
+            }
+
+    monkeypatch.setattr(server, "research", lambda: FakeStore())
+    monkeypatch.setattr(server, "brain", lambda: FakeBrain())
+
+    payload = server._research_map_payload("project-1")
+
+    assert payload["world_model"]["data"] == {"name": "Mechanism map"}
+    assert payload["nodes"][0]["data"] == {
+        "name": "Anchor state",
+        "description": "Carrier",
+        "attributes": {"layer": 8},
+    }
+    assert payload["edges"][0]["data"] == {
+        "source_id": "node-1",
+        "target_id": "node-1",
+        "relation": "CAUSES",
+        "edge_status": "HYPOTHESIZED_CAUSAL",
+    }
