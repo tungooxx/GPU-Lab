@@ -1612,7 +1612,7 @@ class ResearchStore:
 
     def run_update(self, run_id: str, result: dict) -> dict:
         run = self.object_get(run_id)
-        if run["status"] in {"completed", "failed", "cancelled"}:
+        if run["status"] in {"completed", "failed", "cancelled", "RESULT_INSPECTED"}:
             return {"id": run_id, "status": run["status"], "data": run["data"], "already_final": True}
         data = {**run["data"], **result}
         status = result.get("status", run["status"])
@@ -1630,6 +1630,57 @@ class ResearchStore:
             )
             self._event(cur, run["project_id"], event, run_id, result)
         return {"id": run_id, "status": status, "data": data}
+
+    def artifact_record(self, run_id: str, job_id: str, artifact: dict[str, Any]) -> dict:
+        """Idempotently persist one run artifact and its provenance edge."""
+        path = artifact.get("path")
+        if not isinstance(path, str) or not path:
+            raise GPUError("INVALID_ARTIFACT_PATH", "Artifact path is required")
+        now = datetime.now(UTC)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,project_id,kind,status,data FROM research_objects WHERE id=%s FOR UPDATE",
+                (run_id,),
+            )
+            run = cur.fetchone()
+            if not run or run["kind"] != "ExperimentRun":
+                raise GPUError("EXPERIMENT_RUN_NOT_FOUND", run_id)
+            cur.execute(
+                "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
+                "WHERE project_id=%s AND kind='Artifact' AND data->>'run_id'=%s "
+                "AND data->>'path'=%s ORDER BY created_at LIMIT 1",
+                (run["project_id"], run_id, path),
+            )
+            existing = cur.fetchone()
+            if existing:
+                return {**existing, "idempotent_replay": True}
+            artifact_id = uuid.uuid4()
+            data = {"run_id": run_id, "job_id": job_id, **artifact}
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'Artifact','VERIFIED_INTEGRATION',%s,%s)",
+                (artifact_id, run["project_id"], json.dumps(data), now),
+            )
+            cur.execute(
+                "INSERT INTO research_edges VALUES(%s,%s,'PRODUCED',%s) ON CONFLICT DO NOTHING",
+                (run_id, artifact_id, now),
+            )
+            self._event(
+                cur,
+                run["project_id"],
+                "ARTIFACT_RECORDED",
+                artifact_id,
+                data,
+            )
+            return {
+                "id": str(artifact_id),
+                "project_id": str(run["project_id"]),
+                "kind": "Artifact",
+                "status": "VERIFIED_INTEGRATION",
+                "data": data,
+                "created_at": now,
+                "idempotent_replay": False,
+            }
 
     def assess(self, object_id: str, status: str, rationale: str) -> dict:
         item = self.object_get(object_id)

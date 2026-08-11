@@ -47,7 +47,9 @@ settings, service, research_store, research_brain, literature_service, executabl
 )
 _singleton_lock = threading.RLock()
 instructions = (
-    "Safe, structured remote GPU experiment control plane. Credentials are never returned."
+    "Safe, structured remote GPU experiment control plane. Credentials are never returned. "
+    "Before research_experiment_execute, call research_decision_create and pass its decision_id; "
+    "approve the decision first when the returned action requires human approval."
 )
 if settings.gpu_lab_enable_local_runner:
     instructions += (
@@ -642,6 +644,17 @@ async def hypothesis_portfolio_get(project_id: str):
 @mcp.tool()
 async def brain_step(project_id: str):
     """Persist one evidence-aware scientific decision without executing an expensive action."""
+    return await call(brain().brain_step, project_id)
+
+
+@mcp.tool()
+async def research_decision_create(project_id: str):
+    """Create the ResearchDecision required by research_experiment_execute.
+
+    Use this before executing a preregistered experiment. Pass the returned
+    decision_id to research_experiment_execute, after brain_decision_approve
+    when the selected action requires explicit human approval.
+    """
     return await call(brain().brain_step, project_id)
 
 
@@ -1643,7 +1656,11 @@ async def research_experiment_execute(
     python_env: str | None = None,
     execution_attempt_uuid: str | None = None,
 ):
-    """Idempotently run a preregistered experiment and return canonical run/job IDs."""
+    """Run a preregistered experiment with a ResearchDecision created by research_decision_create.
+
+    Retries must reuse execution_attempt_uuid. Every response returns the
+    canonical experiment_id, run_id, and job_id after identity reservation.
+    """
     if not settings.gpu_lab_enable_local_runner:
         return {"error": {"type": "LOCAL_RUNNER_DISABLED"}}
     request = {
@@ -1738,11 +1755,59 @@ async def research_experiment_sync(run_id: str | None = None, job_id: str | None
         if job_mapping["run_id"] != mapping["run_id"]:
             return {"error": {"type": "EXECUTION_IDENTIFIER_MISMATCH"}}
     canonical_run_id, canonical_job_id = mapping["run_id"], mapping["job_id"]
-    run = mapping["run"]
-    outcome = local.job_status(canonical_job_id)
-    artifacts, runtime = local.artifacts(canonical_job_id), await local.status()
+    if mapping["status"] == "RESERVED":
+        return {
+            **mapping,
+            "retry_safe": True,
+            "recovery_action": "RETRY_EXECUTION",
+            "message": (
+                "No local process was submitted. Retry research_experiment_execute with the "
+                "same experiment_id, decision_id, command, and execution_attempt_uuid."
+            ),
+        }
+    if mapping["status"] == "RESULT_INSPECTED":
+        return {**mapping, "retry_safe": True, "recovery_action": "NONE"}
+    outcome = await call(local.job_status, canonical_job_id)
+    if "error" in outcome:
+        return {
+            **mapping,
+            "status": "UNKNOWN",
+            "runner_status": "missing",
+            "retry_safe": True,
+            "recovery_action": "INSPECT_OR_RETRY",
+            "runner_error": outcome["error"],
+        }
+    artifacts = await call(local.artifacts, canonical_job_id)
+    if isinstance(artifacts, dict) and "error" in artifacts:
+        return {
+            **mapping,
+            "status": "UNKNOWN",
+            "runner_status": outcome["status"],
+            "retry_safe": True,
+            "recovery_action": "INSPECT_OR_RETRY",
+            "artifact_error": artifacts["error"],
+        }
+    runtime = await call(local.status)
+    if "error" in runtime:
+        runtime = {"error": runtime["error"]}
     runner_status = outcome["status"]
     research_status = "failed" if runner_status == "unknown" else runner_status
+    for artifact in artifacts:
+        recorded = await call(
+            research().artifact_record,
+            canonical_run_id,
+            canonical_job_id,
+            artifact,
+        )
+        if "error" in recorded:
+            return {
+                **mapping,
+                "status": "UNKNOWN",
+                "runner_status": runner_status,
+                "retry_safe": True,
+                "recovery_action": "RETRY_SYNC",
+                "artifact_record_error": recorded["error"],
+            }
     updated = await call(
         research().run_update,
         canonical_run_id,
@@ -1763,22 +1828,6 @@ async def research_experiment_sync(run_id: str | None = None, job_id: str | None
         "status": updated.get("status", research_status),
         "run": updated,
     }
-    if (
-        "error" in updated
-        or updated.get("already_final")
-        or research_status not in {"completed", "failed"}
-    ):
-        return response
-    for artifact in artifacts:
-        recorded = await call(
-            research().object_create,
-            str(run["project_id"]),
-            "Artifact",
-            {"run_id": canonical_run_id, "job_id": canonical_job_id, **artifact},
-            "ARTIFACT_RECORDED",
-        )
-        if "error" not in recorded:
-            await call(research().edge_create, canonical_run_id, recorded["id"], "PRODUCED")
     return response
 
 
@@ -1928,6 +1977,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--transport", choices=["stdio", "sse", "streamable-http"], default="stdio")
     args = parser.parse_args()
+    reconciliation = local.reconcile_jobs()
+    if reconciliation["reconciled"]:
+        logger.info("Reconciled persisted local jobs at startup: %s", reconciliation)
     if args.transport == "streamable-http":
         import uvicorn
 

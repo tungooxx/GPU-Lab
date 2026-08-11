@@ -5,6 +5,7 @@ import pytest
 from gpu_lab.config import Settings
 from gpu_lab.db import Repository
 from gpu_lab.local_runner import LocalRunner
+from gpu_lab.models import Job
 from gpu_lab.server import _mcp_client_denied, _normalise_mcp_accept_header, scrub
 
 
@@ -95,6 +96,49 @@ async def test_local_submit_replays_reserved_job_id(monkeypatch, tmp_path):
     assert first["job_id"] == second["job_id"]
     assert second["idempotent_replay"] is True
     assert calls == 1
+
+
+def test_reconcile_marks_foreign_running_job_unknown(tmp_path):
+    runner = _runner(tmp_path)
+    job = Job(
+        job_id="local_previous_runner",
+        instance_id="local",
+        repo_path=str(runner.workspace),
+        command="sleep 300",
+        status="running",
+        remote_pid=1,
+        metadata={"runner_instance_id": "previous-container"},
+    )
+    runner.repo.save_job(job)
+
+    result = runner.reconcile_jobs()
+
+    assert result == {"reconciled": 1, "completed": 0, "failed": 0, "unknown": 1}
+    assert runner.repo.get_job(job.job_id).status == "unknown"
+
+
+def test_reconcile_finalizes_job_from_persisted_exit_code(tmp_path):
+    runner = _runner(tmp_path)
+    job = Job(
+        job_id="local_finished_while_gateway_down",
+        instance_id="local",
+        repo_path=str(runner.workspace),
+        command="echo done",
+        status="running",
+        remote_pid=424242,
+        metadata={"runner_instance_id": "previous-container"},
+    )
+    runner.repo.save_job(job)
+    jobdir = runner.workspace / ".gpu-lab" / "jobs" / job.job_id
+    jobdir.mkdir(parents=True)
+    (jobdir / "exit_code").write_text("0")
+
+    result = runner.reconcile_jobs()
+
+    assert result == {"reconciled": 1, "completed": 1, "failed": 0, "unknown": 0}
+    recovered = runner.repo.get_job(job.job_id)
+    assert recovered.status == "completed"
+    assert recovered.exit_code == 0
 
 
 @pytest.mark.asyncio

@@ -21,8 +21,8 @@ The MCP exposes GPU lifecycle, local and Vast execution, logs/artifacts, literat
 reproduction, canonical scientific state, and Brain v1 operations. Use MCP discovery for the full
 typed list. Brain tools include `world_model_create`, `world_model_get`, `world_entity_create`,
 `causal_edge_create`, `causal_edge_update`, `research_agenda_create`,
-`research_agenda_item_create`, `hypothesis_portfolio_get`, `brain_step`, and
-`brain_result_assess`.
+`research_agenda_item_create`, `hypothesis_portfolio_get`, `brain_step`,
+`research_decision_create`, `brain_decision_approve`, and `brain_result_assess`.
 
 Use `gpu_search` before `gpu_create`; creation requires a specific offer rather than making an unbounded cost decision. `gpu_destroy` requires `confirmation="DESTROY"`.
 
@@ -37,6 +37,8 @@ research_project_create
 → paper_ingest / paper_evidence_create / claim_create
 → anomaly_create / hypothesis_related / hypothesis_create
 → experiment_plan_register
+→ research_decision_create
+→ brain_decision_approve (when approval is required)
 → research_experiment_execute / research_experiment_sync
 → research_assess / negative_result_create / lesson_create
 → research_state_update / research_state_get
@@ -49,9 +51,16 @@ execution. `research_experiment_execute` first reserves a canonical PostgreSQL m
 `execution_attempt_uuid` when retrying a request; retries return the same mapping and do not launch
 a duplicate job. If no key is supplied, identical requests use an automatically derived key.
 `research_experiment_sync` accepts either `run_id` or `job_id` and always returns the complete
-canonical mapping. Commands, runtime, logs, exit code, and artifacts are preserved in the run and
-immutable event history. Do not assess a hypothesis from reasoning alone when a local or provider
-experiment is feasible.
+canonical mapping. A reserved attempt without a submitted job returns `RETRY_EXECUTION` rather
+than raising a missing-job exception. Sync preserves `RESULT_INSPECTED`, and artifact provenance is
+idempotent by run and path. Commands, runtime, logs, exit code, and artifacts are preserved in the
+run and immutable event history. Do not assess a hypothesis from reasoning alone when a local or
+provider experiment is feasible.
+
+The gateway reconciles non-final local jobs at startup. Exit-code files finalize jobs that finished
+before a gateway restart; jobs belonging to an earlier container without an exit code become
+`unknown` instead of trusting a potentially reused PID. Their command and logs remain available for
+inspection and an explicit retry decision.
 
 Local environments are persistent under `GPU_LAB_LOCAL_ENV_ROOT`. Docker Compose stores that root
 in the `gpu-lab-envs` named volume, so environments remain available across container rebuilds and

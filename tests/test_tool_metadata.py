@@ -8,6 +8,13 @@ def test_vast_status_tool_has_provider_specific_name():
     assert "gpu_status" not in names
 
 
+def test_research_decision_creation_is_explicitly_discoverable():
+    tool = mcp._tool_manager._tools["research_decision_create"]
+
+    assert tool.fn_metadata.arg_model.model_json_schema()["required"] == ["project_id"]
+    assert "research_experiment_execute" in tool.description
+
+
 def test_every_mcp_tool_has_chatgpt_metadata():
     for tool in mcp._tool_manager._tools.values():
         assert tool.title

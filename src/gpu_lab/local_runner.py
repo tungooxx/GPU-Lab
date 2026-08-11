@@ -20,6 +20,10 @@ class LocalRunner:
     def __init__(self, settings: Settings, repo: Repository):
         self.settings, self.repo = settings, repo
         self.workspace = settings.gpu_lab_local_workspace.resolve()
+        # A PID is meaningful only inside the container/process namespace that
+        # launched it.  Persisting this marker prevents a restarted gateway from
+        # mistaking a reused PID for the original research process.
+        self.runner_instance_id = uuid.uuid4().hex
 
     def _require_enabled(self) -> None:
         if not self.settings.gpu_lab_enable_local_runner:
@@ -147,7 +151,11 @@ class LocalRunner:
             command=command,
             status="queued",
             started_at=datetime.now(UTC),
-            metadata={"request_fingerprint": fingerprint, "python_env": python_env},
+            metadata={
+                "request_fingerprint": fingerprint,
+                "python_env": python_env,
+                "runner_instance_id": self.runner_instance_id,
+            },
         )
         self.repo.save_job(job)
         with stdout.open("wb") as stdout_handle, stderr.open("wb") as stderr_handle:
@@ -237,7 +245,10 @@ class LocalRunner:
             except ValueError:
                 pass
         else:
-            if not job.remote_pid or job.remote_pid <= 0:
+            launched_by_current_runner = (
+                job.metadata.get("runner_instance_id") == self.runner_instance_id
+            )
+            if not launched_by_current_runner or not job.remote_pid or job.remote_pid <= 0:
                 job.status = "unknown"
             else:
                 try:
@@ -250,6 +261,20 @@ class LocalRunner:
             if file.exists():
                 logs += file.read_text(errors="replace")[-65536:]
         return {"job_id": job_id, "status": job.status, "exit_code": job.exit_code, "logs_tail": logs}
+
+    def reconcile_jobs(self) -> dict[str, int]:
+        """Refresh persisted non-final jobs after a gateway start or restart."""
+        summary = {"reconciled": 0, "completed": 0, "failed": 0, "unknown": 0}
+        if not self.settings.gpu_lab_enable_local_runner or not self.workspace.is_dir():
+            return summary
+        for job in self.repo.list_jobs(instance_id="local", limit=10000):
+            if job.status not in {"queued", "running", "unknown"}:
+                continue
+            outcome = self.job_status(job.job_id)
+            summary["reconciled"] += 1
+            if outcome["status"] in summary:
+                summary[outcome["status"]] += 1
+        return summary
 
     def cancel(self, job_id: str) -> dict:
         job = self.repo.get_job(job_id)
