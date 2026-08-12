@@ -52,6 +52,22 @@ class MetaResearchService:
                 bool(item["data"].get("dead_ideas_retrieved")) for item in decisions
             ),
             "comparative_lessons": len(by_kind["ComparativeLesson"]),
+            "null_models_created": len(by_kind["NullModel"]),
+            "null_models_eliminated": self._status(by_kind["NullModel"], "REFUTED"),
+            "decision_outcomes_assessed": len(by_kind["ResearchDecisionOutcome"]),
+            "high_value_decisions": sum(
+                item["data"].get("label") == "HIGH_VALUE"
+                for item in by_kind["ResearchDecisionOutcome"]
+            ),
+            "zero_information_decisions": sum(
+                item["data"].get("label") == "ZERO_INFORMATION"
+                for item in by_kind["ResearchDecisionOutcome"]
+            ),
+            "strategy_patterns": len(by_kind["ResearchStrategyPattern"]),
+            "strategy_negative_transfer_records": sum(
+                len(item["data"].get("counterexamples", []))
+                for item in by_kind["ResearchStrategyPattern"]
+            ),
             "decisions_recorded": len(decisions),
             "decisions_with_hindsight": sum(
                 bool(item["data"].get("hindsight_assessment")) for item in decisions
@@ -96,6 +112,13 @@ class MetaResearchService:
             str(item["data"].get("selected_action", {}).get("action_type", "UNKNOWN"))
             for item in by_kind["ResearchDecision"]
         )
+        outcomes = by_kind["ResearchDecisionOutcome"]
+        repeated_low_value = Counter(
+            str(item["data"].get("action_type", "UNKNOWN"))
+            for item in outcomes
+            if item["data"].get("label")
+            in {"LOW_VALUE", "ZERO_INFORMATION", "REDUNDANT", "PREMATURE"}
+        )
         branches_without_comparison = []
         for branch in by_kind["ExperimentBranch"]:
             branch_id = str(branch["id"])
@@ -122,6 +145,15 @@ class MetaResearchService:
         repeated_dead = [key for key, count in failed_assumptions.items() if count >= 2]
         if repeated_dead:
             recommendations.append("Avoid descendants that inherit repeatedly failed assumptions.")
+        repeated_low_action_types = [
+            action for action, count in repeated_low_value.items() if count >= 2
+        ]
+        if repeated_low_action_types:
+            recommendations.append(
+                "Diminishing returns detected for: "
+                + ", ".join(sorted(repeated_low_action_types))
+                + ". Prefer a more discriminating action family when gates permit."
+            )
         metrics = progress["metrics"]
         inspected = int(metrics["inspected_experiments"])
         decisions = int(metrics["decisions_recorded"])
@@ -171,6 +203,10 @@ class MetaResearchService:
                 "incomplete_reproduction_ids": incomplete_reproductions,
                 "repeated_failed_assumptions": repeated_dead,
                 "experiment_action_patterns": dict(action_patterns),
+                "repeated_low_value_action_types": sorted(repeated_low_action_types),
+                "strategy_pattern_ids": [
+                    str(item["id"]) for item in by_kind["ResearchStrategyPattern"]
+                ],
                 "branches_without_comparison": branches_without_comparison,
                 "recommendations": recommendations,
                 "campaign_readiness": campaign_readiness,

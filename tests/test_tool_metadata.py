@@ -44,6 +44,22 @@ def test_every_mcp_tool_can_convert_a_structured_result():
         assert structured_content == {"result": {"smoke": "ok"}}
 
 
+def test_strategy_writes_are_not_advertised_as_read_only():
+    for name in (
+        "research_null_model_create",
+        "research_null_model_test",
+        "research_decision_outcome_assess",
+    ):
+        annotations = mcp._tool_manager._tools[name].annotations
+        assert annotations.readOnlyHint is False
+        assert annotations.destructiveHint is True
+
+    for name in ("research_strategy_list", "research_strategy_dataset_export"):
+        annotations = mcp._tool_manager._tools[name].annotations
+        assert annotations.readOnlyHint is True
+        assert annotations.destructiveHint is False
+
+
 def test_research_state_summary_excludes_large_object_payloads():
     state = {
         "name": "Fixture",

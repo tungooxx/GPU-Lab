@@ -36,12 +36,14 @@ from .qd import HypothesisQDService
 from .research import ResearchStore
 from .research_operators import HttpResearchOperatorProvider, ResearchOperatorService
 from .service import GPUService
+from .strategy import ResearchStrategyService
 from .terminal import TERMINAL_HTML
 
 logger = logging.getLogger(__name__)
 
-settings, service, research_store, research_brain, brain_bench_service, epistemic_service, literature_service, executable_paper_service, qd_service, branch_service, meta_research_service = (
+settings, service, research_store, research_brain, brain_bench_service, epistemic_service, literature_service, executable_paper_service, qd_service, branch_service, meta_research_service, strategy_service = (
     Settings(),
+    None,
     None,
     None,
     None,
@@ -89,6 +91,7 @@ _READ_ONLY_TOOLS = {
     "research_benchmark_list",
     "research_benchmark_episode_get",
     "research_benchmark_policy_run",
+    "research_benchmark_compare",
     "independent_evidence_count",
     "supporting_evidence_families",
     "contradicting_evidence_families",
@@ -122,6 +125,8 @@ _READ_ONLY_TOOLS = {
     "research_operator_status",
     "research_null_model_critique",
     "research_operator_critique",
+    "research_strategy_list",
+    "research_strategy_dataset_export",
     "paper_ask",
     "reproduction_status",
     "reproduction_plan",
@@ -138,8 +143,9 @@ _DESTRUCTIVE_TOOLS = {
     "executable_paper_build",
     "executable_paper_invoke",
     "research_hypothesis_generate",
-    "research_null_model_critique",
-    "research_operator_critique",
+    "research_null_model_create",
+    "research_null_model_test",
+    "research_decision_outcome_assess",
     "executable_paper_action_approve",
 }
 _OPEN_WORLD_TOOLS = {
@@ -458,6 +464,15 @@ def meta_research() -> MetaResearchService:
     return meta_research_service
 
 
+def strategy() -> ResearchStrategyService:
+    global strategy_service
+    if strategy_service is None:
+        with _singleton_lock:
+            if strategy_service is None:
+                strategy_service = ResearchStrategyService(research())
+    return strategy_service
+
+
 async def call(fn, *args, **kwargs):
     tool_name = getattr(fn, "__name__", "unknown")
     started = time.perf_counter()
@@ -613,6 +628,9 @@ def _compact_brain_step(result: dict[str, Any], limit: int = 10) -> dict[str, An
             _state_object_summary(item) for item in result["competing_hypotheses"][:limit]
         ],
         "dead_ideas_retrieved": result["dead_ideas_retrieved"][:limit],
+        "research_situation": result.get("research_situation"),
+        "strategy_patterns_retrieved": result.get("strategy_patterns_retrieved"),
+        "agenda_diminishing_returns": result.get("agenda_diminishing_returns"),
         "candidate_actions": result["candidate_actions"][:limit],
         "selected_action": result["selected_action"],
         "reason": result.get("reason"),
@@ -792,7 +810,7 @@ async def research_benchmark_episode_get(episode_id: str):
 
 @mcp.tool()
 async def research_benchmark_policy_run(episode_id: str, policy: str):
-    """Run an algorithmic baseline and return its choice without revealing held-out scoring."""
+    """Run one blinded deterministic policy without revealing held-out scoring."""
     episode = await call(brain_bench().get_episode, episode_id)
     if isinstance(episode, dict) and "error" in episode:
         return episode
@@ -810,6 +828,12 @@ async def research_benchmark_policy_run(episode_id: str, policy: str):
     if isinstance(decision, dict) and "error" in decision:
         return decision
     return decision.model_dump(mode="json")
+
+
+@mcp.tool()
+async def research_benchmark_compare():
+    """Score required v1, v1.5, v2, and baseline policies only after blinded policy selection."""
+    return await call(brain_bench().compare_builtin_policies)
 
 
 @mcp.tool()
@@ -1521,6 +1545,49 @@ async def meta_review(project_id: str):
 async def meta_lesson_list(project_id: str):
     """List durable research-process lessons without treating them as scientific evidence."""
     return await call(meta_research().list_lessons, project_id)
+
+
+@mcp.tool()
+async def research_null_model_create(project_id: str, null_model: dict):
+    """Register an explicit alternative explanation; it cannot itself promote scientific truth."""
+    return await call(strategy().null_model_create, project_id, null_model)
+
+
+@mcp.tool()
+async def research_null_model_test(
+    null_model_id: str,
+    outcome: str,
+    evidence_family_ids: list[str],
+    rationale: str,
+):
+    """Record an evidence-backed null-model result before any related causal promotion."""
+    return await call(
+        strategy().null_model_test,
+        null_model_id,
+        outcome,
+        evidence_family_ids,
+        rationale,
+    )
+
+
+@mcp.tool()
+async def research_decision_outcome_assess(
+    decision_id: str, assessment: dict, domain: str | None = None
+):
+    """Persist S_t, A_t, O_t, R_t, S_t+1 and update scoped strategy memory atomically."""
+    return await call(strategy().decision_outcome_assess, decision_id, assessment, domain)
+
+
+@mcp.tool()
+async def research_strategy_list(project_id: str | None = None, as_of: str | None = None):
+    """List project, domain, and global research-process patterns with provenance."""
+    return await call(strategy().strategy_list, project_id, as_of)
+
+
+@mcp.tool()
+async def research_strategy_dataset_export(project_id: str | None = None):
+    """Export versioned observational policy-transition data for offline future evaluation."""
+    return await call(strategy().dataset_export, project_id)
 
 
 @mcp.tool()

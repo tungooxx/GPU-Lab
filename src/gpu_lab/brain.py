@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, ValidationError
 from .epistemics import normalize_scientific_scope, scope_is_empirically_bounded
 from .errors import GPUError
 from .research import ResearchStore
+from .strategy import SCORING_POLICY_VERSION, STRATEGY_POLICY_VERSION, ResearchStrategyService
 
 VerificationStatus = Literal[
     "IMPLEMENTED_UNVERIFIED",
@@ -50,6 +51,10 @@ ACTION_TYPES = {
     "TRAINING_RUN",
     "NOVELTY_CHECK",
     "CODE_INSPECTION",
+    "NULL_MODEL_TEST",
+    "MATCHED_CONTROL",
+    "RANDOM_CONTROL",
+    "MAGNITUDE_MATCHED_CONTROL",
 }
 EXECUTABLE_ACTIONS = {
     "REPRODUCTION",
@@ -59,6 +64,10 @@ EXECUTABLE_ACTIONS = {
     "TRAINING_RUN",
     "CAUSAL_INTERVENTION",
     "ABLATION",
+    "NULL_MODEL_TEST",
+    "MATCHED_CONTROL",
+    "RANDOM_CONTROL",
+    "MAGNITUDE_MATCHED_CONTROL",
 }
 
 
@@ -70,6 +79,7 @@ class ActionScore(BaseModel):
     compute_cost: float = Field(ge=0.1, le=5)
     engineering_cost: float = Field(ge=0.1, le=5)
     execution_risk: float = Field(ge=0.1, le=5)
+    decision_relevance: float = Field(default=1, ge=0.1, le=5)
 
     @property
     def priority(self) -> float:
@@ -78,6 +88,7 @@ class ActionScore(BaseModel):
             * self.expected_discrimination
             * self.expected_information_gain
             * self.feasibility
+            * self.decision_relevance
         )
         denominator = self.compute_cost * self.engineering_cost * self.execution_risk
         return round(numerator / denominator, 6)
@@ -110,6 +121,7 @@ class ResearchBrain:
 
     def __init__(self, store: ResearchStore):
         self.store = store
+        self.strategy = ResearchStrategyService(store)
 
     @classmethod
     def _json_safe(cls, value: Any) -> Any:
@@ -530,7 +542,7 @@ class ResearchBrain:
         )
         related_dead = self._related_dead_ideas(project_id, hypotheses, as_of)
         candidates = self._candidate_actions(project_id, agenda_item, hypotheses, as_of)
-        candidate_data = [
+        base_candidate_data = [
             {
                 **candidate.persisted_data(),
                 "brain_step_id": brain_step_id,
@@ -538,6 +550,28 @@ class ResearchBrain:
             }
             for candidate in candidates
         ]
+        situation_data = self.strategy.construct_situation_data(
+            project_id,
+            agenda_item,
+            model,
+            base_candidate_data,
+            len(related_dead),
+            as_of,
+        )
+        strategy_retrieval = self.strategy.retrieve(project_id, situation_data, as_of)
+        agenda_telemetry = self.strategy.agenda_telemetry(
+            project_id, agenda_item, as_of
+        )
+        hard_gate = len(candidates) == 1 and candidates[0].action_type in {
+            "ARTIFACT_ANALYSIS",
+            "REPRODUCTION",
+        }
+        candidate_data = self.strategy.adjust_candidates(
+            base_candidate_data,
+            strategy_retrieval,
+            agenda_telemetry,
+            hard_gate,
+        )
         selected_index = max(range(len(candidate_data)), key=lambda index: candidate_data[index]["priority"])
         selected = candidate_data[selected_index]
         decision_data = {
@@ -559,6 +593,13 @@ class ResearchBrain:
             "dead_ideas_retrieved": related_dead,
             "comparative_lessons": comparative_lessons,
             "meta_lessons": meta_lessons,
+            "research_situation": situation_data,
+            "strategy_patterns_retrieved": strategy_retrieval["applied"],
+            "strategy_patterns_rejected": strategy_retrieval["rejected"],
+            "agenda_diminishing_returns": agenda_telemetry,
+            "brain_policy_version": "brain-v2-strategy-augmented-v1",
+            "strategy_policy_version": STRATEGY_POLICY_VERSION,
+            "scoring_policy_version": SCORING_POLICY_VERSION,
             "rationale": self._decision_rationale(selected, related_dead),
             "expected_information_gain": self._information_gain_label(
                 selected["score"]["expected_information_gain"]
@@ -586,6 +627,9 @@ class ResearchBrain:
                 "world_model": model,
                 "competing_hypotheses": hypotheses,
                 "dead_ideas_retrieved": related_dead,
+                "research_situation": situation_data,
+                "strategy_patterns_retrieved": strategy_retrieval,
+                "agenda_diminishing_returns": agenda_telemetry,
                 "candidate_actions": candidate_data,
                 "selected_action": selected,
                 "reason": decision_data["rationale"],
@@ -600,6 +644,7 @@ class ResearchBrain:
             candidate_data,
             selected_index,
             decision_data,
+            situation_data,
         )
         decision = persisted_step["decision"]
         persisted = persisted_step["candidates"]
@@ -613,6 +658,9 @@ class ResearchBrain:
             "world_model": model,
             "competing_hypotheses": hypotheses,
             "dead_ideas_retrieved": related_dead,
+            "research_situation": persisted_step["situation"],
+            "strategy_patterns_retrieved": strategy_retrieval,
+            "agenda_diminishing_returns": agenda_telemetry,
             "candidate_actions": persisted,
             "selected_action": selected,
             "reason": decision_data["rationale"],
@@ -970,6 +1018,29 @@ class ResearchBrain:
                 "CAUSAL_PROMOTION_MATCHED_CONTROL_REQUIRED",
                 "The preregistered matched control must be explicitly assessed as passed",
             )
+        if causal_edge_status == "INTERVENTION_SUPPORTED":
+            unresolved_nulls = [
+                item
+                for item in self.store.objects_list(
+                    project_id,
+                    "NullModel",
+                    {"ACTIVE", "OPEN", "PROPOSED"},
+                    limit=None,
+                )
+                if str(item["data"].get("target_entity_id"))
+                in {hypothesis_id, str(causal_edge_id)}
+                and item["data"].get("strength") == "STRONG"
+                and item["data"].get("tested") is not True
+                and isinstance(item["data"].get("estimated_cost"), (int, float))
+                and not isinstance(item["data"].get("estimated_cost"), bool)
+                and float(item["data"]["estimated_cost"]) <= 2
+            ]
+            if unresolved_nulls:
+                raise GPUError(
+                    "CAUSAL_PROMOTION_STRONG_NULL_UNTESTED",
+                    "Test the strong cheap null model(s) before causal promotion: "
+                    + ", ".join(str(item["id"]) for item in unresolved_nulls),
+                )
         evidence_data = {
             "source_type": "ExperimentRun",
             "run_id": run_id,
@@ -1133,6 +1204,53 @@ class ResearchBrain:
                 ).checked()
             ]
         configured = agenda_item["data"].get("candidate_experiments", [])
+        null_models = self.store.objects_list(
+            project_id,
+            "NullModel",
+            {"ACTIVE", "OPEN", "PROPOSED"},
+            limit=None,
+            **temporal,
+        )
+        strong_cheap_nulls = [
+            item
+            for item in null_models
+            if item["data"].get("strength") == "STRONG"
+            and isinstance(item["data"].get("estimated_cost"), (int, float))
+            and not isinstance(item["data"].get("estimated_cost"), bool)
+            and float(item["data"]["estimated_cost"]) <= 2
+            and item["data"].get("tested") is not True
+        ]
+        if strong_cheap_nulls:
+            null_candidates = [
+                ActionCandidate(
+                    action_type=item["data"].get("action_type", "NULL_MODEL_TEST"),
+                    question_addressed=question,
+                    hypotheses_discriminated=hypothesis_ids,
+                    predicted_outcomes=[item["data"].get("expected_outcome", "")],
+                    required_resources=["matched null control", "preregistered metric"],
+                    payload={
+                        "null_model_id": str(item["id"]),
+                        "target_entity_id": item["data"].get("target_entity_id"),
+                        "control": item["data"].get("discriminating_control"),
+                    },
+                    score=ActionScore(
+                        scientific_importance=5,
+                        expected_discrimination=5,
+                        expected_information_gain=5,
+                        feasibility=4,
+                        compute_cost=max(float(item["data"]["estimated_cost"]), 0.1),
+                        engineering_cost=1,
+                        execution_risk=0.5,
+                        decision_relevance=5,
+                    ),
+                ).checked()
+                for item in strong_cheap_nulls
+            ]
+            configured_candidates = [
+                self._configured_candidate(item, question, hypothesis_ids)
+                for item in configured
+            ]
+            return [*null_candidates, *configured_candidates]
         literature_requested = any(
             item.get("action_type") == "LITERATURE_SEARCH" for item in configured
         )
@@ -1349,8 +1467,12 @@ class ResearchBrain:
     @staticmethod
     def _decision_rationale(selected: dict, related_dead: list[dict]) -> str:
         reason = (
-            f"Selected {selected['action_type']} because its heuristic information-per-cost "
-            f"priority ({selected['priority']}) is highest for the active agenda item."
+            f"Selected {selected['action_type']} because its transparent final priority "
+            f"({selected['priority']}) is highest for the active agenda item "
+            f"(base={selected.get('base_priority', selected['priority'])}, "
+            f"strategy+={selected.get('positive_strategy_adjustment', 0)}, "
+            f"strategy-={selected.get('negative_strategy_adjustment', 0)}, "
+            f"diminishing={selected.get('diminishing_return_adjustment', 0)})."
         )
         if related_dead:
             reason += f" Retrieved {len(related_dead)} related dead idea(s) before selection."

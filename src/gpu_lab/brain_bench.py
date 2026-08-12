@@ -210,7 +210,7 @@ class ResearchBrainBench:
 
     def load_episode(self, episode: str | Path) -> BenchmarkEpisode:
         path = Path(episode)
-        if not path.is_absolute():
+        if not path.is_absolute() and path.parent == Path("."):
             path = self.root / path
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
@@ -249,6 +249,96 @@ class ResearchBrainBench:
         return int.from_bytes(digest[:8])
 
     @classmethod
+    def builtin_policy_decision(
+        cls, episode: BenchmarkEpisode, policy: BenchmarkPolicy
+    ) -> BenchmarkDecision:
+        """Run an explicitly heuristic policy using only the blinded episode payload.
+
+        This does not call an LLM and never consults hidden labels, tags, costs, or
+        expected-information values. Its purpose is a reproducible v1/v1.5/v2
+        comparison, not a claim that the frozen episodes are training data.
+        """
+        payload = episode.visible_payload()
+        actions = [item for item in payload["candidate_actions"] if item.get("feasible", True)]
+        if not actions:
+            raise GPUError(
+                "BRAIN_BENCH_NO_VALID_ACTION",
+                f"Benchmark episode {episode.episode_id} has no feasible candidate action",
+                retryable=False,
+            )
+        reproduction = str(payload["visible_state"].get("reproduction_status", "UNKNOWN")).upper()
+        dead = set(payload["known_dead_lineages"])
+        if policy == BenchmarkPolicy.CURRENT_BRAIN_V1:
+            eligible = (
+                [item for item in actions if item["action_type"] == "REPRODUCTION"]
+                if reproduction != "REPRODUCED"
+                else actions
+            )
+            selected = min(
+                eligible,
+                key=lambda item: (
+                    item["action_type"] in {"TRAINING_RUN", "ARCHITECTURE_DESIGN", "CLAIM_PROMOTION"},
+                    item["action_id"],
+                ),
+            )
+            return BenchmarkDecision(selected_action_id=selected["action_id"])
+        if policy == BenchmarkPolicy.BRAIN_V1_5:
+            eligible = [
+                item
+                for item in actions
+                if not (set(item.get("hypothesis_ids", [])) & dead)
+                and item["action_type"] not in {"CLAIM_PROMOTION", "ARCHITECTURE_DESIGN"}
+            ]
+            if reproduction != "REPRODUCED":
+                reproduction_actions = [
+                    item for item in eligible if item["action_type"] == "REPRODUCTION"
+                ]
+                if reproduction_actions:
+                    eligible = reproduction_actions
+            selected = min(
+                eligible or actions,
+                key=lambda item: (
+                    item["action_type"] in {"TRAINING_RUN"},
+                    item["action_type"] not in {"FROZEN_DIAGNOSTIC", "HYPOTHESIS_GENERATION", "EVIDENCE_REVIEW"},
+                    item["action_id"],
+                ),
+            )
+            return BenchmarkDecision(
+                selected_action_id=selected["action_id"],
+                retrieved_record_ids=sorted(dead),
+                considered_null_models=["required-null"]
+                if episode.evaluation_rubric.require_null_model
+                else [],
+            )
+        if policy == BenchmarkPolicy.BRAIN_V2_STRATEGY_AUGMENTED:
+            v15 = cls.builtin_policy_decision(episode, BenchmarkPolicy.BRAIN_V1_5)
+            selected = next(
+                item for item in actions if item["action_id"] == v15.selected_action_id
+            )
+            action_types = {item["action_type"] for item in actions}
+            if (
+                episode.evaluation_rubric.require_null_model
+                and "NULL_MODEL_TEST" in action_types
+            ):
+                selected = next(item for item in actions if item["action_type"] == "NULL_MODEL_TEST")
+            return BenchmarkDecision(
+                selected_action_id=selected["action_id"],
+                retrieved_record_ids=sorted(dead),
+                considered_null_models=["required-null"]
+                if episode.evaluation_rubric.require_null_model
+                else [],
+                strategy_reused=True,
+            )
+        if policy == BenchmarkPolicy.LLM_DIRECT_WITHOUT_STRUCTURED_MEMORY:
+            selected = min(actions, key=lambda item: item["action_id"])
+            return BenchmarkDecision(selected_action_id=selected["action_id"])
+        raise GPUError(
+            "BRAIN_BENCH_POLICY_RUNNER_REQUIRED",
+            f"{policy.value} requires an explicit policy runner for {episode.episode_id}",
+            retryable=False,
+        )
+
+    @classmethod
     def baseline_decision(
         cls,
         episode: BenchmarkEpisode,
@@ -277,6 +367,13 @@ class ResearchBrainBench:
         if policy == BenchmarkPolicy.RANDOM_VALID_ACTION:
             selected = random.Random(cls._seed(episode)).choice(feasible)
             return BenchmarkDecision(selected_action_id=selected.action_id)
+        if policy in {
+            BenchmarkPolicy.CURRENT_BRAIN_V1,
+            BenchmarkPolicy.BRAIN_V1_5,
+            BenchmarkPolicy.BRAIN_V2_STRATEGY_AUGMENTED,
+            BenchmarkPolicy.LLM_DIRECT_WITHOUT_STRUCTURED_MEMORY,
+        } and runner is None:
+            return cls.builtin_policy_decision(episode, policy)
         if runner is None:
             raise GPUError(
                 "BRAIN_BENCH_POLICY_RUNNER_REQUIRED",
@@ -284,6 +381,32 @@ class ResearchBrainBench:
                 retryable=False,
             )
         return runner(episode.visible_payload())
+
+    def compare_builtin_policies(self) -> dict[str, Any]:
+        """Score all required reproducible baselines without exposing answer keys to a policy."""
+        policies = [
+            BenchmarkPolicy.CURRENT_BRAIN_V1,
+            BenchmarkPolicy.CHEAPEST_FEASIBLE_ACTION,
+            BenchmarkPolicy.MAX_EXPECTED_INFORMATION_ACTION,
+            BenchmarkPolicy.LLM_DIRECT_WITHOUT_STRUCTURED_MEMORY,
+            BenchmarkPolicy.RANDOM_VALID_ACTION,
+            BenchmarkPolicy.BRAIN_V1_5,
+            BenchmarkPolicy.BRAIN_V2_STRATEGY_AUGMENTED,
+        ]
+        episodes = self.load_all()
+        results = {}
+        for policy in policies:
+            cards = [
+                self.score(episode, policy, self.baseline_decision(episode, policy))
+                for episode in episodes
+            ]
+            results[policy.value] = self.aggregate(cards).model_dump(mode="json")
+        return {
+            "benchmark_version": "brain-bench-v2-1",
+            "episode_count": len(episodes),
+            "results": results,
+            "warning": "These are sourced historical scorecards; no model policy is claimed validated by this comparison alone.",
+        }
 
     @staticmethod
     def score(

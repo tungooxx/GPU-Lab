@@ -1,6 +1,7 @@
 # Research Brain v2 pre-update audit
 
-Audit date: 2026-08-11. This audit was produced from the current
+Audit date: 2026-08-12. This audit records the pre-update state used to plan the v2 work; the
+post-update verification status is in `docs/verification/brain_v2.md`. It was produced from the current
 `feat/research-brain-v2` source, its tests, the live Compose PostgreSQL schema, and the Brain v1
 verification report. Verification labels describe engineering evidence, not scientific truth.
 

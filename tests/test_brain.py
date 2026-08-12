@@ -83,10 +83,11 @@ def test_state_snapshot_keeps_object_identity_without_copying_large_payloads():
 
 
 class CandidateStore:
-    def __init__(self, *, reproductions=None, runs=None, evidence=None):
+    def __init__(self, *, reproductions=None, runs=None, evidence=None, null_models=None):
         self.reproductions = reproductions or []
         self.runs = runs or []
         self.evidence = evidence or []
+        self.null_models = null_models or []
 
     def objects_list(self, _project_id, kind, *_args, **_kwargs):
         if kind == "ExperimentRun":
@@ -95,6 +96,8 @@ class CandidateStore:
             return self.reproductions
         if kind == "EvidenceUnit":
             return self.evidence
+        if kind == "NullModel":
+            return self.null_models
         return []
 
     def objects_identifiers(self, _project_id, kind, _statuses=None):
@@ -241,6 +244,40 @@ def test_literature_candidates_change_next_action_to_evidence_review():
 
     assert selected.action_type == "EVIDENCE_REVIEW"
     assert selected.payload["evidence_ids"] == ["evidence-1"]
+
+
+def test_strong_cheap_null_model_preempts_architecture_or_causal_work():
+    brain = ResearchBrain(
+        CandidateStore(
+            null_models=[
+                {
+                    "id": "null-1",
+                    "kind": "NullModel",
+                    "status": "ACTIVE",
+                    "data": {
+                        "strength": "STRONG",
+                        "estimated_cost": 0.5,
+                        "tested": False,
+                        "action_type": "MAGNITUDE_MATCHED_CONTROL",
+                        "expected_outcome": "Random magnitude-matched substitution mimics target.",
+                        "discriminating_control": "Match perturbation norm.",
+                        "target_entity_id": "hypothesis",
+                    },
+                }
+            ]
+        )
+    )
+    agenda = {
+        "data": {
+            "question": "Does the intervention identify the mechanism?",
+            "candidate_experiments": [{"action_type": "CAUSAL_INTERVENTION"}],
+        }
+    }
+
+    selected = brain._candidate_actions("project", agenda, [])[0]
+
+    assert selected.action_type == "MAGNITUDE_MATCHED_CONTROL"
+    assert selected.payload["null_model_id"] == "null-1"
 
 
 class AuthorizationStore:

@@ -55,6 +55,11 @@ RESEARCH_OBJECT_KINDS = (
     "ActionApproval",
     "ComparativeLesson",
     "MetaLesson",
+    "NullModel",
+    "ResearchSituation",
+    "ResearchDecisionOutcome",
+    "ResearchStrategyPattern",
+    "StrategyOutcome",
 )
 RESEARCH_OBJECT_STATUSES = {
     "ACTIVE",
@@ -334,6 +339,89 @@ class ResearchStore:
                 "CREATE UNIQUE INDEX IF NOT EXISTS research_objects_evidence_family_key_unique "
                 "ON research_objects(project_id, (data->>'independence_key')) "
                 "WHERE kind='EvidenceFamily'"
+            )
+            cur.execute(
+                "SELECT project_id,data->>'decision_id' AS decision_id,"
+                "array_agg(id ORDER BY created_at,id) AS ids FROM research_objects "
+                "WHERE kind='ResearchDecisionOutcome' AND data ? 'decision_id' "
+                "GROUP BY project_id,data->>'decision_id' HAVING count(*)>1"
+            )
+            for duplicate_group in cur.fetchall():
+                canonical_id = str(duplicate_group["ids"][0])
+                for duplicate_id in duplicate_group["ids"][1:]:
+                    cur.execute(
+                        "SELECT data FROM research_objects WHERE id=%s FOR UPDATE",
+                        (duplicate_id,),
+                    )
+                    duplicate = cur.fetchone()
+                    if not duplicate:
+                        continue
+                    repaired_data = {
+                        **duplicate["data"],
+                        "duplicate_of": canonical_id,
+                        "decision_id": None,
+                        "legacy_duplicate_reconciled": True,
+                    }
+                    cur.execute(
+                        "UPDATE research_objects SET data=%s,status='BLOCKED' WHERE id=%s",
+                        (json.dumps(repaired_data), duplicate_id),
+                    )
+                    self._event(
+                        cur,
+                        duplicate_group["project_id"],
+                        "DECISION_OUTCOME_DUPLICATE_RECONCILED",
+                        duplicate_id,
+                        {"canonical_id": canonical_id},
+                    )
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS research_objects_decision_outcome_unique "
+                "ON research_objects((data->>'decision_id')) "
+                "WHERE kind='ResearchDecisionOutcome'"
+            )
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS research_objects_strategy_key_unique "
+                "ON research_objects((data->>'strategy_key')) "
+                "WHERE kind='ResearchStrategyPattern'"
+            )
+            cur.execute(
+                "SELECT project_id,data->>'decision_outcome_id' AS outcome_id,"
+                "data->>'scope_level' AS scope_level,array_agg(id ORDER BY created_at,id) AS ids "
+                "FROM research_objects WHERE kind='StrategyOutcome' "
+                "AND data ? 'decision_outcome_id' AND data ? 'scope_level' "
+                "GROUP BY project_id,data->>'decision_outcome_id',data->>'scope_level' "
+                "HAVING count(*)>1"
+            )
+            for duplicate_group in cur.fetchall():
+                canonical_id = str(duplicate_group["ids"][0])
+                for duplicate_id in duplicate_group["ids"][1:]:
+                    cur.execute(
+                        "SELECT data FROM research_objects WHERE id=%s FOR UPDATE",
+                        (duplicate_id,),
+                    )
+                    duplicate = cur.fetchone()
+                    if not duplicate:
+                        continue
+                    repaired_data = {
+                        **duplicate["data"],
+                        "duplicate_of": canonical_id,
+                        "decision_outcome_id": None,
+                        "legacy_duplicate_reconciled": True,
+                    }
+                    cur.execute(
+                        "UPDATE research_objects SET data=%s,status='BLOCKED' WHERE id=%s",
+                        (json.dumps(repaired_data), duplicate_id),
+                    )
+                    self._event(
+                        cur,
+                        duplicate_group["project_id"],
+                        "STRATEGY_OUTCOME_DUPLICATE_RECONCILED",
+                        duplicate_id,
+                        {"canonical_id": canonical_id, "scope_level": duplicate_group["scope_level"]},
+                    )
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS research_objects_strategy_outcome_unique "
+                "ON research_objects((data->>'decision_outcome_id'), (data->>'scope_level')) "
+                "WHERE kind='StrategyOutcome'"
             )
             if self.vector_available:
                 cur.execute("ALTER TABLE research_objects ADD COLUMN IF NOT EXISTS embedding vector")
@@ -1557,13 +1645,15 @@ class ResearchStore:
         candidates: list[dict[str, Any]],
         selected_index: int,
         decision_data: dict[str, Any],
+        situation_data: dict[str, Any] | None = None,
     ) -> dict:
-        """Persist one Brain step's candidates and decision in a single transaction."""
+        """Persist one Brain step's situation, candidates, and decision atomically."""
         if not candidates or not 0 <= selected_index < len(candidates):
             raise GPUError("INVALID_BRAIN_DECISION", "A selected candidate is required")
         now = datetime.now(UTC)
         candidate_ids = [uuid.uuid4() for _ in candidates]
         decision_id = uuid.uuid4()
+        situation_id = uuid.uuid4() if situation_data is not None else None
         persisted = _json_document(
             [
                 {**candidate, "id": str(candidate_id)}
@@ -1573,12 +1663,29 @@ class ResearchStore:
         materialized = _json_document(
             {
                 **decision_data,
+                "research_situation_id": str(situation_id) if situation_id else None,
                 "candidate_action_ids": [str(item) for item in candidate_ids],
                 "candidate_actions": persisted,
                 "selected_action": persisted[selected_index],
             }
         )
         with self._connect() as conn, conn.cursor() as cur:
+            if situation_id is not None:
+                persisted_situation = _json_document(
+                    {**situation_data, "created_from_decision_id": str(decision_id)}
+                )
+                cur.execute(
+                    "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                    "VALUES(%s,%s,'ResearchSituation','ACTIVE',%s,%s)",
+                    (situation_id, project_id, json.dumps(persisted_situation), now),
+                )
+                self._event(
+                    cur,
+                    project_id,
+                    "RESEARCH_SITUATION_CREATED",
+                    situation_id,
+                    persisted_situation,
+                )
             for candidate, candidate_id in zip(candidates, candidate_ids, strict=True):
                 cur.execute(
                     "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
@@ -1614,7 +1721,513 @@ class ResearchStore:
             },
             "candidates": persisted,
             "selected": persisted[selected_index],
+            "situation": (
+                {
+                    "id": str(situation_id),
+                    "project_id": project_id,
+                    "kind": "ResearchSituation",
+                    "status": "ACTIVE",
+                    "data": _json_document(
+                        {**situation_data, "created_from_decision_id": str(decision_id)}
+                    ),
+                }
+                if situation_id is not None and situation_data is not None
+                else None
+            ),
         }
+
+    def decision_outcome_apply(
+        self,
+        decision_id: str,
+        outcome_data: dict[str, Any],
+        after_situation_data: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist S_t+1, a reassessable outcome, and strategy updates atomically."""
+        now = datetime.now(UTC)
+        positive_labels = {"HIGH_VALUE", "USEFUL"}
+        negative_labels = {
+            "LOW_VALUE",
+            "ZERO_INFORMATION",
+            "REDUNDANT",
+            "PREMATURE",
+            "INVALID",
+        }
+
+        def strategy_key(scope_level: str, discriminator: str) -> str:
+            material = "|".join(
+                (
+                    "brain-v2-strategy-v1",
+                    scope_level,
+                    discriminator,
+                    str(outcome_data["problem_signature"]),
+                    str(outcome_data["action_type"]),
+                )
+            )
+            return hashlib.sha256(material.encode()).hexdigest()
+
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
+                "WHERE id=%s FOR UPDATE",
+                (decision_id,),
+            )
+            decision = cur.fetchone()
+            if not decision:
+                raise GPUError("RESEARCH_OBJECT_NOT_FOUND", decision_id)
+            if decision["kind"] != "ResearchDecision":
+                raise GPUError("NOT_A_RESEARCHDECISION", decision_id)
+            project_id = str(decision["project_id"])
+            if str(outcome_data.get("project_id")) != project_id:
+                raise GPUError("RESEARCH_PROJECT_MISMATCH", decision_id)
+
+            cur.execute(
+                "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
+                "WHERE kind='ResearchDecisionOutcome' AND data->>'decision_id'=%s FOR UPDATE",
+                (decision_id,),
+            )
+            existing_outcome = cur.fetchone()
+            assessment_history = []
+            if existing_outcome:
+                assessment_history = list(existing_outcome["data"].get("assessment_history", []))
+                previous = {
+                    key: existing_outcome["data"].get(key)
+                    for key in (
+                        "label",
+                        "realized_information_gain",
+                        "hindsight_assessment",
+                        "assessed_at",
+                    )
+                }
+                if previous not in assessment_history:
+                    assessment_history.append(previous)
+                after_situation_id = existing_outcome["data"].get("after_situation_id")
+                if not after_situation_id:
+                    after_situation_id = str(uuid.uuid4())
+                    after_payload = _json_document(
+                        {
+                            **after_situation_data,
+                            "created_from_decision_id": decision_id,
+                            "transition_role": "S_t+1",
+                        }
+                    )
+                    cur.execute(
+                        "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                        "VALUES(%s,%s,'ResearchSituation','ACTIVE',%s,%s)",
+                        (after_situation_id, project_id, json.dumps(after_payload), now),
+                    )
+                    self._event(
+                        cur,
+                        project_id,
+                        "RESEARCH_SITUATION_CREATED",
+                        after_situation_id,
+                        after_payload,
+                    )
+                outcome_id = existing_outcome["id"]
+                materialized_outcome = _json_document(
+                    {
+                        **existing_outcome["data"],
+                        **outcome_data,
+                        "after_situation_id": str(after_situation_id),
+                        "assessment_history": assessment_history,
+                        "assessed_at": now.isoformat(),
+                    }
+                )
+                cur.execute(
+                    "UPDATE research_objects SET status='RESULT_INSPECTED',data=%s WHERE id=%s",
+                    (json.dumps(materialized_outcome), outcome_id),
+                )
+            else:
+                after_situation_id, outcome_id = uuid.uuid4(), uuid.uuid4()
+                after_payload = _json_document(
+                    {
+                        **after_situation_data,
+                        "created_from_decision_id": decision_id,
+                        "transition_role": "S_t+1",
+                    }
+                )
+                cur.execute(
+                    "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                    "VALUES(%s,%s,'ResearchSituation','ACTIVE',%s,%s)",
+                    (after_situation_id, project_id, json.dumps(after_payload), now),
+                )
+                self._event(
+                    cur,
+                    project_id,
+                    "RESEARCH_SITUATION_CREATED",
+                    after_situation_id,
+                    after_payload,
+                )
+                materialized_outcome = _json_document(
+                    {
+                        **outcome_data,
+                        "after_situation_id": str(after_situation_id),
+                        "assessment_history": [],
+                        "assessed_at": now.isoformat(),
+                    }
+                )
+                cur.execute(
+                    "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                    "VALUES(%s,%s,'ResearchDecisionOutcome','RESULT_INSPECTED',%s,%s)",
+                    (outcome_id, project_id, json.dumps(materialized_outcome), now),
+                )
+            self._event(
+                cur,
+                project_id,
+                "DECISION_OUTCOME_ASSESSED",
+                outcome_id,
+                materialized_outcome,
+            )
+
+            decision_data = _json_document(
+                {
+                    **decision["data"],
+                    "decision_outcome_id": str(outcome_id),
+                    "actual_information_gain": outcome_data.get("realized_information_gain"),
+                    "hindsight_assessment": outcome_data.get("hindsight_assessment"),
+                    "outcome": outcome_data.get("observed_result"),
+                }
+            )
+            cur.execute(
+                "UPDATE research_objects SET status='COMPLETED',data=%s WHERE id=%s",
+                (json.dumps(decision_data), decision_id),
+            )
+
+            cur.execute(
+                "SELECT id,project_id,status,data FROM research_objects "
+                "WHERE kind='ResearchDecisionOutcome' "
+                "AND data->>'problem_signature'=%s AND data->>'action_type'=%s FOR UPDATE",
+                (outcome_data["problem_signature"], outcome_data["action_type"]),
+            )
+            related_outcomes = cur.fetchall()
+
+            def cohort(scope_level: str) -> list[dict[str, Any]]:
+                if scope_level == "PROJECT":
+                    return [
+                        item
+                        for item in related_outcomes
+                        if str(item["project_id"]) == project_id
+                    ]
+                if scope_level == "DOMAIN":
+                    return [
+                        item
+                        for item in related_outcomes
+                        if item["data"].get("domain") == outcome_data.get("domain")
+                    ]
+                return related_outcomes
+
+            domain_rows = cohort("DOMAIN")
+            global_rows = cohort("GLOBAL")
+            eligible_for_strategy = outcome_data.get("label") in (
+                positive_labels | negative_labels
+            )
+            scope_levels = ["PROJECT"] if eligible_for_strategy else []
+            if eligible_for_strategy and len({str(item["project_id"]) for item in domain_rows}) >= 2:
+                scope_levels.append("DOMAIN")
+            if (
+                eligible_for_strategy
+                and
+                len({str(item["project_id"]) for item in global_rows}) >= 3
+                and len({str(item["data"].get("domain")) for item in global_rows}) >= 2
+            ):
+                scope_levels.append("GLOBAL")
+
+            patterns: list[dict[str, Any]] = []
+            for scope_level in scope_levels:
+                rows = cohort(scope_level)
+                labels = [str(item["data"].get("label", "UNKNOWN")) for item in rows]
+                successes = sum(label in positive_labels for label in labels)
+                failures = sum(label in negative_labels for label in labels)
+                projects = sorted({str(item["project_id"]) for item in rows})
+                domains = sorted(
+                    {
+                        str(item["data"].get("domain"))
+                        for item in rows
+                        if item["data"].get("domain")
+                    }
+                )
+                discriminator = (
+                    project_id
+                    if scope_level == "PROJECT"
+                    else str(outcome_data.get("domain"))
+                    if scope_level == "DOMAIN"
+                    else "GLOBAL"
+                )
+                key = strategy_key(scope_level, discriminator)
+                cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (key,))
+                cur.execute(
+                    "SELECT id,project_id,status,data,created_at FROM research_objects "
+                    "WHERE kind='ResearchStrategyPattern' AND data->>'strategy_key'=%s "
+                    "FOR UPDATE",
+                    (key,),
+                )
+                existing_pattern = cur.fetchone()
+                if failures and successes:
+                    support_level = "CONTEXT_DEPENDENT"
+                elif failures > successes:
+                    support_level = "REFUTED" if failures >= 2 else "WEAKENED"
+                elif scope_level == "PROJECT":
+                    support_level = (
+                        "PROJECT_REPEATED" if successes >= 2 else "PROJECT_OBSERVATION"
+                    )
+                elif scope_level == "DOMAIN":
+                    support_level = "DOMAIN_REPEATED"
+                else:
+                    support_level = (
+                        "GLOBAL_SUPPORTED"
+                        if len(projects) >= 5 and len(domains) >= 3
+                        else "CROSS_DOMAIN_CANDIDATE"
+                    )
+                counterexamples = [
+                    {
+                        "outcome_id": str(item["id"]),
+                        "decision_id": item["data"].get("decision_id"),
+                        "project_id": str(item["project_id"]),
+                        "domain": item["data"].get("domain"),
+                        "label": item["data"].get("label"),
+                        "failure_conditions": item["data"].get("failure_conditions", []),
+                    }
+                    for item in rows
+                    if str(item["data"].get("label")) in negative_labels
+                ]
+                counts = {
+                    "historical_successes": successes,
+                    "historical_failures": failures,
+                    "high_information_count": sum(
+                        item["data"].get("realized_information_gain") == "HIGH" for item in rows
+                    ),
+                    "medium_information_count": sum(
+                        item["data"].get("realized_information_gain") == "MEDIUM"
+                        for item in rows
+                    ),
+                    "low_information_count": sum(
+                        item["data"].get("realized_information_gain") == "LOW" for item in rows
+                    ),
+                    "zero_information_count": sum(
+                        item["data"].get("realized_information_gain") == "ZERO"
+                        for item in rows
+                    ),
+                }
+                pattern_data = _json_document(
+                    {
+                        "strategy_key": key,
+                        "scope_level": scope_level,
+                        "scope_discriminator": discriminator,
+                        "problem_signature": outcome_data["problem_signature"],
+                        "research_stage": outcome_data.get("research_stage"),
+                        "conditions": outcome_data.get("conditions", {}),
+                        "action_type": outcome_data["action_type"],
+                        "action_parameters_pattern": outcome_data.get(
+                            "action_parameters_pattern", {}
+                        ),
+                        **counts,
+                        "mean_compute_cost": self._mean_numeric(
+                            rows, "actual_compute_cost"
+                        ),
+                        "mean_engineering_cost": self._mean_numeric(
+                            rows, "actual_engineering_cost"
+                        ),
+                        "projects_observed": projects,
+                        "domains_observed": domains,
+                        "counterexamples": counterexamples,
+                        "applicability_conditions": outcome_data.get(
+                            "applicability_conditions", {}
+                        ),
+                        "failure_conditions": sorted(
+                            {
+                                str(condition)
+                                for item in rows
+                                for condition in item["data"].get("failure_conditions", [])
+                            }
+                        ),
+                        "support_level": support_level,
+                        "decision_ids": sorted(
+                            {
+                                str(item["data"].get("decision_id"))
+                                for item in rows
+                                if item["data"].get("decision_id")
+                            }
+                        ),
+                        "outcome_ids": sorted(str(item["id"]) for item in rows),
+                        "experiment_run_ids": sorted(
+                            {
+                                str(run_id)
+                                for item in rows
+                                for run_id in item["data"].get("experiment_run_ids", [])
+                            }
+                        ),
+                        "evidence_family_ids": sorted(
+                            {
+                                str(family_id)
+                                for item in rows
+                                for family_id in item["data"].get(
+                                    "evidence_family_ids", []
+                                )
+                            }
+                        ),
+                        "updated_at": now.isoformat(),
+                    }
+                )
+                object_status = "WEAKENED" if support_level in {"WEAKENED", "REFUTED"} else "ACTIVE"
+                if existing_pattern:
+                    pattern_id = existing_pattern["id"]
+                    previous_support = existing_pattern["data"].get("support_level")
+                    cur.execute(
+                        "UPDATE research_objects SET status=%s,data=%s WHERE id=%s",
+                        (object_status, json.dumps(pattern_data), pattern_id),
+                    )
+                    event_type = (
+                        "STRATEGY_PATTERN_WEAKENED"
+                        if support_level in {"WEAKENED", "REFUTED", "CONTEXT_DEPENDENT"}
+                        else "STRATEGY_PATTERN_STRENGTHENED"
+                    )
+                    if previous_support != support_level and scope_level != "PROJECT":
+                        self._event(
+                            cur,
+                            project_id,
+                            "STRATEGY_PATTERN_SCOPE_CHANGED",
+                            pattern_id,
+                            {"from": previous_support, "to": support_level},
+                        )
+                else:
+                    pattern_id = uuid.uuid4()
+                    cur.execute(
+                        "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                        "VALUES(%s,%s,'ResearchStrategyPattern',%s,%s,%s)",
+                        (
+                            pattern_id,
+                            project_id,
+                            object_status,
+                            json.dumps(pattern_data),
+                            now,
+                        ),
+                    )
+                    event_type = "STRATEGY_PATTERN_CREATED"
+                self._event(cur, project_id, event_type, pattern_id, pattern_data)
+                strategy_outcome_data = {
+                    "strategy_pattern_id": str(pattern_id),
+                    "decision_outcome_id": str(outcome_id),
+                    "decision_id": decision_id,
+                    "label": outcome_data.get("label"),
+                    "scope_level": scope_level,
+                }
+                cur.execute(
+                    "SELECT id,data FROM research_objects WHERE kind='StrategyOutcome' "
+                    "AND data->>'decision_outcome_id'=%s AND data->>'scope_level'=%s FOR UPDATE",
+                    (str(outcome_id), scope_level),
+                )
+                existing_strategy_outcome = cur.fetchone()
+                if existing_strategy_outcome:
+                    strategy_outcome_id = existing_strategy_outcome["id"]
+                    strategy_outcome_data = {
+                        **existing_strategy_outcome["data"],
+                        **strategy_outcome_data,
+                        "updated_at": now.isoformat(),
+                    }
+                    cur.execute(
+                        "UPDATE research_objects SET data=%s WHERE id=%s",
+                        (json.dumps(strategy_outcome_data), strategy_outcome_id),
+                    )
+                else:
+                    strategy_outcome_id = uuid.uuid4()
+                    cur.execute(
+                        "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                        "VALUES(%s,%s,'StrategyOutcome','RESULT_INSPECTED',%s,%s)",
+                        (
+                            strategy_outcome_id,
+                            project_id,
+                            json.dumps(strategy_outcome_data),
+                            now,
+                        ),
+                    )
+                self._event(
+                    cur,
+                    project_id,
+                    "STRATEGY_OUTCOME_RECORDED",
+                    strategy_outcome_id,
+                    strategy_outcome_data,
+                )
+                patterns.append(
+                    {
+                        "id": str(pattern_id),
+                        "project_id": project_id,
+                        "kind": "ResearchStrategyPattern",
+                        "status": object_status,
+                        "data": pattern_data,
+                    }
+                )
+
+            if outcome_data.get("label") in negative_labels:
+                for pattern_id in outcome_data.get("retrieved_strategy_pattern_ids", []):
+                    cur.execute(
+                        "SELECT id,project_id,status,data FROM research_objects "
+                        "WHERE id=%s AND kind='ResearchStrategyPattern' FOR UPDATE",
+                        (pattern_id,),
+                    )
+                    transferred = cur.fetchone()
+                    if not transferred or str(transferred["project_id"]) == project_id:
+                        continue
+                    counterexample = {
+                        "outcome_id": str(outcome_id),
+                        "decision_id": decision_id,
+                        "project_id": project_id,
+                        "domain": outcome_data.get("domain"),
+                        "label": outcome_data.get("label"),
+                        "failure_conditions": outcome_data.get("failure_conditions", []),
+                    }
+                    data = {**transferred["data"]}
+                    existing_counterexamples = list(data.get("counterexamples", []))
+                    if not any(
+                        item.get("outcome_id") == str(outcome_id)
+                        for item in existing_counterexamples
+                    ):
+                        existing_counterexamples.append(counterexample)
+                    data.update(
+                        {
+                            "counterexamples": existing_counterexamples,
+                            "support_level": "CONTEXT_DEPENDENT",
+                            "updated_at": now.isoformat(),
+                        }
+                    )
+                    cur.execute(
+                        "UPDATE research_objects SET data=%s WHERE id=%s",
+                        (json.dumps(data), pattern_id),
+                    )
+                    self._event(
+                        cur,
+                        transferred["project_id"],
+                        "STRATEGY_NEGATIVE_TRANSFER_RECORDED",
+                        pattern_id,
+                        counterexample,
+                    )
+
+        return {
+            "decision": {"id": decision_id, "status": "COMPLETED", "data": decision_data},
+            "outcome": {
+                "id": str(outcome_id),
+                "project_id": project_id,
+                "kind": "ResearchDecisionOutcome",
+                "status": "RESULT_INSPECTED",
+                "data": materialized_outcome,
+            },
+            "after_situation": {
+                "id": str(after_situation_id),
+                "project_id": project_id,
+                "kind": "ResearchSituation",
+                "status": "ACTIVE",
+                "data": after_situation_data,
+            },
+            "strategy_patterns": patterns,
+        }
+
+    @staticmethod
+    def _mean_numeric(rows: list[dict[str, Any]], field: str) -> float | None:
+        values = [
+            float(item["data"][field])
+            for item in rows
+            if isinstance(item["data"].get(field), (int, float))
+            and not isinstance(item["data"].get(field), bool)
+        ]
+        return round(sum(values) / len(values), 6) if values else None
 
     def result_assessment_apply(
         self,
@@ -2307,6 +2920,44 @@ class ResearchStore:
             if data_filters:
                 sql += " AND data @> %s::jsonb"
                 args.append(json.dumps(data_filters))
+            sql += " ORDER BY created_at DESC"
+            if limit is not None:
+                sql += " LIMIT %s"
+                args.append(max(limit, 1))
+            cur.execute(sql, args)
+            return cur.fetchall()
+
+    def objects_global_list(
+        self,
+        kind: str,
+        statuses: set[str] | None = None,
+        limit: int | None = 1000,
+        as_of: datetime | str | None = None,
+    ) -> list[dict]:
+        """List one object kind across projects for explicitly scoped strategy transfer."""
+        if kind not in RESEARCH_OBJECT_KINDS:
+            raise GPUError("INVALID_RESEARCH_OBJECT_KIND", kind)
+        cutoff = self._prepare_as_of(as_of)
+        with self._connect() as conn, conn.cursor() as cur:
+            if cutoff is None:
+                sql = (
+                    "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
+                    "WHERE kind=%s"
+                )
+                args: list[Any] = [kind]
+            else:
+                sql = (
+                    "WITH latest AS ("
+                    "SELECT DISTINCT ON (v.object_id) v.object_id AS id,v.project_id,v.kind,"
+                    "v.status,v.data,v.object_created_at AS created_at "
+                    "FROM research_object_versions v WHERE v.committed_at<=%s "
+                    "ORDER BY v.object_id,v.committed_at DESC,v.revision_id DESC) "
+                    "SELECT id,project_id,kind,status,data,created_at FROM latest WHERE kind=%s"
+                )
+                args = [cutoff, kind]
+            if statuses:
+                sql += " AND status=ANY(%s)"
+                args.append(list(statuses))
             sql += " ORDER BY created_at DESC"
             if limit is not None:
                 sql += " LIMIT %s"

@@ -1,6 +1,6 @@
 # GPU-Lab / Research OS current state
 
-Audit date: 2026-08-11. Verification labels distinguish source inspection, unit tests,
+Audit date: 2026-08-12. Verification labels distinguish source inspection, unit tests,
 integration tests, and real execution.
 
 ## What exists
@@ -40,6 +40,13 @@ integration tests, and real execution.
 - Research progress metrics count uncertainty resolution, falsification, negative-memory reuse,
   inspected evidence, and information per recorded GPU-hour. `meta_review` persists idempotent
   process-only MetaLessons and applies an explicit bounded-campaign readiness gate.
+- Brain v1.5 provides temporal historical visibility, EvidenceFamilies and independent-origin
+  accounting, scope-aware causal support, BeliefAudit, WorldModel consistency checking, and
+  canonical automatic embeddings with safe lexical/structured fallback.
+- Brain v2 adds frozen historical benchmark scorecards and baselines, typed null models/control
+  actions, ResearchSituations, reassessable DecisionOutcomes, scoped project/domain/global strategy
+  patterns, negative-transfer gates, diminishing-return telemetry, and a transparent strategy-aware
+  adjustment to `brain_step()`.
 
 ## What is verified
 
@@ -74,7 +81,9 @@ integration tests, and real execution.
 
 ## What is partial
 
-- pgvector storage/search exists, while automatic scientific embedding generation does not.
+- Automatic provider-neutral embeddings persist canonical source hashes and provider/model/dimension
+  metadata. A provider outage leaves scientific retrieval available through structured, lexical,
+  lineage, and exact-relation paths.
 - PaperQA 2026.3.18 is integrated behind an optional isolated HTTP worker and typed
   `LiteratureProvider`. Its contract, real import/API shape, container health, gateway-to-worker
   connectivity, and credential isolation are verified; a paid/local-model evidence query is not.
@@ -82,15 +91,15 @@ integration tests, and real execution.
   contract, repository validation, canonical-state boundary, idempotent import, generated-tool
   inspection, verification cap, and authorization behavior are unit tested. A real multi-hour
   Paper2Agent generation is not yet verified because no task-scoped Claude credential was supplied.
-- Hypothesis similarity uses lexical structure unless callers provide embeddings.
-- Brain v1 and QD critics are deterministic advisory checks; QD candidate intake is typed but not
-  LLM-generated, and no LLM-backed ResearchOperator is integrated.
+- Model-backed answer quality for PaperQA and model-backed operator value have not been verified.
+- The typed operator boundary exists; external/model-backed operator output remains advisory and must
+  pass schema, dead-memory, QD, and provenance checks before persistence.
 
 ## What is missing
 
-- Automatic embedding generation and autonomous campaign runtime.
+- Autonomous campaign runtime.
 - PaperQA's real model-backed answer quality remains unverified.
-- Additional historical benchmark episodes beyond the permanent HASI gate.
+- Additional sourced historical benchmark episodes and a real inspected multi-branch comparison.
 
 ## What should be reused
 

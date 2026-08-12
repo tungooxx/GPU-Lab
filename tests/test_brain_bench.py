@@ -94,13 +94,25 @@ def test_structured_policy_runner_never_receives_hidden_future_state():
     assert "strong_next_actions" not in seen
 
 
-def test_non_algorithmic_policy_requires_explicit_runner():
+def test_v1_v15_and_v2_policies_run_on_blinded_visible_state():
     episode = ResearchBrainBench(BENCH_ROOT).load_episode("before_ejc.json")
 
-    with pytest.raises(GPUError) as error:
-        ResearchBrainBench.baseline_decision(episode, BenchmarkPolicy.CURRENT_BRAIN_V1)
+    for policy in (
+        BenchmarkPolicy.CURRENT_BRAIN_V1,
+        BenchmarkPolicy.BRAIN_V1_5,
+        BenchmarkPolicy.BRAIN_V2_STRATEGY_AUGMENTED,
+    ):
+        decision = ResearchBrainBench.baseline_decision(episode, policy)
+        assert decision.selected_action_id in {
+            item.action_id for item in episode.candidate_actions
+        }
 
-    assert error.value.error_type == "BRAIN_BENCH_POLICY_RUNNER_REQUIRED"
+
+def test_builtin_comparison_includes_every_required_policy():
+    comparison = ResearchBrainBench(BENCH_ROOT).compare_builtin_policies()
+
+    assert comparison["episode_count"] >= 3
+    assert set(comparison["results"]) == {item.value for item in BenchmarkPolicy}
 
 
 def test_scorecard_exposes_leakage_dead_idea_and_gate_failures_separately():
