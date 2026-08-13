@@ -5,7 +5,7 @@ from collections import Counter, defaultdict
 from typing import Any
 
 from .branches import INSPECTABLE_RUN_STATUSES, RECOVERABLE_RUN_STATUSES
-from .research import ResearchStore
+from .research import ResearchStore, classify_decision_data, strategy_learning_eligibility
 
 _INFORMATION_VALUE = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
 
@@ -25,9 +25,23 @@ class MetaResearchService:
     ) -> dict[str, Any]:
         decisions = by_kind["ResearchDecision"]
         runs = by_kind["ExperimentRun"]
+        outcomes_by_decision = {
+            str(item["data"].get("decision_id")): item
+            for item in by_kind["ResearchDecisionOutcome"]
+        }
+        eligibility = {
+            str(item["id"]): strategy_learning_eligibility(
+                item, outcomes_by_decision.get(str(item["id"]))
+            )
+            for item in decisions
+        }
+        scientific_decisions = [
+            item for item in decisions if classify_decision_data(item["data"])["decision_role"] == "SCIENTIFIC_ACTION"
+        ]
+        eligible_decisions = [item for item in decisions if eligibility[str(item["id"])] ["eligible"]]
         information_points = sum(
             _INFORMATION_VALUE.get(item["data"].get("actual_information_gain"), 0)
-            for item in decisions
+            for item in scientific_decisions
         )
         gpu_hours = sum(self._gpu_hours(item) for item in runs)
         metrics = {
@@ -69,8 +83,20 @@ class MetaResearchService:
                 for item in by_kind["ResearchStrategyPattern"]
             ),
             "decisions_recorded": len(decisions),
+            "scientific_decisions_total": len(scientific_decisions),
+            "scientific_cycles_closed": len(eligible_decisions),
+            "scientific_cycles_open": max(len(scientific_decisions) - len(eligible_decisions), 0),
+            "strategy_eligible_cycles": len(eligible_decisions),
+            "administrative_decisions": sum(
+                classify_decision_data(item["data"])["decision_role"] == "ADMINISTRATIVE_RECOVERY"
+                for item in decisions
+            ),
+            "system_verification_decisions": sum(
+                classify_decision_data(item["data"])["decision_role"] in {"SYSTEM_VERIFICATION", "PROVIDER_CONTRACT_TEST"}
+                for item in decisions
+            ),
             "decisions_with_hindsight": sum(
-                bool(item["data"].get("hindsight_assessment")) for item in decisions
+                bool(item["data"].get("hindsight_assessment")) for item in scientific_decisions
             ),
             "gpu_hours_recorded": round(gpu_hours, 6),
             "information_gain_points": information_points,
@@ -111,6 +137,7 @@ class MetaResearchService:
         action_patterns = Counter(
             str(item["data"].get("selected_action", {}).get("action_type", "UNKNOWN"))
             for item in by_kind["ResearchDecision"]
+            if classify_decision_data(item["data"])["decision_role"] == "SCIENTIFIC_ACTION"
         )
         outcomes = by_kind["ResearchDecisionOutcome"]
         repeated_low_value = Counter(
@@ -156,7 +183,7 @@ class MetaResearchService:
             )
         metrics = progress["metrics"]
         inspected = int(metrics["inspected_experiments"])
-        decisions = int(metrics["decisions_recorded"])
+        decisions = int(metrics["scientific_decisions_total"])
         hindsight = int(metrics["decisions_with_hindsight"])
         campaign_reasons = []
         if inspected < 5:
@@ -164,7 +191,9 @@ class MetaResearchService:
         if decisions == 0:
             campaign_reasons.append("no research decisions recorded")
         elif hindsight / decisions < 0.8:
-            campaign_reasons.append("decision hindsight coverage below 80%")
+            campaign_reasons.append("scientific decision hindsight coverage below 80%")
+        if metrics["scientific_cycles_closed"] == 0 and decisions:
+            campaign_reasons.append("no closed scientific decision cycles")
         if metrics["information_gained_per_gpu_hour"] is None:
             campaign_reasons.append("information-per-GPU-hour is not measurable")
         campaign_readiness = "DO_NOT_BUILD_YET" if campaign_reasons else "EVALUATE_BOUNDED_PILOT"

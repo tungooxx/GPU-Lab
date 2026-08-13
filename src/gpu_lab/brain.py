@@ -574,6 +574,20 @@ class ResearchBrain:
         )
         selected_index = max(range(len(candidate_data)), key=lambda index: candidate_data[index]["priority"])
         selected = candidate_data[selected_index]
+        runner_ups = sorted(
+            (
+                (index, item)
+                for index, item in enumerate(candidate_data)
+                if index != selected_index
+            ),
+            key=lambda item: item[1]["priority"],
+            reverse=True,
+        )
+        runner_up_index, runner_up = runner_ups[0] if runner_ups else (None, None)
+        candidate_comparison = [self._candidate_comparison(item, hypotheses) for item in candidate_data]
+        prospective_hindsight = self._prospective_hindsight_attack(
+            selected, hypotheses, runner_up
+        )
         decision_data = {
             "request_id": request_id,
             "brain_step_id": brain_step_id,
@@ -600,7 +614,22 @@ class ResearchBrain:
             "brain_policy_version": "brain-v2-strategy-augmented-v1",
             "strategy_policy_version": STRATEGY_POLICY_VERSION,
             "scoring_policy_version": SCORING_POLICY_VERSION,
-            "rationale": self._decision_rationale(selected, related_dead),
+            "rationale": self._decision_rationale(selected, related_dead, runner_up),
+            "central_uncertainty": agenda_item["data"].get(
+                "central_uncertainty", agenda_item["data"]["question"]
+            ),
+            "runner_up_candidate_index": runner_up_index,
+            "runner_up_action_type": runner_up.get("action_type") if runner_up else None,
+            "why_selected_over_runner_up": (
+                self._runner_up_reason(selected, runner_up) if runner_up else None
+            ),
+            "candidate_comparison": candidate_comparison,
+            "prospective_hindsight": prospective_hindsight,
+            "hard_blocks_checked": [
+                item["code"]
+                for item in self._critics(selected, related_dead)[-1].get("findings", [])
+                if item.get("hard_block")
+            ],
             "expected_information_gain": self._information_gain_label(
                 selected["score"]["expected_information_gain"]
             ),
@@ -1465,7 +1494,9 @@ class ResearchBrain:
         return [str(item["id"]) for item in records]
 
     @staticmethod
-    def _decision_rationale(selected: dict, related_dead: list[dict]) -> str:
+    def _decision_rationale(
+        selected: dict, related_dead: list[dict], runner_up: dict | None = None
+    ) -> str:
         reason = (
             f"Selected {selected['action_type']} because its transparent final priority "
             f"({selected['priority']}) is highest for the active agenda item "
@@ -1474,12 +1505,111 @@ class ResearchBrain:
             f"strategy-={selected.get('negative_strategy_adjustment', 0)}, "
             f"diminishing={selected.get('diminishing_return_adjustment', 0)})."
         )
+        if runner_up:
+            reason += " " + ResearchBrain._runner_up_reason(selected, runner_up)
         if related_dead:
             reason += f" Retrieved {len(related_dead)} related dead idea(s) before selection."
         return reason
 
     @staticmethod
+    def _runner_up_reason(selected: dict, runner_up: dict) -> str:
+        selected_disc = selected.get("score", {}).get("expected_discrimination")
+        runner_disc = runner_up.get("score", {}).get("expected_discrimination")
+        selected_types = set(selected.get("hypotheses_discriminated", []))
+        runner_types = set(runner_up.get("hypotheses_discriminated", []))
+        if selected_disc != runner_disc:
+            comparison = (
+                f"expected discrimination {selected_disc} versus {runner_disc}"
+            )
+        elif selected_types != runner_types:
+            comparison = "different competing-hypothesis coverage"
+        else:
+            comparison = "the retained candidate comparison and explicit score components"
+        return (
+            f"Compared runner-up {runner_up.get('action_type')}; selected action was preferred "
+            f"for {comparison}, not merely because its numeric priority was higher."
+        )
+
+    @staticmethod
+    def _candidate_comparison(candidate: dict, hypotheses: list[dict]) -> dict[str, Any]:
+        payload = candidate.get("payload", {})
+        predicted = candidate.get("predicted_outcomes", [])
+        return {
+            "candidate_id": candidate.get("id"),
+            "action_type": candidate.get("action_type"),
+            "hypotheses_discriminated": candidate.get(
+                "hypotheses_discriminated", [str(item["id"]) for item in hypotheses]
+            ),
+            "hypotheses_not_discriminated": payload.get("hypotheses_not_discriminated", []),
+            "decisive_prediction": predicted[0] if predicted else None,
+            "expected_if_pass": payload.get("expected_if_pass", predicted),
+            "expected_if_fail": payload.get("expected_if_fail", ["The scoped prediction is not supported"]),
+            "expected_belief_change_if_pass": payload.get("expected_belief_change_if_pass"),
+            "expected_belief_change_if_fail": payload.get("expected_belief_change_if_fail"),
+            "strongest_null": payload.get("strongest_null"),
+            "major_confounds": payload.get("confounds", []),
+            "scientific_value": candidate.get("score", {}).get("decision_relevance"),
+            "cost": candidate.get("score", {}).get("compute_cost"),
+            "reason_not_selected": candidate.get("reason_not_selected"),
+        }
+
+    @staticmethod
+    def _prospective_hindsight_attack(
+        selected: dict, hypotheses: list[dict], runner_up: dict | None
+    ) -> dict[str, Any]:
+        payload = selected.get("payload", {})
+        guard = payload.get("guard_condition") or payload.get("guard")
+        prediction = selected.get("predicted_outcomes", [])
+        failure_explanations = payload.get(
+            "failure_explanations",
+            ["implementation failure", "weak intervention", "invalid control", "metric insensitivity"],
+        )
+        hard_block = not bool(prediction) or (len(hypotheses) > 1 and not selected.get("hypotheses_discriminated"))
+        return {
+            "if_pass": payload.get("expected_belief_change_if_pass", "Update only the scoped mechanism if guards pass."),
+            "if_fail": payload.get("expected_belief_change_if_fail", "Weaken or leave unresolved; do not overclaim refutation."),
+            "would_failure_refute": bool(payload.get("failure_refutes_hypothesis", False)),
+            "failure_explanations_to_rule_out": failure_explanations,
+            "guard_to_check": guard,
+            "prediction_to_check": prediction[0] if prediction else None,
+            "strongest_null": payload.get("strongest_null"),
+            "runner_up_action_type": runner_up.get("action_type") if runner_up else None,
+            "recommendation": "BLOCK" if hard_block else "ACCEPT",
+            "hard_block": hard_block,
+        }
+
+    @staticmethod
     def _critics(selected: dict, related_dead: list[dict]) -> list[dict]:
+        predicted = selected.get("predicted_outcomes", [])
+        hypotheses = selected.get("hypotheses_discriminated", [])
+        scientific_findings = []
+        if len(hypotheses) < 2:
+            scientific_findings.append(
+                {
+                    "code": "LOW_DISCRIMINATION",
+                    "severity": "WARNING",
+                    "description": "The candidate does not explicitly separate at least two competing hypotheses.",
+                    "hard_block": False,
+                }
+            )
+        if not predicted:
+            scientific_findings.append(
+                {
+                    "code": "MISSING_DECISIVE_PREDICTION",
+                    "severity": "ERROR",
+                    "description": "No prospective outcome is recorded for the selected action.",
+                    "hard_block": True,
+                }
+            )
+        if selected.get("action_type") in {"TRAINING_RUN", "GENERALIZATION"}:
+            scientific_findings.append(
+                {
+                    "code": "ARCHITECTURE_PREMATURITY_REVIEW",
+                    "severity": "WARNING",
+                    "description": "Training/generalization should remain blocked until the scoped mechanism test is resolved.",
+                    "hard_block": False,
+                }
+            )
         return [
             {
                 "operator": "ProximityCritic",
@@ -1497,5 +1627,28 @@ class ResearchBrain:
                 "operator": "ReproducibilityCritic",
                 "advisory": True,
                 "finding": "BASELINE_GATE_APPLIED",
+            },
+            {
+                "operator": "ScientificDiscriminationCritic",
+                "advisory": not any(item.get("hard_block") for item in scientific_findings),
+                "recommendation": "BLOCK"
+                if any(item.get("hard_block") for item in scientific_findings)
+                else "ACCEPT",
+                "fatal_flaws": [item["description"] for item in scientific_findings if item["severity"] == "ERROR"],
+                "hypotheses_not_distinguished": [] if len(hypotheses) >= 2 else hypotheses,
+                "outcomes_explained_by_multiple_hypotheses": [],
+                "strongest_null_explanation": selected.get("payload", {}).get("strongest_null"),
+                "missing_control": selected.get("payload", {}).get("control"),
+                "confounded_variables": selected.get("payload", {}).get("confounds", []),
+                "invalid_intervention_risk": selected.get("payload", {}).get("invalid_intervention_risk"),
+                "measurement_artifact_risk": selected.get("payload", {}).get("measurement_artifact_risk"),
+                "scope_overreach_risk": selected.get("payload", {}).get("scope_overreach_risk"),
+                "architecture_prematurity": any(
+                    item["code"] == "ARCHITECTURE_PREMATURITY_REVIEW"
+                    for item in scientific_findings
+                ),
+                "cheaper_decisive_test": selected.get("payload", {}).get("cheaper_decisive_test"),
+                "runner_up_preference": None,
+                "findings": scientific_findings,
             },
         ]

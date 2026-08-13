@@ -167,6 +167,21 @@ established, no real inspected three-branch comparison has been run, and no MCTS
 Native progress metrics and `meta_review` currently mark campaign readiness `DO_NOT_BUILD_YET` because
 the required real-science, model-backed, and hindsight evidence thresholds remain unmet.
 
+### Exporting the research trace
+
+To review what the system observed, selected, executed, and persisted, export a redacted Markdown
+trace directly from PostgreSQL and the local operational database:
+
+```powershell
+uv run python scripts/export_research_trace.py --output trace_export.md
+```
+
+Use `--project-id <uuid>` for one project. The report includes structured state, decisions,
+candidate actions, events, execution attempts, version history, MCP audit records, jobs, and worker
+events. Credentials and bearer values are redacted. Private model chain-of-thought is not stored or
+exportable; improve prompts from the persisted rationale, retrieved records, tool inputs/outputs,
+outcomes, and error history instead.
+
 Enable the Paper2Agent worker only with a task-scoped Anthropic credential and explicit approval of
 the upstream model cost:
 

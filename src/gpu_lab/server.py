@@ -26,6 +26,7 @@ from .branches import ExperimentBranchService
 from .config import Settings
 from .dashboard import DASHBOARD_HTML
 from .embeddings import EmbeddingService, LocalHashEmbeddingProvider
+from .engineering import EngineeringService
 from .epistemics import EpistemicService
 from .errors import GPUError
 from .executable_papers import ExecutablePaperService, HttpExecutablePaperProvider
@@ -57,6 +58,7 @@ settings, service, research_store, research_brain, brain_bench_service, epistemi
 )
 _singleton_lock = threading.RLock()
 embedding_service: EmbeddingService | None = None
+engineering_service: EngineeringService | None = None
 research_operator_service: ResearchOperatorService | None = None
 instructions = (
     "Safe, structured remote GPU experiment control plane. Credentials are never returned. "
@@ -127,6 +129,7 @@ _READ_ONLY_TOOLS = {
     "research_operator_critique",
     "research_strategy_list",
     "research_strategy_dataset_export",
+    "decision_epistemic_audit",
     "paper_ask",
     "reproduction_status",
     "reproduction_plan",
@@ -137,6 +140,10 @@ _READ_ONLY_TOOLS = {
     "local_experiment_logs",
     "local_artifact_list",
     "local_artifact_read",
+    "engineering_task_get",
+    "engineering_context_get",
+    "engineering_result_get",
+    "engineering_task_verify",
 }
 _DESTRUCTIVE_TOOLS = {
     "gpu_destroy",
@@ -321,6 +328,15 @@ def research() -> ResearchStore:
             if research_store is None:
                 research_store = ResearchStore(settings.gpu_lab_research_database_url)
     return research_store
+
+
+def engineering() -> EngineeringService:
+    global engineering_service
+    if engineering_service is None:
+        with _singleton_lock:
+            if engineering_service is None:
+                engineering_service = EngineeringService(research())
+    return engineering_service
 
 
 def initialize_research_runtime() -> ResearchStore | None:
@@ -776,6 +792,77 @@ async def research_state_get(project_id: str, limit: int = 10, as_of: str | None
 async def research_object_get(object_id: str, as_of: str | None = None):
     """Retrieve one complete persisted research record by its ID."""
     return await call(research().object_get, object_id, as_of)
+
+
+@mcp.tool()
+async def engineering_task_create(
+    project_id: str,
+    purpose: str,
+    task_type: str,
+    change_request: str = "",
+    repository: str = "",
+    repository_root: str = "",
+    base_commit: str | None = None,
+    relevant_files: list[str] | None = None,
+    relevant_symbols: list[str] | None = None,
+    scientific_variable_changed: str | None = None,
+    scientific_variables_held_fixed: list[str] | None = None,
+    scientific_invariants: dict[str, Any] | None = None,
+    engineering_invariants: dict[str, Any] | None = None,
+    prohibited_changes: list[str] | None = None,
+    acceptance_tests: list[str] | None = None,
+    baseline_commands: list[str] | None = None,
+    targeted_tests: list[str] | None = None,
+    broader_tests: list[str] | None = None,
+    expected_artifacts: list[str] | None = None,
+    implementation_guards: list[dict[str, Any]] | None = None,
+    research_decision_id: str | None = None,
+    experiment_id: str | None = None,
+):
+    """Create an engineering-only implementation task; it cannot assess scientific truth."""
+    return await call(
+        engineering().task_create, project_id, purpose, task_type, change_request, repository,
+        repository_root, base_commit, relevant_files, relevant_symbols, scientific_variable_changed,
+        scientific_variables_held_fixed, scientific_invariants, engineering_invariants,
+        prohibited_changes, acceptance_tests, baseline_commands, targeted_tests, broader_tests,
+        expected_artifacts, implementation_guards, research_decision_id, experiment_id,
+    )
+
+
+@mcp.tool()
+async def engineering_task_get(task_id: str):
+    """Retrieve a durable engineering task."""
+    return await call(engineering().task_get, task_id)
+
+
+@mcp.tool()
+async def engineering_result_get(result_id: str):
+    """Retrieve implementation evidence without treating it as scientific evidence."""
+    return await call(engineering().result_get, result_id)
+
+
+@mcp.tool()
+async def engineering_task_verify(task_id: str):
+    """Check implementation readiness; this never assesses a hypothesis."""
+    return await call(engineering().task_verify, task_id)
+
+
+@mcp.tool()
+async def engineering_context_get(task_id: str):
+    """Return compact implementation context without dumping scientific state."""
+    return await call(engineering().context_get, task_id)
+
+
+@mcp.tool()
+async def engineering_task_update(task_id: str, status: str, update: dict[str, Any] | None = None):
+    """Update engineering task workflow status and provenance only."""
+    return await call(engineering().task_update, task_id, status, update)
+
+
+@mcp.tool()
+async def engineering_result_record(task_id: str, result: dict[str, Any]):
+    """Record implementation evidence; scientific_result is always NOT_ASSESSED."""
+    return await call(engineering().result_record, task_id, result)
 
 
 @mcp.tool()
@@ -1588,6 +1675,24 @@ async def research_strategy_list(project_id: str | None = None, as_of: str | Non
 async def research_strategy_dataset_export(project_id: str | None = None):
     """Export versioned observational policy-transition data for offline future evaluation."""
     return await call(strategy().dataset_export, project_id)
+
+
+@mcp.tool()
+async def strategy_learning_eligibility(decision_id: str):
+    """Explain whether one decision/outcome may contribute to production strategy memory."""
+    return await call(strategy().strategy_learning_eligibility, decision_id)
+
+
+@mcp.tool()
+async def decision_epistemic_audit(decision_id: str):
+    """Audit one persisted decision's scientific role, closure, and strategy-learning eligibility."""
+    return await call(strategy().decision_epistemic_audit, decision_id)
+
+
+@mcp.tool()
+async def historical_reclassification_report(project_id: str | None = None):
+    """Apply idempotent v2.1 epistemic classifications and return aggregate counts."""
+    return await call(research().epistemic_reclassification, project_id)
 
 
 @mcp.tool()

@@ -60,6 +60,8 @@ RESEARCH_OBJECT_KINDS = (
     "ResearchDecisionOutcome",
     "ResearchStrategyPattern",
     "StrategyOutcome",
+    "EngineeringTask",
+    "EngineeringResult",
 )
 RESEARCH_OBJECT_STATUSES = {
     "ACTIVE",
@@ -96,6 +98,160 @@ RESEARCH_OBJECT_STATUSES = {
     "running",
     "unknown",
 }
+
+# Orthogonal epistemic classifications. These are metadata about the role and
+# quality of a record; they never rewrite the underlying observation.
+DECISION_ROLES = {
+    "SCIENTIFIC_ACTION",
+    "RESULT_INSPECTION",
+    "REPRODUCTION_ACTION",
+    "ADMINISTRATIVE_RECOVERY",
+    "LEGACY_BACKFILL",
+    "SYSTEM_VERIFICATION",
+    "PROVIDER_CONTRACT_TEST",
+    "BENCHMARK_EVALUATION",
+}
+EXECUTION_VERIFICATIONS = {"NOT_EXECUTED", "MOCK", "UNIT", "INTEGRATION", "REAL_CPU", "REAL_GPU"}
+SCIENTIFIC_ROLES = {
+    "NOT_SCIENTIFIC",
+    "SYSTEM_SMOKE",
+    "CONTRACT_TEST",
+    "REPRODUCTION",
+    "DIAGNOSTIC",
+    "NULL_TEST",
+    "CAUSAL_TEST",
+    "REPLICATION",
+    "GENERALIZATION",
+    "TRAINING_EVALUATION",
+}
+SCIENTIFIC_VERIFICATIONS = {
+    "NOT_SCIENTIFIC",
+    "PREREQUISITE_ONLY",
+    "RESULT_UNINSPECTED",
+    "RESULT_INSPECTED",
+    "SUPPORTED_WITHIN_SCOPE",
+    "REPLICATED_WITHIN_SCOPE",
+    "GENERALIZED",
+}
+CYCLE_STATUSES = {"OPEN", "SELECTED", "EXECUTED", "INSPECTED", "ASSESSED", "CLOSED", "BLOCKED", "ABANDONED"}
+LEARNING_NAMESPACES = {"PRODUCTION_SCIENCE", "BENCHMARK", "SYSTEM_TEST"}
+STRATEGY_LEARNING_ROLES = {
+    "EXCLUDE",
+    "SCIENTIFIC_ACTION_OUTCOME",
+    "EXPERIMENTAL_DESIGN_FAILURE",
+    "RESOURCE_FAILURE",
+    "REPRODUCTION_LESSON",
+    "META_RESEARCH_ONLY",
+}
+
+
+def classify_decision_data(data: dict[str, Any]) -> dict[str, str]:
+    """Deterministically classify a decision while preserving legacy fields."""
+    selected = data.get("selected_action", {}) if isinstance(data.get("selected_action"), dict) else {}
+    action = str(selected.get("action_type", data.get("action_type", "UNKNOWN"))).upper()
+    legacy = data.get("legacy_provenance")
+    role = str(data.get("decision_role") or "").upper()
+    if role not in DECISION_ROLES:
+        if isinstance(legacy, dict) and legacy.get("reconstructed"):
+            role = "LEGACY_BACKFILL"
+        elif selected.get("payload", {}).get("mode") in {"INSPECT_RESULT", "INSPECT_FAILURE", "RECOVER_UNFINISHED"}:
+            role = "RESULT_INSPECTION"
+        elif action in {"REPRODUCTION"}:
+            role = "REPRODUCTION_ACTION"
+        elif action in {"SYSTEM_SMOKE", "MCP_CONTRACT_TEST", "CONTRACT_TEST"}:
+            role = "SYSTEM_VERIFICATION"
+        else:
+            # Pre-v2.1 unclassified history has no proof of prospective
+            # selection. Keep it observable, but fail closed for strategy
+            # learning until deterministic backfill can identify its role.
+            role = "LEGACY_BACKFILL" if not data.get("brain_policy_version") else "SCIENTIFIC_ACTION"
+    scientific_role = str(data.get("scientific_role") or "").upper()
+    if scientific_role not in SCIENTIFIC_ROLES:
+        if role in {"LEGACY_BACKFILL", "ADMINISTRATIVE_RECOVERY", "SYSTEM_VERIFICATION", "PROVIDER_CONTRACT_TEST", "BENCHMARK_EVALUATION"}:
+            scientific_role = "NOT_SCIENTIFIC"
+        elif action == "REPRODUCTION":
+            scientific_role = "REPRODUCTION"
+        elif action in {"CAUSAL_INTERVENTION", "ABLATION", "STATE_SUBSTITUTION"}:
+            scientific_role = "CAUSAL_TEST"
+        elif action == "NULL_MODEL_TEST":
+            scientific_role = "NULL_TEST"
+        elif action in {"REPLICATION", "GENERALIZATION", "TRAINING_RUN"}:
+            scientific_role = {"REPLICATION": "REPLICATION", "GENERALIZATION": "GENERALIZATION", "TRAINING_RUN": "TRAINING_EVALUATION"}[action]
+        else:
+            scientific_role = "DIAGNOSTIC" if role == "SCIENTIFIC_ACTION" else "NOT_SCIENTIFIC"
+    namespace = str(data.get("learning_namespace") or "").upper()
+    if namespace not in LEARNING_NAMESPACES:
+        namespace = "PRODUCTION_SCIENCE" if role == "SCIENTIFIC_ACTION" else "SYSTEM_TEST"
+    execution = str(data.get("execution_verification") or "").upper()
+    if execution not in EXECUTION_VERIFICATIONS:
+        execution = "NOT_EXECUTED"
+    scientific_verification = str(data.get("scientific_verification") or "").upper()
+    if scientific_verification not in SCIENTIFIC_VERIFICATIONS:
+        scientific_verification = (
+            "NOT_SCIENTIFIC"
+            if scientific_role in {"NOT_SCIENTIFIC", "SYSTEM_SMOKE", "CONTRACT_TEST"}
+            else "RESULT_UNINSPECTED"
+        )
+    cycle = str(data.get("cycle_status") or "").upper()
+    if cycle not in CYCLE_STATUSES:
+        cycle = "CLOSED" if data.get("decision_outcome_id") else "SELECTED"
+    return {
+        "decision_role": role,
+        "scientific_role": scientific_role,
+        "execution_verification": execution,
+        "scientific_verification": scientific_verification,
+        "cycle_status": cycle,
+        "learning_namespace": namespace,
+    }
+
+
+def strategy_learning_eligibility(decision: dict[str, Any], outcome: dict[str, Any] | None) -> dict[str, Any]:
+    data = decision.get("data", {})
+    if not isinstance(data, dict) or not data:
+        return {
+            "eligible": False,
+            "reasons": [],
+            "exclusions": ["DECISION_CONTEXT_MISSING"],
+            "decision_role": "LEGACY_BACKFILL",
+            "scientific_role": "NOT_SCIENTIFIC",
+            "execution_verification": "NOT_EXECUTED",
+            "scientific_verification": "NOT_SCIENTIFIC",
+            "cycle_status": "OPEN",
+            "learning_namespace": "SYSTEM_TEST",
+        }
+    classification = classify_decision_data(data)
+    reasons: list[str] = []
+    if classification["decision_role"] != "SCIENTIFIC_ACTION":
+        reasons.append("DECISION_ROLE_NOT_SCIENTIFIC_ACTION")
+    if classification["learning_namespace"] != "PRODUCTION_SCIENCE":
+        reasons.append("LEARNING_NAMESPACE_NOT_PRODUCTION_SCIENCE")
+    if outcome is None:
+        reasons.append("DECISION_OUTCOME_MISSING")
+    else:
+        outcome_data = outcome.get("data", {})
+        cycle_status = str(data.get("cycle_status") or "").upper()
+        if cycle_status and cycle_status != "CLOSED":
+            reasons.append("DECISION_CYCLE_NOT_CLOSED")
+        if str(outcome.get("status")) not in {"RESULT_INSPECTED", "ASSESSED", "CLOSED"}:
+            reasons.append("OUTCOME_NOT_INSPECTED")
+        if outcome_data.get("realized_information_gain") in {None, "UNKNOWN"}:
+            reasons.append("REALIZED_INFORMATION_GAIN_UNKNOWN")
+        if not outcome_data.get("hindsight_assessment"):
+            reasons.append("HINDSIGHT_MISSING")
+        basis = outcome_data.get("information_gain_basis", [])
+        if not basis:
+            if outcome_data.get("uncertainties_resolved"):
+                basis = ["UNCERTAINTY_RESOLVED"]
+            elif outcome_data.get("hypotheses_eliminated"):
+                basis = ["HYPOTHESIS_ELIMINATED"]
+            elif outcome_data.get("evidence_family_ids"):
+                basis = ["EVIDENCE_FAMILY_ADDED"]
+        if not isinstance(basis, list) or not basis:
+            reasons.append("INFORMATION_GAIN_BASIS_MISSING")
+    if classification["scientific_role"] in {"NOT_SCIENTIFIC", "SYSTEM_SMOKE", "CONTRACT_TEST"}:
+        reasons.append("SCIENTIFIC_ROLE_EXCLUDED")
+    eligible = not reasons
+    return {"eligible": eligible, "reasons": reasons if eligible else [], "exclusions": reasons if not eligible else [], **classification}
 
 
 def _json_document(value: Any) -> Any:
@@ -1663,6 +1819,8 @@ class ResearchStore:
         materialized = _json_document(
             {
                 **decision_data,
+                **classify_decision_data(decision_data),
+                "cycle_status": decision_data.get("cycle_status", "SELECTED"),
                 "research_situation_id": str(situation_id) if situation_id else None,
                 "candidate_action_ids": [str(item) for item in candidate_ids],
                 "candidate_actions": persisted,
@@ -1735,6 +1893,86 @@ class ResearchStore:
                 else None
             ),
         }
+
+    def epistemic_reclassification(self, project_id: str | None = None) -> dict[str, Any]:
+        """Classify legacy decision records without changing scientific observations.
+
+        The operation is idempotent: an already equivalent v2.1 classification
+        produces no new event or object version.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            sql = (
+                "SELECT id,project_id,status,data FROM research_objects "
+                "WHERE kind='ResearchDecision'"
+            )
+            args: list[Any] = []
+            if project_id:
+                sql += " AND project_id=%s"
+                args.append(project_id)
+            sql += " ORDER BY created_at"
+            cur.execute(sql, args)
+            decisions = cur.fetchall()
+            cur.execute(
+                "SELECT project_id,data FROM research_objects "
+                "WHERE kind='ResearchDecisionOutcome'"
+                + (" AND project_id=%s" if project_id else ""),
+                args,
+            )
+            outcomes = cur.fetchall()
+            outcome_by_decision = {
+                str(item["data"].get("decision_id")): item for item in outcomes
+            }
+            counts: dict[str, int] = {role: 0 for role in DECISION_ROLES}
+            changed = 0
+            eligible = 0
+            closed = 0
+            for decision in decisions:
+                classification = classify_decision_data(decision["data"])
+                outcome = outcome_by_decision.get(str(decision["id"]))
+                if outcome:
+                    classification["cycle_status"] = "CLOSED"
+                    if classification["scientific_role"] not in {"NOT_SCIENTIFIC", "SYSTEM_SMOKE", "CONTRACT_TEST"}:
+                        classification["scientific_verification"] = "RESULT_INSPECTED"
+                eligibility = strategy_learning_eligibility(
+                    {"data": {**decision["data"], **classification}}, outcome
+                )
+                classification["strategy_learning_role"] = (
+                    "SCIENTIFIC_ACTION_OUTCOME"
+                    if eligibility["eligible"]
+                    else "EXCLUDE"
+                )
+                classification["epistemic_classification_version"] = "v2.1"
+                counts[classification["decision_role"]] += 1
+                eligible += int(eligibility["eligible"])
+                closed += int(classification["cycle_status"] == "CLOSED")
+                needs_update = any(
+                    decision["data"].get(key) != value for key, value in classification.items()
+                )
+                if not needs_update:
+                    continue
+                data = _json_document({**decision["data"], **classification})
+                cur.execute(
+                    "UPDATE research_objects SET data=%s WHERE id=%s",
+                    (json.dumps(data), decision["id"]),
+                )
+                self._event(
+                    cur,
+                    decision["project_id"],
+                    "EPISTEMIC_CLASSIFICATION_BACKFILLED",
+                    decision["id"],
+                    {"classification": classification, "strategy_learning_eligible": eligibility["eligible"]},
+                )
+                changed += 1
+            return {
+                "project_id": project_id,
+                "total_decisions": len(decisions),
+                "changed": changed,
+                "decision_roles": counts,
+                "strategy_learning_eligible": eligible,
+                "closed_cycles": closed,
+                "open_or_incomplete_cycles": len(decisions) - closed,
+                "idempotent": changed == 0,
+            }
 
     def decision_outcome_apply(
         self,
@@ -1881,6 +2119,8 @@ class ResearchStore:
             decision_data = _json_document(
                 {
                     **decision["data"],
+                    **classify_decision_data(decision["data"]),
+                    "cycle_status": "CLOSED",
                     "decision_outcome_id": str(outcome_id),
                     "actual_information_gain": outcome_data.get("realized_information_gain"),
                     "hindsight_assessment": outcome_data.get("hindsight_assessment"),
@@ -1900,6 +2140,38 @@ class ResearchStore:
             )
             related_outcomes = cur.fetchall()
 
+            # Only closed, prospective scientific cycles may contribute to
+            # production strategy memory. Operational recovery, smokes,
+            # contract tests, benchmarks, and incomplete outcomes remain
+            # durable evidence but have zero strategy weight.
+            decision_for_learning = {**decision, "data": decision_data}
+            current_outcome = {
+                "id": outcome_id,
+                "status": "RESULT_INSPECTED",
+                "data": materialized_outcome,
+            }
+            eligible_current = strategy_learning_eligibility(
+                decision_for_learning, current_outcome
+            )
+            related_decision_ids = [
+                str(item["data"].get("decision_id"))
+                for item in related_outcomes
+                if item["data"].get("decision_id")
+            ]
+            cur.execute(
+                "SELECT id,data FROM research_objects WHERE kind='ResearchDecision' "
+                "AND id=ANY(%s::uuid[])",
+                (related_decision_ids,),
+            )
+            decisions_by_id = {str(item["id"]): item for item in cur.fetchall()}
+            related_outcomes = [
+                item
+                for item in related_outcomes
+                if strategy_learning_eligibility(
+                    decisions_by_id.get(str(item["data"].get("decision_id")), {}), item
+                )["eligible"]
+            ]
+
             def cohort(scope_level: str) -> list[dict[str, Any]]:
                 if scope_level == "PROJECT":
                     return [
@@ -1917,8 +2189,9 @@ class ResearchStore:
 
             domain_rows = cohort("DOMAIN")
             global_rows = cohort("GLOBAL")
-            eligible_for_strategy = outcome_data.get("label") in (
-                positive_labels | negative_labels
+            eligible_for_strategy = (
+                eligible_current["eligible"]
+                and outcome_data.get("label") in (positive_labels | negative_labels)
             )
             scope_levels = ["PROJECT"] if eligible_for_strategy else []
             if eligible_for_strategy and len({str(item["project_id"]) for item in domain_rows}) >= 2:
@@ -2109,6 +2382,8 @@ class ResearchStore:
                     "decision_id": decision_id,
                     "label": outcome_data.get("label"),
                     "scope_level": scope_level,
+                    "eligible_for_learning": eligible_current["eligible"],
+                    "eligibility": eligible_current,
                 }
                 cur.execute(
                     "SELECT id,data FROM research_objects WHERE kind='StrategyOutcome' "
@@ -2156,7 +2431,7 @@ class ResearchStore:
                     }
                 )
 
-            if outcome_data.get("label") in negative_labels:
+            if eligible_current["eligible"] and outcome_data.get("label") in negative_labels:
                 for pattern_id in outcome_data.get("retrieved_strategy_pattern_ids", []):
                     cur.execute(
                         "SELECT id,project_id,status,data FROM research_objects "
@@ -2242,12 +2517,20 @@ class ResearchStore:
         inspection: dict[str, Any],
         agenda_status: str,
         actual_information_gain: str,
+        information_gain_basis: list[str] | None = None,
         causal_edge_id: str | None = None,
         causal_edge_status: str | None = None,
     ) -> dict:
         """Apply a complete scientific result assessment atomically."""
         self._validate_status(hypothesis_transition)
         self._validate_status(agenda_status)
+        if actual_information_gain not in {"HIGH", "MEDIUM", "LOW", "ZERO", "INVALID", "UNKNOWN"}:
+            raise GPUError("INVALID_INFORMATION_GAIN", actual_information_gain)
+        basis = list(information_gain_basis or [])
+        if actual_information_gain not in {"ZERO", "INVALID", "UNKNOWN"} and not basis:
+            basis = ["HYPOTHESIS_TRANSITION"] if hypothesis_transition != "INCONCLUSIVE" else []
+        if actual_information_gain not in {"ZERO", "INVALID", "UNKNOWN"} and not basis:
+            raise GPUError("INFORMATION_GAIN_BASIS_REQUIRED", "Provide what uncertainty or evidence changed")
         if causal_edge_status == "INTERVENTION_SUPPORTED":
             scope = evidence_data.get("scope")
             bounded_dimensions = (
@@ -2777,7 +3060,25 @@ class ResearchStore:
 
             decision_data = {
                 **decision["data"],
+                **classify_decision_data(decision["data"]),
+                "cycle_status": "CLOSED",
+                "scientific_verification": "RESULT_INSPECTED",
+                "scientific_result": {
+                    "status": "INSPECTED",
+                    "hypothesis_transition": hypothesis_transition,
+                    "prediction_outcome": evidence_data["prediction_outcome"],
+                    "guard_condition_outcome": evidence_data.get("guard_condition_outcome"),
+                },
+                "system_result": {
+                    "execution_success": run["status"] in {"completed", "RESULT_NOT_INSPECTED"},
+                    "run_status": run["status"],
+                },
+                "strategy_result": {
+                    "eligible_for_learning": False,
+                    "reason": "DecisionOutcome required for strategy learning eligibility",
+                },
                 "actual_information_gain": actual_information_gain,
+                "information_gain_basis": basis,
                 "outcome": {
                     "run_id": run_id,
                     "evidence_id": str(evidence_id),

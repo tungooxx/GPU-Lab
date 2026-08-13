@@ -81,6 +81,10 @@ def populated_store():
         "ResearchDecision",
         "SELECTED",
         {
+            "decision_role": "SCIENTIFIC_ACTION",
+            "scientific_role": "DIAGNOSTIC",
+            "learning_namespace": "PRODUCTION_SCIENCE",
+            "cycle_status": "CLOSED",
             "actual_information_gain": "HIGH",
             "dead_ideas_retrieved": ["dead"],
             "selected_action": {"action_type": "FROZEN_DIAGNOSTIC"},

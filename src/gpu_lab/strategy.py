@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from .errors import GPUError
 from .research import ResearchStore
+from .research import strategy_learning_eligibility as assess_strategy_learning_eligibility
 
 DECISION_OUTCOME_LABELS = {
     "HIGH_VALUE",
@@ -70,6 +71,7 @@ class DecisionOutcomeAssessment(BaseModel):
     uncertainties_resolved: list[str] = Field(default_factory=list)
     hypotheses_eliminated: list[str] = Field(default_factory=list)
     failure_conditions: list[str] = Field(default_factory=list)
+    information_gain_basis: list[str] = Field(default_factory=list, max_length=20)
 
     @model_validator(mode="after")
     def validate_labels(self) -> "DecisionOutcomeAssessment":
@@ -78,6 +80,15 @@ class DecisionOutcomeAssessment(BaseModel):
         if self.realized_information_gain not in REALIZED_INFORMATION_LABELS:
             raise ValueError(
                 f"Unsupported realized information label: {self.realized_information_gain}"
+            )
+        if self.realized_information_gain not in {"UNKNOWN", "ZERO", "INVALID"} and not (
+            self.information_gain_basis
+            or self.uncertainties_resolved
+            or self.hypotheses_eliminated
+            or self.evidence_family_ids
+        ):
+            raise ValueError(
+                "A non-zero information label requires an information-gain basis"
             )
         return self
 
@@ -101,6 +112,59 @@ class ResearchStrategyService:
 
     def __init__(self, store: ResearchStore):
         self.store = store
+
+    def strategy_learning_eligibility(self, decision_id: str) -> dict[str, Any]:
+        decision = self.store.object_get(decision_id)
+        if decision["kind"] != "ResearchDecision":
+            raise GPUError("NOT_A_RESEARCHDECISION", decision_id)
+        outcomes = self.store.objects_list(
+            str(decision["project_id"]),
+            "ResearchDecisionOutcome",
+            limit=None,
+            data_filters={"decision_id": str(decision_id)},
+        )
+        outcome = outcomes[0] if outcomes else None
+        return assess_strategy_learning_eligibility(decision, outcome)
+
+    def decision_epistemic_audit(self, decision_id: str) -> dict[str, Any]:
+        """Return a read-only epistemic contract audit for one decision."""
+        decision = self.store.object_get(decision_id)
+        if decision["kind"] != "ResearchDecision":
+            raise GPUError("NOT_A_RESEARCHDECISION", decision_id)
+        outcomes = self.store.objects_list(
+            str(decision["project_id"]),
+            "ResearchDecisionOutcome",
+            limit=None,
+            data_filters={"decision_id": str(decision_id)},
+        )
+        outcome = outcomes[0] if outcomes else None
+        eligibility = assess_strategy_learning_eligibility(decision, outcome)
+        data = decision.get("data", {})
+        selected = data.get("selected_action", {}) if isinstance(data.get("selected_action"), dict) else {}
+        comparisons = data.get("candidate_comparison", [])
+        critic = data.get("critics", [])
+        critic_text = json.dumps(critic, default=str).lower()
+        return {
+            "decision_id": str(decision_id),
+            "is_scientific": eligibility["decision_role"] == "SCIENTIFIC_ACTION"
+            and eligibility["scientific_role"] not in {"NOT_SCIENTIFIC", "SYSTEM_SMOKE", "CONTRACT_TEST"},
+            "decision_role": eligibility["decision_role"],
+            "scientific_role": eligibility["scientific_role"],
+            "execution_verification": eligibility["execution_verification"],
+            "scientific_verification": eligibility["scientific_verification"],
+            "cycle_status": eligibility["cycle_status"],
+            "strategy_learning_eligible": eligibility["eligible"],
+            "classification_reasons": eligibility.get("reasons", []),
+            "warnings": eligibility.get("exclusions", []),
+            "runner_up_compared": data.get("runner_up_candidate_index") is not None
+            or bool(data.get("runner_up_action_type")),
+            "hypotheses_distinguished": bool(selected.get("hypotheses_discriminated"))
+            or any(item.get("hypotheses_discriminated") for item in comparisons if isinstance(item, dict)),
+            "strong_null_considered": bool(data.get("strongest_null")) or "strongest_null" in critic_text,
+            "hindsight_present": bool(data.get("hindsight_assessment") or (outcome or {}).get("data", {}).get("hindsight_assessment")),
+            "realized_information_basis": (outcome or {}).get("data", {}).get("information_gain_basis", []),
+            "scope_present": bool((outcome or {}).get("data", {}).get("scope") or data.get("scope")),
+        }
 
     @staticmethod
     def _hash(value: Any) -> str:
@@ -195,6 +259,10 @@ class ResearchStrategyService:
             or (scope if isinstance(scope, str) and scope.strip() else None)
             or "UNSPECIFIED"
         )
+        # Scientific scope can be long provenance prose; ResearchSituation.domain
+        # is a bounded indexing label. Preserve the full scope on the agenda and
+        # experiment records, but never let it violate the situation schema.
+        inferred_domain = str(inferred_domain).strip()[:200] or "UNSPECIFIED"
         compute_costs = [
             float(item.get("score", {}).get("compute_cost", 0))
             for item in candidate_actions
@@ -221,7 +289,7 @@ class ResearchStrategyService:
             and float(item["data"].get("estimated_cost", 5)) <= 2
         ]
         structural = {
-            "domain": str(inferred_domain).strip(),
+            "domain": inferred_domain,
             "research_stage": research_stage,
             "phenomenon_type": agenda_item["data"].get(
                 "phenomenon_type", "UNSPECIFIED"
@@ -704,6 +772,9 @@ class ResearchStrategyService:
                     ),
                     "S_t_plus_1": situations_by_id.get(str(after_id)),
                     "policy_version": outcome["data"].get("policy_version"),
+                    "strategy_learning_eligibility": assess_strategy_learning_eligibility(
+                        decision, outcome
+                    ),
                 }
             )
         return {

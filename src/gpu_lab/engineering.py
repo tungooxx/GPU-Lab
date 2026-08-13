@@ -1,0 +1,160 @@
+"""Provider-neutral scientist-coder execution records.
+
+Engineering records document implementation work.  They deliberately cannot
+write hypothesis, claim, or causal-edge state; scientific interpretation stays
+inside the existing assessment services.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from .errors import GPUError
+
+TASK_TYPES = {
+    "REPOSITORY_INSPECTION", "BUG_REPRODUCTION", "BUG_FIX", "BASELINE_REPAIR",
+    "EXPERIMENT_INSTRUMENTATION", "SCIENTIFIC_INTERVENTION_IMPLEMENTATION",
+    "CONTROL_IMPLEMENTATION", "METRIC_IMPLEMENTATION", "DATA_PIPELINE_CHANGE",
+    "REPRODUCTION_IMPLEMENTATION", "EXPERIMENT_PROTOTYPE",
+    "REFACTOR_REQUIRED_FOR_EXPERIMENT",
+}
+TASK_STATUSES = {"OPEN", "ACTIVE", "BLOCKED", "COMPLETED", "INCONCLUSIVE"}
+VERIFICATIONS = {"UNVERIFIED", "PARTIALLY_VERIFIED", "VERIFIED_TARGETED",
+                 "VERIFIED_INTEGRATION", "VERIFIED_REAL_EXECUTION", "INVALID_IMPLEMENTATION"}
+
+
+def _list(value: Any, field: str) -> list[Any]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise GPUError("ENGINEERING_FIELD_INVALID", f"{field} must be a list")
+    return value
+
+
+class EngineeringService:
+    def __init__(self, store):
+        self.store = store
+
+    def task_create(self, project_id: str, purpose: str, task_type: str,
+                    change_request: str = "", repository: str = "",
+                    repository_root: str = "", base_commit: str | None = None,
+                    relevant_files: list[str] | None = None,
+                    relevant_symbols: list[str] | None = None,
+                    scientific_variable_changed: str | None = None,
+                    scientific_variables_held_fixed: list[str] | None = None,
+                    scientific_invariants: dict[str, Any] | None = None,
+                    engineering_invariants: dict[str, Any] | None = None,
+                    prohibited_changes: list[str] | None = None,
+                    acceptance_tests: list[str] | None = None,
+                    baseline_commands: list[str] | None = None,
+                    targeted_tests: list[str] | None = None,
+                    broader_tests: list[str] | None = None,
+                    expected_artifacts: list[str] | None = None,
+                    implementation_guards: list[dict[str, Any]] | None = None,
+                    research_decision_id: str | None = None,
+                    experiment_id: str | None = None) -> dict:
+        task_type = task_type.upper()
+        if task_type not in TASK_TYPES:
+            raise GPUError("ENGINEERING_TASK_TYPE_INVALID", task_type)
+        if not purpose.strip():
+            raise GPUError("ENGINEERING_PURPOSE_REQUIRED", "purpose is required")
+        invariants = scientific_invariants or {}
+        if not isinstance(invariants, dict):
+            raise GPUError("ENGINEERING_FIELD_INVALID", "scientific_invariants must be an object")
+        if "must_change" not in invariants and scientific_variable_changed:
+            invariants = {**invariants, "must_change": [scientific_variable_changed]}
+        data = {
+            "purpose": purpose.strip(), "task_type": task_type, "change_request": change_request,
+            "repository": repository, "repository_root": repository_root,
+            "base_commit": base_commit, "relevant_files": _list(relevant_files, "relevant_files"),
+            "relevant_symbols": _list(relevant_symbols, "relevant_symbols"),
+            "scientific_variable_changed": scientific_variable_changed,
+            "scientific_variables_held_fixed": _list(scientific_variables_held_fixed, "scientific_variables_held_fixed"),
+            "scientific_invariants": invariants,
+            "engineering_invariants": engineering_invariants or {},
+            "prohibited_changes": _list(prohibited_changes, "prohibited_changes"),
+            "acceptance_tests": _list(acceptance_tests, "acceptance_tests"),
+            "baseline_commands": _list(baseline_commands, "baseline_commands"),
+            "targeted_tests": _list(targeted_tests, "targeted_tests"),
+            "broader_tests": _list(broader_tests, "broader_tests"),
+            "expected_artifacts": _list(expected_artifacts, "expected_artifacts"),
+            "implementation_guards": _list(implementation_guards, "implementation_guards"),
+            "research_decision_id": research_decision_id, "experiment_id": experiment_id,
+            "scientific_result": "NOT_ASSESSED",
+        }
+        return self.store.object_create(project_id, "EngineeringTask", data, "ENGINEERING_TASK_CREATED", "OPEN")
+
+    def task_get(self, task_id: str) -> dict:
+        item = self.store.object_get(task_id)
+        if item["kind"] != "EngineeringTask":
+            raise GPUError("ENGINEERING_TASK_REQUIRED", task_id)
+        return item
+
+    def task_update(self, task_id: str, status: str, update: dict[str, Any] | None = None) -> dict:
+        status = status.upper()
+        if status not in TASK_STATUSES:
+            raise GPUError("ENGINEERING_TASK_STATUS_INVALID", status)
+        self.task_get(task_id)
+        return self.store.object_update(task_id, update or {}, status, "ENGINEERING_TASK_UPDATED")
+
+    def result_record(self, task_id: str, result: dict[str, Any]) -> dict:
+        task = self.task_get(task_id)
+        if not isinstance(result, dict):
+            raise GPUError("ENGINEERING_RESULT_INVALID", "result must be an object")
+        scientific_result = result.get("scientific_result", "NOT_ASSESSED")
+        if scientific_result != "NOT_ASSESSED":
+            raise GPUError("ENGINEERING_SCIENTIFIC_RESULT_FORBIDDEN", "Scientific assessment belongs to Research OS")
+        guard_fields = ("implementation_guard_results", "scientific_invariant_results")
+        guard_results = {field: _list(result.get(field), field) for field in guard_fields}
+        declared = task["data"].get("scientific_invariants", {})
+        required = set(declared.get("must_change", [])) | set(declared.get("held_fixed", []))
+        required |= set(task["data"].get("scientific_variables_held_fixed", []))
+        checked = {str(item.get("name")) for item in guard_results["scientific_invariant_results"] if isinstance(item, dict)}
+        missing = sorted(required - checked)
+        if missing:
+            raise GPUError("SCIENTIFIC_INVARIANT_GUARD_MISSING", ", ".join(missing))
+        failed = [field for field, items in guard_results.items() if any(item.get("passed") is not True for item in items if isinstance(item, dict))]
+        verification = result.get("implementation_verification", "UNVERIFIED")
+        if verification not in VERIFICATIONS:
+            raise GPUError("ENGINEERING_VERIFICATION_INVALID", str(verification))
+        if failed:
+            verification = "INVALID_IMPLEMENTATION"
+        stored = {**result, **guard_results, "implementation_verification": verification,
+                  "scientific_result": "NOT_ASSESSED", "engineering_task_id": task_id}
+        status = "INCONCLUSIVE" if verification == "INVALID_IMPLEMENTATION" else "COMPLETED"
+        record = self.store.object_create(task["project_id"], "EngineeringResult", stored,
+                                          "ENGINEERING_RESULT_RECORDED", status)
+        self.store.object_update(task_id, {"latest_result_id": record["id"], "implementation_verification": verification},
+                                 "BLOCKED" if verification == "INVALID_IMPLEMENTATION" else "COMPLETED",
+                                 "ENGINEERING_IMPLEMENTATION_INVALID" if verification == "INVALID_IMPLEMENTATION" else "ENGINEERING_VERIFIED")
+        return record
+
+    def result_get(self, result_id: str) -> dict:
+        item = self.store.object_get(result_id)
+        if item["kind"] != "EngineeringResult":
+            raise GPUError("ENGINEERING_RESULT_REQUIRED", result_id)
+        return item
+
+    def task_verify(self, task_id: str) -> dict:
+        task = self.task_get(task_id)
+        result_id = task["data"].get("latest_result_id")
+        if not result_id:
+            raise GPUError("ENGINEERING_RESULT_REQUIRED", "No EngineeringResult is recorded")
+        result = self.result_get(result_id)
+        verification = result["data"].get("implementation_verification", "UNVERIFIED")
+        return {"task_id": task_id, "result_id": result_id, "implementation_verification": verification,
+                "scientific_result": "NOT_ASSESSED", "ready_for_scientific_execution": verification in {
+                    "VERIFIED_TARGETED", "VERIFIED_INTEGRATION", "VERIFIED_REAL_EXECUTION"}}
+
+    def context_get(self, task_id: str) -> dict:
+        task = self.task_get(task_id)
+        data = task["data"]
+        return {"task_id": task["id"], "project_id": task["project_id"], "purpose": data["purpose"],
+                "repository": data["repository"], "repository_root": data["repository_root"],
+                "base_commit": data["base_commit"], "relevant_files": data["relevant_files"],
+                "scientific_variable_changed": data["scientific_variable_changed"],
+                "scientific_variables_held_fixed": data["scientific_variables_held_fixed"],
+                "scientific_invariants": data["scientific_invariants"],
+                "prohibited_changes": data["prohibited_changes"], "tests": {
+                    "acceptance": data["acceptance_tests"], "baseline": data["baseline_commands"],
+                    "targeted": data["targeted_tests"], "broader": data["broader_tests"]}}
