@@ -103,6 +103,21 @@ class EngineeringService:
     def __init__(self, store):
         self.store = store
 
+    def _validate_parent(self, project_id: str, identifier: str | None, kind: str, field: str) -> dict | None:
+        if identifier is None:
+            return None
+        try:
+            item = self.store.object_get(identifier)
+        except (KeyError, GPUError) as exc:
+            if isinstance(exc, GPUError):
+                raise
+            raise GPUError("RESEARCH_OBJECT_NOT_FOUND", identifier) from exc
+        if item.get("kind") != kind:
+            raise GPUError(f"ENGINEERING_{field.upper()}_KIND_INVALID", identifier)
+        if str(item.get("project_id")) != str(project_id):
+            raise GPUError("RESEARCH_PROJECT_MISMATCH", identifier)
+        return item
+
     def task_create(self, project_id: str, purpose: str, task_type: str,
                     change_request: str = "", repository: str = "",
                     repository_root: str = "", base_commit: str | None = None,
@@ -126,6 +141,12 @@ class EngineeringService:
             raise GPUError("ENGINEERING_TASK_TYPE_INVALID", task_type)
         if not purpose.strip():
             raise GPUError("ENGINEERING_PURPOSE_REQUIRED", "purpose is required")
+        decision = self._validate_parent(project_id, research_decision_id, "ResearchDecision", "research_decision")
+        experiment = self._validate_parent(project_id, experiment_id, "Experiment", "experiment")
+        if decision and experiment:
+            decision_experiment = decision.get("data", {}).get("experiment_id")
+            if decision_experiment and str(decision_experiment) != str(experiment_id):
+                raise GPUError("ENGINEERING_PARENT_EXPERIMENT_MISMATCH", experiment_id)
         invariants = scientific_invariants or {}
         if not isinstance(invariants, dict):
             raise GPUError("ENGINEERING_FIELD_INVALID", "scientific_invariants must be an object")

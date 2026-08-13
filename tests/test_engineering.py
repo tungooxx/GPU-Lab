@@ -72,6 +72,24 @@ def test_verified_implementation_is_not_scientific_evidence():
     assert "ENGINEERING_VERIFIED" in store.events
 
 
+def test_task_parent_links_are_project_and_kind_checked():
+    store = Store()
+    store.items.update({
+        "decision": {"id": "decision", "project_id": "project", "kind": "ResearchDecision", "data": {}},
+        "experiment": {"id": "experiment", "project_id": "project", "kind": "Experiment", "data": {}},
+        "other": {"id": "other", "project_id": "other-project", "kind": "Experiment", "data": {}},
+    })
+    service = EngineeringService(store)
+    task = service.task_create("project", "Linked implementation", "BUG_FIX", research_decision_id="decision", experiment_id="experiment")
+    assert task["data"]["research_decision_id"] == "decision"
+    with pytest.raises(GPUError) as mismatch:
+        service.task_create("project", "Wrong project", "BUG_FIX", experiment_id="other")
+    assert mismatch.value.error_type == "RESEARCH_PROJECT_MISMATCH"
+    with pytest.raises(GPUError) as wrong_kind:
+        service.task_create("project", "Wrong kind", "BUG_FIX", research_decision_id="experiment")
+    assert wrong_kind.value.error_type == "ENGINEERING_RESEARCH_DECISION_KIND_INVALID"
+
+
 def test_missing_or_failed_invariant_blocks_implementation_not_hypothesis():
     service = EngineeringService(Store())
     task = _task(service)

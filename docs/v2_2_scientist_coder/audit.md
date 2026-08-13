@@ -47,6 +47,8 @@ with the prior execution API.
   commands, tests, baseline, diff, guard, artifact, implementation-status, and
   unresolved-failure fields. Scientific statuses are rejected and the stored
   scientific result remains `NOT_ASSESSED`.
+- `VERIFIED_UNIT`: EngineeringTask parent IDs are validated for object kind,
+  project ownership, and decision-to-experiment consistency before persistence.
 - `VERIFIED_INTEGRATION`: MCP schema/import compatibility and existing execution
   control tests pass.
 - `IMPLEMENTED_UNVERIFIED`: no real scientific experiment has been routed
