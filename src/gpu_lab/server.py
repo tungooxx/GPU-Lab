@@ -836,6 +836,12 @@ async def engineering_task_get(task_id: str):
 
 
 @mcp.tool()
+async def engineering_task_start(task_id: str, inspection: dict[str, Any], baseline: dict[str, Any]):
+    """Record repository inspection and a passing baseline before implementation work."""
+    return await call(engineering().task_start, task_id, inspection, baseline)
+
+
+@mcp.tool()
 async def engineering_result_get(result_id: str):
     """Retrieve implementation evidence without treating it as scientific evidence."""
     return await call(engineering().result_get, result_id)

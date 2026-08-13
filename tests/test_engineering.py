@@ -28,13 +28,15 @@ class Store:
 
 
 def _task(service):
-    return service.task_create(
+    task = service.task_create(
         "project", "Implement frozen state substitution", "SCIENTIFIC_INTERVENTION_IMPLEMENTATION",
         scientific_variable_changed="anchor_state",
         scientific_variables_held_fixed=["seed", "checkpoint"],
         scientific_invariants={"must_change": ["anchor_state"], "held_fixed": ["seed", "checkpoint"]},
         implementation_guards=[{"name": "native-off"}],
     )
+    service.task_start(task["id"], {"files_read": ["src/model.py"]}, {"commands_run": ["pytest tests/test_model.py"], "passed": True})
+    return task
 
 
 def test_verified_implementation_is_not_scientific_evidence():
@@ -111,6 +113,29 @@ def test_unverified_task_cannot_be_handed_to_scientific_execution():
     assert blocked.value.error_type == "ENGINEERING_RESULT_REQUIRED"
 
 
+def test_task_start_requires_inspection_and_passing_baseline():
+    service = EngineeringService(Store())
+    task = service.task_create("project", "Inspect", "REPOSITORY_INSPECTION")
+    with pytest.raises(GPUError) as no_files:
+        service.task_start(task["id"], {}, {"commands_run": ["pytest"], "passed": True})
+    assert no_files.value.error_type == "ENGINEERING_INSPECTION_REQUIRED"
+    blocked = service.task_start(
+        task["id"], {"files_read": ["src/model.py"]}, {"commands_run": ["pytest"], "passed": False}
+    )
+    assert blocked["status"] == "BLOCKED"
+    assert service.task_get(task["id"])["data"]["baseline_verified"] is False
+
+
+def test_result_requires_task_start_evidence():
+    service = EngineeringService(Store())
+    task = service.task_create(
+        "project", "Implement", "BUG_FIX", implementation_guards=[{"name": "smoke"}]
+    )
+    with pytest.raises(GPUError) as blocked:
+        service.result_record(task["id"], {"implementation_guard_results": [{"name": "smoke", "passed": True}]})
+    assert blocked.value.error_type == "ENGINEERING_INSPECTION_REQUIRED"
+
+
 def test_measurement_guards_detect_native_regression_noop_and_held_fixed_drift():
     service = EngineeringService(Store())
     task = service.task_create(
@@ -122,6 +147,7 @@ def test_measurement_guards_detect_native_regression_noop_and_held_fixed_drift()
             {"name": "seed-fixed", "type": "HELD_FIXED", "tolerance": 0.0},
         ],
     )
+    service.task_start(task["id"], {"files_read": ["src/model.py"]}, {"commands_run": ["pytest"], "passed": True})
     result = service.result_record(task["id"], {
         "implementation_verification": "VERIFIED_REAL_EXECUTION",
         "guard_measurements": [
@@ -146,6 +172,7 @@ def test_measurement_guard_requires_before_and_after_values():
         "project", "Check native path", "EXPERIMENT_INSTRUMENTATION",
         implementation_guards=[{"name": "native-off", "type": "NATIVE_OFF"}],
     )
+    service.task_start(task["id"], {"files_read": ["src/model.py"]}, {"commands_run": ["pytest"], "passed": True})
     with pytest.raises(GPUError) as invalid:
         service.result_record(task["id"], {"guard_measurements": [{"name": "native-off", "before": 0.0}]})
     assert invalid.value.error_type == "ENGINEERING_GUARD_MEASUREMENT_INVALID"

@@ -32,6 +32,9 @@ with the prior execution API.
 - `VERIFIED_UNIT`: measurement guards independently test native-off equivalence,
   intervention-on target change, and held-fixed equality; a no-op or drift is
   persisted as `INVALID_IMPLEMENTATION`, not a scientific result.
+- `VERIFIED_UNIT`: `engineering_task_start` requires recorded repository
+  inspection and a passing baseline before an EngineeringResult can be saved;
+  failed baselines block implementation without changing scientific state.
 - `VERIFIED_INTEGRATION`: MCP schema/import compatibility and existing execution
   control tests pass.
 - `IMPLEMENTED_UNVERIFIED`: no real scientific experiment has been routed

@@ -146,6 +146,45 @@ class EngineeringService:
             raise GPUError("ENGINEERING_TASK_REQUIRED", task_id)
         return item
 
+    def task_start(self, task_id: str, inspection: dict[str, Any], baseline: dict[str, Any]) -> dict:
+        """Record bounded repository inspection and baseline evidence before editing."""
+        task = self.task_get(task_id)
+        if task["status"] not in {"OPEN", "ACTIVE"}:
+            raise GPUError("ENGINEERING_TASK_NOT_STARTABLE", task["status"])
+        if not isinstance(inspection, dict) or not isinstance(baseline, dict):
+            raise GPUError("ENGINEERING_START_INVALID", "inspection and baseline must be objects")
+        files_read = _list(inspection.get("files_read"), "files_read")
+        if not files_read:
+            raise GPUError("ENGINEERING_INSPECTION_REQUIRED", "At least one repository file must be recorded")
+        commands = _list(baseline.get("commands_run"), "commands_run")
+        if not commands:
+            raise GPUError("ENGINEERING_BASELINE_REQUIRED", "At least one baseline command must be recorded")
+        passed = baseline.get("passed")
+        if not isinstance(passed, bool):
+            raise GPUError("ENGINEERING_BASELINE_INVALID", "baseline.passed must be boolean")
+        evidence = {
+            "inspection": {
+                "files_read": files_read[:200],
+                "symbols_checked": _list(inspection.get("symbols_checked"), "symbols_checked")[:200],
+                "relevant_callers": _list(inspection.get("relevant_callers"), "relevant_callers")[:100],
+                "notes": str(inspection.get("notes", ""))[:4000],
+            },
+            "baseline": {
+                "commands_run": [str(command)[:1000] for command in commands[:100]],
+                "passed": passed,
+                "summary": str(baseline.get("summary", ""))[:4000],
+                "artifacts": _list(baseline.get("artifacts"), "artifacts")[:100],
+            },
+        }
+        if not passed:
+            return self.store.object_update(
+                task_id, {**evidence, "baseline_verified": False}, "BLOCKED", "BASELINE_FAILED"
+            )
+        return self.store.object_update(
+            task_id, {**evidence, "inspection_completed": True, "baseline_verified": True},
+            "ACTIVE", "BASELINE_VERIFIED"
+        )
+
     def task_update(self, task_id: str, status: str, update: dict[str, Any] | None = None) -> dict:
         status = status.upper()
         if status not in TASK_STATUSES:
@@ -160,6 +199,10 @@ class EngineeringService:
         scientific_result = result.get("scientific_result", "NOT_ASSESSED")
         if scientific_result != "NOT_ASSESSED":
             raise GPUError("ENGINEERING_SCIENTIFIC_RESULT_FORBIDDEN", "Scientific assessment belongs to Research OS")
+        if task["data"].get("inspection_completed") is not True:
+            raise GPUError("ENGINEERING_INSPECTION_REQUIRED", "Start the task with repository inspection first")
+        if task["data"].get("baseline_verified") is not True:
+            raise GPUError("ENGINEERING_BASELINE_REQUIRED", "A passing baseline is required before implementation")
         guard_fields = ("implementation_guard_results", "scientific_invariant_results")
         guard_results = {field: _list(result.get(field), field) for field in guard_fields}
         declared_guards = task["data"].get("implementation_guards", [])
