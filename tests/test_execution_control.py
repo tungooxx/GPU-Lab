@@ -122,6 +122,16 @@ class LegacyAbandonBrain:
         return {"id": args[0], "status": "cancelled"}
 
 
+class DecisionReservedResearch(LegacyReservedResearch):
+    def object_get(self, _run_id):
+        return {
+            "id": "run-id",
+            "kind": "ExperimentRun",
+            "status": "RESERVED",
+            "data": {"job_id": "missing-job", "decision_id": "decision-id"},
+        }
+
+
 def _mapping(status):
     return {
         "experiment_id": "experiment-id",
@@ -274,3 +284,21 @@ async def test_legacy_reserved_run_abandon_allows_only_verified_abandonment_repl
 
     assert result["status"] == "cancelled"
     assert brain.args == ("run-id", "missing-job", "No local job was submitted")
+
+
+@pytest.mark.asyncio
+async def test_technical_abandonment_explicitly_allows_pre_submit_decision(monkeypatch):
+    brain = LegacyAbandonBrain()
+    monkeypatch.setattr(server.settings, "gpu_lab_enable_local_runner", True)
+    monkeypatch.setattr(server, "research", lambda: DecisionReservedResearch())
+    monkeypatch.setattr(server, "brain", lambda: brain)
+    monkeypatch.setattr(server, "local", MissingLocal())
+
+    result = await server.legacy_reserved_run_abandon(
+        "run-id", "Invalid environment name before job submission", technical_non_scientific=True
+    )
+
+    assert result["status"] == "cancelled"
+    assert brain.args == (
+        "run-id", "missing-job", "Invalid environment name before job submission", True
+    )

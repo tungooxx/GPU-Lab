@@ -460,6 +460,26 @@ def test_legacy_reserved_run_abandon_preserves_pre_decision_provenance():
     )
 
 
+def test_technical_abandonment_preserves_existing_research_decision_without_evidence():
+    store = LegacyAbandonStore()
+    store.objects["decision"] = {
+        "id": "decision", "project_id": "project", "kind": "ResearchDecision",
+        "status": "APPROVED", "data": {},
+    }
+    store.objects["run"]["data"]["decision_id"] = "decision"
+
+    ResearchBrain(store).legacy_reserved_run_abandon(
+        "run", "missing-job", "Invalid environment name before submit", technical_non_scientific=True
+    )
+
+    assert store.abandon_args[3] == {
+        "pre_research_decision": False,
+        "technical_non_scientific": True,
+        "original_decision_id": "decision",
+        "original_decision_kind": "ResearchDecision",
+    }
+
+
 def test_legacy_abandonment_replay_allows_reconstructed_decision():
     store = LegacyAbandonStore()
     store.objects["run"]["status"] = "cancelled"

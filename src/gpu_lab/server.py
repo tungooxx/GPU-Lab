@@ -1250,8 +1250,15 @@ async def legacy_run_provenance_repair(run_id: str, agenda_item_id: str, rationa
 
 
 @mcp.tool()
-async def legacy_reserved_run_abandon(run_id: str, rationale: str):
-    """Cancel one unsubmitted legacy reservation only after verifying its local job is absent."""
+async def legacy_reserved_run_abandon(
+    run_id: str, rationale: str, technical_non_scientific: bool = False
+):
+    """Cancel an unsubmitted reservation only after verifying its local job is absent.
+
+    A linked ResearchDecision requires explicit technical_non_scientific=true.
+    The resulting cancellation is operational bookkeeping, never evidence.
+    The flag is intentionally not inferred from the error text.
+    """
     run = await call(research().object_get, run_id)
     if "error" in run:
         return run
@@ -1277,7 +1284,8 @@ async def legacy_reserved_run_abandon(run_id: str, rationale: str):
                 "message": "The local job exists or could not be verified absent",
             }
         }
-    return await call(brain().legacy_reserved_run_abandon, run_id, job_id, rationale)
+    abandon_args = (run_id, job_id, rationale, technical_non_scientific) if technical_non_scientific else (run_id, job_id, rationale)
+    return await call(brain().legacy_reserved_run_abandon, *abandon_args)
 
 
 @mcp.tool()

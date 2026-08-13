@@ -797,8 +797,10 @@ class ResearchBrain:
         )
         return {"run": repaired_run, "decision": decision, "idempotent_replay": False}
 
-    def legacy_reserved_run_abandon(self, run_id: str, job_id: str, rationale: str) -> dict:
-        """Cancel an unsubmitted pre-decision reservation without creating execution evidence."""
+    def legacy_reserved_run_abandon(
+        self, run_id: str, job_id: str, rationale: str, technical_non_scientific: bool = False
+    ) -> dict:
+        """Cancel a server-verified unsubmitted reservation without execution evidence."""
         run = self._expect(run_id, "ExperimentRun")
         is_abandoned_replay = (
             run["status"] == "cancelled"
@@ -820,17 +822,24 @@ class ResearchBrain:
                     raise
             else:
                 decision_kind = decision["kind"]
-                if decision_kind == "ResearchDecision" and not is_abandoned_replay:
+                if (
+                    decision_kind == "ResearchDecision"
+                    and not technical_non_scientific
+                    and not is_abandoned_replay
+                ):
                     raise GPUError("LEGACY_RUN_HAS_RESEARCH_DECISION", str(decision_id))
+        provenance = {
+            "pre_research_decision": decision_kind != "ResearchDecision",
+            "original_decision_id": str(decision_id) if decision_id else None,
+            "original_decision_kind": decision_kind,
+        }
+        if technical_non_scientific:
+            provenance["technical_non_scientific"] = True
         return self.store.legacy_reserved_run_abandon(
             run_id,
             job_id,
             rationale.strip(),
-            {
-                "pre_research_decision": decision_kind != "ResearchDecision",
-                "original_decision_id": str(decision_id) if decision_id else None,
-                "original_decision_kind": decision_kind,
-            },
+            provenance,
         )
 
     def execution_decision_bind(
