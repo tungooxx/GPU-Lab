@@ -1218,6 +1218,32 @@ async def brain_decision_approve(decision_id: str, approver: str, rationale: str
 
 
 @mcp.tool()
+async def execution_decision_bind(
+    experiment_id: str,
+    decision_id: str,
+    command: str,
+    working_directory: str = ".",
+    env: dict[str, str] | None = None,
+    python_env: str | None = None,
+):
+    """Bind a compatible ResearchDecision to the exact executable request.
+
+    This is safe to use for a RESERVED run whose backing local job is absent:
+    it changes only decision provenance, and the caller must still retry the
+    canonical execution with its original execution_attempt_uuid.
+    """
+    fingerprint = _execution_action_fingerprint(
+        experiment_id, command, working_directory, env, python_env
+    )
+    return await call(
+        brain().execution_decision_bind,
+        experiment_id,
+        decision_id,
+        fingerprint,
+    )
+
+
+@mcp.tool()
 async def legacy_run_provenance_repair(run_id: str, agenda_item_id: str, rationale: str):
     """Reconstruct inspect-only decision provenance for one completed legacy ExperimentRun."""
     return await call(brain().legacy_run_provenance_repair, run_id, agenda_item_id, rationale)

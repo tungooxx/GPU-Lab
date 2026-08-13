@@ -81,6 +81,15 @@ class AuthorizingBrain:
         return {"authorized": True}
 
 
+class BindingBrain:
+    def __init__(self):
+        self.args = None
+
+    def execution_decision_bind(self, *args):
+        self.args = args
+        return {"id": args[1], "data": {"execution_binding": {"experiment_id": args[0]}}}
+
+
 class LegacyReservedResearch:
     def object_get(self, _run_id):
         return {
@@ -143,6 +152,23 @@ async def test_sync_returns_reserved_mapping_without_missing_job_exception(monke
     assert result["retry_safe"] is True
     assert result["recovery_action"] == "RETRY_EXECUTION"
     assert research.updates == []
+
+
+@pytest.mark.asyncio
+async def test_execution_decision_bind_exposes_exact_request_fingerprint(monkeypatch):
+    brain = BindingBrain()
+    monkeypatch.setattr(server, "brain", lambda: brain)
+
+    result = await server.execution_decision_bind(
+        "experiment-id", "decision-id", "python run.py", "/workspace", {"MODE": "test"}, "torch-env"
+    )
+
+    assert result["id"] == "decision-id"
+    assert brain.args[:2] == ("experiment-id", "decision-id")
+    assert len(brain.args[2]) == 64
+    assert brain.args[2] == server._execution_action_fingerprint(
+        "experiment-id", "python run.py", "/workspace", {"MODE": "test"}, "torch-env"
+    )
 
 
 @pytest.mark.asyncio
