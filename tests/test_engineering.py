@@ -111,6 +111,46 @@ def test_unverified_task_cannot_be_handed_to_scientific_execution():
     assert blocked.value.error_type == "ENGINEERING_RESULT_REQUIRED"
 
 
+def test_measurement_guards_detect_native_regression_noop_and_held_fixed_drift():
+    service = EngineeringService(Store())
+    task = service.task_create(
+        "project", "Frozen intervention", "SCIENTIFIC_INTERVENTION_IMPLEMENTATION",
+        scientific_invariants={"must_change": ["target"], "held_fixed": ["seed"]},
+        implementation_guards=[
+            {"name": "native-off", "type": "NATIVE_OFF", "tolerance": 0.0},
+            {"name": "target-on", "type": "TARGET_CHANGED", "minimum_delta": 0.01},
+            {"name": "seed-fixed", "type": "HELD_FIXED", "tolerance": 0.0},
+        ],
+    )
+    result = service.result_record(task["id"], {
+        "implementation_verification": "VERIFIED_REAL_EXECUTION",
+        "guard_measurements": [
+            {"name": "native-off", "before": 1.0, "after": 1.0},
+            {"name": "target-on", "before": 0.0, "after": 0.0},
+            {"name": "seed-fixed", "before": "a", "after": "b"},
+        ],
+        "scientific_invariant_results": [
+            {"name": "target", "passed": True}, {"name": "seed", "passed": False},
+        ],
+    })
+    guards = result["data"]["implementation_guard_results"]
+    assert guards[0]["passed"] is True
+    assert guards[1]["passed"] is False  # A no-op intervention is invalid.
+    assert guards[2]["passed"] is False
+    assert result["data"]["implementation_verification"] == "INVALID_IMPLEMENTATION"
+
+
+def test_measurement_guard_requires_before_and_after_values():
+    service = EngineeringService(Store())
+    task = service.task_create(
+        "project", "Check native path", "EXPERIMENT_INSTRUMENTATION",
+        implementation_guards=[{"name": "native-off", "type": "NATIVE_OFF"}],
+    )
+    with pytest.raises(GPUError) as invalid:
+        service.result_record(task["id"], {"guard_measurements": [{"name": "native-off", "before": 0.0}]})
+    assert invalid.value.error_type == "ENGINEERING_GUARD_MEASUREMENT_INVALID"
+
+
 def test_context_is_compact_and_preserves_frozen_invariants():
     service = EngineeringService(Store())
     task = _task(service)

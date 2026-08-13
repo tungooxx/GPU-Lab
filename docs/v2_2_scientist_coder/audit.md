@@ -29,6 +29,9 @@ with the prior execution API.
 ## Verification status
 
 - `VERIFIED_UNIT`: engineering lifecycle and fail-closed guard regressions pass.
+- `VERIFIED_UNIT`: measurement guards independently test native-off equivalence,
+  intervention-on target change, and held-fixed equality; a no-op or drift is
+  persisted as `INVALID_IMPLEMENTATION`, not a scientific result.
 - `VERIFIED_INTEGRATION`: MCP schema/import compatibility and existing execution
   control tests pass.
 - `IMPLEMENTED_UNVERIFIED`: no real scientific experiment has been routed

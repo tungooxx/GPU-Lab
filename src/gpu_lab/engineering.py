@@ -23,6 +23,62 @@ VERIFICATIONS = {"UNVERIFIED", "PARTIALLY_VERIFIED", "VERIFIED_TARGETED",
                  "VERIFIED_INTEGRATION", "VERIFIED_REAL_EXECUTION", "INVALID_IMPLEMENTATION"}
 
 
+def _numeric_delta(before: Any, after: Any) -> float | None:
+    if isinstance(before, (int, float)) and isinstance(after, (int, float)):
+        return abs(float(after) - float(before))
+    return None
+
+
+def evaluate_guard_measurements(
+    declarations: list[dict[str, Any]], measurements: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Evaluate machine-readable guard measurements without interpreting science."""
+    by_name = {
+        str(item.get("name")): item for item in measurements
+        if isinstance(item, dict) and item.get("name")
+    }
+    evaluated: list[dict[str, Any]] = []
+    for declaration in declarations:
+        if not isinstance(declaration, dict) or not declaration.get("name"):
+            raise GPUError("ENGINEERING_GUARD_DECLARATION_INVALID", "Each guard needs a name")
+        name = str(declaration["name"])
+        kind = str(declaration.get("type", "BOOLEAN")).upper()
+        observed = by_name.get(name)
+        if observed is None:
+            raise GPUError("ENGINEERING_GUARD_MEASUREMENT_MISSING", name)
+        if kind == "BOOLEAN":
+            if not isinstance(observed.get("passed"), bool):
+                raise GPUError("ENGINEERING_GUARD_RESULT_INVALID", name)
+            passed = observed["passed"]
+        else:
+            if "before" not in observed or "after" not in observed:
+                raise GPUError("ENGINEERING_GUARD_MEASUREMENT_INVALID", name)
+            before, after = observed["before"], observed["after"]
+            delta = _numeric_delta(before, after)
+            tolerance = float(declaration.get("tolerance", 0.0))
+            minimum_delta = float(declaration.get("minimum_delta", 0.0))
+            if kind in {"EQUAL", "NATIVE_OFF", "HELD_FIXED"}:
+                if delta is not None:
+                    passed = delta <= tolerance
+                else:
+                    passed = before == after
+            elif kind in {"CHANGED", "TARGET_CHANGED", "DIFFERENT"}:
+                if delta is not None:
+                    passed = delta > minimum_delta
+                else:
+                    passed = before != after
+            elif kind == "CHECKSUM_EQUAL":
+                passed = before == after
+            elif kind == "CHECKSUM_DIFFERENT":
+                passed = before != after
+            else:
+                raise GPUError("ENGINEERING_GUARD_TYPE_INVALID", kind)
+            observed = {**observed, "delta": delta, "tolerance": tolerance,
+                        "minimum_delta": minimum_delta}
+        evaluated.append({**observed, "name": name, "type": kind, "passed": bool(passed)})
+    return evaluated
+
+
 def _list(value: Any, field: str) -> list[Any]:
     if value is None:
         return []
@@ -110,6 +166,12 @@ class EngineeringService:
         declared_guard_names = {
             str(item.get("name")) for item in declared_guards if isinstance(item, dict) and item.get("name")
         }
+        measurements = result.get("guard_measurements")
+        if measurements is not None:
+            measurements = _list(measurements, "guard_measurements")
+            guard_results["implementation_guard_results"] = evaluate_guard_measurements(
+                declared_guards, measurements
+            )
         supplied_guard_names = {
             str(item.get("name")) for item in guard_results["implementation_guard_results"]
             if isinstance(item, dict) and item.get("name")
