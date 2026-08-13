@@ -21,6 +21,11 @@ TASK_TYPES = {
 TASK_STATUSES = {"OPEN", "ACTIVE", "BLOCKED", "COMPLETED", "INCONCLUSIVE"}
 VERIFICATIONS = {"UNVERIFIED", "PARTIALLY_VERIFIED", "VERIFIED_TARGETED",
                  "VERIFIED_INTEGRATION", "VERIFIED_REAL_EXECUTION", "INVALID_IMPLEMENTATION"}
+_FROZEN_TASK_FIELDS = {
+    "research_decision_id", "experiment_id", "scientific_variable_changed",
+    "scientific_variables_held_fixed", "scientific_invariants", "engineering_invariants",
+    "prohibited_changes", "implementation_guards", "base_commit",
+}
 
 
 def _numeric_delta(before: Any, after: Any) -> float | None:
@@ -190,7 +195,44 @@ class EngineeringService:
         if status not in TASK_STATUSES:
             raise GPUError("ENGINEERING_TASK_STATUS_INVALID", status)
         self.task_get(task_id)
-        return self.store.object_update(task_id, update or {}, status, "ENGINEERING_TASK_UPDATED")
+        update = update or {}
+        if not isinstance(update, dict):
+            raise GPUError("ENGINEERING_FIELD_INVALID", "update must be an object")
+        protected = sorted(_FROZEN_TASK_FIELDS & set(update))
+        if protected:
+            raise GPUError("SCIENTIFIC_DESIGN_CHANGE_REQUIRED", ", ".join(protected))
+        return self.store.object_update(task_id, update, status, "ENGINEERING_TASK_UPDATED")
+
+    def diff_review(self, task_id: str, review: dict[str, Any]) -> dict:
+        """Persist a bounded review of the implementation diff before handoff."""
+        task = self.task_get(task_id)
+        if task["data"].get("baseline_verified") is not True:
+            raise GPUError("ENGINEERING_BASELINE_REQUIRED", "A passing baseline is required first")
+        if not isinstance(review, dict):
+            raise GPUError("ENGINEERING_DIFF_REVIEW_INVALID", "review must be an object")
+        required = ("files_changed", "diff_summary", "unrelated_changes", "scientific_variable_drift")
+        if any(field not in review for field in required):
+            raise GPUError("ENGINEERING_DIFF_REVIEW_INVALID", "Missing required review fields")
+        files_changed = _list(review["files_changed"], "files_changed")
+        unrelated = review["unrelated_changes"]
+        drift = review["scientific_variable_drift"]
+        if not isinstance(unrelated, bool) or not isinstance(drift, bool):
+            raise GPUError("ENGINEERING_DIFF_REVIEW_INVALID", "Review flags must be boolean")
+        passed = not unrelated and not drift
+        payload = {
+            "diff_review": {
+                "files_changed": [str(item)[:1000] for item in files_changed[:500]],
+                "diff_summary": str(review["diff_summary"])[:8000],
+                "unrelated_changes": unrelated,
+                "scientific_variable_drift": drift,
+                "prohibited_changes_detected": _list(review.get("prohibited_changes_detected"), "prohibited_changes_detected")[:100],
+                "passed": passed,
+            }
+        }
+        return self.store.object_update(
+            task_id, payload, "ACTIVE" if passed else "BLOCKED",
+            "ENGINEERING_DIFF_REVIEWED" if passed else "SCIENTIFIC_INVARIANT_VIOLATION",
+        )
 
     def result_record(self, task_id: str, result: dict[str, Any]) -> dict:
         task = self.task_get(task_id)
@@ -203,6 +245,8 @@ class EngineeringService:
             raise GPUError("ENGINEERING_INSPECTION_REQUIRED", "Start the task with repository inspection first")
         if task["data"].get("baseline_verified") is not True:
             raise GPUError("ENGINEERING_BASELINE_REQUIRED", "A passing baseline is required before implementation")
+        if task["data"].get("diff_review", {}).get("passed") is not True:
+            raise GPUError("ENGINEERING_DIFF_REVIEW_REQUIRED", "A passing diff review is required before completion")
         guard_fields = ("implementation_guard_results", "scientific_invariant_results")
         guard_results = {field: _list(result.get(field), field) for field in guard_fields}
         declared_guards = task["data"].get("implementation_guards", [])

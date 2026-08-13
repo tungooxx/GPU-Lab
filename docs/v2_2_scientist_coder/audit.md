@@ -35,6 +35,9 @@ with the prior execution API.
 - `VERIFIED_UNIT`: `engineering_task_start` requires recorded repository
   inspection and a passing baseline before an EngineeringResult can be saved;
   failed baselines block implementation without changing scientific state.
+- `VERIFIED_UNIT`: `engineering_diff_review` records changed files and rejects
+  unrelated changes or scientific-variable drift; frozen task fields cannot be
+  edited through the generic update operation.
 - `VERIFIED_INTEGRATION`: MCP schema/import compatibility and existing execution
   control tests pass.
 - `IMPLEMENTED_UNVERIFIED`: no real scientific experiment has been routed

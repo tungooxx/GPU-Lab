@@ -36,6 +36,10 @@ def _task(service):
         implementation_guards=[{"name": "native-off"}],
     )
     service.task_start(task["id"], {"files_read": ["src/model.py"]}, {"commands_run": ["pytest tests/test_model.py"], "passed": True})
+    service.diff_review(task["id"], {
+        "files_changed": ["src/model.py"], "diff_summary": "Scoped intervention hook.",
+        "unrelated_changes": False, "scientific_variable_drift": False,
+    })
     return task
 
 
@@ -136,6 +140,23 @@ def test_result_requires_task_start_evidence():
     assert blocked.value.error_type == "ENGINEERING_INSPECTION_REQUIRED"
 
 
+def test_result_requires_passing_diff_review_and_protects_frozen_design():
+    service = EngineeringService(Store())
+    task = service.task_create("project", "Implement", "BUG_FIX", implementation_guards=[{"name": "smoke"}])
+    service.task_start(task["id"], {"files_read": ["src/x.py"]}, {"commands_run": ["pytest"], "passed": True})
+    with pytest.raises(GPUError) as no_review:
+        service.result_record(task["id"], {"implementation_guard_results": [{"name": "smoke", "passed": True}]})
+    assert no_review.value.error_type == "ENGINEERING_DIFF_REVIEW_REQUIRED"
+    with pytest.raises(GPUError) as frozen:
+        service.task_update(task["id"], "ACTIVE", {"scientific_invariants": {"must_change": ["other"]}})
+    assert frozen.value.error_type == "SCIENTIFIC_DESIGN_CHANGE_REQUIRED"
+    review = service.diff_review(task["id"], {
+        "files_changed": ["src/x.py"], "diff_summary": "Changed wrong state too.",
+        "unrelated_changes": False, "scientific_variable_drift": True,
+    })
+    assert review["status"] == "BLOCKED"
+
+
 def test_measurement_guards_detect_native_regression_noop_and_held_fixed_drift():
     service = EngineeringService(Store())
     task = service.task_create(
@@ -148,6 +169,7 @@ def test_measurement_guards_detect_native_regression_noop_and_held_fixed_drift()
         ],
     )
     service.task_start(task["id"], {"files_read": ["src/model.py"]}, {"commands_run": ["pytest"], "passed": True})
+    service.diff_review(task["id"], {"files_changed": ["src/model.py"], "diff_summary": "Scoped hook.", "unrelated_changes": False, "scientific_variable_drift": False})
     result = service.result_record(task["id"], {
         "implementation_verification": "VERIFIED_REAL_EXECUTION",
         "guard_measurements": [
@@ -173,6 +195,7 @@ def test_measurement_guard_requires_before_and_after_values():
         implementation_guards=[{"name": "native-off", "type": "NATIVE_OFF"}],
     )
     service.task_start(task["id"], {"files_read": ["src/model.py"]}, {"commands_run": ["pytest"], "passed": True})
+    service.diff_review(task["id"], {"files_changed": ["src/model.py"], "diff_summary": "Guard path.", "unrelated_changes": False, "scientific_variable_drift": False})
     with pytest.raises(GPUError) as invalid:
         service.result_record(task["id"], {"guard_measurements": [{"name": "native-off", "before": 0.0}]})
     assert invalid.value.error_type == "ENGINEERING_GUARD_MEASUREMENT_INVALID"

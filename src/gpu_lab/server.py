@@ -866,6 +866,12 @@ async def engineering_task_update(task_id: str, status: str, update: dict[str, A
 
 
 @mcp.tool()
+async def engineering_diff_review(task_id: str, review: dict[str, Any]):
+    """Persist a diff review and block material scientific design drift."""
+    return await call(engineering().diff_review, task_id, review)
+
+
+@mcp.tool()
 async def engineering_result_record(task_id: str, result: dict[str, Any]):
     """Record implementation evidence; scientific_result is always NOT_ASSESSED."""
     return await call(engineering().result_record, task_id, result)
