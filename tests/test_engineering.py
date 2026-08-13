@@ -50,6 +50,11 @@ def test_verified_implementation_is_not_scientific_evidence():
 
     result = service.result_record(task["id"], {
         "implementation_verification": "VERIFIED_REAL_EXECUTION",
+        "resulting_commit_or_diff_identity": "abc123",
+        "commands_run": ["pytest tests/test_model.py"],
+        "tests_run": ["tests/test_model.py"],
+        "tests_passed": ["tests/test_model.py"],
+        "artifacts": [{"path": "artifacts/native-off.json"}],
         "scientific_invariant_results": [
             {"name": "anchor_state", "passed": True}, {"name": "seed", "passed": True},
             {"name": "checkpoint", "passed": True},
@@ -58,6 +63,11 @@ def test_verified_implementation_is_not_scientific_evidence():
     })
 
     assert result["data"]["scientific_result"] == "NOT_ASSESSED"
+    assert result["data"]["files_read"] == ["src/model.py"]
+    assert result["data"]["files_changed"] == ["src/model.py"]
+    assert result["data"]["baseline_result"]["passed"] is True
+    assert result["data"]["resulting_commit_or_diff_identity"] == "abc123"
+    assert result["data"]["engineering_status"] == "COMPLETED"
     assert store.items[task["id"]]["status"] == "COMPLETED"
     assert "ENGINEERING_VERIFIED" in store.events
 
@@ -87,6 +97,21 @@ def test_engineering_result_cannot_assess_scientific_truth():
     with pytest.raises(GPUError) as forbidden:
         service.result_record(task["id"], {"scientific_result": "SUPPORTED"})
     assert forbidden.value.error_type == "ENGINEERING_SCIENTIFIC_RESULT_FORBIDDEN"
+
+
+def test_result_rejects_unknown_engineering_status():
+    service = EngineeringService(Store())
+    task = _task(service)
+    with pytest.raises(GPUError) as invalid:
+        service.result_record(task["id"], {
+            "engineering_status": "HYPOTHESIS_SUPPORTED",
+            "implementation_guard_results": [{"name": "native-off", "passed": True}],
+            "scientific_invariant_results": [
+                {"name": "anchor_state", "passed": True}, {"name": "seed", "passed": True},
+                {"name": "checkpoint", "passed": True},
+            ],
+        })
+    assert invalid.value.error_type == "ENGINEERING_STATUS_INVALID"
 
 
 def test_declared_guard_must_be_present_and_well_formed():

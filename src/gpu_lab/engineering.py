@@ -21,6 +21,9 @@ TASK_TYPES = {
 TASK_STATUSES = {"OPEN", "ACTIVE", "BLOCKED", "COMPLETED", "INCONCLUSIVE"}
 VERIFICATIONS = {"UNVERIFIED", "PARTIALLY_VERIFIED", "VERIFIED_TARGETED",
                  "VERIFIED_INTEGRATION", "VERIFIED_REAL_EXECUTION", "INVALID_IMPLEMENTATION"}
+ENGINEERING_RESULT_STATUSES = {
+    "COMPLETED", "FAILED", "BLOCKED", "DESIGN_REQUIRES_REVISION", "INCONCLUSIVE",
+}
 _FROZEN_TASK_FIELDS = {
     "research_decision_id", "experiment_id", "scientific_variable_changed",
     "scientific_variables_held_fixed", "scientific_invariants", "engineering_invariants",
@@ -90,6 +93,10 @@ def _list(value: Any, field: str) -> list[Any]:
     if not isinstance(value, list):
         raise GPUError("ENGINEERING_FIELD_INVALID", f"{field} must be a list")
     return value
+
+
+def _bounded_strings(value: Any, field: str, limit: int = 200) -> list[str]:
+    return [str(item)[:4000] for item in _list(value, field)[:limit]]
 
 
 class EngineeringService:
@@ -282,8 +289,39 @@ class EngineeringService:
             raise GPUError("ENGINEERING_VERIFICATION_INVALID", str(verification))
         if failed:
             verification = "INVALID_IMPLEMENTATION"
-        stored = {**result, **guard_results, "implementation_verification": verification,
-                  "scientific_result": "NOT_ASSESSED", "engineering_task_id": task_id}
+        engineering_status = str(result.get("engineering_status", "COMPLETED")).upper()
+        if engineering_status not in ENGINEERING_RESULT_STATUSES:
+            raise GPUError("ENGINEERING_STATUS_INVALID", engineering_status)
+        if verification == "INVALID_IMPLEMENTATION":
+            engineering_status = "INCONCLUSIVE"
+        inspection = task["data"]["inspection"]
+        baseline = task["data"]["baseline"]
+        diff_review = task["data"]["diff_review"]
+        stored = {
+            "engineering_task_id": task_id,
+            "base_commit": task["data"].get("base_commit"),
+            "resulting_commit_or_diff_identity": result.get("resulting_commit_or_diff_identity"),
+            "files_read": inspection["files_read"],
+            "files_changed": diff_review["files_changed"],
+            "symbols_changed": _bounded_strings(result.get("symbols_changed"), "symbols_changed"),
+            "diff_summary": diff_review["diff_summary"],
+            "commands_run": _bounded_strings(result.get("commands_run"), "commands_run"),
+            "tests_run": _bounded_strings(result.get("tests_run"), "tests_run"),
+            "tests_passed": _bounded_strings(result.get("tests_passed"), "tests_passed"),
+            "tests_failed": _bounded_strings(result.get("tests_failed"), "tests_failed"),
+            "build_result": result.get("build_result"),
+            "typecheck_result": result.get("typecheck_result"),
+            "lint_result": result.get("lint_result"),
+            "baseline_result": baseline,
+            "diff_review": diff_review,
+            **guard_results,
+            "unexpected_changes": _bounded_strings(result.get("unexpected_changes"), "unexpected_changes"),
+            "unresolved_failures": _bounded_strings(result.get("unresolved_failures"), "unresolved_failures"),
+            "artifacts": _list(result.get("artifacts"), "artifacts")[:200],
+            "implementation_verification": verification,
+            "engineering_status": engineering_status,
+            "scientific_result": "NOT_ASSESSED",
+        }
         status = "INCONCLUSIVE" if verification == "INVALID_IMPLEMENTATION" else "COMPLETED"
         record = self.store.object_create(task["project_id"], "EngineeringResult", stored,
                                           "ENGINEERING_RESULT_RECORDED", status)

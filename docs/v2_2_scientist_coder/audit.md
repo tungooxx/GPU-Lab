@@ -43,6 +43,10 @@ with the prior execution API.
   explicitly supplied PostgreSQL URL. They were not run against the live
   Compose database because its `postgres` hostname is container-only and no
   `GPU_LAB_TEST_DATABASE_URL` was configured in the host environment.
+- `VERIFIED_UNIT`: `EngineeringResult` is normalized with bounded files,
+  commands, tests, baseline, diff, guard, artifact, implementation-status, and
+  unresolved-failure fields. Scientific statuses are rejected and the stored
+  scientific result remains `NOT_ASSESSED`.
 - `VERIFIED_INTEGRATION`: MCP schema/import compatibility and existing execution
   control tests pass.
 - `IMPLEMENTED_UNVERIFIED`: no real scientific experiment has been routed
