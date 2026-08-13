@@ -1,6 +1,6 @@
 import pytest
 
-from gpu_lab.engineering import EngineeringService
+from gpu_lab.engineering import CodingExecutionPolicy, EngineeringService
 from gpu_lab.errors import GPUError
 
 
@@ -88,6 +88,23 @@ def test_task_parent_links_are_project_and_kind_checked():
     with pytest.raises(GPUError) as wrong_kind:
         service.task_create("project", "Wrong kind", "BUG_FIX", research_decision_id="experiment")
     assert wrong_kind.value.error_type == "ENGINEERING_RESEARCH_DECISION_KIND_INVALID"
+
+
+def test_coding_policy_enforces_explore_to_handback_order():
+    state = CodingExecutionPolicy.initial()
+    for phase in CodingExecutionPolicy.phases[1:]:
+        state = CodingExecutionPolicy.advance(state, phase)
+    assert state["phase"] == "HAND_BACK"
+    assert state["completed"][0] == "RECEIVE"
+    with pytest.raises(GPUError) as skipped:
+        CodingExecutionPolicy.advance(CodingExecutionPolicy.initial(), "EDIT")
+    assert skipped.value.error_type == "ENGINEERING_POLICY_ORDER_VIOLATION"
+
+
+def test_coding_policy_is_provider_neutral_and_scientifically_fail_closed():
+    contract = CodingExecutionPolicy.contract()
+    assert contract["scientific_result"] == "NOT_ASSESSED"
+    assert not any(name.lower() in str(contract).lower() for name in ("claude", "codex", "openai"))
 
 
 def test_missing_or_failed_invariant_blocks_implementation_not_hypothesis():

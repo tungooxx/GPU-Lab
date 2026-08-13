@@ -26,7 +26,7 @@ from .branches import ExperimentBranchService
 from .config import Settings
 from .dashboard import DASHBOARD_HTML
 from .embeddings import EmbeddingService, LocalHashEmbeddingProvider
-from .engineering import EngineeringService
+from .engineering import CodingExecutionPolicy, EngineeringService
 from .epistemics import EpistemicService
 from .errors import GPUError
 from .executable_papers import ExecutablePaperService, HttpExecutablePaperProvider
@@ -827,6 +827,12 @@ async def engineering_task_create(
         prohibited_changes, acceptance_tests, baseline_commands, targeted_tests, broader_tests,
         expected_artifacts, implementation_guards, research_decision_id, experiment_id,
     )
+
+
+@mcp.tool()
+async def engineering_policy_get():
+    """Return the provider-neutral engineering phase contract."""
+    return CodingExecutionPolicy.contract()
 
 
 @mcp.tool()

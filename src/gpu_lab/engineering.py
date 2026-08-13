@@ -24,6 +24,10 @@ VERIFICATIONS = {"UNVERIFIED", "PARTIALLY_VERIFIED", "VERIFIED_TARGETED",
 ENGINEERING_RESULT_STATUSES = {
     "COMPLETED", "FAILED", "BLOCKED", "DESIGN_REQUIRES_REVISION", "INCONCLUSIVE",
 }
+ENGINEERING_PHASES = (
+    "RECEIVE", "INSPECT", "UNDERSTAND", "REPRODUCE", "PLAN", "EDIT",
+    "TEST", "VERIFY_INVARIANTS", "REVIEW_DIFF", "RECORD", "HAND_BACK",
+)
 _FROZEN_TASK_FIELDS = {
     "research_decision_id", "experiment_id", "scientific_variable_changed",
     "scientific_variables_held_fixed", "scientific_invariants", "engineering_invariants",
@@ -97,6 +101,40 @@ def _list(value: Any, field: str) -> list[Any]:
 
 def _bounded_strings(value: Any, field: str, limit: int = 200) -> list[str]:
     return [str(item)[:4000] for item in _list(value, field)[:limit]]
+
+
+class CodingExecutionPolicy:
+    """Provider-neutral deterministic phase contract for engineering work."""
+
+    phases = ENGINEERING_PHASES
+
+    @classmethod
+    def initial(cls) -> dict[str, Any]:
+        return {"phase": cls.phases[0], "completed": [], "policy_version": "v2.2"}
+
+    @classmethod
+    def advance(cls, state: dict[str, Any], phase: str) -> dict[str, Any]:
+        if not isinstance(state, dict) or state.get("phase") not in cls.phases:
+            raise GPUError("ENGINEERING_POLICY_STATE_INVALID", "Unknown current phase")
+        phase = phase.upper()
+        if phase not in cls.phases:
+            raise GPUError("ENGINEERING_POLICY_PHASE_INVALID", phase)
+        current_index = cls.phases.index(state["phase"])
+        target_index = cls.phases.index(phase)
+        if target_index != current_index + 1:
+            raise GPUError(
+                "ENGINEERING_POLICY_ORDER_VIOLATION",
+                f"Expected {cls.phases[current_index + 1] if current_index + 1 < len(cls.phases) else 'END'}, got {phase}",
+            )
+        return {
+            "phase": phase,
+            "completed": [*state.get("completed", []), state["phase"]],
+            "policy_version": "v2.2",
+        }
+
+    @classmethod
+    def contract(cls) -> dict[str, Any]:
+        return {"policy_version": "v2.2", "phases": list(cls.phases), "scientific_result": "NOT_ASSESSED"}
 
 
 class EngineeringService:

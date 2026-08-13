@@ -49,6 +49,9 @@ with the prior execution API.
   scientific result remains `NOT_ASSESSED`.
 - `VERIFIED_UNIT`: EngineeringTask parent IDs are validated for object kind,
   project ownership, and decision-to-experiment consistency before persistence.
+- `VERIFIED_UNIT`: `CodingExecutionPolicy` exposes a provider-neutral ordered
+  phase contract (`RECEIVE` through `HAND_BACK`) and rejects skipped phases;
+  its contract is explicitly `scientific_result=NOT_ASSESSED`.
 - `VERIFIED_INTEGRATION`: MCP schema/import compatibility and existing execution
   control tests pass.
 - `IMPLEMENTED_UNVERIFIED`: no real scientific experiment has been routed
