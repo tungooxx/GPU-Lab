@@ -38,6 +38,11 @@ with the prior execution API.
 - `VERIFIED_UNIT`: `engineering_diff_review` records changed files and rejects
   unrelated changes or scientific-variable drift; frozen task fields cannot be
   edited through the generic update operation.
+- `IMPLEMENTED_UNVERIFIED`: `tests/test_engineering_postgres.py` and
+  `scripts/engineering_e2e_smoke.py` cover restart durability against an
+  explicitly supplied PostgreSQL URL. They were not run against the live
+  Compose database because its `postgres` hostname is container-only and no
+  `GPU_LAB_TEST_DATABASE_URL` was configured in the host environment.
 - `VERIFIED_INTEGRATION`: MCP schema/import compatibility and existing execution
   control tests pass.
 - `IMPLEMENTED_UNVERIFIED`: no real scientific experiment has been routed
