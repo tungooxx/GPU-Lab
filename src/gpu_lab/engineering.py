@@ -106,6 +106,20 @@ class EngineeringService:
             raise GPUError("ENGINEERING_SCIENTIFIC_RESULT_FORBIDDEN", "Scientific assessment belongs to Research OS")
         guard_fields = ("implementation_guard_results", "scientific_invariant_results")
         guard_results = {field: _list(result.get(field), field) for field in guard_fields}
+        declared_guards = task["data"].get("implementation_guards", [])
+        declared_guard_names = {
+            str(item.get("name")) for item in declared_guards if isinstance(item, dict) and item.get("name")
+        }
+        supplied_guard_names = {
+            str(item.get("name")) for item in guard_results["implementation_guard_results"]
+            if isinstance(item, dict) and item.get("name")
+        }
+        if any(not isinstance(item, dict) or not item.get("name") or "passed" not in item
+               for items in guard_results.values() for item in items):
+            raise GPUError("ENGINEERING_GUARD_RESULT_INVALID", "Each guard result needs name and passed")
+        missing_guards = sorted(declared_guard_names - supplied_guard_names)
+        if missing_guards:
+            raise GPUError("ENGINEERING_GUARD_MISSING", ", ".join(missing_guards))
         declared = task["data"].get("scientific_invariants", {})
         required = set(declared.get("must_change", [])) | set(declared.get("held_fixed", []))
         required |= set(task["data"].get("scientific_variables_held_fixed", []))
@@ -113,7 +127,7 @@ class EngineeringService:
         missing = sorted(required - checked)
         if missing:
             raise GPUError("SCIENTIFIC_INVARIANT_GUARD_MISSING", ", ".join(missing))
-        failed = [field for field, items in guard_results.items() if any(item.get("passed") is not True for item in items if isinstance(item, dict))]
+        failed = [field for field, items in guard_results.items() if any(item["passed"] is not True for item in items)]
         verification = result.get("implementation_verification", "UNVERIFIED")
         if verification not in VERIFICATIONS:
             raise GPUError("ENGINEERING_VERIFICATION_INVALID", str(verification))
@@ -144,7 +158,17 @@ class EngineeringService:
         verification = result["data"].get("implementation_verification", "UNVERIFIED")
         return {"task_id": task_id, "result_id": result_id, "implementation_verification": verification,
                 "scientific_result": "NOT_ASSESSED", "ready_for_scientific_execution": verification in {
-                    "VERIFIED_TARGETED", "VERIFIED_INTEGRATION", "VERIFIED_REAL_EXECUTION"}}
+                "VERIFIED_TARGETED", "VERIFIED_INTEGRATION", "VERIFIED_REAL_EXECUTION"}}
+
+    def assert_ready_for_experiment(self, task_id: str, experiment_id: str) -> dict:
+        task = self.task_get(task_id)
+        linked_experiment = task["data"].get("experiment_id")
+        if linked_experiment and str(linked_experiment) != str(experiment_id):
+            raise GPUError("ENGINEERING_EXPERIMENT_MISMATCH", str(experiment_id))
+        readiness = self.task_verify(task_id)
+        if not readiness["ready_for_scientific_execution"]:
+            raise GPUError("ENGINEERING_IMPLEMENTATION_NOT_VERIFIED", readiness["implementation_verification"])
+        return readiness
 
     def context_get(self, task_id: str) -> dict:
         task = self.task_get(task_id)

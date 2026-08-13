@@ -2453,6 +2453,7 @@ async def research_experiment_execute(
     env: dict[str, str] | None = None,
     python_env: str | None = None,
     execution_attempt_uuid: str | None = None,
+    engineering_task_id: str | None = None,
 ):
     """Run a preregistered experiment with a ResearchDecision created by research_decision_create.
 
@@ -2461,6 +2462,14 @@ async def research_experiment_execute(
     """
     if not settings.gpu_lab_enable_local_runner:
         return {"error": {"type": "LOCAL_RUNNER_DISABLED"}}
+    if engineering_task_id:
+        readiness = await call(
+            engineering().assert_ready_for_experiment,
+            engineering_task_id,
+            experiment_id,
+        )
+        if "error" in readiness:
+            return readiness
     request = {
         "experiment_id": experiment_id,
         "decision_id": decision_id,

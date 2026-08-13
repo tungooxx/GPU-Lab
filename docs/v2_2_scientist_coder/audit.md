@@ -19,3 +19,17 @@ hypotheses, causal edges, or strategy memory.
 engineering invariants. `EngineeringResult` captures implementation evidence
 with `scientific_result=NOT_ASSESSED`, preserving the separation between code
 validity and scientific evidence.
+
+The execution handoff is guarded when a task ID is supplied: the task must link
+to the requested experiment, all declared implementation/scientific guards must
+be present and pass, and only then is the existing experiment reservation path
+allowed to continue. Tasks without a code-change requirement remain compatible
+with the prior execution API.
+
+## Verification status
+
+- `VERIFIED_UNIT`: engineering lifecycle and fail-closed guard regressions pass.
+- `VERIFIED_INTEGRATION`: MCP schema/import compatibility and existing execution
+  control tests pass.
+- `IMPLEMENTED_UNVERIFIED`: no real scientific experiment has been routed
+  through an EngineeringTask in this audit; this layer does not create evidence.

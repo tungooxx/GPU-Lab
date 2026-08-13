@@ -33,6 +33,7 @@ def _task(service):
         scientific_variable_changed="anchor_state",
         scientific_variables_held_fixed=["seed", "checkpoint"],
         scientific_invariants={"must_change": ["anchor_state"], "held_fixed": ["seed", "checkpoint"]},
+        implementation_guards=[{"name": "native-off"}],
     )
 
 
@@ -60,10 +61,11 @@ def test_missing_or_failed_invariant_blocks_implementation_not_hypothesis():
     task = _task(service)
     with pytest.raises(GPUError) as missing:
         service.result_record(task["id"], {"scientific_invariant_results": []})
-    assert missing.value.error_type == "SCIENTIFIC_INVARIANT_GUARD_MISSING"
+    assert missing.value.error_type == "ENGINEERING_GUARD_MISSING"
 
     result = service.result_record(task["id"], {
         "implementation_verification": "VERIFIED_TARGETED",
+        "implementation_guard_results": [{"name": "native-off", "passed": True}],
         "scientific_invariant_results": [
             {"name": "anchor_state", "passed": False}, {"name": "seed", "passed": True},
             {"name": "checkpoint", "passed": True},
@@ -81,6 +83,34 @@ def test_engineering_result_cannot_assess_scientific_truth():
     assert forbidden.value.error_type == "ENGINEERING_SCIENTIFIC_RESULT_FORBIDDEN"
 
 
+def test_declared_guard_must_be_present_and_well_formed():
+    service = EngineeringService(Store())
+    task = _task(service)
+    with pytest.raises(GPUError) as missing:
+        service.result_record(task["id"], {"scientific_invariant_results": [
+            {"name": "anchor_state", "passed": True}, {"name": "seed", "passed": True},
+            {"name": "checkpoint", "passed": True},
+        ]})
+    assert missing.value.error_type == "ENGINEERING_GUARD_MISSING"
+    with pytest.raises(GPUError) as malformed:
+        service.result_record(task["id"], {
+            "implementation_guard_results": [{"name": "native-off"}],
+            "scientific_invariant_results": [
+                {"name": "anchor_state", "passed": True}, {"name": "seed", "passed": True},
+                {"name": "checkpoint", "passed": True},
+            ],
+        })
+    assert malformed.value.error_type == "ENGINEERING_GUARD_RESULT_INVALID"
+
+
+def test_unverified_task_cannot_be_handed_to_scientific_execution():
+    service = EngineeringService(Store())
+    task = _task(service)
+    with pytest.raises(GPUError) as blocked:
+        service.assert_ready_for_experiment(task["id"], "experiment-1")
+    assert blocked.value.error_type == "ENGINEERING_RESULT_REQUIRED"
+
+
 def test_context_is_compact_and_preserves_frozen_invariants():
     service = EngineeringService(Store())
     task = _task(service)
@@ -95,6 +125,7 @@ def test_task_verify_exposes_readiness_without_scientific_assessment():
     task = _task(service)
     result = service.result_record(task["id"], {
         "implementation_verification": "VERIFIED_TARGETED",
+        "implementation_guard_results": [{"name": "native-off", "passed": True}],
         "scientific_invariant_results": [
             {"name": "anchor_state", "passed": True}, {"name": "seed", "passed": True},
             {"name": "checkpoint", "passed": True},
