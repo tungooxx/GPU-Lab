@@ -115,6 +115,25 @@ def test_brain_step_summary_excludes_large_scientific_state_payloads():
     assert "large" not in str(compact)
 
 
+def test_brain_step_summary_preserves_scalar_canonical_entries():
+    result = {
+        "brain_step_id": "step-1",
+        "decision_id": "decision-1",
+        "agenda_item": {"id": "agenda-1", "kind": "AgendaItem", "status": "ACTIVE", "data": {}},
+        "question": "What next?",
+        "scientific_state": {"established_facts": ["fact-a", "fact-b"]},
+        "world_model": {"id": "model-1", "kind": "WorldModel", "status": "ACTIVE", "data": {}},
+        "competing_hypotheses": [],
+        "dead_ideas_retrieved": [],
+        "candidate_actions": [],
+        "selected_action": {"action_type": "ARTIFACT_ANALYSIS"},
+    }
+
+    compact = _compact_brain_step(result)
+
+    assert compact["scientific_state"]["established_facts"] == ["fact-a", "fact-b"]
+
+
 def test_request_ids_are_safe_to_reflect_in_mcp_logs_and_headers():
     assert _safe_request_id("trace-42.request") == "trace-42.request"
     assert _safe_request_id("bad\r\nlog-forgery") != "bad\r\nlog-forgery"

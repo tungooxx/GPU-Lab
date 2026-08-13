@@ -44,6 +44,14 @@ services:
       postgres:
         condition: service_healthy
     restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)).get('status') == 'ok'"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
     # The gateway is deliberately not attached to worker networks. Fixed-target relays expose only
     # each authenticated worker API; untrusted workers cannot route arbitrary traffic through them.
     networks: [backend]
