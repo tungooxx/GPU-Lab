@@ -1,5 +1,8 @@
 # v2.2 Audit
 
+Audit basis: current source, MCP schema, PostgreSQL models, tests, and the
+provider-neutral workflow study in `docs/integrations/claude-code-study.md`.
+
 ## Current engineering workflow
 
 GPU-Lab already provides a PostgreSQL research object/event store, local/remote
@@ -18,7 +21,59 @@ hypotheses, causal edges, or strategy memory.
 `EngineeringTask` captures a frozen implementation request and scientific versus
 engineering invariants. `EngineeringResult` captures implementation evidence
 with `scientific_result=NOT_ASSESSED`, preserving the separation between code
-validity and scientific evidence.
+validity and scientific evidence. The workflow is provider-neutral and can be
+driven by ChatGPT, Codex, Claude Code, or a future client through MCP.
+
+## Current execution tooling
+
+The existing gateway exposes local and provider-backed execution, canonical
+experiment/run/job mappings, retry-safe execution attempts, artifact and log
+retrieval, and explicit scientific result assessment. An engineering task is an
+optional prerequisite for code-changing experiments; when supplied, readiness
+requires a passing baseline, diff review, guard results, and an accepted
+implementation verification status.
+
+## Current code-change representation
+
+`EngineeringTask` stores purpose, task type, repository and relevant files,
+parent ResearchDecision/Experiment links, change request, frozen scientific
+variables, held-fixed variables, engineering/scientific invariants, prohibited
+changes, acceptance and test commands, expected artifacts, and implementation
+guards. `EngineeringResult` stores inspected/changed files, commands, tests,
+diff identity, artifacts, guard results, verification status, and unresolved
+failures.
+
+## Current experiment implementation flow
+
+Research Brain selects the scientific action and freezes the experiment.
+EngineeringTask then records how the implementation will realize that design.
+The task is inspected and baselined, the implementation is reviewed, machine
+guards are evaluated, and only a verified task can be handed to execution.
+Scientific execution and result assessment remain separate downstream steps.
+
+## Current test infrastructure
+
+Unit and service tests cover policy ordering, parent-link validation, baseline
+gates, native-off/target-changed/held-fixed measurements, diff review, invalid
+implementation handling, scientific-result isolation, MCP compatibility, and
+restart durability when an explicit PostgreSQL test URL is supplied. Real GPU
+scientific execution remains a separate verification category.
+
+## Current git / workspace handling
+
+The gateway records repository paths, inspected files, changed files, base
+commit, diff identity, and unexpected changes. The coding-agent policy requires
+preserving unrelated user changes and reviewing the resulting diff. Workspace
+and command authorization remain enforced by the existing local/remote
+execution boundaries; no Claude/Codex shell runtime is embedded.
+
+## Current scientific validity guards
+
+Scientific variables and held-fixed variables are first-class task data.
+Machine-readable checks support native-off equality, target change, held-fixed
+equality, checksums, and declared guard coverage. A failed guard produces
+`INVALID_IMPLEMENTATION` and blocks scientific interpretation; it cannot refute
+a hypothesis or teach strategy memory.
 
 The execution handoff is guarded when a task ID is supplied: the task must link
 to the requested experiment, all declared implementation/scientific guards must
