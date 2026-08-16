@@ -139,6 +139,13 @@ def test_user_feedback_requires_actual_outcome_evidence_before_campaign_candidat
     assert validated["data"]["expected_value_of_improvement"] == 0.4
 
 
+def test_ranker_readiness_refuses_sparse_observational_history():
+    readiness = MetaResearchController(Store(), PolicyLab()).ranker_readiness("project")
+
+    assert readiness["data"]["decision"] == "DO_NOT_TRAIN_POLICY_MODEL"
+    assert "sufficient_eligible_decisions" in readiness["data"]["blockers"]
+
+
 def test_model_change_creates_one_compatibility_opportunity():
     store = Store()
     controller = MetaResearchController(store, PolicyLab())

@@ -233,6 +233,39 @@ class MetaResearchController:
         self._ensure_meta_records(project_id, updated)
         return updated
 
+    def ranker_readiness(self, project_id: str) -> dict[str, Any]:
+        """Assess whether observational records justify even an offline ranker experiment."""
+        outcomes = self._objects(project_id, "ResearchDecisionOutcome")
+        actions = {str(item["data"].get("action_type", "UNKNOWN")) for item in outcomes}
+        labels = {str(item["data"].get("label", "UNKNOWN")) for item in outcomes}
+        projects = {str(item["project_id"]) for item in outcomes}
+        counterexamples = sum(bool(item["data"].get("unexpected_observations")) for item in outcomes)
+        checks = {
+            "sufficient_eligible_decisions": len(outcomes) >= 30,
+            "sufficient_outcome_coverage": len(outcomes) >= 30 and all(item["data"].get("label") for item in outcomes),
+            "action_diversity": len(actions - {"UNKNOWN"}) >= 3,
+            "stable_labels": len(labels - {"UNKNOWN"}) >= 2,
+            "held_out_projects": len(projects) >= 2,
+            "counterexample_coverage": counterexamples >= 3,
+        }
+        blockers = [name for name, passed in checks.items() if not passed]
+        payload = {
+            "decision": "OFFLINE_ADVISORY_EXPERIMENT_ONLY" if not blockers else "DO_NOT_TRAIN_POLICY_MODEL",
+            "checks": checks,
+            "blockers": blockers,
+            "observed_outcomes": len(outcomes),
+            "action_types": sorted(actions),
+            "label_types": sorted(labels),
+            "project_count": len(projects),
+            "counterexample_count": counterexamples,
+            "warning": "Unchosen actions remain counterfactually unknown and cannot become negative labels.",
+        }
+        fingerprint = f"ranker-readiness:{len(outcomes)}:{len(actions)}:{len(labels)}:{counterexamples}"
+        existing = self._find_by_fingerprint(project_id, "PolicyRankerReadiness", fingerprint)
+        if existing:
+            return existing
+        return self.store.object_create(project_id, "PolicyRankerReadiness", {"fingerprint": fingerprint, **payload}, "POLICY_RANKER_READINESS_ASSESSED", "COMPLETED")
+
     def detect_opportunities(self, project_id: str) -> list[dict[str, Any]]:
         outcomes = self._objects(project_id, "ResearchDecisionOutcome")
         grouped: dict[str, list[dict[str, Any]]] = {}

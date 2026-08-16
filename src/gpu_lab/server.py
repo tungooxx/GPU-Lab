@@ -1105,6 +1105,12 @@ async def policy_feedback_validate(project_id: str, feedback_id: str):
 
 
 @mcp.tool()
+async def policy_ranker_readiness(project_id: str):
+    """Assess whether an offline advisory ranker is justified; it never trains or deploys one."""
+    return await call(meta_controller().ranker_readiness, project_id)
+
+
+@mcp.tool()
 async def policy_canary_start(project_id: str, candidate_policy_id: str, percentage: int = 10):
     """Start a bounded prospective canary; it does not replace production policy."""
     return await call(policy_lab().start_canary, project_id, candidate_policy_id, percentage)
