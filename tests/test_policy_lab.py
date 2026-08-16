@@ -204,3 +204,19 @@ def test_post_promotion_hindsight_is_appended_without_creating_science_records()
 
     assert updated["data"]["post_promotion_hindsight"][0]["observed_improvement"] == 0.2
     assert not [item for item in store.items if item["kind"] in {"WorldModel", "Hypothesis", "EvidenceUnit"}]
+
+
+def test_policy_evaluation_cannot_mutate_production_science(monkeypatch):
+    store = Store()
+    lab = service(store)
+    science = store.object_create("project", "WorldModel", {"name": "production"}, "FIXTURE")
+    result = lab.improve("project", idea="Improve discrimination")
+
+    monkeypatch.setattr(
+        lab,
+        "_run_patch",
+        lambda _patch, episode: BenchmarkDecision(selected_action_id=episode.bad_next_actions[0]),
+    )
+    lab.evaluate("project", result["patches"][0]["id"])
+
+    assert store.object_get(science["id"])["data"] == {"name": "production"}
