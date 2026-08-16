@@ -107,6 +107,9 @@ def test_auto_project_rolls_back_only_after_repeated_negative_hindsight():
 
     assert len(regressions) == 1
     assert regressions[0]["data"]["rollback_decision"] == "ROLLED_BACK"
+    assert store.objects_list("project", "PolicyNegativeResult")
+    assert store.objects_list("project", "MetaWorldModel")
+    assert controller.monitor_promotions("project") == []
 
 
 def test_model_change_creates_one_compatibility_opportunity():
