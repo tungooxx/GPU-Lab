@@ -69,9 +69,13 @@ def test_recurring_bad_outcomes_create_one_durable_opportunity():
     model = store.objects_list("project", "MetaWorldModel")[0]
     agenda = store.objects_list("project", "MetaResearchAgenda")[0]
     benchmark_gap = store.objects_list("project", "BenchmarkGap")[0]
+    proposal = store.objects_list("project", "BenchmarkEpisodeProposal")[0]
     assert model["data"]["relationships"][0]["causal_status"] == "UNRESOLVED"
     assert agenda["data"]["opportunity_id"] == found[0]["id"]
     assert benchmark_gap["data"]["candidate_evaluation_eligibility"] == "FUTURE_BENCHMARK_ONLY"
+    assert proposal["status"] == "PREPARED"
+    assert proposal["data"]["admission_status"] == "NOT_A_BENCHMARK_EPISODE"
+    assert controller.benchmark_gap_prepare("project", benchmark_gap["id"])["id"] == proposal["id"]
     assert controller.detect_opportunities("project") == []
 
 

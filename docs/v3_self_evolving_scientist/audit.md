@@ -40,7 +40,8 @@ warning). This audit is based on current `policy_lab.py`, `meta_research.py`,
 ## V3 implementation progress (current branch)
 
 The current implementation adds durable meta-world observations, agenda items,
-opportunities, campaign claims/budgets, benchmark gaps, regressions, policy
+ opportunities, campaign claims/budgets, benchmark gaps, future-only benchmark
+ authoring proposals, regressions, policy
 hindsight, canary/shadow records, evaluator-firewall audits, ranker readiness,
 and meta-strategy patterns. It triggers one bounded controller pass after a
 decision outcome and a process-only postmortem at five-decision milestones.
@@ -128,6 +129,7 @@ an explicit stop reason.
 | Restart recovery | VERIFIED_UNIT | Durable campaign/run recovery tests prevent duplicate campaign claims and promotion records. |
 | Literature scouting and transfer | VERIFIED_INTEGRATION | Configured scout dispatch creates evidence-candidate-only transfer records for later campaigns. |
 | v2.2 implementation handoff | VERIFIED_INTEGRATION | `EngineeringTask` and verified `EngineeringResult` gate policy evaluation; the controller cannot write arbitrary repository files. |
+| Benchmark authoring handoff | VERIFIED_UNIT | A discovered gap creates a `PREPARED` proposal only. It requires a new independently collected episode and leakage/provenance review; it is never admitted to the current candidate evaluation. |
 | Provider adapter evolution | VERIFIED_INTEGRATION | Compatibility, live PASS/FAIL evidence, and evidence-gated policy descendant promotion are covered. |
 | Live provider behavior | IMPLEMENTED_UNVERIFIED | Requires a configured provider runner and real held-out provider observations. |
 | External coding execution | IMPLEMENTED_UNVERIFIED | Requires a configured engineering executor to perform and verify a bounded task. |

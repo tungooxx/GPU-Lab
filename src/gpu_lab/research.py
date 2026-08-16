@@ -76,6 +76,7 @@ RESEARCH_OBJECT_KINDS = (
     "PolicyAutonomyConfig",
     "PolicyRegression",
     "BenchmarkGap",
+    "BenchmarkEpisodeProposal",
     "MetaStrategyPattern",
     "PolicyCanary",
     "PolicyShadowEvaluation",

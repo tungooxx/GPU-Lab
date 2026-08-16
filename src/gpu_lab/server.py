@@ -2004,6 +2004,12 @@ async def policy_health_report(project_id: str):
 
 
 @mcp.tool()
+async def benchmark_gap_prepare(project_id: str, benchmark_gap_id: str):
+    """Prepare a future-only benchmark authoring proposal; it cannot alter current evaluation."""
+    return await call(meta_controller().benchmark_gap_prepare, project_id, benchmark_gap_id)
+
+
+@mcp.tool()
 async def meta_research_roi(project_id: str):
     """Return bounded meta-research cost and observed-yield metrics."""
     return await call(meta_controller().meta_research_roi, project_id)

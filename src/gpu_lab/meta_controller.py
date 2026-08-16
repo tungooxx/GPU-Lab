@@ -265,6 +265,38 @@ class MetaResearchController:
         )
         return health
 
+    def benchmark_gap_prepare(self, project_id: str, gap_id: str) -> dict[str, Any]:
+        """Create a future-only benchmark authoring proposal from a discovered gap."""
+        gap = self.store.object_get(gap_id)
+        if gap["kind"] != "BenchmarkGap" or str(gap["project_id"]) != str(project_id):
+            raise GPUError("BENCHMARK_GAP_REQUIRED", gap_id)
+        if gap["data"].get("candidate_evaluation_eligibility") != "FUTURE_BENCHMARK_ONLY":
+            raise GPUError("BENCHMARK_GAP_ELIGIBILITY_INVALID", gap_id)
+        fingerprint = f"benchmark-episode-proposal:{gap_id}"
+        existing = self._find_by_fingerprint(project_id, "BenchmarkEpisodeProposal", fingerprint)
+        if existing:
+            return existing
+        return self.store.object_create(
+            project_id,
+            "BenchmarkEpisodeProposal",
+            {
+                "fingerprint": fingerprint,
+                "benchmark_gap_id": gap_id,
+                "observed_failure": gap["data"].get("observed_failure"),
+                "supporting_evidence": gap["data"].get("supporting_evidence", []),
+                "authoring_requirements": [
+                    "Use an independently collected future decision episode.",
+                    "Freeze labels, split, and rubric before candidate policy evaluation.",
+                    "Do not use the triggering evidence as the evaluation episode.",
+                    "Require provenance and a leakage review before benchmark admission.",
+                ],
+                "admission_status": "NOT_A_BENCHMARK_EPISODE",
+                "candidate_evaluation_eligibility": "FUTURE_BENCHMARK_ONLY",
+            },
+            "BENCHMARK_EPISODE_PROPOSAL_CREATED",
+            "PREPARED",
+        )
+
     def _science_vs_meta_schedule(self, project_id: str, opportunity: dict[str, Any]) -> dict[str, Any]:
         """Reserve capacity for a materially more valuable unresolved science task."""
         candidates = []
@@ -343,7 +375,7 @@ class MetaResearchController:
         if not self._find_by_fingerprint(project_id, "BenchmarkGap", fingerprint):
             # A failure that generated this opportunity is contaminated for the
             # current candidate.  It can seed a later benchmark episode only.
-            self.store.object_create(
+            gap = self.store.object_create(
                 project_id,
                 "BenchmarkGap",
                 {
@@ -358,6 +390,7 @@ class MetaResearchController:
                 "BENCHMARK_GAP_DISCOVERED",
                 "CANDIDATE",
             )
+            self.benchmark_gap_prepare(project_id, str(gap["id"]))
 
     def config_get(self, project_id: str) -> dict[str, Any]:
         configs = self._objects(project_id, "PolicyAutonomyConfig")
