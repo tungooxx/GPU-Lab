@@ -43,6 +43,10 @@ def test_recurring_bad_outcomes_create_one_durable_opportunity():
 
     assert len(found) == 1
     assert found[0]["data"]["expected_value_of_improvement"] >= 0.4
+    model = store.objects_list("project", "MetaWorldModel")[0]
+    agenda = store.objects_list("project", "MetaResearchAgenda")[0]
+    assert model["data"]["relationships"][0]["causal_status"] == "UNRESOLVED"
+    assert agenda["data"]["opportunity_id"] == found[0]["id"]
     assert controller.detect_opportunities("project") == []
 
 
@@ -74,4 +78,5 @@ def test_model_change_creates_one_compatibility_opportunity():
     created = controller.model_change_detect("project", "openai", "new-model")
 
     assert created["data"]["required_evaluation"] == "COMPACT_COMPATIBILITY_BENCHMARK"
+    assert store.objects_list("project", "MetaResearchAgenda")[0]["data"]["required_evaluation"] == "COMPACT_COMPATIBILITY_BENCHMARK"
     assert controller.model_change_detect("project", "openai", "new-model") is None
