@@ -362,6 +362,8 @@ class PolicyLabService:
         experiment = self._create(project_id, "PolicyExperiment", {
             "baseline_policy_id": patch["data"]["base_policy_id"], "candidate_patch_id": patch_id,
             "policy_hypothesis_id": patch["data"]["policy_hypothesis_id"], "benchmark_version": "brain-bench-v2.5",
+            "evaluator_version": "policy-evaluator-v3",
+            "judge_configuration": {"runner": "deterministic-policy-runner", "blind_candidate_payload": True},
             "splits": {
                 "development": [e.episode_id for e in episodes if e.benchmark_split == BenchmarkSplit.DEVELOPMENT],
                 "validation": [e.episode_id for e in episodes if e.benchmark_split == BenchmarkSplit.VALIDATION],
@@ -460,7 +462,15 @@ class PolicyLabService:
         delta = self._policy_delta(patch["data"]["semantic_change"]).model_dump(mode="json")
         self._validate_core_patch(patch)
         prediction = patch["data"].get("benchmark_results", {}).get("metrics", {}).get("strong_next_action_recall", {}).get("mean")
-        data = {**current["data"], **{section: {**current["data"].get(section, {}), **change} for section, change in delta.items() if change}, "version": next_version, "parent_policy_id": str(current["id"]), "provenance": {"source_type": "POLICY_PATCH", "patch_id": patch_id}, "notes": f"Promoted patch {patch_id}", "applied_patch_ids": [patch_id], "applied_policy_delta": delta, "policy_benchmark_prediction": prediction}
+        experiment_id = patch["data"].get("experiment_id")
+        experiment = self.store.object_get(str(experiment_id)) if experiment_id else None
+        evaluation_provenance = {
+            "benchmark_version": experiment["data"].get("benchmark_version"),
+            "evaluator_version": experiment["data"].get("evaluator_version"),
+            "judge_configuration": experiment["data"].get("judge_configuration"),
+            "policy_experiment_id": str(experiment_id),
+        } if experiment else None
+        data = {**current["data"], **{section: {**current["data"].get(section, {}), **change} for section, change in delta.items() if change}, "version": next_version, "parent_policy_id": str(current["id"]), "provenance": {"source_type": "POLICY_PATCH", "patch_id": patch_id, "evaluation": evaluation_provenance}, "notes": f"Promoted patch {patch_id}", "applied_patch_ids": [patch_id], "applied_policy_delta": delta, "policy_benchmark_prediction": prediction}
         transactional_promote = getattr(self.store, "production_policy_promote", None)
         if callable(transactional_promote):
             promoted = transactional_promote(project_id, str(current["id"]), data)
