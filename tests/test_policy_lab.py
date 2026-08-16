@@ -120,6 +120,17 @@ def test_promotion_requires_evidence():
         lab.promote("project", patch["id"])
 
 
+def test_policy_lifecycle_restriction_preserves_nonproduction_history():
+    store = Store()
+    lab = service(store)
+    policy = store.object_create("project", "ResearchPolicy", {"version": 1}, "FIXTURE", "SUPERSEDED")
+
+    restricted = lab.restrict_policy("project", policy["id"], "MODEL_INCOMPATIBLE", "adapter compatibility failure")
+
+    assert restricted["status"] == "MODEL_INCOMPATIBLE"
+    assert restricted["data"]["lifecycle_restriction_reason"] == "adapter compatibility failure"
+
+
 def test_policy_patch_cannot_be_evaluated_or_promoted_in_another_project():
     store = Store()
     lab = service(store)

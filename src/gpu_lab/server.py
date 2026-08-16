@@ -1127,6 +1127,12 @@ async def policy_rollback(project_id: str, policy_id: str):
 
 
 @mcp.tool()
+async def policy_restrict(project_id: str, policy_id: str, status: str, reason: str):
+    """Deprecate or scope-restrict a non-production policy without deleting its lineage."""
+    return await call(policy_lab().restrict_policy, project_id, policy_id, status, reason)
+
+
+@mcp.tool()
 async def policy_pin(project_id: str, policy_id: str | None = None):
     """Pin a project policy (or clear the pin) to constrain autonomous policy changes."""
     return await call(meta_controller().policy_pin, project_id, policy_id)

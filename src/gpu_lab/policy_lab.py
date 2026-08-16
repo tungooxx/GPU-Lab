@@ -561,6 +561,22 @@ class PolicyLabService:
             return self.store.object_update(policy_id, {"rollback_from_policy_id": str(current["id"])}, "PRODUCTION", "RESEARCH_POLICY_ROLLED_BACK")
         return target
 
+    def restrict_policy(self, project_id: str, policy_id: str, status: str, reason: str) -> dict[str, Any]:
+        """Apply a non-destructive lifecycle restriction to a non-production policy."""
+        if status not in {"DEPRECATED", "MODEL_INCOMPATIBLE", "DOMAIN_RESTRICTED"}:
+            raise GPUError("POLICY_LIFECYCLE_STATUS_INVALID", status)
+        policy = self.store.object_get(policy_id)
+        if policy["kind"] != "ResearchPolicy" or str(policy["project_id"]) != str(project_id):
+            raise GPUError("RESEARCH_PROJECT_MISMATCH", policy_id)
+        if policy["status"] == "PRODUCTION":
+            raise GPUError("POLICY_PRODUCTION_RESTRICTION_REQUIRES_ROLLBACK", "rollback or promote a replacement first")
+        return self.store.object_update(
+            policy_id,
+            {"lifecycle_restriction_reason": reason},
+            status,
+            "RESEARCH_POLICY_RESTRICTED",
+        )
+
     def start_canary(self, project_id: str, candidate_policy_id: str, percentage: int = 10) -> dict[str, Any]:
         """Create a bounded prospective canary plan without changing production policy."""
         if not 1 <= percentage <= 50:
