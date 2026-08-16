@@ -113,31 +113,20 @@ class ResearchStrategyService:
     def __init__(self, store: ResearchStore):
         self.store = store
 
-    def strategy_learning_eligibility(self, decision_id: str) -> dict[str, Any]:
+    def _decision_with_outcome(self, decision_id: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
         decision = self.store.object_get(decision_id)
         if decision["kind"] != "ResearchDecision":
             raise GPUError("NOT_A_RESEARCHDECISION", decision_id)
-        outcomes = self.store.objects_list(
-            str(decision["project_id"]),
-            "ResearchDecisionOutcome",
-            limit=None,
-            data_filters={"decision_id": str(decision_id)},
-        )
-        outcome = outcomes[0] if outcomes else None
+        outcomes = self.store.objects_list(str(decision["project_id"]), "ResearchDecisionOutcome", limit=None, data_filters={"decision_id": str(decision_id)})
+        return decision, outcomes[0] if outcomes else None
+
+    def strategy_learning_eligibility(self, decision_id: str) -> dict[str, Any]:
+        decision, outcome = self._decision_with_outcome(decision_id)
         return assess_strategy_learning_eligibility(decision, outcome)
 
     def decision_epistemic_audit(self, decision_id: str) -> dict[str, Any]:
         """Return a read-only epistemic contract audit for one decision."""
-        decision = self.store.object_get(decision_id)
-        if decision["kind"] != "ResearchDecision":
-            raise GPUError("NOT_A_RESEARCHDECISION", decision_id)
-        outcomes = self.store.objects_list(
-            str(decision["project_id"]),
-            "ResearchDecisionOutcome",
-            limit=None,
-            data_filters={"decision_id": str(decision_id)},
-        )
-        outcome = outcomes[0] if outcomes else None
+        decision, outcome = self._decision_with_outcome(decision_id)
         eligibility = assess_strategy_learning_eligibility(decision, outcome)
         data = decision.get("data", {})
         selected = data.get("selected_action", {}) if isinstance(data.get("selected_action"), dict) else {}

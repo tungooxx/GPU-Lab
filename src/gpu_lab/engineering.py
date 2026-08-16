@@ -67,8 +67,11 @@ def evaluate_guard_measurements(
                 raise GPUError("ENGINEERING_GUARD_MEASUREMENT_INVALID", name)
             before, after = observed["before"], observed["after"]
             delta = _numeric_delta(before, after)
-            tolerance = float(declaration.get("tolerance", 0.0))
-            minimum_delta = float(declaration.get("minimum_delta", 0.0))
+            try:
+                tolerance = float(declaration.get("tolerance", 0.0))
+                minimum_delta = float(declaration.get("minimum_delta", 0.0))
+            except (TypeError, ValueError) as exc:
+                raise GPUError("ENGINEERING_GUARD_MEASUREMENT_INVALID", name) from exc
             if kind in {"EQUAL", "NATIVE_OFF", "HELD_FIXED"}:
                 if delta is not None:
                     passed = delta <= tolerance
@@ -304,6 +307,17 @@ class EngineeringService:
         task = self.task_get(task_id)
         if not isinstance(result, dict):
             raise GPUError("ENGINEERING_RESULT_INVALID", "result must be an object")
+        previous_result_id = task["data"].get("latest_result_id")
+        if task["status"] == "COMPLETED":
+            raise GPUError("ENGINEERING_RESULT_ALREADY_RECORDED", task_id)
+        if previous_result_id:
+            previous = self.result_get(previous_result_id)
+            if (
+                previous["data"].get("implementation_verification") != "INVALID_IMPLEMENTATION"
+                or task["status"] != "ACTIVE"
+                or task["data"].get("diff_review", {}).get("passed") is not True
+            ):
+                raise GPUError("ENGINEERING_RESULT_ALREADY_RECORDED", task_id)
         scientific_result = result.get("scientific_result", "NOT_ASSESSED")
         if scientific_result != "NOT_ASSESSED":
             raise GPUError("ENGINEERING_SCIENTIFIC_RESULT_FORBIDDEN", "Scientific assessment belongs to Research OS")
@@ -409,7 +423,7 @@ class EngineeringService:
     def assert_ready_for_experiment(self, task_id: str, experiment_id: str) -> dict:
         task = self.task_get(task_id)
         linked_experiment = task["data"].get("experiment_id")
-        if linked_experiment and str(linked_experiment) != str(experiment_id):
+        if not linked_experiment or str(linked_experiment) != str(experiment_id):
             raise GPUError("ENGINEERING_EXPERIMENT_MISMATCH", str(experiment_id))
         readiness = self.task_verify(task_id)
         if not readiness["ready_for_scientific_execution"]:

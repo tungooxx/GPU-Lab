@@ -172,9 +172,39 @@ def test_declared_guard_must_be_present_and_well_formed():
 def test_unverified_task_cannot_be_handed_to_scientific_execution():
     service = EngineeringService(Store())
     task = _task(service)
+    task["data"]["experiment_id"] = "experiment-1"
     with pytest.raises(GPUError) as blocked:
         service.assert_ready_for_experiment(task["id"], "experiment-1")
     assert blocked.value.error_type == "ENGINEERING_RESULT_REQUIRED"
+
+
+def test_result_cannot_be_recorded_twice_after_completion():
+    service = EngineeringService(Store())
+    task = _task(service)
+    payload = {
+        "implementation_guard_results": [{"name": "native-off", "passed": True}],
+        "scientific_invariant_results": [
+            {"name": "anchor_state", "passed": True}, {"name": "seed", "passed": True},
+            {"name": "checkpoint", "passed": True},
+        ],
+    }
+    service.result_record(task["id"], payload)
+    with pytest.raises(GPUError) as duplicate:
+        service.result_record(task["id"], payload)
+    assert duplicate.value.error_type == "ENGINEERING_RESULT_ALREADY_RECORDED"
+
+
+def test_measurement_guard_rejects_non_numeric_threshold():
+    service = EngineeringService(Store())
+    task = service.task_create(
+        "project", "Check native path", "EXPERIMENT_INSTRUMENTATION",
+        implementation_guards=[{"name": "native-off", "type": "NATIVE_OFF", "tolerance": "nope"}],
+    )
+    service.task_start(task["id"], {"files_read": ["src/model.py"]}, {"commands_run": ["pytest"], "passed": True})
+    service.diff_review(task["id"], {"files_changed": ["src/model.py"], "diff_summary": "Guard path.", "unrelated_changes": False, "scientific_variable_drift": False})
+    with pytest.raises(GPUError) as invalid:
+        service.result_record(task["id"], {"guard_measurements": [{"name": "native-off", "before": 0, "after": 0}]})
+    assert invalid.value.error_type == "ENGINEERING_GUARD_MEASUREMENT_INVALID"
 
 
 def test_task_start_requires_inspection_and_passing_baseline():

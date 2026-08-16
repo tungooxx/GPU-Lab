@@ -92,6 +92,27 @@ def test_promotion_requires_evidence():
         lab.promote("project", patch["id"])
 
 
+def test_policy_patch_cannot_be_evaluated_or_promoted_in_another_project():
+    store = Store()
+    lab = service(store)
+    patch = lab.improve("project-a", idea="Improve discrimination")["patches"][0]
+    with pytest.raises(GPUError) as evaluation_mismatch:
+        lab.evaluate("project-b", patch["id"])
+    assert evaluation_mismatch.value.error_type == "RESEARCH_PROJECT_MISMATCH"
+    with pytest.raises(GPUError) as promotion_mismatch:
+        lab.promote("project-b", patch["id"])
+    assert promotion_mismatch.value.error_type == "RESEARCH_PROJECT_MISMATCH"
+
+
+def test_promotion_materializes_validated_policy_delta():
+    store = Store()
+    lab = service(store)
+    patch = next(item for item in lab.improve("project", idea="Improve discrimination")["patches"] if item["status"] == "SUPPORTED_ON_BENCHMARK")
+    promoted = lab.promote("project", patch["id"])
+    assert promoted["data"]["applied_policy_delta"]
+    assert promoted["data"]["decision_policy"].get("preferred_action_types")
+
+
 def test_candidate_that_regresses_on_held_out_is_rejected(monkeypatch):
     store = Store()
     lab = service(store)

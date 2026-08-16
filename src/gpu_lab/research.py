@@ -174,7 +174,7 @@ def classify_decision_data(data: dict[str, Any]) -> dict[str, str]:
     if role not in DECISION_ROLES:
         if isinstance(legacy, dict) and legacy.get("reconstructed"):
             role = "LEGACY_BACKFILL"
-        elif selected.get("payload", {}).get("mode") in {"INSPECT_RESULT", "INSPECT_FAILURE", "RECOVER_UNFINISHED"}:
+        elif isinstance(selected.get("payload"), dict) and selected["payload"].get("mode") in {"INSPECT_RESULT", "INSPECT_FAILURE", "RECOVER_UNFINISHED"}:
             role = "RESULT_INSPECTION"
         elif action in {"REPRODUCTION"}:
             role = "REPRODUCTION_ACTION"
@@ -249,8 +249,7 @@ def strategy_learning_eligibility(decision: dict[str, Any], outcome: dict[str, A
         reasons.append("DECISION_OUTCOME_MISSING")
     else:
         outcome_data = outcome.get("data", {})
-        cycle_status = str(data.get("cycle_status") or "").upper()
-        if cycle_status and cycle_status != "CLOSED":
+        if classification["cycle_status"] != "CLOSED":
             reasons.append("DECISION_CYCLE_NOT_CLOSED")
         if str(outcome.get("status")) not in {"RESULT_INSPECTED", "ASSESSED", "CLOSED"}:
             reasons.append("OUTCOME_NOT_INSPECTED")
@@ -558,6 +557,10 @@ class ResearchStore:
                 "CREATE UNIQUE INDEX IF NOT EXISTS research_objects_strategy_key_unique "
                 "ON research_objects((data->>'strategy_key')) "
                 "WHERE kind='ResearchStrategyPattern'"
+            )
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS research_objects_single_production_policy_unique "
+                "ON research_objects(project_id) WHERE kind='ResearchPolicy' AND status='PRODUCTION'"
             )
             cur.execute(
                 "SELECT project_id,data->>'decision_outcome_id' AS outcome_id,"
@@ -1840,7 +1843,7 @@ class ResearchStore:
             {
                 **decision_data,
                 **classify_decision_data(decision_data),
-                "cycle_status": decision_data.get("cycle_status", "SELECTED"),
+                "cycle_status": classify_decision_data(decision_data)["cycle_status"],
                 "research_situation_id": str(situation_id) if situation_id else None,
                 "candidate_action_ids": [str(item) for item in candidate_ids],
                 "candidate_actions": persisted,
@@ -1929,11 +1932,11 @@ class ResearchStore:
             if project_id:
                 sql += " AND project_id=%s"
                 args.append(project_id)
-            sql += " ORDER BY created_at"
+            sql += " ORDER BY created_at FOR UPDATE"
             cur.execute(sql, args)
             decisions = cur.fetchall()
             cur.execute(
-                "SELECT project_id,data FROM research_objects "
+                "SELECT project_id,status,data FROM research_objects "
                 "WHERE kind='ResearchDecisionOutcome'"
                 + (" AND project_id=%s" if project_id else ""),
                 args,
@@ -1949,7 +1952,7 @@ class ResearchStore:
             for decision in decisions:
                 classification = classify_decision_data(decision["data"])
                 outcome = outcome_by_decision.get(str(decision["id"]))
-                if outcome:
+                if outcome and str(outcome["status"]) in {"RESULT_INSPECTED", "ASSESSED", "CLOSED"}:
                     classification["cycle_status"] = "CLOSED"
                     if classification["scientific_role"] not in {"NOT_SCIENTIFIC", "SYSTEM_SMOKE", "CONTRACT_TEST"}:
                         classification["scientific_verification"] = "RESULT_INSPECTED"
@@ -2542,10 +2545,17 @@ class ResearchStore:
         causal_edge_status: str | None = None,
     ) -> dict:
         """Apply a complete scientific result assessment atomically."""
-        self._validate_status(hypothesis_transition)
-        self._validate_status(agenda_status)
+        if hypothesis_transition not in {"SUPPORTED", "SURVIVES_INITIAL_TEST", "WEAKENED", "REFUTED", "INCONCLUSIVE"}:
+            raise GPUError("INVALID_RESEARCH_OBJECT_STATUS", hypothesis_transition)
+        if agenda_status not in {"OPEN", "ACTIVE", "RESOLVED", "BLOCKED", "DEFERRED"}:
+            raise GPUError("INVALID_RESEARCH_OBJECT_STATUS", agenda_status)
         if actual_information_gain not in {"HIGH", "MEDIUM", "LOW", "ZERO", "INVALID", "UNKNOWN"}:
             raise GPUError("INVALID_INFORMATION_GAIN", actual_information_gain)
+        if information_gain_basis is not None and (
+            not isinstance(information_gain_basis, list)
+            or any(not isinstance(item, str) for item in information_gain_basis)
+        ):
+            raise GPUError("INVALID_INFORMATION_GAIN_BASIS", "information_gain_basis must be a list of strings")
         basis = list(information_gain_basis or [])
         if actual_information_gain not in {"ZERO", "INVALID", "UNKNOWN"} and not basis:
             basis = ["HYPOTHESIS_TRANSITION"] if hypothesis_transition != "INCONCLUSIVE" else []

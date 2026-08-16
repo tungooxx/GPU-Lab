@@ -50,6 +50,15 @@ class PromotionPolicy(BaseModel):
     auto_promote_production: bool = False
 
 
+class PolicyDelta(BaseModel):
+    """Validated, data-only change used by the blinded policy runner."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision_policy: dict[str, Any] = Field(default_factory=dict)
+    critic_policy: dict[str, Any] = Field(default_factory=dict)
+
+
 class PolicyLabService:
     """Create and assess finite policy proposals without autonomous deployment."""
 
@@ -190,22 +199,42 @@ class PolicyLabService:
             return self._create(project_id, "ResearchPolicyPatch", data, "POLICY_PATCH_REJECTED_DUPLICATE", "REJECTED")
         return self._create(project_id, "ResearchPolicyPatch", data, "POLICY_PATCH_CREATED", "CANDIDATE")
 
+    @staticmethod
+    def _policy_delta(semantic_change: Any) -> PolicyDelta:
+        if not isinstance(semantic_change, str) or not semantic_change.strip():
+            raise GPUError("POLICY_PATCH_SEMANTIC_CHANGE_INVALID", "semantic_change must be non-empty text")
+        normalized = semantic_change.lower()
+        if "hypothesis-outcome matrix" in normalized:
+            return PolicyDelta(decision_policy={"required_artifact": "hypothesis_outcome_matrix", "preferred_action_types": ["REPRODUCTION", "CAUSAL_INTERVENTION"]})
+        if "runner-up action comparison" in normalized:
+            return PolicyDelta(decision_policy={"required_artifact": "runner_up_comparison", "preferred_action_types": ["REPRODUCTION", "NULL_MODEL_TEST"]})
+        if "null-focused critic" in normalized:
+            return PolicyDelta(critic_policy={"null_reasoning": "required_when_cheap_falsifier_available"}, decision_policy={"preferred_action_types": ["NULL_MODEL_TEST"]})
+        raise GPUError("POLICY_PATCH_SEMANTIC_CHANGE_INVALID", "unsupported semantic policy change")
+
     def _run_patch(self, patch: dict[str, Any], episode: Any) -> BenchmarkDecision:
         # Candidate behavior is constrained to the blinded payload. A policy patch
         # cannot access labels, costs, tags, or hidden future state.
         payload = episode.visible_payload()
         actions = [a for a in payload["candidate_actions"] if a.get("feasible", True)]
-        preferred = {"NULL_MODEL_TEST", "CAUSAL_INTERVENTION", "REPRODUCTION"}
-        selected = next((a for a in actions if a["action_type"] in preferred), actions[0])
+        delta = self._policy_delta(patch["data"].get("semantic_change"))
+        preferred = delta.decision_policy.get("preferred_action_types", [])
+        selected = next((a for action_type in preferred for a in actions if a["action_type"] == action_type), actions[0])
         return BenchmarkDecision(selected_action_id=selected["action_id"], considered_null_models=["policy-required-null"])
 
     def evaluate(self, project_id: str, patch_id: str) -> dict[str, Any]:
         patch = self.store.object_get(patch_id)
         if patch["kind"] != "ResearchPolicyPatch":
             raise GPUError("NOT_A_RESEARCH_POLICY_PATCH", patch_id)
+        if str(patch["project_id"]) != str(project_id):
+            raise GPUError("RESEARCH_PROJECT_MISMATCH", patch_id)
         if patch["status"] == "REJECTED":
             return {"patch": patch, "decision": "REJECTED", "reason": "duplicate or invalid candidate"}
         implementation = patch["data"].get("implementation_change")
+        try:
+            self._policy_delta(patch["data"].get("semantic_change"))
+        except GPUError:
+            implementation = None
         if not patch["data"].get("semantic_change") or not isinstance(implementation, dict) or not implementation.get("enabled"):
             updated = self.store.object_update(
                 patch_id,
@@ -316,11 +345,14 @@ class PolicyLabService:
 
     def promote(self, project_id: str, patch_id: str) -> dict[str, Any]:
         patch = self.store.object_get(patch_id)
+        if patch["kind"] != "ResearchPolicyPatch" or str(patch["project_id"]) != str(project_id):
+            raise GPUError("RESEARCH_PROJECT_MISMATCH", patch_id)
         if patch["status"] not in {"SUPPORTED_ON_BENCHMARK", "CROSS_PROJECT_SUPPORTED", "CROSS_MODEL_SUPPORTED", "RECOMMENDED_FOR_PROMOTION"}:
             raise GPUError("POLICY_PROMOTION_NOT_SUPPORTED", "Policy patch lacks required evidence")
         current = self.ensure_production_policy(project_id)
         next_version = max([int(p["data"].get("version", 0)) for p in self._objects(project_id, "ResearchPolicy")] or [0]) + 1
-        data = {**current["data"], "version": next_version, "parent_policy_id": str(current["id"]), "provenance": {"source_type": "POLICY_PATCH", "patch_id": patch_id}, "notes": f"Promoted patch {patch_id}", "applied_patch_ids": [patch_id]}
+        delta = self._policy_delta(patch["data"]["semantic_change"]).model_dump(mode="json")
+        data = {**current["data"], **{section: {**current["data"].get(section, {}), **change} for section, change in delta.items() if change}, "version": next_version, "parent_policy_id": str(current["id"]), "provenance": {"source_type": "POLICY_PATCH", "patch_id": patch_id}, "notes": f"Promoted patch {patch_id}", "applied_patch_ids": [patch_id], "applied_policy_delta": delta}
         self.store.object_update(str(current["id"]), {}, "SUPERSEDED", "RESEARCH_POLICY_SUPERSEDED")
         return self._create(project_id, "ResearchPolicy", data, "RESEARCH_POLICY_PROMOTED", "PRODUCTION")
 

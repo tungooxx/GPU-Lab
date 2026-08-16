@@ -137,7 +137,7 @@ def test_meta_review_reports_absent_decisions_separately():
     store = FakeStore()
     review = MetaResearchService(store).meta_review("project")
 
-    assert "no research decisions recorded" in review["data"]["campaign_readiness_reasons"]
+    assert "no scientific decisions recorded" in review["data"]["campaign_readiness_reasons"]
     assert "decision hindsight coverage below 80%" not in review["data"][
         "campaign_readiness_reasons"
     ]

@@ -981,10 +981,15 @@ async def improve_start(
                 "improve --search requires the isolated PaperQA literature provider.",
             )
         weakness_query = failure or idea or component or "research experiment discrimination weakness"
-        literature_result = await literature().search(
+        literature_service = await call(literature)
+        if isinstance(literature_service, dict) and "error" in literature_service:
+            return literature_service
+        literature_result = await call(literature_service.search,
             "Research methods for this measured policy weakness; return competing methods, "
             "limitations, and negative evidence where available: " + weakness_query
         )
+        if isinstance(literature_result, dict) and "error" in literature_result:
+            return literature_result
         paper = literature_result.answer or "\n".join(
             candidate.source_excerpt for candidate in literature_result.evidence_candidates[:3]
         )
@@ -1411,8 +1416,7 @@ async def legacy_reserved_run_abandon(
                 "message": "The local job exists or could not be verified absent",
             }
         }
-    abandon_args = (run_id, job_id, rationale, technical_non_scientific) if technical_non_scientific else (run_id, job_id, rationale)
-    return await call(brain().legacy_reserved_run_abandon, *abandon_args)
+    return await call(brain().legacy_reserved_run_abandon, run_id, job_id, rationale, technical_non_scientific)
 
 
 @mcp.tool()

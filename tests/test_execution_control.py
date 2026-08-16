@@ -255,7 +255,7 @@ async def test_legacy_reserved_run_abandon_requires_server_verified_missing_job(
     result = await server.legacy_reserved_run_abandon("run-id", "No local job was submitted")
 
     assert result["status"] == "cancelled"
-    assert brain.args == ("run-id", "missing-job", "No local job was submitted")
+    assert brain.args == ("run-id", "missing-job", "No local job was submitted", False)
 
 
 @pytest.mark.asyncio
@@ -283,7 +283,7 @@ async def test_legacy_reserved_run_abandon_allows_only_verified_abandonment_repl
     result = await server.legacy_reserved_run_abandon("run-id", "No local job was submitted")
 
     assert result["status"] == "cancelled"
-    assert brain.args == ("run-id", "missing-job", "No local job was submitted")
+    assert brain.args == ("run-id", "missing-job", "No local job was submitted", False)
 
 
 @pytest.mark.asyncio
