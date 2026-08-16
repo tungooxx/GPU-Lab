@@ -759,6 +759,67 @@ class ResearchStore:
             "data": data,
         }
 
+    def production_policy_ensure(self, project_id: str, data: dict[str, Any]) -> dict:
+        """Return the sole production policy, creating it under a project lock."""
+        ident, now = uuid.uuid4(), datetime.now(UTC)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"production-policy:{project_id}",))
+            cur.execute(
+                "SELECT id,project_id,kind,status,data FROM research_objects "
+                "WHERE project_id=%s AND kind='ResearchPolicy' AND status='PRODUCTION' FOR UPDATE",
+                (project_id,),
+            )
+            existing = cur.fetchone()
+            if existing:
+                return {**existing, "id": str(existing["id"])}
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'ResearchPolicy','PRODUCTION',%s,%s)",
+                (ident, project_id, json.dumps(data), now),
+            )
+            self._event(cur, project_id, "RESEARCH_POLICY_CREATED", ident, data)
+        return {"id": str(ident), "project_id": project_id, "kind": "ResearchPolicy", "status": "PRODUCTION", "data": data}
+
+    def production_policy_promote(self, project_id: str, current_policy_id: str, data: dict[str, Any]) -> dict:
+        """Atomically supersede the current production policy and insert its successor."""
+        ident, now = uuid.uuid4(), datetime.now(UTC)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"production-policy:{project_id}",))
+            cur.execute(
+                "SELECT id FROM research_objects WHERE id=%s AND project_id=%s "
+                "AND kind='ResearchPolicy' AND status='PRODUCTION' FOR UPDATE",
+                (current_policy_id, project_id),
+            )
+            if not cur.fetchone():
+                raise GPUError("POLICY_PRODUCTION_CONFLICT", current_policy_id)
+            cur.execute("UPDATE research_objects SET status='SUPERSEDED' WHERE id=%s", (current_policy_id,))
+            self._event(cur, project_id, "RESEARCH_POLICY_SUPERSEDED", current_policy_id, {})
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'ResearchPolicy','PRODUCTION',%s,%s)",
+                (ident, project_id, json.dumps(data), now),
+            )
+            self._event(cur, project_id, "RESEARCH_POLICY_PROMOTED", ident, data)
+        return {"id": str(ident), "project_id": project_id, "kind": "ResearchPolicy", "status": "PRODUCTION", "data": data}
+
+    def production_policy_rollback(self, project_id: str, current_policy_id: str, target_policy_id: str) -> dict:
+        """Atomically restore a prior policy as the sole production policy."""
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"production-policy:{project_id}",))
+            cur.execute("SELECT id FROM research_objects WHERE id=%s AND project_id=%s AND kind='ResearchPolicy' AND status='PRODUCTION' FOR UPDATE", (current_policy_id, project_id))
+            if not cur.fetchone():
+                raise GPUError("POLICY_PRODUCTION_CONFLICT", current_policy_id)
+            cur.execute("SELECT id,data FROM research_objects WHERE id=%s AND project_id=%s AND kind='ResearchPolicy' FOR UPDATE", (target_policy_id, project_id))
+            target = cur.fetchone()
+            if not target:
+                raise GPUError("INVALID_POLICY_ROLLBACK_TARGET", target_policy_id)
+            cur.execute("UPDATE research_objects SET status='SUPERSEDED' WHERE id=%s", (current_policy_id,))
+            data = {**target["data"], "rollback_from_policy_id": str(current_policy_id)}
+            cur.execute("UPDATE research_objects SET status='PRODUCTION',data=%s WHERE id=%s", (json.dumps(data), target_policy_id))
+            self._event(cur, project_id, "RESEARCH_POLICY_SUPERSEDED", current_policy_id, {})
+            self._event(cur, project_id, "RESEARCH_POLICY_ROLLED_BACK", target_policy_id, {"rollback_from_policy_id": str(current_policy_id)})
+        return {"id": str(target_policy_id), "project_id": project_id, "kind": "ResearchPolicy", "status": "PRODUCTION", "data": data}
+
     def evidence_family_create_atomic(
         self,
         project_id: str,

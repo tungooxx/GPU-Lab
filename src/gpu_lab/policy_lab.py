@@ -105,6 +105,9 @@ class PolicyLabService:
             applicability={"scope": "PROJECT"},
             notes="Canonical v2.5 baseline; deterministic v2.2 code remains the implementation source.",
         ).model_dump(mode="json")
+        transactional_ensure = getattr(self.store, "production_policy_ensure", None)
+        if callable(transactional_ensure):
+            return transactional_ensure(project_id, payload)
         return self._create(project_id, "ResearchPolicy", payload, "RESEARCH_POLICY_CREATED", "PRODUCTION")
 
     def detect_weaknesses(self, project_id: str, component: str | None = None) -> list[dict[str, Any]]:
@@ -353,6 +356,9 @@ class PolicyLabService:
         next_version = max([int(p["data"].get("version", 0)) for p in self._objects(project_id, "ResearchPolicy")] or [0]) + 1
         delta = self._policy_delta(patch["data"]["semantic_change"]).model_dump(mode="json")
         data = {**current["data"], **{section: {**current["data"].get(section, {}), **change} for section, change in delta.items() if change}, "version": next_version, "parent_policy_id": str(current["id"]), "provenance": {"source_type": "POLICY_PATCH", "patch_id": patch_id}, "notes": f"Promoted patch {patch_id}", "applied_patch_ids": [patch_id], "applied_policy_delta": delta}
+        transactional_promote = getattr(self.store, "production_policy_promote", None)
+        if callable(transactional_promote):
+            return transactional_promote(project_id, str(current["id"]), data)
         self.store.object_update(str(current["id"]), {}, "SUPERSEDED", "RESEARCH_POLICY_SUPERSEDED")
         return self._create(project_id, "ResearchPolicy", data, "RESEARCH_POLICY_PROMOTED", "PRODUCTION")
 
@@ -395,6 +401,9 @@ class PolicyLabService:
             raise GPUError("INVALID_POLICY_ROLLBACK_TARGET", policy_id)
         current = self.ensure_production_policy(project_id)
         if str(current["id"]) != policy_id:
+            transactional_rollback = getattr(self.store, "production_policy_rollback", None)
+            if callable(transactional_rollback):
+                return transactional_rollback(project_id, str(current["id"]), policy_id)
             self.store.object_update(str(current["id"]), {}, "SUPERSEDED", "RESEARCH_POLICY_SUPERSEDED")
             return self.store.object_update(policy_id, {"rollback_from_policy_id": str(current["id"])}, "PRODUCTION", "RESEARCH_POLICY_ROLLED_BACK")
         return target
