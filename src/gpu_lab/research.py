@@ -83,6 +83,7 @@ RESEARCH_OBJECT_KINDS = (
     "PolicyUserFeedback",
     "PolicyEvaluationAudit",
     "PolicyRankerReadiness",
+    "MetaResearchCampaign",
 )
 RESEARCH_OBJECT_STATUSES = {
     "ACTIVE",

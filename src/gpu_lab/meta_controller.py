@@ -322,6 +322,31 @@ class MetaResearchController:
             return {"decision": "COMPATIBILITY_EVALUATED", "opportunities": opportunities, "compatibility": compatibility}
         budget = {key: config["data"][key] for key in self.defaults if key != "mode"}
         source_context = self._candidate_sources(project_id, opportunity)
+        campaign_fingerprint = f"meta-campaign:{opportunity['id']}"
+        active_campaign = next(
+            (
+                item for item in self._objects(project_id, "MetaResearchCampaign")
+                if item["data"].get("fingerprint") == campaign_fingerprint and item["status"] in {"RUNNING", "ACTIVE"}
+            ),
+            None,
+        )
+        if active_campaign:
+            return {"decision": "CAMPAIGN_IN_PROGRESS", "opportunities": opportunities, "campaign": active_campaign}
+        campaign = self.store.object_create(
+            project_id,
+            "MetaResearchCampaign",
+            {
+                "fingerprint": campaign_fingerprint,
+                "opportunity_id": str(opportunity["id"]),
+                "trigger": opportunity["data"].get("source"),
+                "scope": opportunity["data"]["scope"],
+                "budget": budget,
+                "source_context": source_context,
+                "resume_state": "POLICY_LAB_NOT_STARTED",
+            },
+            "META_RESEARCH_STARTED",
+            "RUNNING",
+        )
         result = self.policy_lab.improve(
             project_id,
             failure=opportunity["data"]["observed_failure"],
@@ -331,6 +356,12 @@ class MetaResearchController:
             source_context=source_context,
         )
         run_id = str(result["improvement_run"]["id"])
+        self.store.object_update(
+            str(campaign["id"]),
+            {"improvement_run_id": run_id, "resume_state": "POLICY_LAB_COMPLETED"},
+            "COMPLETED",
+            "META_RESEARCH_COMPLETED",
+        )
         self.store.object_update(run_id, {"meta_campaign": {"trigger": str(opportunity["id"]), "target_component": opportunity["data"]["target_component"], "scope": opportunity["data"]["scope"], "budget": budget, "candidate_sources": source_context, "stop_conditions": ["candidate budget exhausted", "benchmark budget exhausted", "hard epistemic regression", "revision limit reached"]}}, "COMPLETED", "META_RESEARCH_BUDGET_RECORDED")
         self.store.object_update(str(opportunity["id"]), {"improvement_run_id": run_id}, "COMPLETED", "META_RESEARCH_STARTED")
         promoted = None
@@ -341,7 +372,7 @@ class MetaResearchController:
             self.store.object_update(run_id, {"auto_promotion_preflight": promotion_preflight}, "COMPLETED", "POLICY_AUTO_PROMOTION_PREFLIGHT")
             if config["data"]["mode"] == "AUTO_PROJECT" and promotion_preflight["eligible"]:
                 promoted = self.policy_lab.promote(project_id, best_patch)
-        return {"decision": "CAMPAIGN_STARTED", "opportunities": opportunities, "improvement": result, "promotion_preflight": promotion_preflight, "promoted_policy": promoted}
+        return {"decision": "CAMPAIGN_STARTED", "opportunities": opportunities, "campaign": campaign, "improvement": result, "promotion_preflight": promotion_preflight, "promoted_policy": promoted}
 
     def monitor_promotions(self, project_id: str) -> list[dict[str, Any]]:
         """Detect severe, repeated post-promotion failures and rollback scoped policy."""

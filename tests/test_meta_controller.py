@@ -198,3 +198,18 @@ def test_auto_project_runs_closed_meta_cycle_and_promotes_supported_patch():
     run = store.objects_list("project", "ImprovementRun")[0]
     assert run["data"]["meta_campaign"]["candidate_sources"]["MetaWorldModel"]
     assert run["data"]["auto_promotion_preflight"]["policy_experiment_id"]
+    assert store.objects_list("project", "MetaResearchCampaign")[0]["status"] == "COMPLETED"
+
+
+def test_active_campaign_claim_prevents_duplicate_retry_after_interruption():
+    store = Store()
+    controller = MetaResearchController(store, PolicyLab())
+    for _ in range(2):
+        store.object_create("project", "ResearchDecisionOutcome", {"label": "LOW_VALUE", "action_type": "DIAGNOSTIC"}, "FIXTURE", "RESULT_INSPECTED")
+    opportunity = controller.detect_opportunities("project")[0]
+    campaign = store.object_create("project", "MetaResearchCampaign", {"fingerprint": f"meta-campaign:{opportunity['id']}"}, "FIXTURE", "RUNNING")
+
+    result = controller.run_once("project")
+
+    assert result["decision"] == "CAMPAIGN_IN_PROGRESS"
+    assert result["campaign"]["id"] == campaign["id"]
