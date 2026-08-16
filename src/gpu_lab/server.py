@@ -1232,7 +1232,7 @@ async def policy_hindsight_record(
     unexpected_failure: str | None = None,
     decision_ids: list[str] | None = None,
 ):
-    """Record post-promotion policy calibration data without changing scientific state."""
+    """Record hindsight, then autonomously assess calibration and rollback evidence."""
     result = await call(
         policy_lab().record_hindsight,
         policy_id,
@@ -1243,8 +1243,14 @@ async def policy_hindsight_record(
     )
     if "error" in result:
         return result
-    calibration = await call(meta_controller().monitor_calibration, str(result["project_id"]))
-    return {**result, "calibration_opportunities": calibration}
+    project_id = str(result["project_id"])
+    calibration = await call(meta_controller().monitor_calibration, project_id)
+    regressions = await call(meta_controller().monitor_promotions, project_id)
+    return {
+        **result,
+        "calibration_opportunities": calibration,
+        "policy_regressions": regressions,
+    }
 
 
 @mcp.tool()

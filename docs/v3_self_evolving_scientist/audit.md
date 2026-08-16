@@ -114,6 +114,10 @@ scope and only runs when the matching autonomy mode is enabled. Every detected
 regression also creates a durable calibration-diagnosis agenda question before
 the failed policy can be reconsidered.
 
+Recording a prospective `PolicyHindsight` event is itself an autonomous trigger:
+the MCP path runs both calibration monitoring and scoped regression/rollback
+monitoring, so operators do not need to invoke a second regression-check tool.
+
 The `meta_research_roi` MCP tool reports campaign budget ceilings and observed
 candidate, promotion, regression, hindsight, invalid-experiment, and
 zero-information rates. It intentionally reports future research cost avoided

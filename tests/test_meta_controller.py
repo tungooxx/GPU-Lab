@@ -3,6 +3,9 @@ from __future__ import annotations
 import uuid
 from pathlib import Path
 
+import pytest
+
+from gpu_lab import server
 from gpu_lab.brain_bench import ResearchBrainBench
 from gpu_lab.meta_controller import MetaResearchController
 from gpu_lab.policy_lab import PolicyLabService
@@ -43,6 +46,36 @@ class PolicyLab:
 
     def provider_adapter_candidate(self, project_id, provider, model, compatibility_experiment_id):
         return {"id": "adapter-candidate", "data": {"provider": provider, "model": model}}
+
+
+@pytest.mark.asyncio
+async def test_hindsight_event_automatically_checks_calibration_and_regressions(monkeypatch):
+    calls = []
+
+    class HindsightLab:
+        def record_hindsight(self, *_args):
+            return {"id": "hindsight", "project_id": "project"}
+
+    class HindsightController:
+        def monitor_calibration(self, project_id):
+            calls.append(("calibration", project_id))
+            return ["calibration-opportunity"]
+
+        def monitor_promotions(self, project_id):
+            calls.append(("regressions", project_id))
+            return ["regression"]
+
+    async def direct_call(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(server, "call", direct_call)
+    monkeypatch.setattr(server, "policy_lab", lambda: HindsightLab())
+    monkeypatch.setattr(server, "meta_controller", lambda: HindsightController())
+
+    result = await server.policy_hindsight_record("policy", -0.2, 1.0, "invalid experiments increased")
+
+    assert calls == [("calibration", "project"), ("regressions", "project")]
+    assert result["policy_regressions"] == ["regression"]
 
 
 class CampaignPolicyLab(PolicyLab):
