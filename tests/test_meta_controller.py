@@ -123,6 +123,22 @@ def test_policy_pin_prevents_automatic_rollback():
     assert regression["data"]["rollback_decision"] == "PENDING"
 
 
+def test_user_feedback_requires_actual_outcome_evidence_before_campaign_candidate():
+    store = Store()
+    controller = MetaResearchController(store, PolicyLab())
+    recorded = controller.feedback_record("project", "Too many low-value diagnostics")
+
+    assert recorded["opportunity"]["status"] == "PENDING_EVIDENCE_REVIEW"
+    assert controller.feedback_validate("project", recorded["feedback"]["id"])["status"] == "PENDING_EVIDENCE_REVIEW"
+    for _ in range(2):
+        store.object_create("project", "ResearchDecisionOutcome", {"label": "LOW_VALUE", "action_type": "DIAGNOSTIC"}, "FIXTURE", "RESULT_INSPECTED")
+
+    validated = controller.feedback_validate("project", recorded["feedback"]["id"])
+
+    assert validated["status"] == "CANDIDATE"
+    assert validated["data"]["expected_value_of_improvement"] == 0.4
+
+
 def test_model_change_creates_one_compatibility_opportunity():
     store = Store()
     controller = MetaResearchController(store, PolicyLab())

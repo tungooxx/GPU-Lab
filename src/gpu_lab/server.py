@@ -1093,6 +1093,18 @@ async def policy_pin(project_id: str, policy_id: str | None = None):
 
 
 @mcp.tool()
+async def policy_feedback_record(project_id: str, feedback: str, target_component: str = "experiment_selection"):
+    """Record user feedback as a hypothesis pending inspection of actual outcomes."""
+    return await call(meta_controller().feedback_record, project_id, feedback, target_component)
+
+
+@mcp.tool()
+async def policy_feedback_validate(project_id: str, feedback_id: str):
+    """Validate feedback against persisted decision outcomes before creating a candidate."""
+    return await call(meta_controller().feedback_validate, project_id, feedback_id)
+
+
+@mcp.tool()
 async def policy_canary_start(project_id: str, candidate_policy_id: str, percentage: int = 10):
     """Start a bounded prospective canary; it does not replace production policy."""
     return await call(policy_lab().start_canary, project_id, candidate_policy_id, percentage)

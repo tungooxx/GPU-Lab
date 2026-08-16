@@ -154,6 +154,56 @@ class MetaResearchController:
         """Persist an operator override without deleting autonomous conclusions."""
         return self.config_update(project_id, {"pinned_policy_id": policy_id})
 
+    def feedback_record(self, project_id: str, feedback: str, target_component: str = "experiment_selection") -> dict[str, Any]:
+        """Persist user feedback as a hypothesis, not as policy authority."""
+        if not isinstance(feedback, str) or not feedback.strip():
+            raise GPUError("POLICY_USER_FEEDBACK_INVALID", "feedback must be non-empty")
+        feedback_record = self.store.object_create(
+            project_id,
+            "PolicyUserFeedback",
+            {"feedback": feedback.strip(), "target_component": target_component, "validation_status": "PENDING_OUTCOME_INSPECTION"},
+            "POLICY_USER_FEEDBACK_RECORDED",
+            "PENDING_EVIDENCE_REVIEW",
+        )
+        opportunity = self.store.object_create(
+            project_id,
+            "ImprovementOpportunity",
+            {
+                "source": "USER_FEEDBACK",
+                "target_component": target_component,
+                "observed_failure": feedback.strip(),
+                "supporting_evidence": [str(feedback_record["id"])],
+                "frequency": 0,
+                "severity": 0,
+                "scientific_cost": 0.0,
+                "compute_cost": 0.0,
+                "confidence": 0.0,
+                "estimated_fixability": 0.5,
+                "expected_value_of_improvement": 0.0,
+                "scope": "PROJECT",
+                "fingerprint": f"user-feedback:{feedback_record['id']}",
+                "requires_outcome_validation": True,
+            },
+            "IMPROVEMENT_OPPORTUNITY_CREATED",
+            "PENDING_EVIDENCE_REVIEW",
+        )
+        return {"feedback": feedback_record, "opportunity": opportunity}
+
+    def feedback_validate(self, project_id: str, feedback_id: str) -> dict[str, Any]:
+        """Gate feedback-derived opportunities on actual inspected outcomes."""
+        feedback = self.store.object_get(feedback_id)
+        if feedback["kind"] != "PolicyUserFeedback" or str(feedback["project_id"]) != str(project_id):
+            raise GPUError("POLICY_USER_FEEDBACK_INVALID", feedback_id)
+        outcomes = self._objects(project_id, "ResearchDecisionOutcome")
+        negative = [item for item in outcomes if item["data"].get("label") in {"LOW_VALUE", "ZERO_INFORMATION", "PREMATURE", "INVALID"}]
+        if len(negative) < 2:
+            return self.store.object_update(str(feedback["id"]), {"validation_status": "INSUFFICIENT_OUTCOME_EVIDENCE"}, "PENDING_EVIDENCE_REVIEW", "POLICY_USER_FEEDBACK_VALIDATED")
+        opportunity = next(item for item in self._objects(project_id, "ImprovementOpportunity") if str(feedback["id"]) in item["data"].get("supporting_evidence", []))
+        updated = self.store.object_update(str(opportunity["id"]), {"supporting_evidence": [str(feedback["id"]), *[str(item["id"]) for item in negative]], "frequency": len(negative), "confidence": min(0.9, 0.3 + len(negative) * 0.15), "expected_value_of_improvement": 0.4}, "CANDIDATE", "USER_FEEDBACK_EVIDENCE_CONFIRMED")
+        self.store.object_update(str(feedback["id"]), {"validation_status": "OUTCOME_EVIDENCE_CONFIRMED"}, "COMPLETED", "POLICY_USER_FEEDBACK_VALIDATED")
+        self._ensure_meta_records(project_id, updated)
+        return updated
+
     def detect_opportunities(self, project_id: str) -> list[dict[str, Any]]:
         outcomes = self._objects(project_id, "ResearchDecisionOutcome")
         grouped: dict[str, list[dict[str, Any]]] = {}

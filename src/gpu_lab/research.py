@@ -80,6 +80,7 @@ RESEARCH_OBJECT_KINDS = (
     "PolicyCanary",
     "PolicyShadowEvaluation",
     "PolicyHindsight",
+    "PolicyUserFeedback",
 )
 RESEARCH_OBJECT_STATUSES = {
     "ACTIVE",
