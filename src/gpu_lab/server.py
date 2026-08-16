@@ -489,7 +489,13 @@ async def run_meta_research(project_id: str) -> dict[str, Any]:
         "COMPLETED",
         "LITERATURE_SCOUT_COMPLETED",
     )
-    return {**result, "postmortem": postmortem, "literature_scout": {"status": "COMPLETED", "request": completed, "gathered": gathered}}
+    transfers = await call(
+        meta_controller().literature_scout_complete,
+        project_id,
+        str(request["id"]),
+        [str(item["id"]) for item in gathered.get("evidence", [])],
+    )
+    return {**result, "postmortem": postmortem, "literature_scout": {"status": "COMPLETED", "request": completed, "gathered": gathered, "policy_transfers": transfers}}
 
 
 def executable_papers() -> ExecutablePaperService:

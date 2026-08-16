@@ -47,7 +47,60 @@ class MetaResearchController:
             "MetaLesson": [str(item["id"]) for item in self._objects(project_id, "MetaLesson")[-5:]],
             "ResearchStrategyPattern": [str(item["id"]) for item in self._objects(project_id, "ResearchStrategyPattern")[-5:]],
             "PolicyNegativeResult": [str(item["id"]) for item in self._objects(project_id, "PolicyNegativeResult")[-10:]],
+            "LiteraturePolicyTransfer": [
+                str(item["id"])
+                for item in self._objects(project_id, "LiteraturePolicyTransfer")
+                if str(item["data"].get("opportunity_id")) == str(opportunity["id"])
+                and item["status"] == "CANDIDATE"
+            ][-10:],
         }
+
+    def literature_scout_complete(self, project_id: str, request_id: str, evidence_ids: list[str]) -> list[dict[str, Any]]:
+        """Extract bounded, reviewable policy-transfer candidates from scout evidence.
+
+        This performs no scientific validation and does not execute paper text.
+        Each record is a later policy-idea input whose provenance remains the
+        original candidate EvidenceUnit.
+        """
+        request = self.store.object_get(request_id)
+        if request["kind"] != "LiteratureScoutRequest" or str(request["project_id"]) != str(project_id):
+            raise GPUError("LITERATURE_SCOUT_REQUEST_INVALID", request_id)
+        transfers = []
+        for evidence_id in evidence_ids[:20]:
+            evidence = self.store.object_get(str(evidence_id))
+            if evidence["kind"] != "EvidenceUnit" or str(evidence["project_id"]) != str(project_id):
+                raise GPUError("LITERATURE_SCOUT_EVIDENCE_INVALID", str(evidence_id))
+            fingerprint = f"literature-policy-transfer:{request_id}:{evidence_id}"
+            existing = self._find_by_fingerprint(project_id, "LiteraturePolicyTransfer", fingerprint)
+            if existing:
+                transfers.append(existing)
+                continue
+            excerpt = str(evidence["data"].get("excerpt", evidence["data"].get("source_excerpt", "")))
+            lowered = excerpt.lower()
+            overlap = any(term in lowered for term in ("hypothesis-outcome", "runner-up", "null-focused"))
+            transfers.append(self.store.object_create(
+                project_id,
+                "LiteraturePolicyTransfer",
+                {
+                    "fingerprint": fingerprint,
+                    "opportunity_id": str(request["data"].get("opportunity_id")),
+                    "literature_scout_request_id": request_id,
+                    "evidence_id": str(evidence_id),
+                    "problem_addressed": request["data"].get("question"),
+                    "proposed_mechanism_excerpt": excerpt[:4000],
+                    "procedure": "UNEXTRACTED_FROM_CANDIDATE_EVIDENCE",
+                    "assumptions": "UNVERIFIED_EXTERNAL_SOURCE",
+                    "benchmark_or_ablation": "UNEXTRACTED_FROM_CANDIDATE_EVIDENCE",
+                    "failure_or_cost": "UNEXTRACTED_FROM_CANDIDATE_EVIDENCE",
+                    "transferable_principle": "Requires policy-hypothesis review and blinded benchmark evaluation.",
+                    "non_transferable_architecture": "External architecture is not imported by this record.",
+                    "comparison": "PARTIAL_OVERLAP" if overlap else "NOVEL_CANDIDATE",
+                    "authority": "EVIDENCE_CANDIDATE_ONLY",
+                },
+                "LITERATURE_POLICY_TRANSFER_EXTRACTED",
+                "CANDIDATE",
+            ))
+        return transfers
 
     def _diagnose_opportunity(self, project_id: str, opportunity: dict[str, Any]) -> dict[str, Any]:
         """Persist competing, explicitly non-causal explanations before patching."""

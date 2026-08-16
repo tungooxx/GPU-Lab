@@ -82,3 +82,9 @@ meta campaign; repeated severe invalid outcomes can still preempt that deferral.
 sequence: repeated LOW_VALUE outcomes launch a project-scoped campaign without
 manual `/improve`, promote a held-out supported policy, record prospective
 positive policy hindsight, and confirm that no rollback is triggered.
+
+Completed literature scouts now create durable `LiteraturePolicyTransfer`
+records. They preserve candidate-evidence provenance, a minimal transferable
+principle, explicit unknown extraction fields, and an overlap classification;
+they seed later policy invention but never automatically import an external
+architecture or establish a scientific claim.

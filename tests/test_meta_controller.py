@@ -203,6 +203,22 @@ def test_model_change_creates_one_compatibility_opportunity():
     assert controller.model_change_detect("project", "openai", "new-model") is None
 
 
+def test_literature_scout_extracts_candidate_only_policy_transfer_with_provenance():
+    store = Store()
+    controller = MetaResearchController(store, PolicyLab())
+    opportunity = store.object_create("project", "ImprovementOpportunity", {"target_component": "critic", "observed_failure": "critic misses", "expected_value_of_improvement": 0.5, "scope": "PROJECT"}, "FIXTURE", "CANDIDATE")
+    request = store.object_create("project", "LiteratureScoutRequest", {"opportunity_id": opportunity["id"], "question": "How to improve critic behavior?"}, "FIXTURE", "PREPARED")
+    evidence = store.object_create("project", "EvidenceUnit", {"excerpt": "A distinct critique procedure improved falsification."}, "FIXTURE", "CANDIDATE")
+
+    transfers = controller.literature_scout_complete("project", request["id"], [evidence["id"]])
+
+    assert transfers[0]["data"]["evidence_id"] == evidence["id"]
+    assert transfers[0]["data"]["comparison"] == "NOVEL_CANDIDATE"
+    assert transfers[0]["data"]["authority"] == "EVIDENCE_CANDIDATE_ONLY"
+    assert controller._candidate_sources("project", opportunity)["LiteraturePolicyTransfer"] == [transfers[0]["id"]]
+    assert controller.literature_scout_complete("project", request["id"], [evidence["id"]])[0]["id"] == transfers[0]["id"]
+
+
 def test_model_change_runs_compatibility_instead_of_mutating_policy():
     store = Store()
     controller = MetaResearchController(store, PolicyLab())
