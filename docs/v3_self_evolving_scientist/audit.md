@@ -163,3 +163,45 @@ submitted or simulated.
 PostgreSQL was reachable read-only with durable `research_objects` and
 `research_events` rows present. No live service restart was performed because
 it would interrupt the running user deployment.
+
+## V3 requirement coverage
+
+| Requirement | Status | Authoritative evidence |
+| --- | --- | --- |
+| Meta world model and agenda | VERIFIED_UNIT | `MetaResearchController` persists `MetaWorldModel` and `MetaResearchAgenda`; controller fixtures assert both records. |
+| Autonomous triggers and prioritization | VERIFIED_INTEGRATION | Decision-outcome, postmortem, feedback, calibration, and model-change triggers feed one bounded controller pass. |
+| Bounded controller and budgets | VERIFIED_UNIT | Durable campaign claims record all configured ceilings, consumption, stop reasons, and restart-resume state. |
+| Science-vs-meta scheduling | VERIFIED_UNIT | Controller tests cover deferral to a more valuable domain agenda item and severe-failure override. |
+| Targeted literature scouting | VERIFIED_INTEGRATION | The configured service dispatches one bounded problem-driven request and stores candidate-only transfers. |
+| Internal invention and competing hypotheses | VERIFIED_UNIT | The policy lab creates mechanism-distinct candidate-generation, ranking, and critic hypotheses after a non-causal diagnosis. |
+| Negative policy memory | VERIFIED_UNIT | Semantic fingerprints of `PolicyNegativeResult` prevent casual recreation of failed patches. |
+| Bounded v2.2 implementation handoff | VERIFIED_INTEGRATION | Code patches require bounded `EngineeringTask` evidence before benchmark evaluation. |
+| Evaluation and evaluator firewall | VERIFIED_UNIT | Frozen development/validation/held-out splits, evaluator audits, and tampering rejection are exercised in policy-lab tests. |
+| Benchmark firewall and gap isolation | VERIFIED_UNIT | Candidates cannot inspect hidden data; discovered gaps become future-only authoring proposals, never current evaluation evidence. |
+| Falsification, revision, and tournament | VERIFIED_UNIT | Adversarial held-out checks, hard regression rejection, bounded descendants, and tournament ranking have regression coverage. |
+| Scoped promotion and autonomy config | VERIFIED_INTEGRATION | Project promotion/rollback sequences and DOMAIN/GLOBAL preflight conditions are covered. |
+| Canary and shadow records | VERIFIED_UNIT | Canary stop conditions and counterfactual-unknown shadow records are persisted without fabricating unchosen outcomes. |
+| Hindsight, calibration, regression, rollback | VERIFIED_INTEGRATION | Recording hindsight automatically invokes calibration and scoped rollback monitoring; failed policies create negative memory and a calibration agenda. |
+| Provider adaptation | VERIFIED_INTEGRATION | Compatibility detection, live PASS/FAIL evidence retention, and scoped adapter descendants are covered; live provider proof is separate. |
+| Durable events and restart recovery | VERIFIED_UNIT | Object/event persistence and campaign resume fixtures prevent duplicate runs and promotions. |
+| Existing v2.1/v2.2/v2.5 coverage | VERIFIED_INTEGRATION | Full local suite passed with `269 passed, 19 skipped`; skipped PostgreSQL-only tests require an explicitly configured test database. |
+
+## Required final-report outline
+
+The source and test evidence above correspond to the requested v3 report:
+
+- **Meta World Model, Meta Research Agenda, Improvement Opportunities, Autonomous Triggers, Meta Research Controller, Meta-Science Budgets, Science vs Meta-Science Scheduling:** implemented and unit/integration verified.
+- **Autonomous Literature Scouting, Internal Policy Invention, Competing Policy Hypotheses, Policy Diagnostics, Policy Dead Memory:** implemented and verified without treating external literature as authority.
+- **Automatic Implementation, Automatic Evaluation, Evaluator Firewall, Benchmark Firewall, Automatic Falsification, Automatic Revision, Policy Tournament:** implementation/evaluation paths are verified; live external code execution remains unverified until an executor is configured.
+- **Project/Domain/Global Autonomy, Canary, Shadow Evaluation, Policy Hindsight, Calibration, Regression Detection, Automatic Rollback:** scoped paths and safeguards are covered in fixtures. Canary routing remains prospective because it requires real eligible decisions.
+- **Model Change Handling, Provider Adapter Evolution, Benchmark Gap Discovery, Meta-Research ROI, Restart Durability:** code and local verification exist; live provider behavior and deployed restart recovery remain unverified.
+
+## Remaining proof gaps
+
+1. Restart the deployed `gpu-lab` service and verify health plus a durable
+   campaign resume against PostgreSQL. This is deliberately pending operator
+   approval because it interrupts the running service.
+2. Configure a real provider to obtain cross-model held-out observations. Until
+   then adapter candidates remain correctly marked `CROSS_MODEL_UNVERIFIED`.
+3. Configure Paper2Agent only if live code-bearing policy patches must be
+   exercised. Its absence does not block v3 semantic policy evolution.
