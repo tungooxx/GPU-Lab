@@ -60,6 +60,13 @@ def test_improvement_budget_bounds_candidates_and_revisions():
     assert result["improvement_run"]["data"]["budget"] == {"candidate_budget": 1, "max_revisions": 0}
 
 
+def test_improvement_keeps_meta_source_provenance_on_hypotheses_and_run():
+    result = service().improve("project", idea="Improve discrimination", source_context={"MetaLesson": ["lesson-1"], "PolicyNegativeResult": ["negative-1"]})
+
+    assert result["hypotheses"][0]["data"]["source_ids"] == ["lesson-1", "negative-1"]
+    assert result["improvement_run"]["data"]["source_context"]["MetaLesson"] == ["lesson-1"]
+
+
 def test_duplicate_failed_policy_is_rejected_before_evaluation():
     store = Store()
     lab = service(store)

@@ -34,6 +34,21 @@ class MetaResearchController:
             None,
         )
 
+    def _candidate_sources(self, project_id: str, opportunity: dict[str, Any]) -> dict[str, list[str]]:
+        """Return durable, reviewable inputs for policy invention.
+
+        Sources are evidence and constraints, not executable instructions.  In
+        particular rejected policy results are retained to avoid repeating a
+        failed mechanism casually.
+        """
+        return {
+            "ImprovementOpportunity": [str(opportunity["id"])],
+            "MetaWorldModel": [str(item["id"]) for item in self._objects(project_id, "MetaWorldModel")[-5:]],
+            "MetaLesson": [str(item["id"]) for item in self._objects(project_id, "MetaLesson")[-5:]],
+            "ResearchStrategyPattern": [str(item["id"]) for item in self._objects(project_id, "ResearchStrategyPattern")[-5:]],
+            "PolicyNegativeResult": [str(item["id"]) for item in self._objects(project_id, "PolicyNegativeResult")[-10:]],
+        }
+
     def _ensure_meta_records(self, project_id: str, opportunity: dict[str, Any]) -> None:
         """Turn an observed weakness into explicit, non-causal meta-science records.
 
@@ -184,15 +199,17 @@ class MetaResearchController:
             )
             return {"decision": "COMPATIBILITY_EVALUATED", "opportunities": opportunities, "compatibility": compatibility}
         budget = {key: config["data"][key] for key in self.defaults if key != "mode"}
+        source_context = self._candidate_sources(project_id, opportunity)
         result = self.policy_lab.improve(
             project_id,
             failure=opportunity["data"]["observed_failure"],
             component=opportunity["data"]["target_component"],
             candidate_budget=int(config["data"]["candidate_budget"]),
             max_revisions=int(config["data"]["max_revision_rounds"]),
+            source_context=source_context,
         )
         run_id = str(result["improvement_run"]["id"])
-        self.store.object_update(run_id, {"meta_campaign": {"trigger": str(opportunity["id"]), "target_component": opportunity["data"]["target_component"], "scope": opportunity["data"]["scope"], "budget": budget, "stop_conditions": ["candidate budget exhausted", "benchmark budget exhausted", "hard epistemic regression", "revision limit reached"]}}, "COMPLETED", "META_RESEARCH_BUDGET_RECORDED")
+        self.store.object_update(run_id, {"meta_campaign": {"trigger": str(opportunity["id"]), "target_component": opportunity["data"]["target_component"], "scope": opportunity["data"]["scope"], "budget": budget, "candidate_sources": source_context, "stop_conditions": ["candidate budget exhausted", "benchmark budget exhausted", "hard epistemic regression", "revision limit reached"]}}, "COMPLETED", "META_RESEARCH_BUDGET_RECORDED")
         self.store.object_update(str(opportunity["id"]), {"improvement_run_id": run_id}, "COMPLETED", "META_RESEARCH_STARTED")
         promoted = None
         best_patch = result["improvement_run"]["data"].get("best_supported_patch_id")
