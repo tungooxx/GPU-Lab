@@ -65,6 +65,6 @@ semantic adaptations; external text cannot authorize commands or policy changes.
   external model/provider evaluation is claimed.
 - Targeted literature search is provider-dependent and has not been executed in
   this environment.
-- CodeRabbit could not run locally: the prescribed WSL user is absent and the
-  fallback WSL environment has no Node runtime for the CLI.
+- CodeRabbit review was explicitly waived by the user. Local test and lint
+  evidence remains the verification basis for this handoff.
 - No autonomous continuous self-evolution is implemented; this is intentional.
