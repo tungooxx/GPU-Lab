@@ -452,7 +452,12 @@ async def test_worker_health_is_secret_free_and_other_routes_require_auth(monkey
     from gpu_lab import literature_worker
 
     monkeypatch.setattr(literature_worker, "WORKER_TOKEN", "scoped-token")
+    monkeypatch.delenv("NGHIMMO_MODEL", raising=False)
+    monkeypatch.delenv("NGHIMMO_BASE_URL", raising=False)
+    monkeypatch.delenv("NGHIMMO_API_KEY", raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "task-scoped-test-key")
+    monkeypatch.setattr(literature_worker.provider, "model", None)
+    monkeypatch.setattr(literature_worker.provider, "base_url", None)
     transport = httpx.ASGITransport(app=literature_worker.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://worker") as client:
         health = await client.post("/health", json={})

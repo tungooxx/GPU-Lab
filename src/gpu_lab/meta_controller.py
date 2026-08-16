@@ -89,3 +89,16 @@ class MetaResearchController:
                 self.store.object_update(str(regression["id"]), {"rollback_decision": "ROLLED_BACK", "restored_policy_id": str(restored["id"])}, "COMPLETED", "POLICY_ROLLED_BACK")
             regressions.append(regression)
         return regressions
+
+    def state_get(self, project_id: str) -> dict[str, Any]:
+        """Compact durable view; never substitutes meta records for scientific truth."""
+        policies = self._objects(project_id, "ResearchPolicy")
+        production = next((item for item in policies if item["status"] == "PRODUCTION"), None)
+        return {
+            "production_policy_id": str(production["id"]) if production else None,
+            "autonomy": self.config_get(project_id),
+            "active_opportunities": [item for item in self._objects(project_id, "ImprovementOpportunity") if item["status"] in {"CANDIDATE", "ACTIVE"}],
+            "active_runs": [item for item in self._objects(project_id, "ImprovementRun") if item["status"] not in {"COMPLETED", "REJECTED"}],
+            "recent_regressions": self._objects(project_id, "PolicyRegression")[-10:],
+            "benchmark_health": {"policy_experiments": len(self._objects(project_id, "PolicyExperiment")), "benchmark_gaps": len(self._objects(project_id, "BenchmarkGap"))},
+        }

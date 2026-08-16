@@ -1847,6 +1847,12 @@ async def improvement_opportunities(project_id: str):
 
 
 @mcp.tool()
+async def meta_state_get(project_id: str):
+    """Return compact meta-science state and active policy health."""
+    return await call(meta_controller().state_get, project_id)
+
+
+@mcp.tool()
 async def meta_research_run_once(project_id: str):
     """Run at most one bounded autonomous meta-research campaign."""
     return await call(meta_controller().run_once, project_id)
