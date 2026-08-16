@@ -41,6 +41,9 @@ class PolicyLab:
     def evaluate_provider_compatibility(self, project_id, provider, model):
         return {"id": "compatibility", "data": {"provider": provider, "model": model}}
 
+    def provider_adapter_candidate(self, project_id, provider, model, compatibility_experiment_id):
+        return {"id": "adapter-candidate", "data": {"provider": provider, "model": model}}
+
 
 class CampaignPolicyLab(PolicyLab):
     def __init__(self, store):
@@ -229,6 +232,7 @@ def test_model_change_runs_compatibility_instead_of_mutating_policy():
     assert result["decision"] == "COMPATIBILITY_EVALUATED"
     opportunity = store.objects_list("project", "ImprovementOpportunity")[0]
     assert opportunity["data"]["compatibility_experiment_id"] == "compatibility"
+    assert opportunity["data"]["provider_adapter_candidate_id"] == "adapter-candidate"
 
 
 def test_meta_state_exposes_candidates_and_provider_compatibility():

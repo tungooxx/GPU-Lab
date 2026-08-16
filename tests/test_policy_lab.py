@@ -376,6 +376,18 @@ def test_provider_compatibility_is_not_claimed_as_cross_model_success():
     assert result["data"]["results"]["live_model_evaluation"] == "UNAVAILABLE"
 
 
+def test_model_compatibility_creates_a_candidate_only_provider_adapter():
+    store = Store()
+    lab = service(store)
+    compatibility = lab.evaluate_provider_compatibility("project", "openai", "new-model")
+
+    candidate = lab.provider_adapter_candidate("project", "openai", "new-model", compatibility["id"])
+
+    assert candidate["status"] == "CANDIDATE"
+    assert candidate["data"]["evaluation_status"] == "LIVE_MODEL_EVALUATION_REQUIRED"
+    assert candidate["data"]["promotion_status"] == "NOT_ELIGIBLE_WITHOUT_CROSS_MODEL_SUPPORT"
+
+
 def test_policy_evaluation_cannot_mutate_production_science(monkeypatch):
     store = Store()
     lab = service(store)
@@ -456,3 +468,11 @@ def test_provider_compilation_preserves_canonical_invariants():
 
     assert len({output["content_hash"] for output in outputs}) == 4
     assert all("execution is not evidence" in output["content"] for output in outputs)
+
+
+def test_provider_compilation_includes_only_the_selected_adapter_data():
+    compiler = PromptCompiler()
+    compiled = compiler.compile({"data": {"version": 1, "provider_adapters": {"codex": {"format": "structured"}}}}, "CODEX")
+
+    assert compiled["provider_adapter"] == {"format": "structured"}
+    assert 'Provider adapter data: {"format": "structured"}' in compiled["content"]

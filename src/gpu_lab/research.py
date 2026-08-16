@@ -86,6 +86,7 @@ RESEARCH_OBJECT_KINDS = (
     "MetaResearchCampaign",
     "LiteratureScoutRequest",
     "LiteraturePolicyTransfer",
+    "ProviderAdapterCandidate",
     "PolicyTournament",
 )
 RESEARCH_OBJECT_STATUSES = {

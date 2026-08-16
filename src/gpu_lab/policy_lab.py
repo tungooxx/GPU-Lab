@@ -567,6 +567,43 @@ class PolicyLabService:
             "CROSS_MODEL_UNVERIFIED",
         )
 
+    def provider_adapter_candidate(self, project_id: str, provider: str, model: str, compatibility_experiment_id: str) -> dict[str, Any]:
+        """Create a non-promotable adapter proposal after a model change.
+
+        Compilation proves only that a canonical policy can be rendered. A
+        separate live provider evaluation must support this candidate before it
+        could become part of a promoted ResearchPolicy.
+        """
+        compatibility = self.store.object_get(compatibility_experiment_id)
+        if compatibility["kind"] != "PolicyExperiment" or str(compatibility["project_id"]) != str(project_id):
+            raise GPUError("POLICY_COMPATIBILITY_EXPERIMENT_REQUIRED", compatibility_experiment_id)
+        normalized = provider.strip().lower()
+        fingerprint = self._fingerprint({"provider": normalized, "model": model, "compatibility": compatibility_experiment_id})
+        existing = next(
+            (item for item in self._objects(project_id, "ProviderAdapterCandidate") if item["data"].get("fingerprint") == fingerprint),
+            None,
+        )
+        if existing:
+            return existing
+        policy = self.ensure_production_policy(project_id)
+        return self._create(
+            project_id,
+            "ProviderAdapterCandidate",
+            {
+                "fingerprint": fingerprint,
+                "base_policy_id": str(policy["id"]),
+                "provider": provider,
+                "model": model,
+                "compatibility_experiment_id": compatibility_experiment_id,
+                "adapter_data": {"provider": normalized, "model": model, "instruction_format": "provider_specific_canonical_policy"},
+                "evaluation_status": "LIVE_MODEL_EVALUATION_REQUIRED",
+                "promotion_status": "NOT_ELIGIBLE_WITHOUT_CROSS_MODEL_SUPPORT",
+                "authority": "CANDIDATE_ONLY",
+            },
+            "PROVIDER_ADAPTER_CANDIDATE_CREATED",
+            "CANDIDATE",
+        )
+
     def rollback(self, project_id: str, policy_id: str) -> dict[str, Any]:
         target = self.store.object_get(policy_id)
         if target["kind"] != "ResearchPolicy" or str(target["project_id"]) != project_id:

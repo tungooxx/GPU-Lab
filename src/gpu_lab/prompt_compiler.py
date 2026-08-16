@@ -46,6 +46,8 @@ class PromptCompiler:
         if provider not in PROVIDERS:
             raise GPUError("PROMPT_PROVIDER_INVALID", target_provider)
         data = policy.get("data", policy)
+        adapters = data.get("provider_adapters", {})
+        adapter = adapters.get(provider.lower(), adapters.get(provider, {}))
         invariants = tuple(data.get("core_epistemic_invariants", CORE_EPISTEMIC_INVARIANTS))
         missing = sorted(set(CORE_EPISTEMIC_INVARIANTS) - set(invariants))
         if missing:
@@ -66,12 +68,14 @@ class PromptCompiler:
             "Operating policy:",
             *[f"- {name}: {json.dumps(value, sort_keys=True)}" for name, value in sections.items() if value],
             f"Provider adaptation: {self._provider_note(provider)}",
+            f"Provider adapter data: {json.dumps(adapter, sort_keys=True)}",
         ]
         content = "\n".join(lines) + "\n"
         return {
             "policy_id": str(policy.get("id", "")), "policy_version": data.get("version"),
             "target_provider": provider, "target_runtime": target_runtime,
             "provenance": data.get("provenance", {}), "semantic_sections": sections,
+            "provider_adapter": adapter,
             "generated_at": datetime.now(UTC).isoformat(), "content": content,
             "content_hash": hashlib.sha256(content.encode()).hexdigest(),
             "compiled_prompt_tokens": len(content.split()),

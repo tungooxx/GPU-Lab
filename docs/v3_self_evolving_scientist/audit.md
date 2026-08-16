@@ -88,3 +88,8 @@ records. They preserve candidate-evidence provenance, a minimal transferable
 principle, explicit unknown extraction fields, and an overlap classification;
 they seed later policy invention but never automatically import an external
 architecture or establish a scientific claim.
+
+A detected provider/model change now runs the compact compatibility compile and
+creates a durable candidate-only `ProviderAdapterCandidate`. The canonical
+policy compiler renders selected adapter data, while the candidate remains
+ineligible for promotion until genuine live cross-model support is recorded.

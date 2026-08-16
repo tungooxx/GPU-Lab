@@ -553,13 +553,19 @@ class MetaResearchController:
                 str(opportunity["data"].get("provider", "GENERIC")),
                 str(opportunity["data"].get("model", "unknown")),
             )
+            adapter_candidate = self.policy_lab.provider_adapter_candidate(
+                project_id,
+                str(opportunity["data"].get("provider", "GENERIC")),
+                str(opportunity["data"].get("model", "unknown")),
+                str(compatibility["id"]),
+            )
             self.store.object_update(
                 str(opportunity["id"]),
-                {"compatibility_experiment_id": str(compatibility["id"])},
+                {"compatibility_experiment_id": str(compatibility["id"]), "provider_adapter_candidate_id": str(adapter_candidate["id"])},
                 "COMPLETED",
                 "POLICY_COMPATIBILITY_EVALUATED",
             )
-            return {"decision": "COMPATIBILITY_EVALUATED", "opportunities": opportunities, "compatibility": compatibility}
+            return {"decision": "COMPATIBILITY_EVALUATED", "opportunities": opportunities, "compatibility": compatibility, "provider_adapter_candidate": adapter_candidate}
         budget = {key: config["data"][key] for key in self.defaults if key != "mode"}
         source_context = self._candidate_sources(project_id, opportunity)
         diagnosis = self._diagnose_opportunity(project_id, opportunity)
