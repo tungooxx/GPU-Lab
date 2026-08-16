@@ -339,6 +339,10 @@ class MetaResearchController:
         """Compact durable view; never substitutes meta records for scientific truth."""
         policies = self._objects(project_id, "ResearchPolicy")
         production = next((item for item in policies if item["status"] == "PRODUCTION"), None)
+        compatibility = [
+            item for item in self._objects(project_id, "PolicyExperiment")
+            if item["data"].get("benchmark_version") == "provider-compatibility-v3"
+        ]
         return {
             "production_policy_id": str(production["id"]) if production else None,
             "autonomy": self.config_get(project_id),
@@ -346,8 +350,10 @@ class MetaResearchController:
             "active_agenda": [item for item in self._objects(project_id, "MetaResearchAgenda") if item["status"] in {"OPEN", "ACTIVE"}],
             "meta_world_models": self._objects(project_id, "MetaWorldModel")[-10:],
             "active_runs": [item for item in self._objects(project_id, "ImprovementRun") if item["status"] not in {"COMPLETED", "REJECTED"}],
+            "policy_candidates": [item for item in self._objects(project_id, "ResearchPolicyPatch") if item["status"] in {"CANDIDATE", "SUPPORTED_ON_BENCHMARK", "CROSS_PROJECT_SUPPORTED", "CROSS_MODEL_SUPPORTED", "RECOMMENDED_FOR_PROMOTION"}],
             "recent_regressions": self._objects(project_id, "PolicyRegression")[-10:],
             "benchmark_health": {"policy_experiments": len(self._objects(project_id, "PolicyExperiment")), "benchmark_gaps": len(self._objects(project_id, "BenchmarkGap"))},
+            "model_provider_compatibility": compatibility[-10:],
         }
 
     def model_change_detect(self, project_id: str, provider: str, model: str) -> dict[str, Any] | None:

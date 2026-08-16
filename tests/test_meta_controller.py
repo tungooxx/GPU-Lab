@@ -162,6 +162,18 @@ def test_model_change_runs_compatibility_instead_of_mutating_policy():
     assert opportunity["data"]["compatibility_experiment_id"] == "compatibility"
 
 
+def test_meta_state_exposes_candidates_and_provider_compatibility():
+    store = Store()
+    controller = MetaResearchController(store, PolicyLab())
+    store.object_create("project", "ResearchPolicyPatch", {}, "FIXTURE", "SUPPORTED_ON_BENCHMARK")
+    store.object_create("project", "PolicyExperiment", {"benchmark_version": "provider-compatibility-v3", "provider": "openai"}, "FIXTURE", "CROSS_MODEL_UNVERIFIED")
+
+    state = controller.state_get("project")
+
+    assert len(state["policy_candidates"]) == 1
+    assert state["model_provider_compatibility"][0]["data"]["provider"] == "openai"
+
+
 def test_auto_project_runs_closed_meta_cycle_and_promotes_supported_patch():
     store = Store()
     lab = PolicyLabService(store, ResearchBrainBench(Path(__file__).parents[1] / "research_bench"))
