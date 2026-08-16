@@ -58,6 +58,7 @@ settings, service, research_store, research_brain, brain_bench_service, epistemi
     None,
     None,
 )
+meta_controller_service: MetaResearchController | None = None
 _singleton_lock = threading.RLock()
 embedding_service: EmbeddingService | None = None
 engineering_service: EngineeringService | None = None
@@ -389,6 +390,20 @@ def policy_lab() -> PolicyLabService:
     return policy_lab_service
 
 
+def meta_controller() -> MetaResearchController:
+    global meta_controller_service
+    if meta_controller_service is None:
+        with _singleton_lock:
+            if meta_controller_service is None:
+                meta_controller_service = MetaResearchController(
+                    research(), policy_lab(), mode=settings.gpu_lab_policy_autonomy_mode,
+                    candidate_budget=settings.gpu_lab_policy_meta_candidate_budget,
+                    benchmark_budget=settings.gpu_lab_policy_meta_benchmark_budget,
+                    literature_budget=settings.gpu_lab_policy_meta_literature_budget,
+                )
+    return meta_controller_service
+
+
 def epistemics() -> EpistemicService:
     global epistemic_service
     if epistemic_service is None:
@@ -646,7 +661,10 @@ def _compact_canonical_state(canonical_state: dict[str, Any], limit: int) -> dic
     compact: dict[str, Any] = {}
     for key, value in canonical_state.items():
         if isinstance(value, list):
-            compact[key] = [_state_object_summary(item) for item in value[:limit]]
+            compact[key] = [
+                _state_object_summary(item) if isinstance(item, dict) else item
+                for item in value[:limit]
+            ]
             if len(value) > limit:
                 compact[f"{key}_truncated"] = len(value) - limit
         else:

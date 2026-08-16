@@ -70,6 +70,13 @@ RESEARCH_OBJECT_KINDS = (
     "ResearchPolicyWeakness",
     "ImprovementRun",
     "ResearchPolicyArtifact",
+    "MetaWorldModel",
+    "MetaResearchAgenda",
+    "ImprovementOpportunity",
+    "PolicyAutonomyConfig",
+    "PolicyRegression",
+    "BenchmarkGap",
+    "MetaStrategyPattern",
 )
 RESEARCH_OBJECT_STATUSES = {
     "ACTIVE",

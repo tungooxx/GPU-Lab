@@ -1,0 +1,53 @@
+from __future__ import annotations
+
+import uuid
+
+from gpu_lab.meta_controller import MetaResearchController
+
+
+class Store:
+    def __init__(self):
+        self.items: list[dict] = []
+
+    def object_create(self, project_id, kind, data, event, status="ACTIVE"):
+        item = {"id": str(uuid.uuid4()), "project_id": project_id, "kind": kind, "data": data, "status": status}
+        self.items.append(item)
+        return item
+
+    def objects_list(self, project_id, kind, limit=None):
+        values = [item for item in self.items if item["project_id"] == project_id and item["kind"] == kind]
+        return values if limit is None else values[:limit]
+
+    def object_update(self, object_id, update, status, event):
+        item = next(item for item in self.items if item["id"] == object_id)
+        item["data"] = {**item["data"], **update}
+        item["status"] = status
+        return item
+
+
+class PolicyLab:
+    def improve(self, project_id, **kwargs):
+        return {"recommendation": "REJECT_OR_REVISE", "improvement_run": {"id": "run", "data": {"best_supported_patch_id": None}}}
+
+
+def test_recurring_bad_outcomes_create_one_durable_opportunity():
+    store = Store()
+    controller = MetaResearchController(store, PolicyLab())
+    for _ in range(2):
+        store.object_create("project", "ResearchDecisionOutcome", {"label": "LOW_VALUE", "action_type": "DIAGNOSTIC"}, "FIXTURE", "RESULT_INSPECTED")
+
+    found = controller.detect_opportunities("project")
+
+    assert len(found) == 1
+    assert found[0]["data"]["expected_value_of_improvement"] >= 0.4
+    assert controller.detect_opportunities("project") == []
+
+
+def test_paused_autonomy_never_starts_campaign():
+    store = Store()
+    controller = MetaResearchController(store, PolicyLab())
+    controller.config_update("project", {"paused": True})
+    for _ in range(2):
+        store.object_create("project", "ResearchDecisionOutcome", {"label": "INVALID", "action_type": "TRAINING_RUN"}, "FIXTURE", "RESULT_INSPECTED")
+
+    assert controller.run_once("project")["decision"] == "PAUSED"
