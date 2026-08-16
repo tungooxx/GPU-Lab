@@ -146,3 +146,20 @@ def test_auto_revision_is_bounded_to_configured_limit(monkeypatch):
     revisions = [patch for patch in result["patches"] if patch["data"].get("revision_count") == 1]
     assert len(revisions) == 3
     assert not [patch for patch in result["patches"] if patch["data"].get("revision_count", 0) > 1]
+
+
+def test_transfer_classification_distinguishes_project_specific_and_model_sensitive():
+    store = Store()
+    lab = service(store)
+    result = lab.improve("project", idea="Improve discrimination")
+    experiment_id = result["evaluations"][0]["experiment"]["id"]
+
+    project_specific = lab.classify_transfer(experiment_id, {"project": True})
+    model_sensitive = lab.classify_transfer(
+        experiment_id,
+        {"project-a": True, "project-b": True},
+        {"gpt": True, "codex": False},
+    )
+
+    assert project_specific["status"] == "PROJECT_SPECIFIC"
+    assert model_sensitive["status"] == "MODEL_SENSITIVE"

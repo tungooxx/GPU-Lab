@@ -1010,6 +1010,16 @@ async def policy_experiment_get(policy_experiment_id: str):
 
 
 @mcp.tool()
+async def policy_transfer_classify(
+    policy_experiment_id: str,
+    project_results: dict[str, bool],
+    model_results: dict[str, bool] | None = None,
+):
+    """Classify isolated policy evidence across projects and optionally across models."""
+    return await call(policy_lab().classify_transfer, policy_experiment_id, project_results, model_results)
+
+
+@mcp.tool()
 async def policy_promote(project_id: str, patch_id: str):
     """Explicitly promote a benchmark-supported patch; auto-promotion is disabled by default."""
     return await call(policy_lab().promote, project_id, patch_id)

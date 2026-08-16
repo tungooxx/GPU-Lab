@@ -324,6 +324,39 @@ class PolicyLabService:
         self.store.object_update(str(current["id"]), {}, "SUPERSEDED", "RESEARCH_POLICY_SUPERSEDED")
         return self._create(project_id, "ResearchPolicy", data, "RESEARCH_POLICY_PROMOTED", "PRODUCTION")
 
+    def classify_transfer(
+        self,
+        policy_experiment_id: str,
+        project_results: dict[str, bool],
+        model_results: dict[str, bool] | None = None,
+    ) -> dict[str, Any]:
+        """Attach explicit project/model transfer evidence to an isolated experiment."""
+        experiment = self.store.object_get(policy_experiment_id)
+        if experiment["kind"] != "PolicyExperiment":
+            raise GPUError("NOT_A_POLICY_EXPERIMENT", policy_experiment_id)
+        models = model_results or {}
+        if len(project_results) <= 1:
+            classification = "PROJECT_SPECIFIC"
+        elif all(project_results.values()):
+            classification = "CROSS_PROJECT_SUPPORTED"
+        else:
+            classification = "REJECTED"
+        if models and len(set(models.values())) > 1:
+            classification = "MODEL_SENSITIVE"
+        patch_id = str(experiment["data"]["candidate_patch_id"])
+        self.store.object_update(
+            patch_id,
+            {"transfer_classification": classification, "project_results": project_results, "model_results": models},
+            classification,
+            "POLICY_TRANSFER_CLASSIFIED",
+        )
+        return self.store.object_update(
+            policy_experiment_id,
+            {"transfer_classification": classification, "project_results": project_results, "model_results": models},
+            classification,
+            "POLICY_EXPERIMENT_TRANSFER_CLASSIFIED",
+        )
+
     def rollback(self, project_id: str, policy_id: str) -> dict[str, Any]:
         target = self.store.object_get(policy_id)
         if target["kind"] != "ResearchPolicy" or str(target["project_id"]) != project_id:
