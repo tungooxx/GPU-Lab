@@ -29,6 +29,9 @@ class PolicyLab:
     def improve(self, project_id, **kwargs):
         return {"recommendation": "REJECT_OR_REVISE", "improvement_run": {"id": "run", "data": {"best_supported_patch_id": None}}}
 
+    def rollback(self, project_id, policy_id):
+        return {"id": policy_id, "status": "PRODUCTION"}
+
 
 def test_recurring_bad_outcomes_create_one_durable_opportunity():
     store = Store()
@@ -51,3 +54,14 @@ def test_paused_autonomy_never_starts_campaign():
         store.object_create("project", "ResearchDecisionOutcome", {"label": "INVALID", "action_type": "TRAINING_RUN"}, "FIXTURE", "RESULT_INSPECTED")
 
     assert controller.run_once("project")["decision"] == "PAUSED"
+
+
+def test_auto_project_rolls_back_only_after_repeated_negative_hindsight():
+    store = Store()
+    controller = MetaResearchController(store, PolicyLab(), mode="AUTO_PROJECT")
+    store.object_create("project", "ResearchPolicy", {"parent_policy_id": "parent", "post_promotion_hindsight": [{"observed_improvement": -0.1}, {"unexpected_failure": "scope regression"}]}, "FIXTURE", "PRODUCTION")
+
+    regressions = controller.monitor_promotions("project")
+
+    assert len(regressions) == 1
+    assert regressions[0]["data"]["rollback_decision"] == "ROLLED_BACK"

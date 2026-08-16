@@ -1841,6 +1841,36 @@ async def meta_review(project_id: str):
 
 
 @mcp.tool()
+async def improvement_opportunities(project_id: str):
+    """Detect recurring, evidence-backed scientist-behavior weaknesses."""
+    return await call(meta_controller().detect_opportunities, project_id)
+
+
+@mcp.tool()
+async def meta_research_run_once(project_id: str):
+    """Run at most one bounded autonomous meta-research campaign."""
+    return await call(meta_controller().run_once, project_id)
+
+
+@mcp.tool()
+async def policy_regressions_check(project_id: str):
+    """Inspect post-promotion evidence and apply only configured scoped rollback."""
+    return await call(meta_controller().monitor_promotions, project_id)
+
+
+@mcp.tool()
+async def autonomy_config_get(project_id: str):
+    """Return durable policy-autonomy mode and campaign budgets."""
+    return await call(meta_controller().config_get, project_id)
+
+
+@mcp.tool()
+async def autonomy_config_update(project_id: str, update: dict[str, Any]):
+    """Update bounded autonomy settings; default mode remains advisory."""
+    return await call(meta_controller().config_update, project_id, update)
+
+
+@mcp.tool()
 async def meta_lesson_list(project_id: str):
     """List durable research-process lessons without treating them as scientific evidence."""
     return await call(meta_research().list_lessons, project_id)

@@ -70,3 +70,22 @@ class MetaResearchController:
         if config["data"]["mode"] == "AUTO_PROJECT" and result["recommendation"] == "PROMOTE" and best_patch:
             promoted = self.policy_lab.promote(project_id, best_patch)
         return {"decision": "CAMPAIGN_STARTED", "opportunities": opportunities, "improvement": result, "promoted_policy": promoted}
+
+    def monitor_promotions(self, project_id: str) -> list[dict[str, Any]]:
+        """Detect severe, repeated post-promotion failures and rollback scoped policy."""
+        config = self.config_get(project_id)
+        regressions = []
+        for policy in self._objects(project_id, "ResearchPolicy"):
+            if policy["status"] != "PRODUCTION":
+                continue
+            hindsight = policy["data"].get("post_promotion_hindsight", [])
+            failures = [item for item in hindsight if item.get("unexpected_failure") or (isinstance(item.get("observed_improvement"), (int, float)) and item["observed_improvement"] < 0)]
+            if len(failures) < 2:
+                continue
+            regression = self.store.object_create(project_id, "PolicyRegression", {"policy_id": str(policy["id"]), "expected_behavior": "non-regressing scoped research behavior", "observed_behavior": "repeated negative post-promotion hindsight", "supporting_decisions": [], "severity": "HIGH", "confidence": min(0.95, 0.5 + len(failures) * 0.1), "affected_scope": "PROJECT", "rollback_decision": "PENDING", "revisit_condition": "new causal diagnosis required"}, "POLICY_REGRESSION_DETECTED", "CANDIDATE")
+            parent = policy["data"].get("parent_policy_id")
+            if config["data"]["mode"] == "AUTO_PROJECT" and parent and not config["data"].get("pinned_policy_id"):
+                restored = self.policy_lab.rollback(project_id, str(parent))
+                self.store.object_update(str(regression["id"]), {"rollback_decision": "ROLLED_BACK", "restored_policy_id": str(restored["id"])}, "COMPLETED", "POLICY_ROLLED_BACK")
+            regressions.append(regression)
+        return regressions
