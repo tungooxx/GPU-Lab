@@ -626,6 +626,73 @@ class PolicyLabService:
             "CANDIDATE",
         )
 
+    def provider_adapter_evaluate(self, project_id: str, candidate_id: str, evidence_ids: list[str], live_result: str) -> dict[str, Any]:
+        """Record bounded live adapter evidence; compilation alone remains insufficient."""
+        candidate = self.store.object_get(candidate_id)
+        if candidate["kind"] != "ProviderAdapterCandidate" or str(candidate["project_id"]) != str(project_id):
+            raise GPUError("PROVIDER_ADAPTER_CANDIDATE_REQUIRED", candidate_id)
+        if candidate["status"] != "CANDIDATE":
+            raise GPUError("PROVIDER_ADAPTER_NOT_EVALUABLE", candidate["status"])
+        if live_result not in {"PASS", "FAIL"} or not evidence_ids:
+            raise GPUError("PROVIDER_ADAPTER_EVIDENCE_INVALID", "PASS/FAIL and at least one durable evidence ID are required")
+        for evidence_id in evidence_ids:
+            evidence = self.store.object_get(str(evidence_id))
+            if str(evidence["project_id"]) != str(project_id):
+                raise GPUError("RESEARCH_PROJECT_MISMATCH", str(evidence_id))
+        status = "CROSS_MODEL_SUPPORTED" if live_result == "PASS" else "REJECTED"
+        experiment = self._create(
+            project_id,
+            "PolicyExperiment",
+            {
+                "baseline_policy_id": candidate["data"]["base_policy_id"],
+                "candidate_patch_id": None,
+                "provider_adapter_candidate_id": candidate_id,
+                "benchmark_version": "provider-adapter-live-v3",
+                "provider": candidate["data"]["provider"],
+                "model": candidate["data"]["model"],
+                "evidence_ids": [str(item) for item in evidence_ids],
+                "results": {"live_model_evaluation": live_result},
+                "transfer_classification": status,
+                "namespace": "BENCHMARK",
+            },
+            "PROVIDER_ADAPTER_EVALUATED",
+            status,
+        )
+        return self.store.object_update(
+            candidate_id,
+            {"evaluation_status": status, "live_evaluation_experiment_id": str(experiment["id"]), "evidence_ids": [str(item) for item in evidence_ids]},
+            status,
+            "PROVIDER_ADAPTER_EVALUATION_RECORDED",
+        )
+
+    def provider_adapter_promote(self, project_id: str, candidate_id: str) -> dict[str, Any]:
+        """Promote only a live-supported adapter into a scoped policy descendant."""
+        candidate = self.store.object_get(candidate_id)
+        if candidate["kind"] != "ProviderAdapterCandidate" or str(candidate["project_id"]) != str(project_id):
+            raise GPUError("PROVIDER_ADAPTER_CANDIDATE_REQUIRED", candidate_id)
+        if candidate["status"] != "CROSS_MODEL_SUPPORTED":
+            raise GPUError("PROVIDER_ADAPTER_PROMOTION_NOT_SUPPORTED", candidate["status"])
+        current = self.ensure_production_policy(project_id)
+        next_version = max([int(policy["data"].get("version", 0)) for policy in self._objects(project_id, "ResearchPolicy")] or [0]) + 1
+        key = str(candidate["data"]["provider"]).strip().lower()
+        data = {
+            **current["data"],
+            "version": next_version,
+            "parent_policy_id": str(current["id"]),
+            "provider_adapters": {**current["data"].get("provider_adapters", {}), key: candidate["data"]["adapter_data"]},
+            "provenance": {"source_type": "PROVIDER_ADAPTER_CANDIDATE", "candidate_id": candidate_id, "live_evaluation_experiment_id": candidate["data"].get("live_evaluation_experiment_id")},
+            "notes": f"Promoted provider adapter {candidate_id}",
+        }
+        transactional_promote = getattr(self.store, "production_policy_promote", None)
+        if callable(transactional_promote):
+            promoted = transactional_promote(project_id, str(current["id"]), data)
+        else:
+            self.store.object_update(str(current["id"]), {}, "SUPERSEDED", "RESEARCH_POLICY_SUPERSEDED")
+            promoted = self._create(project_id, "ResearchPolicy", data, "PROVIDER_ADAPTER_PROMOTED", "PRODUCTION")
+        self._compile_production_artifacts(promoted)
+        self.store.object_update(candidate_id, {"promoted_policy_id": str(promoted["id"]), "promotion_status": "PROMOTED"}, "COMPLETED", "PROVIDER_ADAPTER_PROMOTED")
+        return promoted
+
     def rollback(self, project_id: str, policy_id: str) -> dict[str, Any]:
         target = self.store.object_get(policy_id)
         if target["kind"] != "ResearchPolicy" or str(target["project_id"]) != project_id:

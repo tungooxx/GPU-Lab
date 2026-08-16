@@ -93,6 +93,8 @@ A detected provider/model change now runs the compact compatibility compile and
 creates a durable candidate-only `ProviderAdapterCandidate`. The canonical
 policy compiler renders selected adapter data, while the candidate remains
 ineligible for promotion until genuine live cross-model support is recorded.
+The evidence-gated adapter lifecycle now records live PASS/FAIL evidence and
+promotes only supported adapters into a new scoped policy descendant.
 
 The `policy_health_report` MCP tool now provides the compact v3 operational
 report: production policy and lineage, scoped overrides, adapter candidates,

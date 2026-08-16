@@ -392,6 +392,24 @@ def test_model_compatibility_creates_a_candidate_only_provider_adapter():
     assert candidate["data"]["promotion_status"] == "NOT_ELIGIBLE_WITHOUT_CROSS_MODEL_SUPPORT"
 
 
+def test_live_supported_provider_adapter_can_be_promoted_but_unverified_one_cannot():
+    store = Store()
+    lab = service(store)
+    compatibility = lab.evaluate_provider_compatibility("project", "openai", "new-model")
+    candidate = lab.provider_adapter_candidate("project", "openai", "new-model", compatibility["id"])
+    evidence = store.object_create("project", "EvidenceUnit", {"excerpt": "Live evaluation trace"}, "FIXTURE", "CANDIDATE")
+
+    with pytest.raises(GPUError) as error:
+        lab.provider_adapter_promote("project", candidate["id"])
+    assert error.value.error_type == "PROVIDER_ADAPTER_PROMOTION_NOT_SUPPORTED"
+    evaluated = lab.provider_adapter_evaluate("project", candidate["id"], [evidence["id"]], "PASS")
+    promoted = lab.provider_adapter_promote("project", candidate["id"])
+
+    assert evaluated["status"] == "CROSS_MODEL_SUPPORTED"
+    assert promoted["status"] == "PRODUCTION"
+    assert promoted["data"]["provider_adapters"]["openai"]["model"] == "new-model"
+
+
 def test_policy_evaluation_cannot_mutate_production_science(monkeypatch):
     store = Store()
     lab = service(store)

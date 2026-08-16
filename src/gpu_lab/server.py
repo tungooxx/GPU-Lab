@@ -2040,6 +2040,18 @@ async def policy_model_change_detect(project_id: str, provider: str, model: str)
 
 
 @mcp.tool()
+async def provider_adapter_evaluate(project_id: str, candidate_id: str, evidence_ids: list[str], live_result: str):
+    """Record durable live PASS/FAIL evidence for a proposed provider adapter."""
+    return await call(policy_lab().provider_adapter_evaluate, project_id, candidate_id, evidence_ids, live_result)
+
+
+@mcp.tool()
+async def provider_adapter_promote(project_id: str, candidate_id: str):
+    """Promote only a provider adapter that survived live cross-model evaluation."""
+    return await call(policy_lab().provider_adapter_promote, project_id, candidate_id)
+
+
+@mcp.tool()
 async def meta_lesson_list(project_id: str):
     """List durable research-process lessons without treating them as scientific evidence."""
     return await call(meta_research().list_lessons, project_id)
