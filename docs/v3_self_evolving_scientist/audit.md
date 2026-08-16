@@ -164,6 +164,16 @@ PostgreSQL was reachable read-only with durable `research_objects` and
 `research_events` rows present. No live service restart was performed because
 it would interrupt the running user deployment.
 
+## Deployed restart verification (2026-08-16)
+
+The user rebuilt the `gpu-lab` and PostgreSQL images and Docker recreated both
+containers. After the restart, `docker compose ps` reported both services
+healthy and `GET /health` returned `status: ok`, with the MCP tool count rising
+from 148 before rebuild to 170 afterward. This verifies that the rebuilt v3
+server is running against the recreated durable service stack. It intentionally
+does not create synthetic production campaigns solely to prove resume behavior;
+that behavior remains covered by restart-durability fixtures.
+
 ## V3 requirement coverage
 
 | Requirement | Status | Authoritative evidence |
