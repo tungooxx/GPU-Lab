@@ -136,3 +136,11 @@ an explicit stop reason.
 The latest local suite result was `266 passed, 19 skipped` with one existing
 Pydantic settings warning; Ruff passed. This document is not a claim that
 configured external-provider and executor integrations have been proven live.
+
+## Runtime verification (read-only)
+
+The deployed GPU-Lab `/health` endpoint returned `ok` with 148 tools and the
+local runner enabled. The isolated Literature relay returned PaperQA `ready`.
+The isolated Paper2Agent relay was reachable but reported `needs_credentials`
+with credentials not configured, so no live engineering-executor task was
+submitted or simulated.
