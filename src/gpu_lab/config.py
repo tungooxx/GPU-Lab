@@ -30,7 +30,9 @@ class Settings(BaseSettings):
     gpu_lab_policy_auto_revise: bool = True
     gpu_lab_policy_auto_promote_production: bool = False
     gpu_lab_policy_max_revisions: int = Field(default=1, ge=0, le=3)
-    gpu_lab_policy_autonomy_mode: str = "ADVISORY"
+    # v3 defaults to narrowly-scoped autonomy; domain/global still require an
+    # explicit operator choice and every run remains budgeted.
+    gpu_lab_policy_autonomy_mode: str = "AUTO_PROJECT"
     gpu_lab_policy_meta_candidate_budget: int = Field(default=3, ge=1, le=10)
     gpu_lab_policy_meta_benchmark_budget: int = Field(default=6, ge=1, le=30)
     gpu_lab_policy_meta_literature_budget: int = Field(default=1, ge=0, le=5)

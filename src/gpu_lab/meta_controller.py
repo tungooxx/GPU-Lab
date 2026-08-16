@@ -10,7 +10,7 @@ from .errors import GPUError
 class MetaResearchController:
     """Observe research behavior and launch at most one evidence-gated campaign."""
 
-    def __init__(self, store, policy_lab, *, mode: str = "ADVISORY", candidate_budget: int = 3, benchmark_budget: int = 6, literature_budget: int = 1):
+    def __init__(self, store, policy_lab, *, mode: str = "AUTO_PROJECT", candidate_budget: int = 3, benchmark_budget: int = 6, literature_budget: int = 1):
         self.store, self.policy_lab = store, policy_lab
         self.defaults = {
             "mode": mode,
