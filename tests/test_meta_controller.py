@@ -319,6 +319,27 @@ def test_end_to_end_autonomous_improvement_promotes_and_survives_positive_real_h
     assert not store.objects_list("project", "PolicyRegression")
 
 
+def test_end_to_end_autonomous_promotion_rolls_back_after_repeated_real_regression():
+    store = Store()
+    lab = PolicyLabService(store, ResearchBrainBench(Path(__file__).parents[1] / "research_bench"))
+    controller = MetaResearchController(store, lab, mode="AUTO_PROJECT")
+    for _ in range(2):
+        store.object_create("project", "ResearchDecisionOutcome", {"label": "LOW_VALUE", "action_type": "DIAGNOSTIC"}, "FIXTURE", "RESULT_INSPECTED")
+
+    promoted = controller.run_once("project")["promoted_policy"]
+    parent_id = promoted["data"]["parent_policy_id"]
+    lab.record_hindsight(promoted["id"], observed_improvement=-0.2, observed_cost=1.2, unexpected_failure="invalid experiment rate increased")
+    lab.record_hindsight(promoted["id"], observed_improvement=-0.1, observed_cost=1.1, unexpected_failure="invalid experiment rate increased")
+
+    regressions = controller.monitor_promotions("project")
+
+    assert regressions[0]["data"]["rollback_decision"] == "ROLLED_BACK"
+    assert lab.ensure_production_policy("project")["id"] == parent_id
+    assert promoted["status"] == "ROLLED_BACK"
+    negatives = store.objects_list("project", "PolicyNegativeResult")
+    assert any(item["data"].get("proposal") == promoted["id"] for item in negatives)
+
+
 def test_active_campaign_resumes_after_interruption_without_creating_a_second_claim():
     store = Store()
     controller = MetaResearchController(store, CampaignPolicyLab(store))

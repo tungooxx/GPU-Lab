@@ -102,3 +102,7 @@ rollbacks, and known policy failure modes.
 Policy evaluation includes an adversarial falsification pass over eligible
 held-out high-risk episodes. New hard regressions versus the frozen baseline
 are stored on the `PolicyExperiment` and block promotion.
+
+The autonomous rollback acceptance test covers a real controller sequence:
+auto-promotion, repeated negative prospective hindsight, `PolicyRegression`,
+rollback to the parent policy, and preservation of `PolicyNegativeResult`.
