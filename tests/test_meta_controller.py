@@ -258,6 +258,24 @@ def test_meta_state_reports_benchmark_composition_when_bench_available():
     assert health["split_distribution"]
 
 
+def test_policy_health_report_aggregates_lineage_calibration_and_failure_views():
+    store = Store()
+    controller = MetaResearchController(store, PolicyLab())
+    parent = store.object_create("project", "ResearchPolicy", {"version": 1}, "FIXTURE", "ROLLED_BACK")
+    current = store.object_create("project", "ResearchPolicy", {"version": 2, "parent_policy_id": parent["id"], "applicability": {"scope": "PROJECT"}, "policy_benchmark_prediction": 0.4, "post_promotion_hindsight": [{"observed_improvement": 0.2}], "known_failure_modes": ["scope regression"], "provenance": {"source_type": "POLICY_PATCH"}}, "FIXTURE", "PRODUCTION")
+    store.object_create("project", "ProviderAdapterCandidate", {"provider": "openai"}, "FIXTURE", "CANDIDATE")
+    store.object_create("project", "PolicyNegativeResult", {"failure_mode": "overfit"}, "FIXTURE", "REJECTED")
+
+    report = controller.policy_health_report("project")
+
+    assert report["current_production_policy"]["id"] == current["id"]
+    assert [item["version"] for item in report["policy_lineage"]] == [2, 1]
+    assert report["real_world_policy_calibration"]["mean_realized_improvement"] == 0.2
+    assert report["model_adapters"][0]["data"]["provider"] == "openai"
+    assert report["recent_rollbacks"][0]["id"] == parent["id"]
+    assert report["known_policy_failure_modes"] == ["scope regression"]
+
+
 def test_auto_project_runs_closed_meta_cycle_and_promotes_supported_patch():
     store = Store()
     lab = PolicyLabService(store, ResearchBrainBench(Path(__file__).parents[1] / "research_bench"))

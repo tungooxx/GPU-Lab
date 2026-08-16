@@ -1998,6 +1998,12 @@ async def meta_state_get(project_id: str):
 
 
 @mcp.tool()
+async def policy_health_report(project_id: str):
+    """Return the compact v3 production-policy health report."""
+    return await call(meta_controller().policy_health_report, project_id)
+
+
+@mcp.tool()
 async def meta_research_run_once(project_id: str):
     """Run at most one bounded autonomous meta-research campaign."""
     return await run_meta_research(project_id)

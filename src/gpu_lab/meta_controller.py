@@ -813,6 +813,45 @@ class MetaResearchController:
             "model_provider_compatibility": compatibility[-10:],
         }
 
+    def policy_health_report(self, project_id: str) -> dict[str, Any]:
+        """Return the bounded operational policy report required by v3."""
+        state = self.state_get(project_id)
+        policies = self._objects(project_id, "ResearchPolicy")
+        production = next((item for item in policies if item["status"] == "PRODUCTION"), None)
+        lineage = []
+        cursor = production
+        while cursor and len(lineage) < 20:
+            lineage.append({"policy_id": str(cursor["id"]), "version": cursor["data"].get("version"), "status": cursor["status"]})
+            parent_id = cursor["data"].get("parent_policy_id")
+            cursor = next((item for item in policies if str(item["id"]) == str(parent_id)), None) if parent_id else None
+        hindsight = production["data"].get("post_promotion_hindsight", []) if production else []
+        observed = [item["observed_improvement"] for item in hindsight if isinstance(item.get("observed_improvement"), (int, float))]
+        prediction = production["data"].get("policy_benchmark_prediction") if production else None
+        calibration = {
+            "benchmark_prediction": prediction,
+            "mean_realized_improvement": sum(observed) / len(observed) if observed else None,
+            "observations": len(observed),
+            "latest_error": production["data"].get("policy_calibration_error") if production else None,
+        }
+        overrides = [
+            item for item in policies
+            if item["status"] == "PRODUCTION" and item["data"].get("applicability", {}).get("scope") in {"PROJECT", "DOMAIN"}
+        ]
+        return {
+            "current_production_policy": production,
+            "policy_lineage": lineage,
+            "active_project_domain_overrides": overrides,
+            "model_adapters": self._objects(project_id, "ProviderAdapterCandidate")[-10:],
+            "benchmark_health": state["benchmark_health"],
+            "real_world_policy_calibration": calibration,
+            "recent_improvement_opportunities": state["active_opportunities"][-10:],
+            "active_meta_research": [item for item in self._objects(project_id, "MetaResearchCampaign") if item["status"] in {"RUNNING", "ACTIVE"}],
+            "recent_promotions": [item for item in policies if item["data"].get("provenance", {}).get("source_type") == "POLICY_PATCH"][-10:],
+            "recent_rejections": self._objects(project_id, "PolicyNegativeResult")[-10:],
+            "recent_rollbacks": [item for item in policies if item["status"] == "ROLLED_BACK"][-10:],
+            "known_policy_failure_modes": production["data"].get("known_failure_modes", []) if production else [],
+        }
+
     def model_change_detect(self, project_id: str, provider: str, model: str) -> dict[str, Any] | None:
         """Record provider/model drift as a bounded compatibility-evaluation opportunity."""
         fingerprint = f"model-change:{provider}:{model}"
