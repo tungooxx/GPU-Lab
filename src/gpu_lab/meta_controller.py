@@ -49,6 +49,35 @@ class MetaResearchController:
             "PolicyNegativeResult": [str(item["id"]) for item in self._objects(project_id, "PolicyNegativeResult")[-10:]],
         }
 
+    def _promotion_preflight(self, project_id: str, patch_id: str, config: dict[str, Any]) -> dict[str, Any]:
+        """Apply v3's scoped auto-promotion gates before creating a new policy."""
+        patch = self.store.object_get(patch_id)
+        experiments = [
+            item for item in self._objects(project_id, "PolicyExperiment")
+            if str(item["data"].get("candidate_patch_id")) == patch_id
+        ]
+        experiment = experiments[-1] if experiments else None
+        reasons = []
+        if patch["status"] not in {"SUPPORTED_ON_BENCHMARK", "CROSS_PROJECT_SUPPORTED", "CROSS_MODEL_SUPPORTED", "RECOMMENDED_FOR_PROMOTION"}:
+            reasons.append("patch_not_supported")
+        if not experiment or not experiment["data"].get("splits", {}).get("held_out"):
+            reasons.append("held_out_coverage_missing")
+        if experiment and experiment["data"].get("regressions"):
+            reasons.append("benchmark_regressions_present")
+        if not patch["data"].get("implementation_change", {}).get("enabled"):
+            reasons.append("implementation_not_verified")
+        if not any(item["status"] == "PRODUCTION" for item in self._objects(project_id, "ResearchPolicy")):
+            reasons.append("rollback_target_missing")
+        if config.get("pinned_policy_id"):
+            reasons.append("operator_policy_pin_active")
+        return {
+            "eligible": not reasons,
+            "reasons": reasons,
+            "scope": patch["data"].get("applicability", {}).get("scope", "PROJECT"),
+            "patch_id": patch_id,
+            "policy_experiment_id": str(experiment["id"]) if experiment else None,
+        }
+
     def _ensure_meta_records(self, project_id: str, opportunity: dict[str, Any]) -> None:
         """Turn an observed weakness into explicit, non-causal meta-science records.
 
@@ -273,9 +302,13 @@ class MetaResearchController:
         self.store.object_update(str(opportunity["id"]), {"improvement_run_id": run_id}, "COMPLETED", "META_RESEARCH_STARTED")
         promoted = None
         best_patch = result["improvement_run"]["data"].get("best_supported_patch_id")
-        if config["data"]["mode"] == "AUTO_PROJECT" and result["recommendation"] == "PROMOTE" and best_patch:
-            promoted = self.policy_lab.promote(project_id, best_patch)
-        return {"decision": "CAMPAIGN_STARTED", "opportunities": opportunities, "improvement": result, "promoted_policy": promoted}
+        promotion_preflight = None
+        if result["recommendation"] == "PROMOTE" and best_patch:
+            promotion_preflight = self._promotion_preflight(project_id, best_patch, config["data"])
+            self.store.object_update(run_id, {"auto_promotion_preflight": promotion_preflight}, "COMPLETED", "POLICY_AUTO_PROMOTION_PREFLIGHT")
+            if config["data"]["mode"] == "AUTO_PROJECT" and promotion_preflight["eligible"]:
+                promoted = self.policy_lab.promote(project_id, best_patch)
+        return {"decision": "CAMPAIGN_STARTED", "opportunities": opportunities, "improvement": result, "promotion_preflight": promotion_preflight, "promoted_policy": promoted}
 
     def monitor_promotions(self, project_id: str) -> list[dict[str, Any]]:
         """Detect severe, repeated post-promotion failures and rollback scoped policy."""
