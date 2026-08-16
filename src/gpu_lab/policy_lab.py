@@ -576,6 +576,42 @@ class PolicyLabService:
             "ACTIVE",
         )
 
+    def record_canary_observation(
+        self,
+        canary_id: str,
+        decision_id: str,
+        observed_behavior: dict[str, Any],
+        *,
+        hard_epistemic_regression: bool = False,
+    ) -> dict[str, Any]:
+        """Append prospective canary evidence and stop immediately on a hard regression."""
+        canary = self.store.object_get(canary_id)
+        if canary["kind"] != "PolicyCanary":
+            raise GPUError("NOT_A_POLICY_CANARY", canary_id)
+        if canary["status"] != "ACTIVE":
+            raise GPUError("POLICY_CANARY_NOT_ACTIVE", canary_id)
+        observations = list(canary["data"].get("observations", []))
+        if any(item.get("decision_id") == decision_id for item in observations):
+            return canary
+        observations.append(
+            {
+                "decision_id": decision_id,
+                "observed_behavior": observed_behavior,
+                "hard_epistemic_regression": hard_epistemic_regression,
+                "recorded_at": datetime.now(UTC).isoformat(),
+            }
+        )
+        status = "COMPLETED" if hard_epistemic_regression else "ACTIVE"
+        update = {"observations": observations, "decision_count": len(observations)}
+        if hard_epistemic_regression:
+            update["stop_reason"] = "hard epistemic regression"
+        return self.store.object_update(
+            canary_id,
+            update,
+            status,
+            "POLICY_CANARY_STOPPED" if hard_epistemic_regression else "POLICY_CANARY_OBSERVATION_RECORDED",
+        )
+
     def record_shadow(
         self,
         project_id: str,

@@ -1157,6 +1157,23 @@ async def policy_canary_start(project_id: str, candidate_policy_id: str, percent
 
 
 @mcp.tool()
+async def policy_canary_observation_record(
+    canary_id: str,
+    decision_id: str,
+    observed_behavior: dict[str, Any],
+    hard_epistemic_regression: bool = False,
+):
+    """Record a prospective canary observation; hard epistemic regression stops the canary."""
+    return await call(
+        policy_lab().record_canary_observation,
+        canary_id,
+        decision_id,
+        observed_behavior,
+        hard_epistemic_regression=hard_epistemic_regression,
+    )
+
+
+@mcp.tool()
 async def policy_shadow_record(
     project_id: str,
     production_policy_id: str,

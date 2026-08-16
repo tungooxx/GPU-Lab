@@ -276,6 +276,9 @@ def test_shadow_comparison_preserves_counterfactual_unknown_and_canary_does_not_
     assert canary["status"] == "ACTIVE"
     assert lab.ensure_production_policy("project")["id"] == production["id"]
     assert shadow["data"]["counterfactual_status"] == "COUNTERFACTUAL_UNKNOWN"
+    stopped = lab.record_canary_observation(canary["id"], "decision-1", {"scope_violation": True}, hard_epistemic_regression=True)
+    assert stopped["status"] == "COMPLETED"
+    assert stopped["data"]["stop_reason"] == "hard epistemic regression"
 
 
 def test_provider_compatibility_is_not_claimed_as_cross_model_success():
