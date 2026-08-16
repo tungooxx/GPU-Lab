@@ -389,6 +389,31 @@ class PolicyLabService:
         data["semantic_fingerprint"] = self._fingerprint(data["semantic_change"])
         return self._create(project_id, "ResearchPolicyPatch", data, "POLICY_PATCH_REVISED", "CANDIDATE")
 
+    def _tournament(self, project_id: str, supported: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """Compare surviving candidates on the frozen benchmark; never combine by brute force."""
+        if len(supported) < 2:
+            return None
+        participants = []
+        for evaluation in supported:
+            patch = evaluation["patch"]
+            metrics = patch["data"].get("benchmark_results", {}).get("metrics", {})
+            primary = metrics.get("strong_next_action_recall", {}).get("mean")
+            participants.append({"patch_id": str(patch["id"]), "primary_score": primary if isinstance(primary, (int, float)) else -1.0})
+        ranked = sorted(participants, key=lambda item: (-item["primary_score"], item["patch_id"]))
+        return self._create(
+            project_id,
+            "PolicyTournament",
+            {
+                "candidate_patch_ids": [item["patch_id"] for item in ranked],
+                "primary_metric": "strong_next_action_recall",
+                "ranking": ranked,
+                "winner_patch_id": ranked[0]["patch_id"],
+                "combination_policy": "No combinations evaluated without an explicit complementarity hypothesis.",
+            },
+            "POLICY_TOURNAMENT_COMPLETED",
+            "COMPLETED",
+        )
+
     def improve(self, project_id: str, *, idea: str | None = None, paper: str | None = None, failure: str | None = None, component: str | None = None, search: bool = False, prompt: bool = False, candidate_budget: int | None = None, max_revisions: int | None = None, source_context: dict[str, list[str]] | None = None) -> dict[str, Any]:
         if candidate_budget is not None and candidate_budget < 1:
             raise GPUError("POLICY_CANDIDATE_BUDGET_EXHAUSTED", "candidate_budget must be at least one")
@@ -419,8 +444,10 @@ class PolicyLabService:
             patches.extend(revisions)
             evaluations.extend(self.evaluate(project_id, str(patch["id"])) for patch in revisions)
         supported = [e for e in evaluations if e["decision"] == "SUPPORTED_ON_BENCHMARK"]
-        run = self._create(project_id, "ImprovementRun", {"input": {"idea": idea, "paper": paper, "failure": failure, "component": component, "search": search, "prompt": prompt}, "source_context": source_context or {}, "budget": {"candidate_budget": candidate_budget or 3, "max_revisions": self.max_revisions if max_revisions is None else max_revisions}, "base_policy_id": str(policy["id"]), "weakness_ids": [str(w["id"]) for w in weaknesses], "hypothesis_ids": [str(h["id"]) for h in hypotheses], "patch_ids": [str(p["id"]) for p in patches], "evaluation_ids": [str(e["experiment"]["id"]) for e in evaluations if e.get("experiment")], "invalid_patch_ids": [str(e["patch"]["id"]) for e in evaluations if e["decision"] == "INVALID_EVALUATION"], "best_supported_patch_id": str(supported[0]["patch"]["id"]) if supported else None, "recommendation": "PROMOTE" if supported else "REJECT_OR_REVISE", "production_unchanged": True, "namespace": "META_RESEARCH"}, "IMPROVEMENT_RUN_COMPLETED", "COMPLETED")
-        return {"improvement_run": run, "production_policy_id": str(policy["id"]), "weaknesses": weaknesses, "hypotheses": hypotheses, "patches": patches, "evaluations": evaluations, "recommendation": run["data"]["recommendation"]}
+        tournament = self._tournament(project_id, supported)
+        best_patch_id = tournament["data"]["winner_patch_id"] if tournament else str(supported[0]["patch"]["id"]) if supported else None
+        run = self._create(project_id, "ImprovementRun", {"input": {"idea": idea, "paper": paper, "failure": failure, "component": component, "search": search, "prompt": prompt}, "source_context": source_context or {}, "budget": {"candidate_budget": candidate_budget or 3, "max_revisions": self.max_revisions if max_revisions is None else max_revisions}, "base_policy_id": str(policy["id"]), "weakness_ids": [str(w["id"]) for w in weaknesses], "hypothesis_ids": [str(h["id"]) for h in hypotheses], "patch_ids": [str(p["id"]) for p in patches], "evaluation_ids": [str(e["experiment"]["id"]) for e in evaluations if e.get("experiment")], "invalid_patch_ids": [str(e["patch"]["id"]) for e in evaluations if e["decision"] == "INVALID_EVALUATION"], "tournament_id": str(tournament["id"]) if tournament else None, "best_supported_patch_id": best_patch_id, "recommendation": "PROMOTE" if supported else "REJECT_OR_REVISE", "production_unchanged": True, "namespace": "META_RESEARCH"}, "IMPROVEMENT_RUN_COMPLETED", "COMPLETED")
+        return {"improvement_run": run, "production_policy_id": str(policy["id"]), "weaknesses": weaknesses, "hypotheses": hypotheses, "patches": patches, "evaluations": evaluations, "tournament": tournament, "recommendation": run["data"]["recommendation"]}
 
     def promote(self, project_id: str, patch_id: str) -> dict[str, Any]:
         patch = self.store.object_get(patch_id)

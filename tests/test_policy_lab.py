@@ -67,6 +67,18 @@ def test_improvement_keeps_meta_source_provenance_on_hypotheses_and_run():
     assert result["improvement_run"]["data"]["source_context"]["MetaLesson"] == ["lesson-1"]
 
 
+def test_policy_tournament_ranks_multiple_supported_candidates_without_combining_them():
+    store = Store()
+    lab = service(store)
+    first = store.object_create("project", "ResearchPolicyPatch", {"benchmark_results": {"metrics": {"strong_next_action_recall": {"mean": 0.4}}}}, "FIXTURE", "SUPPORTED_ON_BENCHMARK")
+    second = store.object_create("project", "ResearchPolicyPatch", {"benchmark_results": {"metrics": {"strong_next_action_recall": {"mean": 0.8}}}}, "FIXTURE", "SUPPORTED_ON_BENCHMARK")
+
+    tournament = lab._tournament("project", [{"patch": first}, {"patch": second}])
+
+    assert tournament["data"]["winner_patch_id"] == second["id"]
+    assert "No combinations" in tournament["data"]["combination_policy"]
+
+
 def test_duplicate_failed_policy_is_rejected_before_evaluation():
     store = Store()
     lab = service(store)
