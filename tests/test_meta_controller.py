@@ -145,6 +145,8 @@ def test_campaign_records_bounded_budget_and_passes_limits_to_policy_lab():
     assert lab.kwargs["candidate_budget"] == 1
     run = store.objects_list("project", "ImprovementRun")[0]
     assert run["data"]["meta_campaign"]["budget"]["token_budget"] == 100
+    assert run["data"]["meta_campaign"]["consumption"]["candidates_generated"] == 0
+    assert run["data"]["meta_campaign"]["stop_reason"] == "no_supported_candidate"
 
 
 def test_auto_project_rolls_back_only_after_repeated_negative_hindsight():

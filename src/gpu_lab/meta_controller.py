@@ -633,13 +633,34 @@ class MetaResearchController:
                 diagnostic_hypotheses=diagnosis["data"]["diagnostic_hypotheses"],
             )
         run_id = str(result["improvement_run"]["id"])
+        run_data = result["improvement_run"].get("data", {})
+        patch_ids = [str(item) for item in run_data.get("patch_ids", [])]
+        evaluation_ids = [str(item) for item in run_data.get("evaluation_ids", [])]
+        revised = sum(
+            int(self.store.object_get(patch_id)["data"].get("revision_count", 0)) > 0
+            for patch_id in patch_ids
+        )
+        consumption = {
+            "candidates_generated": len(patch_ids),
+            "benchmark_evaluations": len(evaluation_ids),
+            "revisions_generated": revised,
+            "literature_requests_prepared": 1 if literature_request else 0,
+            "engineering_tasks_prepared": sum(
+                bool(self.store.object_get(patch_id)["data"].get("engineering_task_id")) for patch_id in patch_ids
+            ),
+        }
+        stop_reason = (
+            "candidate_supported" if result["recommendation"] == "PROMOTE"
+            else "candidate_budget_exhausted" if consumption["candidates_generated"] >= int(config["data"]["candidate_budget"])
+            else "no_supported_candidate"
+        )
         self.store.object_update(
             str(campaign["id"]),
-            {"improvement_run_id": run_id, "resume_state": "POLICY_LAB_COMPLETED"},
+            {"improvement_run_id": run_id, "resume_state": "POLICY_LAB_COMPLETED", "consumption": consumption, "stop_reason": stop_reason},
             "RUNNING",
             "META_RESEARCH_POLICY_LAB_COMPLETED",
         )
-        self.store.object_update(run_id, {"meta_campaign": {"trigger": str(opportunity["id"]), "target_component": opportunity["data"]["target_component"], "scope": opportunity["data"]["scope"], "budget": budget, "candidate_sources": source_context, "stop_conditions": ["candidate budget exhausted", "benchmark budget exhausted", "hard epistemic regression", "revision limit reached"]}}, "COMPLETED", "META_RESEARCH_BUDGET_RECORDED")
+        self.store.object_update(run_id, {"meta_campaign": {"trigger": str(opportunity["id"]), "target_component": opportunity["data"]["target_component"], "scope": opportunity["data"]["scope"], "budget": budget, "consumption": consumption, "stop_reason": stop_reason, "candidate_sources": source_context, "stop_conditions": ["candidate budget exhausted", "benchmark budget exhausted", "hard epistemic regression", "revision limit reached"]}}, "COMPLETED", "META_RESEARCH_BUDGET_RECORDED")
         self.store.object_update(str(opportunity["id"]), {"improvement_run_id": run_id}, "COMPLETED", "META_RESEARCH_STARTED")
         best_patch = result["improvement_run"]["data"].get("best_supported_patch_id")
         promoted = next(
@@ -683,7 +704,7 @@ class MetaResearchController:
                     )
         campaign = self.store.object_update(
             str(campaign["id"]),
-            {"improvement_run_id": run_id, "resume_state": "COMPLETED", "promoted_policy_id": str(promoted["id"]) if promoted else None},
+            {"improvement_run_id": run_id, "resume_state": "COMPLETED", "consumption": consumption, "stop_reason": stop_reason, "promoted_policy_id": str(promoted["id"]) if promoted else None},
             "COMPLETED",
             "META_RESEARCH_COMPLETED",
         )

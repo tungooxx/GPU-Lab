@@ -113,3 +113,7 @@ The `meta_research_roi` MCP tool reports campaign budget ceilings and observed
 candidate, promotion, regression, hindsight, invalid-experiment, and
 zero-information rates. It intentionally reports future research cost avoided
 as unknown until matched prospective evidence can support a causal estimate.
+
+Each durable meta campaign now records actual candidate, benchmark, revision,
+literature, and engineering-task consumption alongside its ceiling budget and
+an explicit stop reason.
