@@ -974,6 +974,20 @@ async def improve_start(
     search: bool = False,
 ):
     """Create bounded policy candidates and evaluate them without changing production policy."""
+    if search:
+        if settings.gpu_lab_literature_provider != "paperqa-http":
+            raise GPUError(
+                "LITERATURE_PROVIDER_UNAVAILABLE",
+                "improve --search requires the isolated PaperQA literature provider.",
+            )
+        weakness_query = failure or idea or component or "research experiment discrimination weakness"
+        literature_result = await literature().search(
+            "Research methods for this measured policy weakness; return competing methods, "
+            "limitations, and negative evidence where available: " + weakness_query
+        )
+        paper = literature_result.answer or "\n".join(
+            candidate.source_excerpt for candidate in literature_result.evidence_candidates[:3]
+        )
     return await call(
         policy_lab().improve,
         project_id,
