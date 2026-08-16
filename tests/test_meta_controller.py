@@ -244,3 +244,15 @@ def test_scheduler_prioritizes_open_meta_agenda_over_raw_opportunity_value():
     controller.run_once("project")
 
     assert lab.kwargs["component"] == "critic"
+
+
+def test_repeated_benchmark_overprediction_creates_calibration_opportunity():
+    store = Store()
+    controller = MetaResearchController(store, PolicyLab())
+    store.object_create("project", "ResearchPolicy", {"policy_benchmark_prediction": 0.8, "post_promotion_hindsight": [{"observed_improvement": 0.1}, {"observed_improvement": 0.2}]}, "FIXTURE", "PRODUCTION")
+
+    opportunities = controller.monitor_calibration("project")
+
+    assert len(opportunities) == 1
+    assert opportunities[0]["data"]["source"] == "POLICY_HINDSIGHT"
+    assert opportunities[0]["data"]["causal_status"] == "UNRESOLVED"

@@ -459,7 +459,8 @@ class PolicyLabService:
         next_version = max([int(p["data"].get("version", 0)) for p in self._objects(project_id, "ResearchPolicy")] or [0]) + 1
         delta = self._policy_delta(patch["data"]["semantic_change"]).model_dump(mode="json")
         self._validate_core_patch(patch)
-        data = {**current["data"], **{section: {**current["data"].get(section, {}), **change} for section, change in delta.items() if change}, "version": next_version, "parent_policy_id": str(current["id"]), "provenance": {"source_type": "POLICY_PATCH", "patch_id": patch_id}, "notes": f"Promoted patch {patch_id}", "applied_patch_ids": [patch_id], "applied_policy_delta": delta}
+        prediction = patch["data"].get("benchmark_results", {}).get("metrics", {}).get("strong_next_action_recall", {}).get("mean")
+        data = {**current["data"], **{section: {**current["data"].get(section, {}), **change} for section, change in delta.items() if change}, "version": next_version, "parent_policy_id": str(current["id"]), "provenance": {"source_type": "POLICY_PATCH", "patch_id": patch_id}, "notes": f"Promoted patch {patch_id}", "applied_patch_ids": [patch_id], "applied_policy_delta": delta, "policy_benchmark_prediction": prediction}
         transactional_promote = getattr(self.store, "production_policy_promote", None)
         if callable(transactional_promote):
             promoted = transactional_promote(project_id, str(current["id"]), data)
@@ -659,7 +660,7 @@ class PolicyLabService:
             "observed_cost": observed_cost,
             "unexpected_failure": unexpected_failure,
         })
-        predicted = policy["data"].get("benchmark_results", {}).get("strong_next_action_recall")
+        predicted = policy["data"].get("policy_benchmark_prediction")
         calibration = None
         if isinstance(predicted, (int, float)) and observed_improvement is not None:
             calibration = observed_improvement - predicted

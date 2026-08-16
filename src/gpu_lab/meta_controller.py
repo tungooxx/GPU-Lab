@@ -505,6 +505,50 @@ class MetaResearchController:
             regressions.append(regression)
         return regressions
 
+    def monitor_calibration(self, project_id: str) -> list[dict[str, Any]]:
+        """Detect repeated benchmark overprediction without mistaking it for causal proof."""
+        opportunities = []
+        for policy in self._objects(project_id, "ResearchPolicy"):
+            predicted = policy["data"].get("policy_benchmark_prediction")
+            hindsight = policy["data"].get("post_promotion_hindsight", [])
+            observed = [item.get("observed_improvement") for item in hindsight if isinstance(item.get("observed_improvement"), (int, float))]
+            if not isinstance(predicted, (int, float)) or len(observed) < 2:
+                continue
+            mean_observed = sum(observed) / len(observed)
+            calibration_error = mean_observed - predicted
+            if calibration_error >= -0.2:
+                continue
+            fingerprint = f"policy-calibration:{policy['id']}:{len(observed)}"
+            if self._find_by_fingerprint(project_id, "ImprovementOpportunity", fingerprint):
+                continue
+            opportunity = self.store.object_create(
+                project_id,
+                "ImprovementOpportunity",
+                {
+                    "source": "POLICY_HINDSIGHT",
+                    "target_component": "policy_evaluator",
+                    "observed_failure": "Benchmark prediction repeatedly overestimates realized policy improvement.",
+                    "supporting_evidence": [],
+                    "frequency": len(observed),
+                    "severity": 2,
+                    "scientific_cost": 0.0,
+                    "compute_cost": 0.0,
+                    "confidence": min(0.9, 0.4 + len(observed) * 0.1),
+                    "estimated_fixability": 0.4,
+                    "expected_value_of_improvement": 0.4,
+                    "scope": "PROJECT",
+                    "fingerprint": fingerprint,
+                    "predicted_improvement": predicted,
+                    "realized_improvement": mean_observed,
+                    "causal_status": "UNRESOLVED",
+                },
+                "IMPROVEMENT_OPPORTUNITY_CREATED",
+                "CANDIDATE",
+            )
+            self._ensure_meta_records(project_id, opportunity)
+            opportunities.append(opportunity)
+        return opportunities
+
     def state_get(self, project_id: str) -> dict[str, Any]:
         """Compact durable view; never substitutes meta records for scientific truth."""
         policies = self._objects(project_id, "ResearchPolicy")

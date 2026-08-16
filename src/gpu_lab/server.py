@@ -1187,13 +1187,17 @@ async def policy_hindsight_record(
     unexpected_failure: str | None = None,
 ):
     """Record post-promotion policy calibration data without changing scientific state."""
-    return await call(
+    result = await call(
         policy_lab().record_hindsight,
         policy_id,
         observed_improvement,
         observed_cost,
         unexpected_failure,
     )
+    if "error" in result:
+        return result
+    calibration = await call(meta_controller().monitor_calibration, str(result["project_id"]))
+    return {**result, "calibration_opportunities": calibration}
 
 
 @mcp.tool()
