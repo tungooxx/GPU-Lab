@@ -284,6 +284,19 @@ def test_core_invariant_attack_is_rejected_before_benchmark():
     assert not [item for item in store.items if item["kind"] == "PolicyExperiment"]
 
 
+def test_evaluator_tampering_is_rejected_before_benchmark():
+    store = Store()
+    lab = service(store)
+    policy = lab.ensure_production_policy("project")
+    patch = lab._patch("project", policy, lab._hypotheses_for("project", "USER_IDEA", "problem", "critic")[0])
+    patch["data"]["benchmark_labels"] = {"rewrite": "forbidden"}
+
+    result = lab.evaluate("project", patch["id"])
+
+    assert result["decision"] == "INVALID_EVALUATION"
+    assert not [item for item in store.items if item["kind"] == "PolicyExperiment"]
+
+
 def test_provider_compilation_preserves_canonical_invariants():
     policy = {"id": "policy", "data": {"version": 1, "core_epistemic_invariants": list(CORE_EPISTEMIC_INVARIANTS), "decision_policy": {"falsification_first": True}}}
     compiler = PromptCompiler()

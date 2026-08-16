@@ -264,6 +264,9 @@ class PolicyLabService:
             raise GPUError("CORE_POLICY_INVARIANT_VIOLATION", "ordinary patches cannot alter core epistemic invariants")
         if patch["data"].get("patch_type") == "CORE_POLICY_CHANGE":
             raise GPUError("CORE_POLICY_CHANGE_REQUIRES_STRONG_REVIEW", "core policy changes require a separate review path")
+        forbidden = {"benchmark_labels", "benchmark_splits", "evaluation_metrics", "promotion_thresholds", "evaluator_change"}
+        if forbidden & set(patch["data"]):
+            raise GPUError("INVALID_POLICY_EXPERIMENT", "candidate patches cannot alter their evaluator")
 
     def evaluate(self, project_id: str, patch_id: str) -> dict[str, Any]:
         patch = self.store.object_get(patch_id)
