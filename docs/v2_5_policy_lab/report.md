@@ -51,7 +51,7 @@ semantic adaptations; external text cannot authorize commands or policy changes.
 
 ## Verified unit and integration checks
 
-- Full test suite after the policy-lab changes: `216 passed, 19 skipped`.
+- Full test suite after the policy-lab changes: `218 passed, 19 skipped`.
 - Ruff: `ruff check src tests` passed.
 - Focused policy, benchmark, and MCP metadata tests cover automatic evaluation,
   duplicate rejection, held-out regression rejection, no-op rejection, bounded
