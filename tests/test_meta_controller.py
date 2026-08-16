@@ -215,3 +215,16 @@ def test_active_campaign_claim_prevents_duplicate_retry_after_interruption():
 
     assert result["decision"] == "CAMPAIGN_IN_PROGRESS"
     assert result["campaign"]["id"] == campaign["id"]
+
+
+def test_domain_promotion_requires_matching_mode_and_cross_project_transfer():
+    store = Store()
+    controller = MetaResearchController(store, PolicyLab())
+    store.object_create("project", "ResearchPolicy", {}, "FIXTURE", "PRODUCTION")
+    patch = store.object_create("project", "ResearchPolicyPatch", {"implementation_change": {"enabled": True}, "applicability": {"scope": "DOMAIN"}}, "FIXTURE", "SUPPORTED_ON_BENCHMARK")
+    store.object_create("project", "PolicyExperiment", {"candidate_patch_id": patch["id"], "splits": {"held_out": ["episode"]}, "regressions": [], "transfer_classification": "CROSS_PROJECT_SUPPORTED"}, "FIXTURE", "CROSS_PROJECT_SUPPORTED")
+
+    assert "autonomy_mode_must_be_AUTO_DOMAIN" in controller._promotion_preflight("project", patch["id"], controller.config_get("project")["data"])["reasons"]
+    config = controller.config_update("project", {"mode": "AUTO_DOMAIN"})
+
+    assert controller._promotion_preflight("project", patch["id"], config["data"])["eligible"] is True

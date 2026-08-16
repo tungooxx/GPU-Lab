@@ -96,12 +96,23 @@ class MetaResearchController:
             reasons.append("implementation_not_verified")
         if not any(item["status"] == "PRODUCTION" for item in self._objects(project_id, "ResearchPolicy")):
             reasons.append("rollback_target_missing")
+        scope = str(patch["data"].get("applicability", {}).get("scope", "PROJECT")).upper()
+        required_mode = f"AUTO_{scope}"
+        if config.get("mode") != required_mode:
+            reasons.append(f"autonomy_mode_must_be_{required_mode}")
+        transfer = experiment["data"].get("transfer_classification") if experiment else None
+        if scope == "DOMAIN" and transfer not in {"CROSS_PROJECT_SUPPORTED", "CROSS_MODEL_SUPPORTED"}:
+            reasons.append("cross_project_support_missing")
+        if scope == "GLOBAL" and transfer != "CROSS_MODEL_SUPPORTED":
+            reasons.append("cross_model_support_missing")
+        if scope not in {"PROJECT", "DOMAIN", "GLOBAL"}:
+            reasons.append("invalid_policy_scope")
         if config.get("pinned_policy_id"):
             reasons.append("operator_policy_pin_active")
         return {
             "eligible": not reasons,
             "reasons": reasons,
-            "scope": patch["data"].get("applicability", {}).get("scope", "PROJECT"),
+            "scope": scope,
             "patch_id": patch_id,
             "policy_experiment_id": str(experiment["id"]) if experiment else None,
         }
@@ -401,7 +412,7 @@ class MetaResearchController:
         if result["recommendation"] == "PROMOTE" and best_patch:
             promotion_preflight = self._promotion_preflight(project_id, best_patch, config["data"])
             self.store.object_update(run_id, {"auto_promotion_preflight": promotion_preflight}, "COMPLETED", "POLICY_AUTO_PROMOTION_PREFLIGHT")
-            if config["data"]["mode"] == "AUTO_PROJECT" and promotion_preflight["eligible"]:
+            if promotion_preflight["eligible"]:
                 promoted = self.policy_lab.promote(project_id, best_patch)
         return {"decision": "CAMPAIGN_STARTED", "opportunities": opportunities, "campaign": campaign, "literature_request": literature_request, "improvement": result, "promotion_preflight": promotion_preflight, "promoted_policy": promoted}
 
