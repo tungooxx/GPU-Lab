@@ -131,6 +131,18 @@ def test_policy_lifecycle_restriction_preserves_nonproduction_history():
     assert restricted["data"]["lifecycle_restriction_reason"] == "adapter compatibility failure"
 
 
+def test_code_bearing_policy_patch_creates_bounded_engineering_task():
+    store = Store()
+    lab = service(store)
+    policy = lab.ensure_production_policy("project")
+    patch = lab._patch("project", policy, lab._hypotheses_for("project", "USER_IDEA", "problem", "critic")[0])
+
+    result = lab.code_patch_prepare("project", patch["id"], {"purpose": "Bound candidate scoring", "files": ["src/gpu_lab/policy_lab.py"], "tests": ["tests/test_policy_lab.py"]})
+
+    assert result["patch"]["status"] == "IMPLEMENTED_UNVERIFIED"
+    assert result["engineering_task"]["data"]["scientific_result"] == "NOT_ASSESSED"
+
+
 def test_policy_patch_cannot_be_evaluated_or_promoted_in_another_project():
     store = Store()
     lab = service(store)

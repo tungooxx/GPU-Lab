@@ -1133,6 +1133,12 @@ async def policy_restrict(project_id: str, policy_id: str, status: str, reason: 
 
 
 @mcp.tool()
+async def policy_code_patch_prepare(project_id: str, patch_id: str, code_change: dict[str, Any]):
+    """Create a bounded EngineeringTask for a code-bearing policy patch; it is not policy success."""
+    return await call(policy_lab().code_patch_prepare, project_id, patch_id, code_change)
+
+
+@mcp.tool()
 async def policy_pin(project_id: str, policy_id: str | None = None):
     """Pin a project policy (or clear the pin) to constrain autonomous policy changes."""
     return await call(meta_controller().policy_pin, project_id, policy_id)

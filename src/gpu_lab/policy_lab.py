@@ -577,6 +577,48 @@ class PolicyLabService:
             "RESEARCH_POLICY_RESTRICTED",
         )
 
+    def code_patch_prepare(self, project_id: str, patch_id: str, code_change: dict[str, Any]) -> dict[str, Any]:
+        """Hand a bounded code-bearing policy patch to the existing engineering workflow."""
+        patch = self.store.object_get(patch_id)
+        if patch["kind"] != "ResearchPolicyPatch" or str(patch["project_id"]) != str(project_id):
+            raise GPUError("RESEARCH_PROJECT_MISMATCH", patch_id)
+        if not isinstance(code_change, dict):
+            raise GPUError("POLICY_CODE_CHANGE_INVALID", "code_change must be an object")
+        files = code_change.get("files", [])
+        tests = code_change.get("tests", [])
+        purpose = str(code_change.get("purpose", "")).strip()
+        if not purpose or not isinstance(files, list) or not files or len(files) > 10 or not isinstance(tests, list) or not tests:
+            raise GPUError("POLICY_CODE_CHANGE_INVALID", "purpose, 1-10 files, and tests are required")
+        prohibited = {".env", "docker-compose.yml", "src/gpu_lab/research.py"}
+        if any(str(path) in prohibited for path in files):
+            raise GPUError("POLICY_CODE_CHANGE_CORE_SYSTEM", "core data/security files require stronger review")
+        task = self._create(
+            project_id,
+            "EngineeringTask",
+            {
+                "purpose": purpose,
+                "task_type": "BUG_FIX",
+                "change_request": str(code_change.get("change_request", patch["data"].get("semantic_change", ""))),
+                "relevant_files": [str(path) for path in files],
+                "targeted_tests": [str(test) for test in tests],
+                "broader_tests": ["pytest -q", "ruff check src tests"],
+                "prohibited_changes": sorted(prohibited),
+                "engineering_invariants": {"bounded_policy_patch": True, "scientific_truth_unchanged": True},
+                "implementation_guards": [],
+                "policy_patch_id": patch_id,
+                "scientific_result": "NOT_ASSESSED",
+            },
+            "POLICY_CODE_ENGINEERING_TASK_CREATED",
+            "OPEN",
+        )
+        updated = self.store.object_update(
+            patch_id,
+            {"code_change": code_change, "engineering_task_id": str(task["id"]), "implementation_verified": False},
+            "IMPLEMENTED_UNVERIFIED",
+            "POLICY_CODE_PATCH_PREPARED",
+        )
+        return {"patch": updated, "engineering_task": task}
+
     def start_canary(self, project_id: str, candidate_policy_id: str, percentage: int = 10) -> dict[str, Any]:
         """Create a bounded prospective canary plan without changing production policy."""
         if not 1 <= percentage <= 50:
