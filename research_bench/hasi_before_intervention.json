@@ -1,5 +1,6 @@
 {
   "schema_version": "1.0",
+  "benchmark_split": "DEVELOPMENT",
   "episode_id": "hasi-before-intervention",
   "project_id": "historical-vlm-pointcloud",
   "domain": "point-cloud completion",

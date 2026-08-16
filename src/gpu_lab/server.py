@@ -33,6 +33,7 @@ from .executable_papers import ExecutablePaperService, HttpExecutablePaperProvid
 from .literature import HttpLiteratureProvider, LiteratureService
 from .local_runner import LocalRunner
 from .meta_research import MetaResearchService
+from .policy_lab import PolicyLabService
 from .qd import HypothesisQDService
 from .research import ResearchStore
 from .research_operators import HttpResearchOperatorProvider, ResearchOperatorService
@@ -42,8 +43,9 @@ from .terminal import TERMINAL_HTML
 
 logger = logging.getLogger(__name__)
 
-settings, service, research_store, research_brain, brain_bench_service, epistemic_service, literature_service, executable_paper_service, qd_service, branch_service, meta_research_service, strategy_service = (
+settings, service, research_store, research_brain, brain_bench_service, epistemic_service, literature_service, executable_paper_service, qd_service, branch_service, meta_research_service, strategy_service, policy_lab_service = (
     Settings(),
+    None,
     None,
     None,
     None,
@@ -94,6 +96,10 @@ _READ_ONLY_TOOLS = {
     "research_benchmark_episode_get",
     "research_benchmark_policy_run",
     "research_benchmark_compare",
+    "improve_status",
+    "policy_get",
+    "policy_compare",
+    "policy_experiment_get",
     "independent_evidence_count",
     "supporting_evidence_families",
     "contradicting_evidence_families",
@@ -364,6 +370,23 @@ def brain_bench() -> ResearchBrainBench:
                     Path(settings.gpu_lab_research_bench_dir)
                 )
     return brain_bench_service
+
+
+def policy_lab() -> PolicyLabService:
+    global policy_lab_service
+    if policy_lab_service is None:
+        with _singleton_lock:
+            if policy_lab_service is None:
+                policy_lab_service = PolicyLabService(
+                    research(),
+                    brain_bench(),
+                    auto_evaluate=settings.gpu_lab_policy_auto_evaluate,
+                    auto_reject=settings.gpu_lab_policy_auto_reject,
+                    auto_revise=settings.gpu_lab_policy_auto_revise,
+                    max_revisions=settings.gpu_lab_policy_max_revisions,
+                    auto_promote_production=settings.gpu_lab_policy_auto_promote_production,
+                )
+    return policy_lab_service
 
 
 def epistemics() -> EpistemicService:
@@ -939,6 +962,63 @@ async def research_benchmark_policy_run(episode_id: str, policy: str):
 async def research_benchmark_compare():
     """Score required v1, v1.5, v2, and baseline policies only after blinded policy selection."""
     return await call(brain_bench().compare_builtin_policies)
+
+
+@mcp.tool()
+async def improve_start(
+    project_id: str,
+    idea: str | None = None,
+    paper: str | None = None,
+    failure: str | None = None,
+    component: str | None = None,
+    search: bool = False,
+):
+    """Create bounded policy candidates and evaluate them without changing production policy."""
+    return await call(
+        policy_lab().improve,
+        project_id,
+        idea=idea,
+        paper=paper,
+        failure=failure,
+        component=component,
+        search=search,
+    )
+
+
+@mcp.tool()
+async def improve_status(improvement_run_id: str):
+    """Retrieve a durable improvement run and its recommendation."""
+    return await call(research().object_get, improvement_run_id)
+
+
+@mcp.tool()
+async def policy_get(policy_id: str):
+    """Retrieve a versioned ResearchPolicy without compiling or applying it."""
+    return await call(research().object_get, policy_id)
+
+
+@mcp.tool()
+async def policy_compare(base_policy_id: str, candidate_policy_id: str):
+    """Show the semantic diff between two durable policy versions."""
+    return await call(policy_lab().policy_diff, base_policy_id, candidate_policy_id)
+
+
+@mcp.tool()
+async def policy_experiment_get(policy_experiment_id: str):
+    """Retrieve an isolated meta-research PolicyExperiment."""
+    return await call(research().object_get, policy_experiment_id)
+
+
+@mcp.tool()
+async def policy_promote(project_id: str, patch_id: str):
+    """Explicitly promote a benchmark-supported patch; auto-promotion is disabled by default."""
+    return await call(policy_lab().promote, project_id, patch_id)
+
+
+@mcp.tool()
+async def policy_rollback(project_id: str, policy_id: str):
+    """Restore a previous policy version while retaining all policy history."""
+    return await call(policy_lab().rollback, project_id, policy_id)
 
 
 @mcp.tool()

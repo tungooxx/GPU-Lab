@@ -18,6 +18,12 @@ class ProvenanceKind(StrEnum):
     RECONSTRUCTED_INFERENCE = "RECONSTRUCTED_INFERENCE"
 
 
+class BenchmarkSplit(StrEnum):
+    DEVELOPMENT = "DEVELOPMENT"
+    VALIDATION = "VALIDATION"
+    HELD_OUT = "HELD_OUT"
+
+
 class BenchmarkPolicy(StrEnum):
     CURRENT_BRAIN_V1 = "CURRENT_BRAIN_V1"
     CHEAPEST_FEASIBLE_ACTION = "CHEAPEST_FEASIBLE_ACTION"
@@ -81,6 +87,7 @@ class BenchmarkEpisode(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: str = "1.0"
+    benchmark_split: BenchmarkSplit = BenchmarkSplit.DEVELOPMENT
     episode_id: str = Field(min_length=1)
     project_id: str = Field(min_length=1)
     domain: str = Field(min_length=1)

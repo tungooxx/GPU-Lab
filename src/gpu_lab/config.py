@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     gpu_lab_terminal_password: str | None = None
     gpu_lab_research_database_url: str | None = None
     gpu_lab_research_bench_dir: Path = Path("./research_bench")
+    gpu_lab_policy_auto_evaluate: bool = True
+    gpu_lab_policy_auto_reject: bool = True
+    gpu_lab_policy_auto_revise: bool = True
+    gpu_lab_policy_auto_promote_production: bool = False
+    gpu_lab_policy_max_revisions: int = Field(default=1, ge=0, le=3)
     gpu_lab_embedding_provider: str = "local-hash"
     gpu_lab_embedding_dimension: int = Field(default=384, ge=32, le=4096)
     gpu_lab_research_operator_provider: str = "disabled"
