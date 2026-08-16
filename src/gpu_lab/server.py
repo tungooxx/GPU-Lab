@@ -1633,6 +1633,7 @@ async def brain_result_assess(
     causal_edge_id: str | None = None,
     causal_edge_status: str | None = None,
     actual_information_gain: str = "MEDIUM",
+    information_gain_basis: list[str] | None = None,
     guard_passed: bool | None = None,
     matched_control_passed: bool | None = None,
 ):
@@ -1656,6 +1657,7 @@ async def brain_result_assess(
         causal_edge_id=causal_edge_id,
         causal_edge_status=causal_edge_status,
         actual_information_gain=actual_information_gain,
+        information_gain_basis=information_gain_basis,
         guard_passed=guard_passed,
         matched_control_passed=matched_control_passed,
     )

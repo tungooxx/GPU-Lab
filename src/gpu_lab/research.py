@@ -2670,6 +2670,98 @@ class ResearchStore:
         ]
         return round(sum(values) / len(values), 6) if values else None
 
+    def technical_result_inspection_apply(
+        self,
+        *,
+        run_id: str,
+        decision_id: str,
+        actual_information_gain: str,
+        information_gain_basis: list[str],
+        inspection: dict[str, Any],
+    ) -> dict:
+        """Close a failed execution without manufacturing scientific evidence."""
+        if actual_information_gain not in {"ZERO", "INVALID", "UNKNOWN"}:
+            raise GPUError("INVALID_INFORMATION_GAIN", actual_information_gain)
+        if not information_gain_basis:
+            raise GPUError(
+                "INFORMATION_GAIN_BASIS_REQUIRED",
+                "Provide what technical uncertainty or evidence changed",
+            )
+        try:
+            run_id = str(uuid.UUID(run_id))
+            decision_id = str(uuid.UUID(decision_id))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise GPUError("INVALID_RESEARCH_OBJECT_ID", str(exc)) from exc
+        now = datetime.now(UTC)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,project_id,kind,status,data FROM research_objects "
+                "WHERE id=ANY(%s::uuid[]) FOR UPDATE",
+                ([run_id, decision_id],),
+            )
+            rows = {str(row["id"]): row for row in cur.fetchall()}
+            if len(rows) != 2:
+                missing = next(item for item in (run_id, decision_id) if item not in rows)
+                raise GPUError("RESEARCH_OBJECT_NOT_FOUND", missing)
+            run, decision = rows[run_id], rows[decision_id]
+            if run["kind"] != "ExperimentRun":
+                raise GPUError("NOT_AN_EXPERIMENTRUN", run_id)
+            if decision["kind"] != "ResearchDecision":
+                raise GPUError("NOT_A_RESEARCHDECISION", decision_id)
+            if str(run["project_id"]) != str(decision["project_id"]):
+                raise GPUError("RESEARCH_PROJECT_MISMATCH", "Run and decision differ")
+            if run["status"] not in {"failed", "cancelled", "unknown"}:
+                raise GPUError("TECHNICAL_INSPECTION_REQUIRES_FAILED_RUN", run["status"])
+            prior = run["data"].get("inspection")
+            if prior is not None:
+                if (
+                    prior.get("inspection_kind") == "TECHNICAL_FAILURE"
+                    and prior.get("decision_id") == decision_id
+                ):
+                    return {
+                        "run": {"id": run_id, "status": run["status"], "data": run["data"]},
+                        "decision": {
+                            "id": decision_id,
+                            "status": decision["status"],
+                            "data": decision["data"],
+                        },
+                        "idempotent_replay": True,
+                    }
+                raise GPUError("EXPERIMENT_RESULT_ALREADY_INSPECTED", run_id)
+            inspection_data = _json_document(
+                {
+                    **inspection,
+                    "inspection_kind": "TECHNICAL_FAILURE",
+                    "decision_id": decision_id,
+                    "assessed_at": now.isoformat(),
+                    "execution_status": run["status"],
+                    "scientific_result": "NOT_ASSESSED",
+                    "actual_information_gain": actual_information_gain,
+                    "information_gain_basis": information_gain_basis,
+                }
+            )
+            run_data = _json_document({**run["data"], "inspection": inspection_data})
+            cur.execute(
+                "UPDATE research_objects SET data=%s WHERE id=%s",
+                (json.dumps(run_data), run_id),
+            )
+            self._event(
+                cur,
+                str(run["project_id"]),
+                "EXPERIMENT_FAILURE_INSPECTED",
+                run_id,
+                inspection_data,
+            )
+        return {
+            "run": {"id": run_id, "status": run["status"], "data": run_data},
+            "decision": {
+                "id": decision_id,
+                "status": decision["status"],
+                "data": decision["data"],
+            },
+            "technical_non_scientific": True,
+        }
+
     def result_assessment_apply(
         self,
         *,

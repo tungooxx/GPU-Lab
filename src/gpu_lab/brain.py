@@ -937,6 +937,7 @@ class ResearchBrain:
         causal_edge_id: str | None = None,
         causal_edge_status: str | None = None,
         actual_information_gain: str = "MEDIUM",
+        information_gain_basis: list[str] | None = None,
         guard_passed: bool | None = None,
         matched_control_passed: bool | None = None,
     ) -> dict:
@@ -1007,10 +1008,46 @@ class ResearchBrain:
         }
         if hypothesis_transition not in allowed_transitions:
             raise GPUError("INVALID_SCIENTIFIC_STATUS", hypothesis_transition)
-        if actual_information_gain not in {"HIGH", "MEDIUM", "LOW"}:
+        if actual_information_gain not in {
+            "HIGH",
+            "MEDIUM",
+            "LOW",
+            "ZERO",
+            "INVALID",
+            "UNKNOWN",
+        }:
             raise GPUError("INVALID_INFORMATION_GAIN", actual_information_gain)
         guard_passed = condition_evaluations[pass_condition]
         successful_run = run["status"] in {"completed", "RESULT_NOT_INSPECTED"}
+        basis = list(information_gain_basis or [])
+        technical_non_scientific = (
+            not successful_run and actual_information_gain in {"ZERO", "INVALID", "UNKNOWN"}
+        )
+        if technical_non_scientific:
+            if causal_edge_id or causal_edge_status:
+                raise GPUError(
+                    "TECHNICAL_INSPECTION_CANNOT_UPDATE_CAUSAL_EDGE",
+                    "A failed technical run cannot update a causal edge",
+                )
+            result = self.store.technical_result_inspection_apply(
+                run_id=run_id,
+                decision_id=decision_id,
+                actual_information_gain=actual_information_gain,
+                information_gain_basis=basis,
+                inspection={
+                    "prediction_outcome": prediction_outcome,
+                    "guard_condition_outcome": guard_condition_outcome,
+                    "frozen_pass_condition": pass_condition,
+                    "condition_evaluations": condition_evaluations,
+                    "guard_passed": guard_passed,
+                    "scope": normalize_scientific_scope(scope),
+                    "rationale": rationale,
+                },
+            )
+            return {
+                **result,
+                "verification_status": "TECHNICAL_FAILURE_INSPECTED",
+            }
         if hypothesis_transition in {"SUPPORTED", "SURVIVES_INITIAL_TEST"} and not guard_passed:
             raise GPUError(
                 "EXPERIMENT_GUARD_NOT_PASSED",
@@ -1124,6 +1161,7 @@ class ResearchBrain:
                 else "RESOLVED"
             ),
             actual_information_gain=actual_information_gain,
+            information_gain_basis=basis,
             causal_edge_id=causal_edge_id,
             causal_edge_status=causal_edge_status,
         )
