@@ -105,7 +105,7 @@ def test_promotion_is_explicit_and_rollback_preserves_history():
 
     assert promoted["id"] != original["id"]
     assert rolled_back["status"] == "PRODUCTION"
-    assert any(item["status"] == "SUPERSEDED" for item in store.items if item["kind"] == "ResearchPolicy")
+    assert any(item["status"] == "ROLLED_BACK" for item in store.items if item["kind"] == "ResearchPolicy")
 
 
 def test_promotion_requires_evidence():

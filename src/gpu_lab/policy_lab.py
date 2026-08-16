@@ -546,7 +546,7 @@ class PolicyLabService:
             transactional_rollback = getattr(self.store, "production_policy_rollback", None)
             if callable(transactional_rollback):
                 return transactional_rollback(project_id, str(current["id"]), policy_id)
-            self.store.object_update(str(current["id"]), {}, "SUPERSEDED", "RESEARCH_POLICY_SUPERSEDED")
+            self.store.object_update(str(current["id"]), {}, "ROLLED_BACK", "RESEARCH_POLICY_ROLLED_BACK")
             return self.store.object_update(policy_id, {"rollback_from_policy_id": str(current["id"])}, "PRODUCTION", "RESEARCH_POLICY_ROLLED_BACK")
         return target
 

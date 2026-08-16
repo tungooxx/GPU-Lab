@@ -123,6 +123,10 @@ RESEARCH_OBJECT_STATUSES = {
     "CROSS_MODEL_SUPPORTED",
     "REJECTED",
     "SUPERSEDED",
+    "ROLLED_BACK",
+    "DEPRECATED",
+    "MODEL_INCOMPATIBLE",
+    "DOMAIN_RESTRICTED",
     "PRODUCTION",
     "OVERFIT",
     "INVALID_EVALUATION",
@@ -830,10 +834,10 @@ class ResearchStore:
             target = cur.fetchone()
             if not target:
                 raise GPUError("INVALID_POLICY_ROLLBACK_TARGET", target_policy_id)
-            cur.execute("UPDATE research_objects SET status='SUPERSEDED' WHERE id=%s", (current_policy_id,))
+            cur.execute("UPDATE research_objects SET status='ROLLED_BACK' WHERE id=%s", (current_policy_id,))
             data = {**target["data"], "rollback_from_policy_id": str(current_policy_id)}
             cur.execute("UPDATE research_objects SET status='PRODUCTION',data=%s WHERE id=%s", (json.dumps(data), target_policy_id))
-            self._event(cur, project_id, "RESEARCH_POLICY_SUPERSEDED", current_policy_id, {})
+            self._event(cur, project_id, "RESEARCH_POLICY_ROLLED_BACK", current_policy_id, {"restored_policy_id": str(target_policy_id)})
             self._event(cur, project_id, "RESEARCH_POLICY_ROLLED_BACK", target_policy_id, {"rollback_from_policy_id": str(current_policy_id)})
         return {"id": str(target_policy_id), "project_id": project_id, "kind": "ResearchPolicy", "status": "PRODUCTION", "data": data}
 
