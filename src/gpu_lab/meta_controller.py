@@ -416,9 +416,7 @@ class MetaResearchController:
             ),
             None,
         )
-        if active_campaign:
-            return {"decision": "CAMPAIGN_IN_PROGRESS", "opportunities": opportunities, "campaign": active_campaign}
-        campaign = self.store.object_create(
+        campaign = active_campaign or self.store.object_create(
             project_id,
             "MetaResearchCampaign",
             {
@@ -433,52 +431,98 @@ class MetaResearchController:
             "META_RESEARCH_STARTED",
             "RUNNING",
         )
-        result = self.policy_lab.improve(
-            project_id,
-            failure=opportunity["data"]["observed_failure"],
-            component=opportunity["data"]["target_component"],
-            candidate_budget=int(config["data"]["candidate_budget"]),
-            max_revisions=int(config["data"]["max_revision_rounds"]),
-            source_context=source_context,
+        source_context = {
+            **source_context,
+            "MetaResearchCampaign": [str(campaign["id"])],
+        }
+        if not active_campaign:
+            campaign = self.store.object_update(
+                str(campaign["id"]), {"source_context": source_context}, "RUNNING", "META_RESEARCH_CONTEXT_LINKED"
+            )
+        recovered_run = next(
+            (
+                item for item in self._objects(project_id, "ImprovementRun")
+                if str(campaign["id"]) in item["data"].get("source_context", {}).get("MetaResearchCampaign", [])
+            ),
+            None,
         )
+        resumed = active_campaign is not None
+        if recovered_run:
+            result = {
+                "improvement_run": recovered_run,
+                "recommendation": recovered_run["data"].get("recommendation", "REJECT_OR_REVISE"),
+                "recovered": True,
+            }
+        else:
+            if resumed:
+                campaign = self.store.object_update(
+                    str(campaign["id"]), {"resume_state": "POLICY_LAB_RESUMED", "source_context": source_context}, "RUNNING", "META_RESEARCH_RESUMED"
+                )
+            result = self.policy_lab.improve(
+                project_id,
+                failure=opportunity["data"]["observed_failure"],
+                component=opportunity["data"]["target_component"],
+                candidate_budget=int(config["data"]["candidate_budget"]),
+                max_revisions=int(config["data"]["max_revision_rounds"]),
+                source_context=source_context,
+            )
         run_id = str(result["improvement_run"]["id"])
         self.store.object_update(
             str(campaign["id"]),
             {"improvement_run_id": run_id, "resume_state": "POLICY_LAB_COMPLETED"},
-            "COMPLETED",
-            "META_RESEARCH_COMPLETED",
+            "RUNNING",
+            "META_RESEARCH_POLICY_LAB_COMPLETED",
         )
         self.store.object_update(run_id, {"meta_campaign": {"trigger": str(opportunity["id"]), "target_component": opportunity["data"]["target_component"], "scope": opportunity["data"]["scope"], "budget": budget, "candidate_sources": source_context, "stop_conditions": ["candidate budget exhausted", "benchmark budget exhausted", "hard epistemic regression", "revision limit reached"]}}, "COMPLETED", "META_RESEARCH_BUDGET_RECORDED")
         self.store.object_update(str(opportunity["id"]), {"improvement_run_id": run_id}, "COMPLETED", "META_RESEARCH_STARTED")
-        promoted = None
         best_patch = result["improvement_run"]["data"].get("best_supported_patch_id")
+        promoted = next(
+            (
+                policy for policy in self._objects(project_id, "ResearchPolicy")
+                if best_patch in policy["data"].get("applied_patch_ids", [])
+            ),
+            None,
+        )
         promotion_preflight = None
         if result["recommendation"] == "PROMOTE" and best_patch:
             promotion_preflight = self._promotion_preflight(project_id, best_patch, config["data"])
             self.store.object_update(run_id, {"auto_promotion_preflight": promotion_preflight}, "COMPLETED", "POLICY_AUTO_PROMOTION_PREFLIGHT")
             if promotion_preflight["eligible"]:
-                promoted = self.policy_lab.promote(project_id, best_patch)
+                if not promoted:
+                    promoted = self.policy_lab.promote(project_id, best_patch)
                 patch = self.store.object_get(best_patch)
-                self.store.object_create(
-                    project_id,
-                    "MetaStrategyPattern",
-                    {
-                        "policy_id": str(promoted["id"]),
-                        "patch_id": best_patch,
-                        "target_component": opportunity["data"]["target_component"],
-                        "scope": promotion_preflight["scope"],
-                        "observed_effect": "BENCHMARK_SUPPORTED_AWAITING_REAL_WORLD_HINDSIGHT",
-                        "mechanism": patch["data"].get("semantic_change"),
-                        "supporting_evidence": [str(promotion_preflight["policy_experiment_id"])],
-                        "counterexamples": [],
-                        "provider_sensitivity": "UNVERIFIED",
-                        "domain_sensitivity": "UNVERIFIED",
-                        "revisit_condition": "Accumulate prospective policy hindsight before reuse beyond the promoted scope.",
-                    },
-                    "META_STRATEGY_PATTERN_CREATED",
-                    "CANDIDATE",
-                )
-        return {"decision": "CAMPAIGN_STARTED", "opportunities": opportunities, "campaign": campaign, "literature_request": literature_request, "improvement": result, "promotion_preflight": promotion_preflight, "promoted_policy": promoted}
+                if not any(
+                    item["data"].get("policy_id") == str(promoted["id"])
+                    and item["data"].get("patch_id") == best_patch
+                    for item in self._objects(project_id, "MetaStrategyPattern")
+                ):
+                    self.store.object_create(
+                        project_id,
+                        "MetaStrategyPattern",
+                        {
+                            "policy_id": str(promoted["id"]),
+                            "patch_id": best_patch,
+                            "target_component": opportunity["data"]["target_component"],
+                            "scope": promotion_preflight["scope"],
+                            "observed_effect": "BENCHMARK_SUPPORTED_AWAITING_REAL_WORLD_HINDSIGHT",
+                            "mechanism": patch["data"].get("semantic_change"),
+                            "supporting_evidence": [str(promotion_preflight["policy_experiment_id"])],
+                            "counterexamples": [],
+                            "provider_sensitivity": "UNVERIFIED",
+                            "domain_sensitivity": "UNVERIFIED",
+                            "revisit_condition": "Accumulate prospective policy hindsight before reuse beyond the promoted scope.",
+                        },
+                        "META_STRATEGY_PATTERN_CREATED",
+                        "CANDIDATE",
+                    )
+        campaign = self.store.object_update(
+            str(campaign["id"]),
+            {"improvement_run_id": run_id, "resume_state": "COMPLETED", "promoted_policy_id": str(promoted["id"]) if promoted else None},
+            "COMPLETED",
+            "META_RESEARCH_COMPLETED",
+        )
+        decision = "CAMPAIGN_RECOVERED" if recovered_run else "CAMPAIGN_RESUMED" if resumed else "CAMPAIGN_STARTED"
+        return {"decision": decision, "opportunities": opportunities, "campaign": campaign, "literature_request": literature_request, "improvement": result, "promotion_preflight": promotion_preflight, "promoted_policy": promoted}
 
     def monitor_promotions(self, project_id: str) -> list[dict[str, Any]]:
         """Detect severe, repeated post-promotion failures and rollback scoped policy."""

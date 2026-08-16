@@ -216,9 +216,9 @@ def test_auto_project_runs_closed_meta_cycle_and_promotes_supported_patch():
     assert store.objects_list("project", "MetaResearchCampaign")[0]["status"] == "COMPLETED"
 
 
-def test_active_campaign_claim_prevents_duplicate_retry_after_interruption():
+def test_active_campaign_resumes_after_interruption_without_creating_a_second_claim():
     store = Store()
-    controller = MetaResearchController(store, PolicyLab())
+    controller = MetaResearchController(store, CampaignPolicyLab(store))
     for _ in range(2):
         store.object_create("project", "ResearchDecisionOutcome", {"label": "LOW_VALUE", "action_type": "DIAGNOSTIC"}, "FIXTURE", "RESULT_INSPECTED")
     opportunity = controller.detect_opportunities("project")[0]
@@ -226,8 +226,26 @@ def test_active_campaign_claim_prevents_duplicate_retry_after_interruption():
 
     result = controller.run_once("project")
 
-    assert result["decision"] == "CAMPAIGN_IN_PROGRESS"
+    assert result["decision"] == "CAMPAIGN_RESUMED"
     assert result["campaign"]["id"] == campaign["id"]
+    assert len(store.objects_list("project", "MetaResearchCampaign")) == 1
+
+
+def test_restart_recovers_completed_policy_lab_run_without_rerunning_it():
+    store = Store()
+    lab = CampaignPolicyLab(store)
+    controller = MetaResearchController(store, lab)
+    for _ in range(2):
+        store.object_create("project", "ResearchDecisionOutcome", {"label": "LOW_VALUE", "action_type": "DIAGNOSTIC"}, "FIXTURE", "RESULT_INSPECTED")
+    opportunity = controller.detect_opportunities("project")[0]
+    campaign = store.object_create("project", "MetaResearchCampaign", {"fingerprint": f"meta-campaign:{opportunity['id']}"}, "FIXTURE", "RUNNING")
+    run = store.object_create("project", "ImprovementRun", {"recommendation": "REJECT_OR_REVISE", "source_context": {"MetaResearchCampaign": [campaign["id"]]}}, "FIXTURE", "COMPLETED")
+
+    result = controller.run_once("project")
+
+    assert result["decision"] == "CAMPAIGN_RECOVERED"
+    assert result["improvement"]["improvement_run"]["id"] == run["id"]
+    assert lab.kwargs is None
 
 
 def test_domain_promotion_requires_matching_mode_and_cross_project_transfer():

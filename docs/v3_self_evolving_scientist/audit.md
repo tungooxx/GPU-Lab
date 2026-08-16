@@ -62,3 +62,8 @@ repository-write authority. Richer causal meta-diagnostics, live multi-provider
 policy evaluation, benchmark-authoring workflow, and prospective canary routing
 remain broader integration work. The deterministic benchmark runner should not
 be represented as live-model or real-world proof.
+
+Meta-campaign claims are restart-durable: a restarted controller resumes a
+claimed campaign, reuses a linked completed `ImprovementRun` when present, and
+finishes promotion idempotently. This covers controller restart recovery, not
+durable recovery of an external code executor or unavailable provider.
