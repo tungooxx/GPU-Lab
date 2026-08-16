@@ -451,6 +451,41 @@ def literature() -> LiteratureService:
     return literature_service
 
 
+async def run_meta_research(project_id: str) -> dict[str, Any]:
+    """Run one bounded campaign and, when configured, its single prepared literature scout."""
+    result = await call(meta_controller().run_once, project_id)
+    request = result.get("literature_request") if isinstance(result, dict) else None
+    if not request:
+        return result
+    if settings.gpu_lab_literature_provider != "paperqa-http":
+        deferred = await call(
+            research().object_update,
+            str(request["id"]),
+            {"dispatch_status": "DEFERRED", "dispatch_reason": "literature provider unavailable"},
+            "DEFERRED",
+            "LITERATURE_SCOUT_DEFERRED",
+        )
+        return {**result, "literature_scout": {"status": "DEFERRED", "request": deferred}}
+    gathered = await call(literature().gather, project_id, request["data"]["question"])
+    if "error" in gathered:
+        deferred = await call(
+            research().object_update,
+            str(request["id"]),
+            {"dispatch_status": "UNAVAILABLE", "provider_error": gathered["error"]},
+            "DEFERRED",
+            "LITERATURE_SCOUT_DEFERRED",
+        )
+        return {**result, "literature_scout": {"status": "UNAVAILABLE", "request": deferred}}
+    completed = await call(
+        research().object_update,
+        str(request["id"]),
+        {"dispatch_status": "COMPLETED", "evidence_ids": [str(item["id"]) for item in gathered.get("evidence", [])]},
+        "COMPLETED",
+        "LITERATURE_SCOUT_COMPLETED",
+    )
+    return {**result, "literature_scout": {"status": "COMPLETED", "request": completed, "gathered": gathered}}
+
+
 def executable_papers() -> ExecutablePaperService:
     global executable_paper_service
     if settings.gpu_lab_executable_paper_provider != "paper2agent-http":
@@ -1909,7 +1944,7 @@ async def meta_state_get(project_id: str):
 @mcp.tool()
 async def meta_research_run_once(project_id: str):
     """Run at most one bounded autonomous meta-research campaign."""
-    return await call(meta_controller().run_once, project_id)
+    return await run_meta_research(project_id)
 
 
 @mcp.tool()
@@ -1974,7 +2009,7 @@ async def research_decision_outcome_assess(
     if "error" in result:
         return result
     project_id = str(result["outcome"]["project_id"])
-    meta_result = await call(meta_controller().run_once, project_id)
+    meta_result = await run_meta_research(project_id)
     return {**result, "meta_research": meta_result}
 
 

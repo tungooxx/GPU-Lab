@@ -49,6 +49,34 @@ class MetaResearchController:
             "PolicyNegativeResult": [str(item["id"]) for item in self._objects(project_id, "PolicyNegativeResult")[-10:]],
         }
 
+    def _prepare_literature_scout(self, project_id: str, opportunity: dict[str, Any], literature_budget: int) -> dict[str, Any] | None:
+        """Create a finite, problem-driven literature brief before any retrieval happens."""
+        if literature_budget < 1:
+            return None
+        data = opportunity["data"]
+        fingerprint = f"literature-scout:{opportunity['id']}"
+        existing = self._find_by_fingerprint(project_id, "LiteratureScoutRequest", fingerprint)
+        if existing:
+            return existing
+        question = (
+            f"What tested methods improve {data['target_component']} when the observed weakness is: "
+            f"{data['observed_failure']}? Compare mechanisms, ablations, limitations, negative results, and cost."
+        )
+        return self.store.object_create(
+            project_id,
+            "LiteratureScoutRequest",
+            {
+                "fingerprint": fingerprint,
+                "opportunity_id": str(opportunity["id"]),
+                "question": question,
+                "max_queries": literature_budget,
+                "required_perspectives": ["target method", "closest prior method", "competing methods", "ablations", "limitations", "negative results"],
+                "status_reason": "Problem-driven request; external content remains untrusted evidence.",
+            },
+            "LITERATURE_SCOUT_PREPARED",
+            "PREPARED",
+        )
+
     def _promotion_preflight(self, project_id: str, patch_id: str, config: dict[str, Any]) -> dict[str, Any]:
         """Apply v3's scoped auto-promotion gates before creating a new policy."""
         patch = self.store.object_get(patch_id)
@@ -322,6 +350,9 @@ class MetaResearchController:
             return {"decision": "COMPATIBILITY_EVALUATED", "opportunities": opportunities, "compatibility": compatibility}
         budget = {key: config["data"][key] for key in self.defaults if key != "mode"}
         source_context = self._candidate_sources(project_id, opportunity)
+        literature_request = self._prepare_literature_scout(project_id, opportunity, int(config["data"]["literature_budget"]))
+        if literature_request:
+            source_context["LiteratureScoutRequest"] = [str(literature_request["id"])]
         campaign_fingerprint = f"meta-campaign:{opportunity['id']}"
         active_campaign = next(
             (
@@ -372,7 +403,7 @@ class MetaResearchController:
             self.store.object_update(run_id, {"auto_promotion_preflight": promotion_preflight}, "COMPLETED", "POLICY_AUTO_PROMOTION_PREFLIGHT")
             if config["data"]["mode"] == "AUTO_PROJECT" and promotion_preflight["eligible"]:
                 promoted = self.policy_lab.promote(project_id, best_patch)
-        return {"decision": "CAMPAIGN_STARTED", "opportunities": opportunities, "campaign": campaign, "improvement": result, "promotion_preflight": promotion_preflight, "promoted_policy": promoted}
+        return {"decision": "CAMPAIGN_STARTED", "opportunities": opportunities, "campaign": campaign, "literature_request": literature_request, "improvement": result, "promotion_preflight": promotion_preflight, "promoted_policy": promoted}
 
     def monitor_promotions(self, project_id: str) -> list[dict[str, Any]]:
         """Detect severe, repeated post-promotion failures and rollback scoped policy."""

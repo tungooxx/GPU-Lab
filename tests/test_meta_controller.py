@@ -193,10 +193,12 @@ def test_auto_project_runs_closed_meta_cycle_and_promotes_supported_patch():
     assert result["decision"] == "CAMPAIGN_STARTED"
     assert result["promoted_policy"]["status"] == "PRODUCTION"
     assert result["promotion_preflight"]["eligible"] is True
+    assert "methods improve experiment_selection" in result["literature_request"]["data"]["question"]
     assert store.objects_list("project", "MetaWorldModel")
     assert store.objects_list("project", "PolicyExperiment")
     run = store.objects_list("project", "ImprovementRun")[0]
     assert run["data"]["meta_campaign"]["candidate_sources"]["MetaWorldModel"]
+    assert run["data"]["meta_campaign"]["candidate_sources"]["LiteratureScoutRequest"]
     assert run["data"]["auto_promotion_preflight"]["policy_experiment_id"]
     assert store.objects_list("project", "MetaResearchCampaign")[0]["status"] == "COMPLETED"
 
