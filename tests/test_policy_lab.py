@@ -163,3 +163,20 @@ def test_transfer_classification_distinguishes_project_specific_and_model_sensit
 
     assert project_specific["status"] == "PROJECT_SPECIFIC"
     assert model_sensitive["status"] == "MODEL_SENSITIVE"
+
+
+def test_improve_records_invalid_patch_without_assuming_an_experiment(monkeypatch):
+    store = Store()
+    lab = service(store)
+    original_patch = lab._patch
+
+    def no_op_patch(project_id, policy, hypothesis):
+        patch = original_patch(project_id, policy, hypothesis)
+        patch["data"]["implementation_change"] = {"enabled": False}
+        return patch
+
+    monkeypatch.setattr(lab, "_patch", no_op_patch)
+    result = lab.improve("project", idea="Invalid fixture")
+
+    assert len(result["improvement_run"]["data"]["invalid_patch_ids"]) == 3
+    assert result["improvement_run"]["data"]["evaluation_ids"] == []

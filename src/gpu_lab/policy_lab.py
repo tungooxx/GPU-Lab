@@ -259,7 +259,7 @@ class PolicyLabService:
             regressions.append("held_out_coverage_missing")
         if no_primary_gain:
             regressions.append("strong_next_action_recall")
-        status = "REJECTED" if regressions else "SUPPORTED_ON_BENCHMARK"
+        status = "REJECTED" if regressions and self.auto_reject else "CANDIDATE" if regressions else "SUPPORTED_ON_BENCHMARK"
         experiment = self._create(project_id, "PolicyExperiment", {
             "baseline_policy_id": patch["data"]["base_policy_id"], "candidate_patch_id": patch_id,
             "policy_hypothesis_id": patch["data"]["policy_hypothesis_id"], "benchmark_version": "brain-bench-v2.5",
@@ -311,7 +311,7 @@ class PolicyLabService:
             patches.extend(revisions)
             evaluations.extend(self.evaluate(project_id, str(patch["id"])) for patch in revisions)
         supported = [e for e in evaluations if e["decision"] == "SUPPORTED_ON_BENCHMARK"]
-        run = self._create(project_id, "ImprovementRun", {"input": {"idea": idea, "paper": paper, "failure": failure, "component": component, "search": search}, "base_policy_id": str(policy["id"]), "weakness_ids": [str(w["id"]) for w in weaknesses], "hypothesis_ids": [str(h["id"]) for h in hypotheses], "patch_ids": [str(p["id"]) for p in patches], "evaluation_ids": [str(e["experiment"]["id"]) for e in evaluations], "best_supported_patch_id": str(supported[0]["patch"]["id"]) if supported else None, "recommendation": "PROMOTE" if supported else "REJECT_OR_REVISE", "production_unchanged": True, "namespace": "META_RESEARCH"}, "IMPROVEMENT_RUN_COMPLETED", "COMPLETED")
+        run = self._create(project_id, "ImprovementRun", {"input": {"idea": idea, "paper": paper, "failure": failure, "component": component, "search": search}, "base_policy_id": str(policy["id"]), "weakness_ids": [str(w["id"]) for w in weaknesses], "hypothesis_ids": [str(h["id"]) for h in hypotheses], "patch_ids": [str(p["id"]) for p in patches], "evaluation_ids": [str(e["experiment"]["id"]) for e in evaluations if e.get("experiment")], "invalid_patch_ids": [str(e["patch"]["id"]) for e in evaluations if e["decision"] == "INVALID_EVALUATION"], "best_supported_patch_id": str(supported[0]["patch"]["id"]) if supported else None, "recommendation": "PROMOTE" if supported else "REJECT_OR_REVISE", "production_unchanged": True, "namespace": "META_RESEARCH"}, "IMPROVEMENT_RUN_COMPLETED", "COMPLETED")
         return {"improvement_run": run, "production_policy_id": str(policy["id"]), "weaknesses": weaknesses, "hypotheses": hypotheses, "patches": patches, "evaluations": evaluations, "recommendation": run["data"]["recommendation"]}
 
     def promote(self, project_id: str, patch_id: str) -> dict[str, Any]:
