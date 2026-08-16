@@ -117,3 +117,22 @@ as unknown until matched prospective evidence can support a causal estimate.
 Each durable meta campaign now records actual candidate, benchmark, revision,
 literature, and engineering-task consumption alongside its ceiling budget and
 an explicit stop reason.
+
+## Verification status
+
+| Area | Status | Evidence |
+| --- | --- | --- |
+| Autonomous weakness detection, agenda, bounded campaigns | VERIFIED_UNIT | Controller tests cover recurring outcomes, prioritization, scheduling, budgets, and durable claims. |
+| Evaluation, held-out and adversarial falsification | VERIFIED_UNIT | Policy-lab tests cover evaluator firewall, held-out rejection, and high-risk adversarial regression. |
+| Project auto-promotion and rollback | VERIFIED_INTEGRATION | End-to-end controller fixtures exercise promotion, positive hindsight, regression detection, rollback, and negative-result preservation. |
+| Restart recovery | VERIFIED_UNIT | Durable campaign/run recovery tests prevent duplicate campaign claims and promotion records. |
+| Literature scouting and transfer | VERIFIED_INTEGRATION | Configured scout dispatch creates evidence-candidate-only transfer records for later campaigns. |
+| v2.2 implementation handoff | VERIFIED_INTEGRATION | `EngineeringTask` and verified `EngineeringResult` gate policy evaluation; the controller cannot write arbitrary repository files. |
+| Provider adapter evolution | VERIFIED_INTEGRATION | Compatibility, live PASS/FAIL evidence, and evidence-gated policy descendant promotion are covered. |
+| Live provider behavior | IMPLEMENTED_UNVERIFIED | Requires a configured provider runner and real held-out provider observations. |
+| External coding execution | IMPLEMENTED_UNVERIFIED | Requires a configured engineering executor to perform and verify a bounded task. |
+| PostgreSQL/service restart | IMPLEMENTED_UNVERIFIED | Unit-level durable recovery is covered; a deployed PostgreSQL restart smoke remains required. |
+
+The latest local suite result was `266 passed, 19 skipped` with one existing
+Pydantic settings warning; Ruff passed. This document is not a claim that
+configured external-provider and executor integrations have been proven live.
