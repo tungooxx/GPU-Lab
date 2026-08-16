@@ -345,7 +345,18 @@ class MetaResearchController:
         viable = [item for item in opportunities if item["data"]["expected_value_of_improvement"] >= 0.4]
         if not viable:
             return {"decision": "NO_CAMPAIGN", "opportunities": opportunities}
-        opportunity = max(viable, key=lambda item: item["data"]["expected_value_of_improvement"])
+        agenda_priority = {
+            str(item["data"].get("opportunity_id")): float(item["data"].get("priority", 0.0))
+            for item in self._objects(project_id, "MetaResearchAgenda")
+            if item["status"] in {"OPEN", "ACTIVE"}
+        }
+        opportunity = max(
+            viable,
+            key=lambda item: (
+                agenda_priority.get(str(item["id"]), 0.0),
+                float(item["data"]["expected_value_of_improvement"]),
+            ),
+        )
         if opportunity["data"].get("required_evaluation") == "COMPACT_COMPATIBILITY_BENCHMARK":
             compatibility = self.policy_lab.evaluate_provider_compatibility(
                 project_id,

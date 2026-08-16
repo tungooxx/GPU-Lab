@@ -228,3 +228,17 @@ def test_domain_promotion_requires_matching_mode_and_cross_project_transfer():
     config = controller.config_update("project", {"mode": "AUTO_DOMAIN"})
 
     assert controller._promotion_preflight("project", patch["id"], config["data"])["eligible"] is True
+
+
+def test_scheduler_prioritizes_open_meta_agenda_over_raw_opportunity_value():
+    store = Store()
+    lab = CampaignPolicyLab(store)
+    controller = MetaResearchController(store, lab)
+    low_priority = store.object_create("project", "ImprovementOpportunity", {"target_component": "ranking", "observed_failure": "ranking issue", "expected_value_of_improvement": 0.9, "scope": "PROJECT"}, "FIXTURE", "CANDIDATE")
+    high_priority = store.object_create("project", "ImprovementOpportunity", {"target_component": "critic", "observed_failure": "critic issue", "expected_value_of_improvement": 0.4, "scope": "PROJECT"}, "FIXTURE", "CANDIDATE")
+    store.object_create("project", "MetaResearchAgenda", {"opportunity_id": low_priority["id"], "priority": 0.1}, "FIXTURE", "OPEN")
+    store.object_create("project", "MetaResearchAgenda", {"opportunity_id": high_priority["id"], "priority": 0.95}, "FIXTURE", "OPEN")
+
+    controller.run_once("project")
+
+    assert lab.kwargs["component"] == "critic"
