@@ -2004,6 +2004,12 @@ async def policy_health_report(project_id: str):
 
 
 @mcp.tool()
+async def meta_research_roi(project_id: str):
+    """Return bounded meta-research cost and observed-yield metrics."""
+    return await call(meta_controller().meta_research_roi, project_id)
+
+
+@mcp.tool()
 async def meta_research_run_once(project_id: str):
     """Run at most one bounded autonomous meta-research campaign."""
     return await run_meta_research(project_id)

@@ -106,3 +106,8 @@ are stored on the `PolicyExperiment` and block promotion.
 The autonomous rollback acceptance test covers a real controller sequence:
 auto-promotion, repeated negative prospective hindsight, `PolicyRegression`,
 rollback to the parent policy, and preservation of `PolicyNegativeResult`.
+
+The `meta_research_roi` MCP tool reports campaign budget ceilings and observed
+candidate, promotion, regression, hindsight, invalid-experiment, and
+zero-information rates. It intentionally reports future research cost avoided
+as unknown until matched prospective evidence can support a causal estimate.

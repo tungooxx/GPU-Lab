@@ -852,6 +852,37 @@ class MetaResearchController:
             "known_policy_failure_modes": production["data"].get("known_failure_modes", []) if production else [],
         }
 
+    def meta_research_roi(self, project_id: str) -> dict[str, Any]:
+        """Report observed meta-science yield without inventing causal savings."""
+        campaigns = self._objects(project_id, "MetaResearchCampaign")
+        outcomes = self._objects(project_id, "ResearchDecisionOutcome")
+        experiments = self._objects(project_id, "PolicyExperiment")
+        patches = self._objects(project_id, "ResearchPolicyPatch")
+        promoted = [item for item in self._objects(project_id, "ResearchPolicy") if item["data"].get("provenance", {}).get("source_type") == "POLICY_PATCH"]
+        hindsight = [entry for item in promoted for entry in item["data"].get("post_promotion_hindsight", [])]
+        realized = [entry["observed_improvement"] for entry in hindsight if isinstance(entry.get("observed_improvement"), (int, float))]
+        completed = [item for item in campaigns if item["status"] == "COMPLETED"]
+        budget_keys = ("token_budget", "llm_call_budget", "literature_budget", "benchmark_budget", "engineering_budget", "wall_clock_iteration_budget", "candidate_budget", "gpu_budget")
+        budget_ceiling = {
+            key: sum(float(item["data"].get("budget", {}).get(key, 0)) for item in completed)
+            for key in budget_keys
+        }
+        rejected = [item for item in patches if item["status"] in {"REJECTED", "INVALID_EVALUATION"}]
+        return {
+            "campaigns_completed": len(completed),
+            "campaigns_active": sum(item["status"] in {"RUNNING", "ACTIVE"} for item in campaigns),
+            "meta_research_budget_ceiling": budget_ceiling,
+            "policy_candidates_evaluated": len(experiments),
+            "policy_candidate_rejection_rate": len(rejected) / len(patches) if patches else None,
+            "policy_promotions": len(promoted),
+            "post_promotion_regression_rate": len(self._objects(project_id, "PolicyRegression")) / len(promoted) if promoted else None,
+            "zero_information_action_rate": sum(item["data"].get("label") == "ZERO_INFORMATION" for item in outcomes) / len(outcomes) if outcomes else None,
+            "invalid_experiment_rate": sum(item["data"].get("label") == "INVALID" for item in outcomes) / len(outcomes) if outcomes else None,
+            "observed_policy_improvement_mean": sum(realized) / len(realized) if realized else None,
+            "estimated_future_research_cost_avoided": None,
+            "roi_interpretation": "Operational observations only; causal savings require matched prospective evidence.",
+        }
+
     def model_change_detect(self, project_id: str, provider: str, model: str) -> dict[str, Any] | None:
         """Record provider/model drift as a bounded compatibility-evaluation opportunity."""
         fingerprint = f"model-change:{provider}:{model}"

@@ -276,6 +276,25 @@ def test_policy_health_report_aggregates_lineage_calibration_and_failure_views()
     assert report["known_policy_failure_modes"] == ["scope regression"]
 
 
+def test_meta_research_roi_reports_observed_yield_and_keeps_causal_savings_unknown():
+    store = Store()
+    controller = MetaResearchController(store, PolicyLab())
+    store.object_create("project", "MetaResearchCampaign", {"budget": {"token_budget": 100, "candidate_budget": 2}}, "FIXTURE", "COMPLETED")
+    store.object_create("project", "ResearchPolicyPatch", {}, "FIXTURE", "REJECTED")
+    store.object_create("project", "ResearchPolicyPatch", {}, "FIXTURE", "SUPPORTED_ON_BENCHMARK")
+    store.object_create("project", "PolicyExperiment", {}, "FIXTURE", "COMPLETED")
+    store.object_create("project", "ResearchDecisionOutcome", {"label": "INVALID"}, "FIXTURE", "RESULT_INSPECTED")
+    store.object_create("project", "ResearchDecisionOutcome", {"label": "ZERO_INFORMATION"}, "FIXTURE", "RESULT_INSPECTED")
+
+    roi = controller.meta_research_roi("project")
+
+    assert roi["meta_research_budget_ceiling"]["token_budget"] == 100.0
+    assert roi["policy_candidate_rejection_rate"] == 0.5
+    assert roi["invalid_experiment_rate"] == 0.5
+    assert roi["zero_information_action_rate"] == 0.5
+    assert roi["estimated_future_research_cost_avoided"] is None
+
+
 def test_auto_project_runs_closed_meta_cycle_and_promotes_supported_patch():
     store = Store()
     lab = PolicyLabService(store, ResearchBrainBench(Path(__file__).parents[1] / "research_bench"))
