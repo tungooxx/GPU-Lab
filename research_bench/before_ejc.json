@@ -1,0 +1,84 @@
+{
+  "schema_version": "1.0",
+  "benchmark_split": "VALIDATION",
+  "episode_id": "pointcloud-before-ejc",
+  "project_id": "historical-vlm-pointcloud",
+  "domain": "point-cloud completion",
+  "cutoff_timestamp": "2026-08-10T00:41:21+07:00",
+  "scientific_question": "What should happen after ERS and ERE failed but before committing to EJC?",
+  "visible_state": {
+    "reproduction_status": "REPRODUCED",
+    "dead_mechanisms": [
+      "universal latent drift",
+      "simple missing-region story",
+      "MaterialCell as root cause",
+      "ERS latent-box substrate",
+      "ERE static object-specific compatible-shape set"
+    ],
+    "remaining_phenomenon": "sparse low-error outputs can switch under changed evidence",
+    "scope": "frozen selected VRCNet and SymmCompletion cases"
+  },
+  "hidden_future_state": {
+    "candidate": "Evidence-Justified Commitments",
+    "authorized_test": "frozen-model commitment-boundary falsification"
+  },
+  "known_dead_lineages": ["materialcell", "ers-latent-box", "ere-static-set"],
+  "known_active_hypotheses": ["decision-boundary-switch", "metric-artifact"],
+  "known_unknowns": [
+    "whether output changes are commensurate with decision-relevant evidence",
+    "whether the phenotype survives matched controls and null explanations"
+  ],
+  "candidate_actions": [
+    {
+      "action_id": "frozen-boundary-diagnostic",
+      "action_type": "FROZEN_DIAGNOSTIC",
+      "hypothesis_ids": ["inference-dynamics:decision-boundary-switch", "metric-artifact:metric-artifact"],
+      "expected_information_gain": 5.0,
+      "compute_cost": 0.8,
+      "engineering_cost": 1.0,
+      "execution_risk": 0.5,
+      "tags": ["CHEAP_FALSIFIER"],
+      "prediction": "Failure trajectories should show a controlled switch signature beyond matched null controls."
+    },
+    {
+      "action_id": "revive-ers",
+      "action_type": "TRAINING_RUN",
+      "hypothesis_ids": ["ers-latent-box"],
+      "expected_information_gain": 1.0,
+      "compute_cost": 4.0,
+      "engineering_cost": 4.0,
+      "execution_risk": 3.0,
+      "tags": ["DUPLICATE_EXPERIMENT"]
+    },
+    {
+      "action_id": "train-ejc",
+      "action_type": "ARCHITECTURE_DESIGN",
+      "hypothesis_ids": ["inference-dynamics:decision-boundary-switch"],
+      "expected_information_gain": 2.0,
+      "compute_cost": 5.0,
+      "engineering_cost": 5.0,
+      "execution_risk": 4.0
+    }
+  ],
+  "strong_next_actions": ["frozen-boundary-diagnostic"],
+  "acceptable_next_actions": [],
+  "bad_next_actions": ["revive-ers", "train-ejc"],
+  "forbidden_future_records": ["ejc-document", "stage6g-result", "stage6j-result", "hasi-result"],
+  "source_provenance": [
+    {
+      "kind": "RECONSTRUCTED_INFERENCE",
+      "source": "F:/Newgeneration/VLM/EJC.md",
+      "locator": "sections 2, 3, 11, 14, and 21",
+      "captured_at": "2026-08-10T00:41:22+07:00",
+      "note": "The checkpoint is reconstructed from the document's explicit prior failures and authorization boundary; the EJC proposal itself remains hidden."
+    }
+  ],
+  "evaluation_rubric": {
+    "require_negative_memory": true,
+    "require_scope_preservation": true,
+    "require_reproduction_gate": true,
+    "require_null_model": true,
+    "minimum_hypothesis_niches": 2,
+    "architecture_action_types": ["ARCHITECTURE_DESIGN", "TRAINING_RUN"]
+  }
+}

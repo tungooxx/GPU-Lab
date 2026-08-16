@@ -156,11 +156,31 @@ slice on PostgreSQL and a local GTX 1650. PaperQA is integrated as an optional i
 its real model-backed answer quality is not yet verified. Paper2Agent is also integrated behind an
 optional isolated executable-paper worker pinned to an audited upstream commit. Its provider,
 generated-MCP inspection/invocation, network isolation, and canonical-truth boundary are verified,
-but a paid model-backed paper conversion has not been run. Automatic embedding generation and
-campaign automation remain later milestones. Native QD niches, lineage, dead-idea proximity, and
-deterministic experiment branches are implemented; their longitudinal scientific value is not yet
-established, and no MCTS policy is present. Native progress metrics and `meta_review` currently mark
-campaign readiness `DO_NOT_BUILD_YET` because the inspected/hindsight evidence threshold is unmet.
+but a paid model-backed paper conversion has not been run. Automatic, provider-neutral scientific
+embeddings now maintain canonical text hashes and metadata, with structured and lexical retrieval
+as a safe fallback when embedding is unavailable. Brain v1.5 adds evidence-family accounting,
+scope-aware causal support, BeliefAudit, and WorldModel consistency checks. Brain v2 adds historical
+benchmark baselines, null-model/control actions, ResearchSituations, explicit DecisionOutcomes, and
+scoped strategy-memory adjustments to `brain_step()`. Native QD niches, lineage, dead-idea proximity,
+and deterministic experiment branches are implemented; their longitudinal scientific value is not yet
+established, no real inspected three-branch comparison has been run, and no MCTS policy is present.
+Native progress metrics and `meta_review` currently mark campaign readiness `DO_NOT_BUILD_YET` because
+the required real-science, model-backed, and hindsight evidence thresholds remain unmet.
+
+### Exporting the research trace
+
+To review what the system observed, selected, executed, and persisted, export a redacted Markdown
+trace directly from PostgreSQL and the local operational database:
+
+```powershell
+uv run python scripts/export_research_trace.py --output trace_export.md
+```
+
+Use `--project-id <uuid>` for one project. The report includes structured state, decisions,
+candidate actions, events, execution attempts, version history, MCP audit records, jobs, and worker
+events. Credentials and bearer values are redacted. Private model chain-of-thought is not stored or
+exportable; improve prompts from the persisted rationale, retrieved records, tool inputs/outputs,
+outcomes, and error history instead.
 
 Enable the Paper2Agent worker only with a task-scoped Anthropic credential and explicit approval of
 the upstream model cost:

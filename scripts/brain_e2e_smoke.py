@@ -463,12 +463,22 @@ def main() -> None:
             "evidence_against": [],
             "unexpected_observations": [],
             "alternative_explanations": ["The fixture does not prove dataset generalization"],
-            "scope": "VRCNet CUDA intervention smoke fixture",
+            "scope": {
+                "description": "VRCNet CUDA intervention smoke fixture",
+                "models": ["VRCNet"],
+                "architectures": ["VRCNet"],
+                "checkpoints": ["canonical VRC checkpoint"],
+                "datasets": ["Brain v1 smoke fixture"],
+                "objects": ["synthetic recipient fixture"],
+                "interventions": ["frozen anchor-state substitution"],
+                "metrics": ["max_recipient_effect_R"],
+            },
             "hypothesis_transition": "SURVIVES_INITIAL_TEST",
             "rationale": "The preregistered scoped prediction passed on real CUDA execution.",
             "causal_edge_id": edge["id"],
             "causal_edge_status": "INTERVENTION_SUPPORTED",
             "actual_information_gain": "HIGH",
+            "matched_control_passed": True,
         },
     )
     after = call_tool("brain_step", {"project_id": project_id})

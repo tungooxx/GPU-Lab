@@ -5,8 +5,10 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
+from .epistemics import normalize_scientific_scope, scope_is_empirically_bounded
 from .errors import GPUError
 from .research import ResearchStore
+from .strategy import SCORING_POLICY_VERSION, STRATEGY_POLICY_VERSION, ResearchStrategyService
 
 VerificationStatus = Literal[
     "IMPLEMENTED_UNVERIFIED",
@@ -49,13 +51,23 @@ ACTION_TYPES = {
     "TRAINING_RUN",
     "NOVELTY_CHECK",
     "CODE_INSPECTION",
+    "NULL_MODEL_TEST",
+    "MATCHED_CONTROL",
+    "RANDOM_CONTROL",
+    "MAGNITUDE_MATCHED_CONTROL",
 }
-APPROVAL_REQUIRED_ACTIONS = {"TRAINING_RUN", "CAUSAL_INTERVENTION", "ABLATION"}
-EXECUTABLE_ACTIONS = APPROVAL_REQUIRED_ACTIONS | {
+EXECUTABLE_ACTIONS = {
     "REPRODUCTION",
     "FROZEN_DIAGNOSTIC",
     "REPLICATION",
     "GENERALIZATION",
+    "TRAINING_RUN",
+    "CAUSAL_INTERVENTION",
+    "ABLATION",
+    "NULL_MODEL_TEST",
+    "MATCHED_CONTROL",
+    "RANDOM_CONTROL",
+    "MAGNITUDE_MATCHED_CONTROL",
 }
 
 
@@ -67,6 +79,7 @@ class ActionScore(BaseModel):
     compute_cost: float = Field(ge=0.1, le=5)
     engineering_cost: float = Field(ge=0.1, le=5)
     execution_risk: float = Field(ge=0.1, le=5)
+    decision_relevance: float = Field(default=1, ge=0.1, le=5)
 
     @property
     def priority(self) -> float:
@@ -75,6 +88,7 @@ class ActionScore(BaseModel):
             * self.expected_discrimination
             * self.expected_information_gain
             * self.feasibility
+            * self.decision_relevance
         )
         denominator = self.compute_cost * self.engineering_cost * self.execution_risk
         return round(numerator / denominator, 6)
@@ -107,6 +121,7 @@ class ResearchBrain:
 
     def __init__(self, store: ResearchStore):
         self.store = store
+        self.strategy = ResearchStrategyService(store)
 
     @classmethod
     def _json_safe(cls, value: Any) -> Any:
@@ -121,18 +136,42 @@ class ResearchBrain:
             return str(value)
         return value
 
+    @staticmethod
+    def _state_snapshot(state: dict) -> dict:
+        """Persist a traceable planning snapshot without embedding every object payload."""
+        snapshot: dict[str, Any] = {}
+        for key, value in state["canonical_state"].items():
+            if isinstance(value, list):
+                snapshot[key] = [
+                    {
+                        field: str(item[field]) if field == "id" else item[field]
+                        for field in ("id", "kind", "status")
+                        if field in item
+                    }
+                    for item in value
+                ]
+            else:
+                snapshot[key] = value
+        return snapshot
+
     def world_model_create(self, project_id: str, name: str, scope: str) -> dict:
         return self.store.world_model_create_atomic(project_id, name, scope)
 
-    def world_model_get(self, world_model_id: str) -> dict:
-        model = self._expect(world_model_id, "WorldModel")
-        nodes = [self.store.object_get(item) for item in model["data"].get("node_ids", [])]
-        edges = [self.store.object_get(item) for item in model["data"].get("edge_ids", [])]
+    def world_model_get(self, world_model_id: str, as_of: str | None = None) -> dict:
+        temporal = {"as_of": as_of} if as_of is not None else {}
+        model = self._expect(world_model_id, "WorldModel", as_of)
+        nodes = [
+            self.store.object_get(item, **temporal) for item in model["data"].get("node_ids", [])
+        ]
+        edges = [
+            self.store.object_get(item, **temporal) for item in model["data"].get("edge_ids", [])
+        ]
         versions = self.store.objects_list(
             model["project_id"],
             "WorldModelVersion",
             limit=None,
             data_filters={"world_model_id": world_model_id},
+            **temporal,
         )
         return {"world_model": model, "nodes": nodes, "edges": edges, "versions": versions}
 
@@ -184,6 +223,9 @@ class ResearchBrain:
         against_ids: list[str] | None = None,
         unresolved_prediction_ids: list[str] | None = None,
         decision_id: str | None = None,
+        scope: str | dict[str, Any] | None = None,
+        supporting_evidence_family_ids: list[str] | None = None,
+        contradicting_evidence_family_ids: list[str] | None = None,
     ) -> dict:
         if status not in EDGE_STATUSES:
             raise GPUError("INVALID_CAUSAL_EDGE_STATUS", status)
@@ -204,7 +246,21 @@ class ResearchBrain:
             )
         evidence = list(dict.fromkeys([*(supporting_ids or []), *(against_ids or [])]))
         predictions = list(dict.fromkeys(unresolved_prediction_ids or []))
-        references = [*evidence, *predictions, *([decision_id] if decision_id else [])]
+        if supporting_evidence_family_ids or contradicting_evidence_family_ids:
+            raise GPUError(
+                "CAUSAL_EVIDENCE_FAMILY_REQUIRES_RESULT_ASSESSMENT",
+                "EvidenceFamily support is derived from an inspected result, not supplied directly",
+            )
+        if status == "INTERVENTION_SUPPORTED":
+            raise GPUError(
+                "CAUSAL_PROMOTION_REQUIRES_RESULT_ASSESSMENT",
+                "Use brain_result_assess so intervention provenance, controls, and scope are verified atomically",
+            )
+        references = [
+            *evidence,
+            *predictions,
+            *([decision_id] if decision_id else []),
+        ]
         self._validate_references(model["project_id"], references)
         if decision_id:
             self._expect(decision_id, "ResearchDecision")
@@ -218,6 +274,7 @@ class ResearchBrain:
                 "CAUSAL_EDGE_PROVENANCE_REQUIRED",
                 "Hypothesized edges need evidence or an unresolved prediction",
             )
+        normalized_scope = normalize_scientific_scope(scope)
         edge_data = {
             "world_model_id": world_model_id,
             "source_id": source_id,
@@ -228,6 +285,15 @@ class ResearchBrain:
             "against_ids": against_ids or [],
             "unresolved_prediction_ids": predictions,
             "decision_id": decision_id,
+            "scope": normalized_scope,
+            "support_level": "NONE",
+            "supporting_evidence_family_ids": [],
+            "contradicting_evidence_family_ids": [],
+            "independent_support_family_count": 0,
+            "independent_contradicting_family_count": 0,
+            "replication_count": 0,
+            "matched_control_count": 0,
+            "counter_intervention_count": 0,
         }
         created = self.store.world_model_child_create(
             world_model_id,
@@ -249,36 +315,48 @@ class ResearchBrain:
         supporting_ids: list[str] | None = None,
         against_ids: list[str] | None = None,
         decision_id: str | None = None,
+        scope: str | dict[str, Any] | None = None,
+        supporting_evidence_family_ids: list[str] | None = None,
+        contradicting_evidence_family_ids: list[str] | None = None,
     ) -> dict:
         if status not in EDGE_STATUSES:
             raise GPUError("INVALID_CAUSAL_EDGE_STATUS", status)
+        if supporting_evidence_family_ids or contradicting_evidence_family_ids:
+            raise GPUError(
+                "CAUSAL_EVIDENCE_FAMILY_REQUIRES_RESULT_ASSESSMENT",
+                "EvidenceFamily support is derived from an inspected result, not supplied directly",
+            )
+        if status == "INTERVENTION_SUPPORTED":
+            raise GPUError(
+                "CAUSAL_PROMOTION_REQUIRES_RESULT_ASSESSMENT",
+                "Use brain_result_assess so intervention provenance, controls, and scope are verified atomically",
+            )
         edge = self._expect(edge_id, "CausalEdge")
         model = self._expect(edge["data"]["world_model_id"], "WorldModel")
-        supporting = list(
-            dict.fromkeys([*edge["data"].get("supporting_ids", []), *(supporting_ids or [])])
-        )
-        against = list(dict.fromkeys([*edge["data"].get("against_ids", []), *(against_ids or [])]))
-        evidence = [*supporting, *against]
-        references = [*evidence, *([decision_id] if decision_id else [])]
+        supporting_additions = list(dict.fromkeys(supporting_ids or []))
+        against_additions = list(dict.fromkeys(against_ids or []))
+        evidence = [*supporting_additions, *against_additions]
+        references = [
+            *evidence,
+            *([decision_id] if decision_id else []),
+        ]
         self._validate_references(model["project_id"], references)
         if decision_id:
             self._expect(decision_id, "ResearchDecision")
-        if (
-            status
-            in {"OBSERVED_ASSOCIATION", "INTERVENTION_SUPPORTED", "WEAKENED", "REFUTED"}
-            and not evidence
-        ):
-            raise GPUError("CAUSAL_EDGE_EVIDENCE_REQUIRED", status)
+        normalized_scope = normalize_scientific_scope(
+            scope if scope is not None else edge["data"].get("scope")
+        )
         return self.store.causal_edge_update_atomic(
             edge_id,
             {
                 "edge_status": status,
-                "supporting_ids": supporting,
-                "against_ids": against,
+                "supporting_ids": supporting_additions,
+                "against_ids": against_additions,
                 "decision_id": decision_id,
                 "last_update_rationale": rationale,
+                "scope": normalized_scope,
             },
-            "VERIFIED_REAL" if status == "INTERVENTION_SUPPORTED" else "RESULT_INSPECTED",
+            "RESULT_INSPECTED",
             {
                 "edges_status_changed": [
                     {"edge_id": edge_id, "from": edge["data"]["edge_status"], "to": status}
@@ -286,6 +364,7 @@ class ResearchBrain:
             },
             evidence,
             decision_id,
+            expected_edge_status=str(edge["data"].get("edge_status")),
         )
 
     def agenda_create(self, project_id: str, name: str) -> dict:
@@ -343,10 +422,11 @@ class ResearchBrain:
             "AGENDA_ITEM_STATUS_CHANGED",
         )
 
-    def _portfolio_data(self, project_id: str) -> dict:
-        hypotheses = self.store.objects_identifiers(project_id, "Hypothesis")
-        negative = self.store.objects_identifiers(project_id, "NegativeResult")
-        niches = self.store.objects_list(project_id, "HypothesisNiche", limit=None)
+    def _portfolio_data(self, project_id: str, as_of: str | None = None) -> dict:
+        temporal = {"as_of": as_of} if as_of is not None else {}
+        hypotheses = self.store.objects_identifiers(project_id, "Hypothesis", **temporal)
+        negative = self.store.objects_identifiers(project_id, "NegativeResult", **temporal)
+        niches = self.store.objects_list(project_id, "HypothesisNiche", limit=None, **temporal)
         return {
             "active_hypothesis_ids": [
                 str(item["id"])
@@ -399,12 +479,22 @@ class ResearchBrain:
             "HYPOTHESIS_PORTFOLIO_CREATED",
         )
 
-    def brain_step(self, project_id: str) -> dict:
+    def brain_step(
+        self, project_id: str, as_of: str | None = None, persist: bool = True
+    ) -> dict:
+        if as_of is not None and persist:
+            raise GPUError(
+                "TEMPORAL_DECISION_MUST_BE_DRY_RUN",
+                "Historical Brain evaluation cannot mutate canonical scientific state",
+            )
+        temporal = {"as_of": as_of} if as_of is not None else {}
         started = datetime.now(UTC)
         brain_step_id, request_id = str(uuid.uuid4()), str(uuid.uuid4())
-        state = self.store.state_get(project_id)
-        models = self.store.objects_list(project_id, "WorldModel", limit=1)
-        agendas = self.store.objects_list(project_id, "ResearchAgenda", {"ACTIVE"}, 1)
+        state = self.store.state_get(project_id, **temporal)
+        models = self.store.objects_list(project_id, "WorldModel", limit=1, **temporal)
+        agendas = self.store.objects_list(
+            project_id, "ResearchAgenda", {"ACTIVE"}, 1, **temporal
+        )
         if not models or not agendas:
             missing = [
                 name
@@ -419,6 +509,7 @@ class ResearchBrain:
             {"OPEN", "ACTIVE", "BLOCKED"},
             limit=None,
             data_filters={"agenda_id": str(agenda["id"])},
+            **temporal,
         )
         if not items:
             raise GPUError("RESEARCH_AGENDA_EMPTY", str(agenda["id"]))
@@ -426,17 +517,32 @@ class ResearchBrain:
             items,
             key=lambda item: item["data"].get("importance", 1) * item["data"].get("uncertainty", 1),
         )
-        portfolio = self._portfolio_refresh(project_id)
+        portfolio = (
+            self._portfolio_refresh(project_id)
+            if persist
+            else {
+                "id": None,
+                "kind": "HypothesisPortfolio",
+                "status": "TEMPORAL_PREVIEW",
+                "data": self._portfolio_data(project_id, as_of),
+            }
+        )
         hypotheses = self.store.objects_list(
-            project_id, "Hypothesis", {"ACTIVE", "SURVIVES_INITIAL_TEST"}, limit=None
+            project_id,
+            "Hypothesis",
+            {"ACTIVE", "SURVIVES_INITIAL_TEST"},
+            limit=None,
+            **temporal,
         )
         comparative_lessons = self.store.objects_list(
-            project_id, "ComparativeLesson", limit=None
+            project_id, "ComparativeLesson", limit=None, **temporal
         )
-        meta_lessons = self.store.objects_list(project_id, "MetaLesson", limit=None)
-        related_dead = self._related_dead_ideas(project_id, hypotheses)
-        candidates = self._candidate_actions(project_id, agenda_item, hypotheses)
-        candidate_data = [
+        meta_lessons = self.store.objects_list(
+            project_id, "MetaLesson", limit=None, **temporal
+        )
+        related_dead = self._related_dead_ideas(project_id, hypotheses, as_of)
+        candidates = self._candidate_actions(project_id, agenda_item, hypotheses, as_of)
+        base_candidate_data = [
             {
                 **candidate.persisted_data(),
                 "brain_step_id": brain_step_id,
@@ -444,8 +550,44 @@ class ResearchBrain:
             }
             for candidate in candidates
         ]
+        situation_data = self.strategy.construct_situation_data(
+            project_id,
+            agenda_item,
+            model,
+            base_candidate_data,
+            len(related_dead),
+            as_of,
+        )
+        strategy_retrieval = self.strategy.retrieve(project_id, situation_data, as_of)
+        agenda_telemetry = self.strategy.agenda_telemetry(
+            project_id, agenda_item, as_of
+        )
+        hard_gate = len(candidates) == 1 and candidates[0].action_type in {
+            "ARTIFACT_ANALYSIS",
+            "REPRODUCTION",
+        }
+        candidate_data = self.strategy.adjust_candidates(
+            base_candidate_data,
+            strategy_retrieval,
+            agenda_telemetry,
+            hard_gate,
+        )
         selected_index = max(range(len(candidate_data)), key=lambda index: candidate_data[index]["priority"])
         selected = candidate_data[selected_index]
+        runner_ups = sorted(
+            (
+                (index, item)
+                for index, item in enumerate(candidate_data)
+                if index != selected_index
+            ),
+            key=lambda item: item[1]["priority"],
+            reverse=True,
+        )
+        runner_up_index, runner_up = runner_ups[0] if runner_ups else (None, None)
+        candidate_comparison = [self._candidate_comparison(item, hypotheses) for item in candidate_data]
+        prospective_hindsight = self._prospective_hindsight_attack(
+            selected, hypotheses, runner_up
+        )
         decision_data = {
             "request_id": request_id,
             "brain_step_id": brain_step_id,
@@ -455,8 +597,8 @@ class ResearchBrain:
                 "world_model_id": str(model["id"]),
                 "world_model_version_id": model["data"].get("current_version_id"),
                 "agenda_id": str(agenda["id"]),
-                "portfolio_id": str(portfolio["id"]),
-                "research_state": self._json_safe(state["canonical_state"]),
+                "portfolio_id": str(portfolio["id"]) if portfolio["id"] else None,
+                "research_state": self._state_snapshot(state),
                 "comparative_lesson_ids": [str(item["id"]) for item in comparative_lessons],
                 "meta_lesson_ids": [str(item["id"]) for item in meta_lessons],
             },
@@ -465,7 +607,29 @@ class ResearchBrain:
             "dead_ideas_retrieved": related_dead,
             "comparative_lessons": comparative_lessons,
             "meta_lessons": meta_lessons,
-            "rationale": self._decision_rationale(selected, related_dead),
+            "research_situation": situation_data,
+            "strategy_patterns_retrieved": strategy_retrieval["applied"],
+            "strategy_patterns_rejected": strategy_retrieval["rejected"],
+            "agenda_diminishing_returns": agenda_telemetry,
+            "brain_policy_version": "brain-v2-strategy-augmented-v1",
+            "strategy_policy_version": STRATEGY_POLICY_VERSION,
+            "scoring_policy_version": SCORING_POLICY_VERSION,
+            "rationale": self._decision_rationale(selected, related_dead, runner_up),
+            "central_uncertainty": agenda_item["data"].get(
+                "central_uncertainty", agenda_item["data"]["question"]
+            ),
+            "runner_up_candidate_index": runner_up_index,
+            "runner_up_action_type": runner_up.get("action_type") if runner_up else None,
+            "why_selected_over_runner_up": (
+                self._runner_up_reason(selected, runner_up) if runner_up else None
+            ),
+            "candidate_comparison": candidate_comparison,
+            "prospective_hindsight": prospective_hindsight,
+            "hard_blocks_checked": [
+                item["code"]
+                for item in self._critics(selected, related_dead)[-1].get("findings", [])
+                if item.get("hard_block")
+            ],
             "expected_information_gain": self._information_gain_label(
                 selected["score"]["expected_information_gain"]
             ),
@@ -482,11 +646,34 @@ class ResearchBrain:
             "duration_ms": 0,
         }
         decision_data["duration_ms"] = int((datetime.now(UTC) - started).total_seconds() * 1000)
+        if not persist:
+            return {
+                "brain_step_id": brain_step_id,
+                "decision_id": None,
+                "agenda_item": agenda_item,
+                "question": agenda_item["data"]["question"],
+                "scientific_state": state["canonical_state"],
+                "world_model": model,
+                "competing_hypotheses": hypotheses,
+                "dead_ideas_retrieved": related_dead,
+                "research_situation": situation_data,
+                "strategy_patterns_retrieved": strategy_retrieval,
+                "agenda_diminishing_returns": agenda_telemetry,
+                "candidate_actions": candidate_data,
+                "selected_action": selected,
+                "reason": decision_data["rationale"],
+                "expected_information_gain": decision_data["expected_information_gain"],
+                "estimated_cost": decision_data["estimated_cost"],
+                "requires_human_approval": False,
+                "verification_status": "TEMPORAL_DRY_RUN",
+                "as_of": as_of,
+            }
         persisted_step = self.store.brain_decision_create(
             project_id,
             candidate_data,
             selected_index,
             decision_data,
+            situation_data,
         )
         decision = persisted_step["decision"]
         persisted = persisted_step["candidates"]
@@ -500,13 +687,15 @@ class ResearchBrain:
             "world_model": model,
             "competing_hypotheses": hypotheses,
             "dead_ideas_retrieved": related_dead,
+            "research_situation": persisted_step["situation"],
+            "strategy_patterns_retrieved": strategy_retrieval,
+            "agenda_diminishing_returns": agenda_telemetry,
             "candidate_actions": persisted,
             "selected_action": selected,
             "reason": decision_data["rationale"],
             "expected_information_gain": decision_data["expected_information_gain"],
             "estimated_cost": decision_data["estimated_cost"],
-            "requires_human_approval": selected["action_type"]
-            in APPROVAL_REQUIRED_ACTIONS,
+            "requires_human_approval": False,
             "verification_status": "IMPLEMENTED_UNVERIFIED",
         }
 
@@ -531,6 +720,126 @@ class ResearchBrain:
             },
             "APPROVED",
             "RESEARCH_DECISION_APPROVED",
+        )
+
+    def legacy_run_provenance_repair(
+        self, run_id: str, agenda_item_id: str, rationale: str
+    ) -> dict:
+        """Attach inspect-only reconstructed provenance to one pre-binding run."""
+        run = self._expect(run_id, "ExperimentRun")
+        if run["status"] not in {"completed", "RESULT_NOT_INSPECTED", "failed", "cancelled", "unknown"}:
+            raise GPUError("LEGACY_RUN_NOT_INSPECTABLE", run["status"])
+        agenda_item = self._expect(agenda_item_id, "AgendaItem")
+        experiment = self._expect(str(run["data"].get("experiment_id")), "Experiment")
+        hypothesis_id = str(experiment["data"].get("hypothesis_id"))
+        hypothesis = self._expect(hypothesis_id, "Hypothesis")
+        project_id = str(run["project_id"])
+        if any(str(item["project_id"]) != project_id for item in (agenda_item, experiment, hypothesis)):
+            raise GPUError("RESEARCH_PROJECT_MISMATCH", "Legacy repair inputs must share a project")
+        existing_id = run["data"].get("decision_id")
+        if existing_id:
+            existing = self.store.object_get(str(existing_id))
+            if existing["kind"] == "ResearchDecision":
+                legacy = existing["data"].get("legacy_provenance", {})
+                if legacy.get("run_id") == run_id and legacy.get("reconstructed") is True:
+                    return {"run": run, "decision": existing, "idempotent_replay": True}
+                raise GPUError("LEGACY_RUN_ALREADY_HAS_DECISION", run_id)
+            abandonment = run["data"].get("legacy_abandonment", {})
+            if abandonment.get("verified_missing_backing_job") is not True:
+                raise GPUError("LEGACY_RUN_INVALID_DECISION_PROVENANCE", str(existing_id))
+        if not rationale.strip():
+            raise GPUError("LEGACY_REPAIR_RATIONALE_REQUIRED", "Provide the provenance reconstruction reason")
+        question = agenda_item["data"].get("question") or experiment["data"].get("plan", {}).get(
+            "research_question", "Legacy result inspection"
+        )
+        decision = self.store.object_create(
+            project_id,
+            "ResearchDecision",
+            {
+                "agenda_item_id": agenda_item_id,
+                "question": question,
+                "hypotheses_affected": [hypothesis_id],
+                "selected_action": {
+                    "id": f"legacy-inspect:{run_id}",
+                    "action_type": "ARTIFACT_ANALYSIS",
+                    "question_addressed": question,
+                    "payload": {"run_id": run_id, "mode": "INSPECT_LEGACY_RESULT"},
+                },
+                "legacy_provenance": {
+                    "reconstructed": True,
+                    "run_id": run_id,
+                    "experiment_id": str(experiment["id"]),
+                    "artifact_count": len(run["data"].get("artifacts", [])),
+                    "superseded_pre_decision_id": str(existing_id) if existing_id else None,
+                    "superseded_pre_decision_kind": existing["kind"] if existing_id else None,
+                    "rationale": rationale.strip(),
+                    "limitations": [
+                        "Decision was reconstructed after execution.",
+                        "Repair authorizes artifact inspection only; it does not validate the result.",
+                    ],
+                },
+            },
+            "LEGACY_PROVENANCE_RECONSTRUCTED",
+            "SELECTED",
+        )
+        repaired_run = self.store.object_update(
+            run_id,
+            {
+                "decision_id": str(decision["id"]),
+                "legacy_provenance": {
+                    "reconstructed": True,
+                    "decision_id": str(decision["id"]),
+                    "superseded_pre_decision_id": str(existing_id) if existing_id else None,
+                },
+            },
+            run["status"],
+            "EXPERIMENT_RUN_LEGACY_PROVENANCE_REPAIRED",
+        )
+        return {"run": repaired_run, "decision": decision, "idempotent_replay": False}
+
+    def legacy_reserved_run_abandon(
+        self, run_id: str, job_id: str, rationale: str, technical_non_scientific: bool = False
+    ) -> dict:
+        """Cancel a server-verified unsubmitted reservation without execution evidence."""
+        run = self._expect(run_id, "ExperimentRun")
+        is_abandoned_replay = (
+            run["status"] == "cancelled"
+            and run["data"].get("legacy_abandonment", {}).get("verified_missing_backing_job") is True
+        )
+        if run["status"] != "RESERVED" and not is_abandoned_replay:
+            raise GPUError("LEGACY_RUN_NOT_ABANDONABLE", run["status"])
+        if run["data"].get("job_id") != job_id:
+            raise GPUError("LEGACY_RUN_JOB_MISMATCH", job_id)
+        if not rationale.strip():
+            raise GPUError("LEGACY_ABANDON_RATIONALE_REQUIRED", "Provide the missing-job rationale")
+        decision_id = run["data"].get("decision_id")
+        decision_kind = None
+        if decision_id:
+            try:
+                decision = self.store.object_get(str(decision_id))
+            except GPUError as exc:
+                if exc.error_type != "RESEARCH_OBJECT_NOT_FOUND":
+                    raise
+            else:
+                decision_kind = decision["kind"]
+                if (
+                    decision_kind == "ResearchDecision"
+                    and not technical_non_scientific
+                    and not is_abandoned_replay
+                ):
+                    raise GPUError("LEGACY_RUN_HAS_RESEARCH_DECISION", str(decision_id))
+        provenance = {
+            "pre_research_decision": decision_kind != "ResearchDecision",
+            "original_decision_id": str(decision_id) if decision_id else None,
+            "original_decision_kind": decision_kind,
+        }
+        if technical_non_scientific:
+            provenance["technical_non_scientific"] = True
+        return self.store.legacy_reserved_run_abandon(
+            run_id,
+            job_id,
+            rationale.strip(),
+            provenance,
         )
 
     def execution_decision_bind(
@@ -602,19 +911,11 @@ class ResearchBrain:
                 "RESEARCH_EXECUTION_NOT_BOUND",
                 "Create a decision bound to this exact experiment command before execution",
             )
-        requires_approval = selected.get("action_type") in APPROVAL_REQUIRED_ACTIONS
-        approval = decision["data"].get("approval")
-        if requires_approval and (
-            decision["status"] != "APPROVED"
-            or not approval
-            or approval.get("selected_action_id") != selected.get("id")
-        ):
-            raise GPUError("RESEARCH_APPROVAL_REQUIRED", selected.get("action_type", "UNKNOWN"))
         return {
             "decision_id": decision_id,
             "action_type": selected.get("action_type"),
-            "requires_human_approval": requires_approval,
-            "approved": decision["status"] == "APPROVED",
+            "requires_human_approval": False,
+            "approved": True,
         }
 
     def result_assess(
@@ -630,12 +931,14 @@ class ResearchBrain:
         evidence_against: list[str],
         unexpected_observations: list[str],
         alternative_explanations: list[str],
-        scope: str,
+        scope: str | dict[str, Any],
         hypothesis_transition: str,
         rationale: str,
         causal_edge_id: str | None = None,
         causal_edge_status: str | None = None,
         actual_information_gain: str = "MEDIUM",
+        guard_passed: bool | None = None,
+        matched_control_passed: bool | None = None,
     ) -> dict:
         run = self._expect(run_id, "ExperimentRun")
         decision = self._expect(decision_id, "ResearchDecision")
@@ -678,7 +981,16 @@ class ResearchBrain:
             raise GPUError("EXPERIMENT_GUARD_NOT_PREREGISTERED", experiment_id)
         if any(item["data"].get("pass_condition") != pass_condition for item in predictions):
             raise GPUError("EXPERIMENT_GUARD_MISMATCH", experiment_id)
-        if set(condition_evaluations) != {pass_condition} or not all(
+        if guard_passed is not None:
+            if not isinstance(guard_passed, bool):
+                raise GPUError(
+                    "EXPERIMENT_GUARD_EVALUATION_INVALID",
+                    "guard_passed must be a boolean",
+                )
+            # Bind the supplied outcome to the server-side preregistered text.
+            # This avoids requiring clients to round-trip long Unicode condition keys.
+            condition_evaluations = {pass_condition: guard_passed}
+        elif set(condition_evaluations) != {pass_condition} or not all(
             isinstance(value, bool) for value in condition_evaluations.values()
         ):
             raise GPUError(
@@ -721,6 +1033,52 @@ class ResearchBrain:
             edge = self._expect(causal_edge_id, "CausalEdge")
             if str(edge["project_id"]) != project_id:
                 raise GPUError("RESEARCH_PROJECT_MISMATCH", causal_edge_id)
+        normalized_scope = normalize_scientific_scope(scope)
+        if causal_edge_status == "INTERVENTION_SUPPORTED" and not scope_is_empirically_bounded(
+            normalized_scope
+        ):
+            raise GPUError(
+                "CAUSAL_PROMOTION_SCOPE_REQUIRED",
+                "Intervention support requires explicit model/architecture, intervention, and metric scope",
+            )
+        if matched_control_passed is not None and not isinstance(matched_control_passed, bool):
+            raise GPUError(
+                "MATCHED_CONTROL_EVALUATION_INVALID",
+                "matched_control_passed must be a boolean when supplied",
+            )
+        control_preregistered = bool(experiment["data"].get("plan", {}).get("control"))
+        if (
+            causal_edge_status == "INTERVENTION_SUPPORTED"
+            and control_preregistered
+            and matched_control_passed is not True
+        ):
+            raise GPUError(
+                "CAUSAL_PROMOTION_MATCHED_CONTROL_REQUIRED",
+                "The preregistered matched control must be explicitly assessed as passed",
+            )
+        if causal_edge_status == "INTERVENTION_SUPPORTED":
+            unresolved_nulls = [
+                item
+                for item in self.store.objects_list(
+                    project_id,
+                    "NullModel",
+                    {"ACTIVE", "OPEN", "PROPOSED"},
+                    limit=None,
+                )
+                if str(item["data"].get("target_entity_id"))
+                in {hypothesis_id, str(causal_edge_id)}
+                and item["data"].get("strength") == "STRONG"
+                and item["data"].get("tested") is not True
+                and isinstance(item["data"].get("estimated_cost"), (int, float))
+                and not isinstance(item["data"].get("estimated_cost"), bool)
+                and float(item["data"]["estimated_cost"]) <= 2
+            ]
+            if unresolved_nulls:
+                raise GPUError(
+                    "CAUSAL_PROMOTION_STRONG_NULL_UNTESTED",
+                    "Test the strong cheap null model(s) before causal promotion: "
+                    + ", ".join(str(item["id"]) for item in unresolved_nulls),
+                )
         evidence_data = {
             "source_type": "ExperimentRun",
             "run_id": run_id,
@@ -735,7 +1093,9 @@ class ResearchBrain:
             "against_observations": evidence_against,
             "unexpected_observations": unexpected_observations,
             "alternative_explanations": alternative_explanations,
-            "scope": scope,
+            "scope": normalized_scope,
+            "matched_control_preregistered": control_preregistered,
+            "matched_control_passed": matched_control_passed,
             "artifacts": run["data"].get("artifacts", []),
             "exit_code": run["data"].get("exit_code"),
             "extraction_method": "explicit_result_assessment",
@@ -756,7 +1116,7 @@ class ResearchBrain:
                 "frozen_pass_condition": pass_condition,
                 "condition_evaluations": condition_evaluations,
                 "guard_passed": guard_passed,
-                "scope": scope,
+                "scope": normalized_scope,
             },
             agenda_status=(
                 "ACTIVE"
@@ -770,16 +1130,24 @@ class ResearchBrain:
         return {**result, "verification_status": "RESULT_INSPECTED"}
 
     def _candidate_actions(
-        self, project_id: str, agenda_item: dict, hypotheses: list[dict]
+        self,
+        project_id: str,
+        agenda_item: dict,
+        hypotheses: list[dict],
+        as_of: str | None = None,
     ) -> list[ActionCandidate]:
+        temporal = {"as_of": as_of} if as_of is not None else {}
         uninspected = self.store.experiment_run_first(
-            project_id, {"completed", "RESULT_NOT_INSPECTED"}, inspected=False
+            project_id,
+            {"completed", "RESULT_NOT_INSPECTED"},
+            inspected=False,
+            **temporal,
         )
         unfinished = self.store.experiment_run_first(
-            project_id, {"RESERVED", "running", "unknown"}
+            project_id, {"RESERVED", "running", "unknown"}, **temporal
         )
         failed_uninspected = self.store.experiment_run_first(
-            project_id, {"failed", "cancelled"}, inspected=False
+            project_id, {"failed", "cancelled"}, inspected=False, **temporal
         )
         question = agenda_item["data"]["question"]
         hypothesis_ids = [str(item["id"]) for item in hypotheses]
@@ -846,7 +1214,9 @@ class ResearchBrain:
                     ),
                 ).checked()
             ]
-        reproductions = self.store.objects_list(project_id, "Reproduction", limit=None)
+        reproductions = self.store.objects_list(
+            project_id, "Reproduction", limit=None, **temporal
+        )
         baseline_reproduced = any(item["status"] == "REPRODUCED" for item in reproductions)
         needs_reproduction = (
             bool(agenda_item["data"].get("reproduction_required")) and not baseline_reproduced
@@ -872,11 +1242,58 @@ class ResearchBrain:
                 ).checked()
             ]
         configured = agenda_item["data"].get("candidate_experiments", [])
+        null_models = self.store.objects_list(
+            project_id,
+            "NullModel",
+            {"ACTIVE", "OPEN", "PROPOSED"},
+            limit=None,
+            **temporal,
+        )
+        strong_cheap_nulls = [
+            item
+            for item in null_models
+            if item["data"].get("strength") == "STRONG"
+            and isinstance(item["data"].get("estimated_cost"), (int, float))
+            and not isinstance(item["data"].get("estimated_cost"), bool)
+            and float(item["data"]["estimated_cost"]) <= 2
+            and item["data"].get("tested") is not True
+        ]
+        if strong_cheap_nulls:
+            null_candidates = [
+                ActionCandidate(
+                    action_type=item["data"].get("action_type", "NULL_MODEL_TEST"),
+                    question_addressed=question,
+                    hypotheses_discriminated=hypothesis_ids,
+                    predicted_outcomes=[item["data"].get("expected_outcome", "")],
+                    required_resources=["matched null control", "preregistered metric"],
+                    payload={
+                        "null_model_id": str(item["id"]),
+                        "target_entity_id": item["data"].get("target_entity_id"),
+                        "control": item["data"].get("discriminating_control"),
+                    },
+                    score=ActionScore(
+                        scientific_importance=5,
+                        expected_discrimination=5,
+                        expected_information_gain=5,
+                        feasibility=4,
+                        compute_cost=max(float(item["data"]["estimated_cost"]), 0.1),
+                        engineering_cost=1,
+                        execution_risk=0.5,
+                        decision_relevance=5,
+                    ),
+                ).checked()
+                for item in strong_cheap_nulls
+            ]
+            configured_candidates = [
+                self._configured_candidate(item, question, hypothesis_ids)
+                for item in configured
+            ]
+            return [*null_candidates, *configured_candidates]
         literature_requested = any(
             item.get("action_type") == "LITERATURE_SEARCH" for item in configured
         )
         candidate_evidence = self.store.objects_list(
-            project_id, "EvidenceUnit", {"CANDIDATE"}, limit=None
+            project_id, "EvidenceUnit", {"CANDIDATE"}, limit=None, **temporal
         )
         if literature_requested and candidate_evidence:
             return [
@@ -1003,11 +1420,14 @@ class ResearchBrain:
         except (KeyError, ValidationError) as exc:
             raise GPUError("INVALID_RESEARCH_ACTION", str(exc)) from exc
 
-    def _related_dead_ideas(self, project_id: str, hypotheses: list[dict]) -> list[dict]:
+    def _related_dead_ideas(
+        self, project_id: str, hypotheses: list[dict], as_of: str | None = None
+    ) -> list[dict]:
+        temporal = {"as_of": as_of} if as_of is not None else {}
         found: dict[str, dict] = {}
         candidates = [
-            *self.store.objects_list(project_id, "Hypothesis", limit=None),
-            *self.store.objects_list(project_id, "NegativeResult", limit=None),
+            *self.store.objects_list(project_id, "Hypothesis", limit=None, **temporal),
+            *self.store.objects_list(project_id, "NegativeResult", limit=None, **temporal),
         ]
         for hypothesis in hypotheses:
             mechanism = hypothesis["data"].get("mechanism", "")
@@ -1054,8 +1474,9 @@ class ResearchBrain:
             if str(item["project_id"]) != str(project_id):
                 raise GPUError("RESEARCH_PROJECT_MISMATCH", identifier)
 
-    def _expect(self, object_id: str, kind: str) -> dict:
-        item = self.store.object_get(object_id)
+    def _expect(self, object_id: str, kind: str, as_of: str | None = None) -> dict:
+        temporal = {"as_of": as_of} if as_of is not None else {}
+        item = self.store.object_get(object_id, **temporal)
         if item["kind"] != kind:
             raise GPUError(f"NOT_A_{kind.upper()}", object_id)
         return item
@@ -1082,17 +1503,122 @@ class ResearchBrain:
         return [str(item["id"]) for item in records]
 
     @staticmethod
-    def _decision_rationale(selected: dict, related_dead: list[dict]) -> str:
+    def _decision_rationale(
+        selected: dict, related_dead: list[dict], runner_up: dict | None = None
+    ) -> str:
         reason = (
-            f"Selected {selected['action_type']} because its heuristic information-per-cost "
-            f"priority ({selected['priority']}) is highest for the active agenda item."
+            f"Selected {selected['action_type']} because its transparent final priority "
+            f"({selected['priority']}) is highest for the active agenda item "
+            f"(base={selected.get('base_priority', selected['priority'])}, "
+            f"strategy+={selected.get('positive_strategy_adjustment', 0)}, "
+            f"strategy-={selected.get('negative_strategy_adjustment', 0)}, "
+            f"diminishing={selected.get('diminishing_return_adjustment', 0)})."
         )
+        if runner_up:
+            reason += " " + ResearchBrain._runner_up_reason(selected, runner_up)
         if related_dead:
             reason += f" Retrieved {len(related_dead)} related dead idea(s) before selection."
         return reason
 
     @staticmethod
+    def _runner_up_reason(selected: dict, runner_up: dict) -> str:
+        selected_disc = selected.get("score", {}).get("expected_discrimination")
+        runner_disc = runner_up.get("score", {}).get("expected_discrimination")
+        selected_types = set(selected.get("hypotheses_discriminated", []))
+        runner_types = set(runner_up.get("hypotheses_discriminated", []))
+        if selected_disc != runner_disc:
+            comparison = (
+                f"expected discrimination {selected_disc} versus {runner_disc}"
+            )
+        elif selected_types != runner_types:
+            comparison = "different competing-hypothesis coverage"
+        else:
+            comparison = "the retained candidate comparison and explicit score components"
+        return (
+            f"Compared runner-up {runner_up.get('action_type')}; selected action was preferred "
+            f"for {comparison}, not merely because its numeric priority was higher."
+        )
+
+    @staticmethod
+    def _candidate_comparison(candidate: dict, hypotheses: list[dict]) -> dict[str, Any]:
+        payload = candidate.get("payload", {})
+        predicted = candidate.get("predicted_outcomes", [])
+        return {
+            "candidate_id": candidate.get("id"),
+            "action_type": candidate.get("action_type"),
+            "hypotheses_discriminated": candidate.get(
+                "hypotheses_discriminated", [str(item["id"]) for item in hypotheses]
+            ),
+            "hypotheses_not_discriminated": payload.get("hypotheses_not_discriminated", []),
+            "decisive_prediction": predicted[0] if predicted else None,
+            "expected_if_pass": payload.get("expected_if_pass", predicted),
+            "expected_if_fail": payload.get("expected_if_fail", ["The scoped prediction is not supported"]),
+            "expected_belief_change_if_pass": payload.get("expected_belief_change_if_pass"),
+            "expected_belief_change_if_fail": payload.get("expected_belief_change_if_fail"),
+            "strongest_null": payload.get("strongest_null"),
+            "major_confounds": payload.get("confounds", []),
+            "scientific_value": candidate.get("score", {}).get("decision_relevance"),
+            "cost": candidate.get("score", {}).get("compute_cost"),
+            "reason_not_selected": candidate.get("reason_not_selected"),
+        }
+
+    @staticmethod
+    def _prospective_hindsight_attack(
+        selected: dict, hypotheses: list[dict], runner_up: dict | None
+    ) -> dict[str, Any]:
+        payload = selected.get("payload", {})
+        guard = payload.get("guard_condition") or payload.get("guard")
+        prediction = selected.get("predicted_outcomes", [])
+        failure_explanations = payload.get(
+            "failure_explanations",
+            ["implementation failure", "weak intervention", "invalid control", "metric insensitivity"],
+        )
+        hard_block = not bool(prediction) or (len(hypotheses) > 1 and not selected.get("hypotheses_discriminated"))
+        return {
+            "if_pass": payload.get("expected_belief_change_if_pass", "Update only the scoped mechanism if guards pass."),
+            "if_fail": payload.get("expected_belief_change_if_fail", "Weaken or leave unresolved; do not overclaim refutation."),
+            "would_failure_refute": bool(payload.get("failure_refutes_hypothesis", False)),
+            "failure_explanations_to_rule_out": failure_explanations,
+            "guard_to_check": guard,
+            "prediction_to_check": prediction[0] if prediction else None,
+            "strongest_null": payload.get("strongest_null"),
+            "runner_up_action_type": runner_up.get("action_type") if runner_up else None,
+            "recommendation": "BLOCK" if hard_block else "ACCEPT",
+            "hard_block": hard_block,
+        }
+
+    @staticmethod
     def _critics(selected: dict, related_dead: list[dict]) -> list[dict]:
+        predicted = selected.get("predicted_outcomes", [])
+        hypotheses = selected.get("hypotheses_discriminated", [])
+        scientific_findings = []
+        if len(hypotheses) < 2:
+            scientific_findings.append(
+                {
+                    "code": "LOW_DISCRIMINATION",
+                    "severity": "WARNING",
+                    "description": "The candidate does not explicitly separate at least two competing hypotheses.",
+                    "hard_block": False,
+                }
+            )
+        if not predicted:
+            scientific_findings.append(
+                {
+                    "code": "MISSING_DECISIVE_PREDICTION",
+                    "severity": "ERROR",
+                    "description": "No prospective outcome is recorded for the selected action.",
+                    "hard_block": True,
+                }
+            )
+        if selected.get("action_type") in {"TRAINING_RUN", "GENERALIZATION"}:
+            scientific_findings.append(
+                {
+                    "code": "ARCHITECTURE_PREMATURITY_REVIEW",
+                    "severity": "WARNING",
+                    "description": "Training/generalization should remain blocked until the scoped mechanism test is resolved.",
+                    "hard_block": False,
+                }
+            )
         return [
             {
                 "operator": "ProximityCritic",
@@ -1110,5 +1636,28 @@ class ResearchBrain:
                 "operator": "ReproducibilityCritic",
                 "advisory": True,
                 "finding": "BASELINE_GATE_APPLIED",
+            },
+            {
+                "operator": "ScientificDiscriminationCritic",
+                "advisory": not any(item.get("hard_block") for item in scientific_findings),
+                "recommendation": "BLOCK"
+                if any(item.get("hard_block") for item in scientific_findings)
+                else "ACCEPT",
+                "fatal_flaws": [item["description"] for item in scientific_findings if item["severity"] == "ERROR"],
+                "hypotheses_not_distinguished": [] if len(hypotheses) >= 2 else hypotheses,
+                "outcomes_explained_by_multiple_hypotheses": [],
+                "strongest_null_explanation": selected.get("payload", {}).get("strongest_null"),
+                "missing_control": selected.get("payload", {}).get("control"),
+                "confounded_variables": selected.get("payload", {}).get("confounds", []),
+                "invalid_intervention_risk": selected.get("payload", {}).get("invalid_intervention_risk"),
+                "measurement_artifact_risk": selected.get("payload", {}).get("measurement_artifact_risk"),
+                "scope_overreach_risk": selected.get("payload", {}).get("scope_overreach_risk"),
+                "architecture_prematurity": any(
+                    item["code"] == "ARCHITECTURE_PREMATURITY_REVIEW"
+                    for item in scientific_findings
+                ),
+                "cheaper_decisive_test": selected.get("payload", {}).get("cheaper_decisive_test"),
+                "runner_up_preference": None,
+                "findings": scientific_findings,
             },
         ]

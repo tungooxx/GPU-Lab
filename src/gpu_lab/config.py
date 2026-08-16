@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -24,6 +24,15 @@ class Settings(BaseSettings):
     gpu_lab_canonical_vrc_env: str = "vrc-py313-torch260-cu124"
     gpu_lab_terminal_password: str | None = None
     gpu_lab_research_database_url: str | None = None
+    gpu_lab_research_bench_dir: Path = Path("./research_bench")
+    gpu_lab_policy_auto_evaluate: bool = True
+    gpu_lab_policy_auto_reject: bool = True
+    gpu_lab_policy_auto_revise: bool = True
+    gpu_lab_policy_auto_promote_production: bool = False
+    gpu_lab_policy_max_revisions: int = Field(default=1, ge=0, le=3)
+    gpu_lab_embedding_provider: str = "local-hash"
+    gpu_lab_embedding_dimension: int = Field(default=384, ge=32, le=4096)
+    gpu_lab_research_operator_provider: str = "disabled"
     gpu_lab_literature_provider: str = "disabled"
     gpu_lab_literature_worker_url: str = "http://literature:8010"
     gpu_lab_literature_worker_token: str | None = None
@@ -47,6 +56,24 @@ class Settings(BaseSettings):
         normalized = value.strip().lower()
         if normalized not in {"disabled", "paperqa-http"}:
             raise ValueError("GPU_LAB_LITERATURE_PROVIDER must be disabled or paperqa-http")
+        return normalized
+
+    @field_validator("gpu_lab_embedding_provider")
+    @classmethod
+    def valid_embedding_provider(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"disabled", "local-hash"}:
+            raise ValueError("GPU_LAB_EMBEDDING_PROVIDER must be disabled or local-hash")
+        return normalized
+
+    @field_validator("gpu_lab_research_operator_provider")
+    @classmethod
+    def valid_research_operator_provider(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"disabled", "literature-http"}:
+            raise ValueError(
+                "GPU_LAB_RESEARCH_OPERATOR_PROVIDER must be disabled or literature-http"
+            )
         return normalized
 
     @field_validator("gpu_lab_executable_paper_provider")

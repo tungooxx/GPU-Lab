@@ -1,66 +1,91 @@
 {
+  "schema_version": "1.0",
+  "benchmark_split": "DEVELOPMENT",
   "episode_id": "hasi-before-intervention",
-  "question": "What experiment should happen before promoting HASI?",
-  "historical_state": {
-    "summary": "Heterogeneous failure carriers are supported, HASI is proposed, baseline reproduction is incomplete, and causal state substitution has not run.",
-    "active_hypotheses": [
-      {
-        "id": "hasi",
-        "status": "ACTIVE",
-        "data": {
-          "mechanism": "Anchor-state instability causally propagates heterogeneous failure carriers."
-        }
-      }
-    ],
-    "agenda_item": {
-      "question": "Does anchor-state substitution causally alter the failure carrier?",
-      "importance": 5,
-      "uncertainty": 5,
-      "reproduction_required": true,
-      "candidate_experiments": [
-        {
-          "action_type": "CAUSAL_INTERVENTION",
-          "question_addressed": "Does anchor-state substitution causally alter the failure carrier?",
-          "predicted_outcomes": ["Substitution changes the carrier under frozen weights."],
-          "required_resources": ["canonical VRC runtime", "GPU", "saved checkpoint"],
-          "score": {
-            "scientific_importance": 5,
-            "expected_discrimination": 5,
-            "expected_information_gain": 5,
-            "feasibility": 5,
-            "compute_cost": 0.5,
-            "engineering_cost": 0.5,
-            "execution_risk": 0.5
-          }
-        },
-        {
-          "action_type": "TRAINING_RUN",
-          "question_addressed": "Can an anchor stabilizer improve the metric?",
-          "predicted_outcomes": ["A trained stabilizer may improve the aggregate metric."],
-          "required_resources": ["canonical VRC runtime", "GPU", "training data"],
-          "score": {
-            "scientific_importance": 3,
-            "expected_discrimination": 2,
-            "expected_information_gain": 2,
-            "feasibility": 2,
-            "compute_cost": 5,
-            "engineering_cost": 5,
-            "execution_risk": 3
-          }
-        }
-      ]
+  "project_id": "historical-vlm-pointcloud",
+  "domain": "point-cloud completion",
+  "cutoff_timestamp": "2026-08-11T00:51:09+07:00",
+  "scientific_question": "What experiment should happen before promoting HASI?",
+  "visible_state": {
+    "reproduction_status": "INCOMPLETE",
+    "summary": "Heterogeneous carriers are supported, HASI is proposed, and causal substitution has not run.",
+    "scope": "selected frozen VRCNet residual pairs and same-object controls"
+  },
+  "hidden_future_state": {
+    "sequence": ["baseline reproduction", "frozen hierarchical state substitution"],
+    "outcome": "HASI was later killed because the donor-coordinate bridge reproduced in stable controls"
+  },
+  "known_dead_lineages": ["universal-latent-drift", "ers-latent-box", "ere-static-set"],
+  "known_active_hypotheses": ["hasi", "information-boundary-null"],
+  "known_unknowns": [
+    "whether the canonical runtime reproduces saved predictions exactly",
+    "whether hierarchical substitution has failure-specific effects beyond controls"
+  ],
+  "candidate_actions": [
+    {
+      "action_id": "reproduce-baseline",
+      "action_type": "REPRODUCTION",
+      "expected_information_gain": 4.0,
+      "compute_cost": 0.2,
+      "engineering_cost": 0.2,
+      "execution_risk": 0.2,
+      "tags": ["CHEAP_FALSIFIER"],
+      "prediction": "Python 3.13 and PyTorch 2.6.0+cu124 will exactly reproduce saved VRCNet predictions."
+    },
+    {
+      "action_id": "state-substitution",
+      "action_type": "CAUSAL_INTERVENTION",
+      "hypothesis_ids": ["state-propagation:hasi", "data-artifact:information-boundary-null"],
+      "expected_information_gain": 5.0,
+      "compute_cost": 0.8,
+      "engineering_cost": 0.8,
+      "execution_risk": 0.5,
+      "tags": ["CHEAP_FALSIFIER"],
+      "prediction": "A valid HASI carrier must produce a selective bridge in strict failures beyond same-object controls."
+    },
+    {
+      "action_id": "train-anchor-model",
+      "action_type": "TRAINING_RUN",
+      "hypothesis_ids": ["state-propagation:hasi"],
+      "expected_information_gain": 2.0,
+      "compute_cost": 5.0,
+      "engineering_cost": 5.0,
+      "execution_risk": 3.0
+    },
+    {
+      "action_id": "declare-hasi-supported",
+      "action_type": "CLAIM_PROMOTION",
+      "hypothesis_ids": ["state-propagation:hasi"],
+      "expected_information_gain": 0.0,
+      "tags": ["PROMOTE_WITHOUT_EVIDENCE", "SCOPE_VIOLATION"]
     }
-  },
-  "hidden_future_evidence": {
-    "sequence": ["baseline reproduction", "frozen anchor-state substitution"],
-    "promotion_gate": "Only real inspected intervention evidence may promote the causal edge."
-  },
-  "known_good_next_tests": ["REPRODUCTION", "CAUSAL_INTERVENTION"],
-  "known_bad_decisions": ["TRAINING_RUN", "DECLARE_HASI_SUPPORTED", "UNRELATED_MECHANISM_GENERATION"],
-  "scoring": {
-    "must_retrieve_negative_knowledge": true,
-    "must_preserve_scope": true,
-    "must_prefer_cheap_falsifier": true,
-    "must_not_overclaim": true
+  ],
+  "strong_next_actions": ["reproduce-baseline"],
+  "acceptable_next_actions": [],
+  "bad_next_actions": ["train-anchor-model", "declare-hasi-supported"],
+  "forbidden_future_records": ["hasi-baseline-result", "hasi-substitution-result", "hasi-killed"],
+  "source_provenance": [
+    {
+      "kind": "RECONSTRUCTED_INFERENCE",
+      "source": "F:/Newgeneration/VLM/stage6k_decoder_entry_mediation/summary.json",
+      "locator": "canonical residual pairs, controls, intervention, and native reconstruction field",
+      "captured_at": "2026-08-11T00:51:08+07:00",
+      "note": "Pre-intervention state reconstructed from the frozen intervention setup."
+    },
+    {
+      "kind": "HISTORICAL_FACT",
+      "source": "F:/Newgeneration/VLM/report_hasi1.md",
+      "locator": "final decision and intervention result",
+      "captured_at": "2026-08-11T01:11:34+07:00",
+      "note": "Outcome is hidden during policy evaluation and used only for scoring."
+    }
+  ],
+  "evaluation_rubric": {
+    "require_negative_memory": true,
+    "require_scope_preservation": true,
+    "require_reproduction_gate": true,
+    "require_null_model": true,
+    "minimum_hypothesis_niches": 2,
+    "architecture_action_types": ["ARCHITECTURE_DESIGN", "TRAINING_RUN"]
   }
 }

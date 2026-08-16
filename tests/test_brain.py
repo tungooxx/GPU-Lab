@@ -4,7 +4,9 @@ from pathlib import Path
 import pytest
 
 from gpu_lab.brain import ActionScore, ResearchBrain
+from gpu_lab.brain_bench import BenchmarkEpisode
 from gpu_lab.errors import GPUError
+from gpu_lab.research import _json_document
 
 
 def test_action_score_rewards_information_and_penalizes_cost():
@@ -30,6 +32,17 @@ def test_action_score_rewards_information_and_penalizes_cost():
     assert cheap_discriminator.priority > expensive_training.priority
 
 
+def test_research_json_document_normalizes_postgres_uuid_values():
+    from uuid import uuid4
+
+    identifier = uuid4()
+
+    assert _json_document({"id": identifier, "nested": [identifier]}) == {
+        "id": str(identifier),
+        "nested": [str(identifier)],
+    }
+
+
 def test_configured_action_rejects_unknown_action_type():
     with pytest.raises(GPUError) as error:
         ResearchBrain._configured_candidate(
@@ -46,11 +59,35 @@ def test_causal_edge_status_requires_finite_agenda_scores():
     assert error.value.error_type == "INVALID_AGENDA_SCORE"
 
 
+def test_state_snapshot_keeps_object_identity_without_copying_large_payloads():
+    state = {
+        "canonical_state": {
+            "research_question": "What happened?",
+            "active_hypotheses": [
+                {
+                    "id": "hypothesis-1",
+                    "kind": "Hypothesis",
+                    "status": "ACTIVE",
+                    "data": {"large": "x" * 100_000},
+                }
+            ],
+        }
+    }
+
+    snapshot = ResearchBrain._state_snapshot(state)
+
+    assert snapshot["active_hypotheses"] == [
+        {"id": "hypothesis-1", "kind": "Hypothesis", "status": "ACTIVE"}
+    ]
+    assert "large" not in str(snapshot)
+
+
 class CandidateStore:
-    def __init__(self, *, reproductions=None, runs=None, evidence=None):
+    def __init__(self, *, reproductions=None, runs=None, evidence=None, null_models=None):
         self.reproductions = reproductions or []
         self.runs = runs or []
         self.evidence = evidence or []
+        self.null_models = null_models or []
 
     def objects_list(self, _project_id, kind, *_args, **_kwargs):
         if kind == "ExperimentRun":
@@ -59,6 +96,8 @@ class CandidateStore:
             return self.reproductions
         if kind == "EvidenceUnit":
             return self.evidence
+        if kind == "NullModel":
+            return self.null_models
         return []
 
     def objects_identifiers(self, _project_id, kind, _statuses=None):
@@ -84,13 +123,40 @@ class CandidateStore:
 
 def _hasi_episode():
     path = Path(__file__).parents[1] / "research_bench" / "hasi_before_intervention.json"
-    return json.loads(path.read_text(encoding="utf-8"))
+    return BenchmarkEpisode.model_validate(json.loads(path.read_text(encoding="utf-8")))
 
 
 def test_hasi_benchmark_enforces_reproduction_then_causal_intervention():
     episode = _hasi_episode()
-    agenda = {"data": episode["historical_state"]["agenda_item"]}
-    hypotheses = episode["historical_state"]["active_hypotheses"]
+    state_substitution = next(
+        action for action in episode.candidate_actions if action.action_id == "state-substitution"
+    )
+    agenda = {
+        "data": {
+            "question": episode.scientific_question,
+            "reproduction_required": True,
+            "candidate_experiments": [
+                {
+                    "action_type": state_substitution.action_type,
+                    "predicted_outcomes": [state_substitution.prediction],
+                    "payload": {"benchmark_action_id": state_substitution.action_id},
+                    "score": {
+                        "scientific_importance": 5,
+                        "expected_discrimination": 5,
+                        "expected_information_gain": state_substitution.expected_information_gain,
+                        "feasibility": 5,
+                        "compute_cost": state_substitution.compute_cost,
+                        "engineering_cost": state_substitution.engineering_cost,
+                        "execution_risk": state_substitution.execution_risk,
+                    },
+                }
+            ],
+        }
+    }
+    hypotheses = [
+        {"id": hypothesis_id, "status": "ACTIVE", "data": {"mechanism": hypothesis_id}}
+        for hypothesis_id in episode.known_active_hypotheses
+    ]
     brain = ResearchBrain(CandidateStore(reproductions=[{"id": "baseline", "status": "PARTIAL"}]))
 
     before = brain._candidate_actions("project", agenda, hypotheses)
@@ -100,8 +166,7 @@ def test_hasi_benchmark_enforces_reproduction_then_causal_intervention():
     after = brain._candidate_actions("project", agenda, hypotheses)
     selected = max(after, key=lambda candidate: candidate.score.priority)
     assert selected.action_type == "CAUSAL_INTERVENTION"
-    assert selected.action_type in episode["known_good_next_tests"]
-    assert selected.action_type not in episode["known_bad_decisions"]
+    assert selected.payload["benchmark_action_id"] == "state-substitution"
 
 
 def test_provider_failure_selects_an_alternative_action():
@@ -124,6 +189,32 @@ def test_provider_failure_selects_an_alternative_action():
     assert selected.action_type == "LITERATURE_SEARCH"
     assert selected.payload["mode"] == "ALTERNATIVE_ACTION"
     assert selected.payload["blocked_actions"][0]["blocked_reason"] == "GPU unavailable"
+
+
+def test_operationally_inspected_abandoned_run_does_not_block_new_experiment():
+    agenda = {
+        "data": {
+            "question": "Does the frozen intervention discriminate?",
+            "candidate_experiments": [
+                {"action_type": "CAUSAL_INTERVENTION", "available": True}
+            ],
+        }
+    }
+    brain = ResearchBrain(
+        CandidateStore(
+            runs=[
+                {
+                    "id": "abandoned-run",
+                    "status": "cancelled",
+                    "data": {"inspection": {"mode": "EXECUTION_NOT_SUBMITTED"}},
+                }
+            ]
+        )
+    )
+
+    selected = brain._candidate_actions("project", agenda, [])[0]
+
+    assert selected.action_type == "CAUSAL_INTERVENTION"
 
 
 def test_portfolio_get_does_not_mutate_scientific_state():
@@ -153,6 +244,40 @@ def test_literature_candidates_change_next_action_to_evidence_review():
 
     assert selected.action_type == "EVIDENCE_REVIEW"
     assert selected.payload["evidence_ids"] == ["evidence-1"]
+
+
+def test_strong_cheap_null_model_preempts_architecture_or_causal_work():
+    brain = ResearchBrain(
+        CandidateStore(
+            null_models=[
+                {
+                    "id": "null-1",
+                    "kind": "NullModel",
+                    "status": "ACTIVE",
+                    "data": {
+                        "strength": "STRONG",
+                        "estimated_cost": 0.5,
+                        "tested": False,
+                        "action_type": "MAGNITUDE_MATCHED_CONTROL",
+                        "expected_outcome": "Random magnitude-matched substitution mimics target.",
+                        "discriminating_control": "Match perturbation norm.",
+                        "target_entity_id": "hypothesis",
+                    },
+                }
+            ]
+        )
+    )
+    agenda = {
+        "data": {
+            "question": "Does the intervention identify the mechanism?",
+            "candidate_experiments": [{"action_type": "CAUSAL_INTERVENTION"}],
+        }
+    }
+
+    selected = brain._candidate_actions("project", agenda, [])[0]
+
+    assert selected.action_type == "MAGNITUDE_MATCHED_CONTROL"
+    assert selected.payload["null_model_id"] == "null-1"
 
 
 class AuthorizationStore:
@@ -210,6 +335,194 @@ def test_execution_decision_requires_exact_bound_command():
     assert error.value.error_type == "RESEARCH_EXECUTION_NOT_BOUND"
     authorized = brain.authorize_execution("experiment", "decision", "bound-request")
     assert authorized["action_type"] == "FROZEN_DIAGNOSTIC"
+
+
+def test_causal_execution_is_authorized_without_a_separate_approval():
+    brain = ResearchBrain(AuthorizationStore(action_type="CAUSAL_INTERVENTION"))
+
+    authorized = brain.authorize_execution("experiment", "decision", "bound-request")
+
+    assert authorized["requires_human_approval"] is False
+    assert authorized["approved"] is True
+
+
+class LegacyRepairStore:
+    def __init__(self):
+        self.created = []
+        self.objects = {
+            "run": {
+                "id": "run",
+                "project_id": "project",
+                "kind": "ExperimentRun",
+                "status": "completed",
+                "data": {"experiment_id": "experiment", "artifacts": [{"path": "stdout.log"}]},
+            },
+            "experiment": {
+                "id": "experiment",
+                "project_id": "project",
+                "kind": "Experiment",
+                "status": "ACTIVE",
+                "data": {"hypothesis_id": "hypothesis", "plan": {"research_question": "Q?"}},
+            },
+            "hypothesis": {
+                "id": "hypothesis",
+                "project_id": "project",
+                "kind": "Hypothesis",
+                "status": "ACTIVE",
+                "data": {},
+            },
+            "agenda": {
+                "id": "agenda",
+                "project_id": "project",
+                "kind": "AgendaItem",
+                "status": "OPEN",
+                "data": {"question": "Q?"},
+            },
+        }
+
+    def object_get(self, object_id):
+        return self.objects[object_id]
+
+    def object_create(self, project_id, kind, data, event_type, status="ACTIVE"):
+        item = {
+            "id": "reconstructed-decision",
+            "project_id": project_id,
+            "kind": kind,
+            "status": status,
+            "data": data,
+        }
+        self.objects[item["id"]] = item
+        self.created.append((item, event_type))
+        return item
+
+    def object_update(self, object_id, data_update, status, event_type):
+        item = self.objects[object_id]
+        item["data"] = {**item["data"], **data_update}
+        item["status"] = status
+        return item
+
+
+def test_legacy_run_provenance_repair_reconstructs_inspection_decision_once():
+    store = LegacyRepairStore()
+    brain = ResearchBrain(store)
+
+    repaired = brain.legacy_run_provenance_repair("run", "agenda", "Historical run predates binding")
+    replay = brain.legacy_run_provenance_repair("run", "agenda", "Historical run predates binding")
+
+    assert repaired["decision"]["data"]["legacy_provenance"]["reconstructed"] is True
+    assert repaired["decision"]["data"]["selected_action"]["action_type"] == "ARTIFACT_ANALYSIS"
+    assert store.objects["run"]["data"]["decision_id"] == "reconstructed-decision"
+    assert replay["idempotent_replay"] is True
+
+
+class LegacyAbandonStore(LegacyRepairStore):
+    def __init__(self):
+        super().__init__()
+        self.objects["run"]["status"] = "RESERVED"
+        self.objects["run"]["data"].update(
+            {"job_id": "missing-job", "decision_id": "prediction"}
+        )
+        self.objects["prediction"] = {
+            "id": "prediction",
+            "project_id": "project",
+            "kind": "Prediction",
+            "status": "ACTIVE",
+            "data": {},
+        }
+        self.abandon_args = None
+
+    def legacy_reserved_run_abandon(self, run_id, job_id, rationale, provenance):
+        self.abandon_args = (run_id, job_id, rationale, provenance)
+        self.objects[run_id]["status"] = "cancelled"
+        self.objects[run_id]["data"]["legacy_abandonment"] = {
+            "verified_missing_backing_job": True,
+            "job_id": job_id,
+        }
+        return {"id": run_id, "status": "cancelled"}
+
+
+def test_legacy_reserved_run_abandon_preserves_pre_decision_provenance():
+    store = LegacyAbandonStore()
+    result = ResearchBrain(store).legacy_reserved_run_abandon(
+        "run", "missing-job", "No local job was ever submitted"
+    )
+
+    assert result["status"] == "cancelled"
+    assert store.abandon_args == (
+        "run",
+        "missing-job",
+        "No local job was ever submitted",
+        {
+            "pre_research_decision": True,
+            "original_decision_id": "prediction",
+            "original_decision_kind": "Prediction",
+        },
+    )
+
+
+def test_technical_abandonment_preserves_existing_research_decision_without_evidence():
+    store = LegacyAbandonStore()
+    store.objects["decision"] = {
+        "id": "decision", "project_id": "project", "kind": "ResearchDecision",
+        "status": "APPROVED", "data": {},
+    }
+    store.objects["run"]["data"]["decision_id"] = "decision"
+
+    ResearchBrain(store).legacy_reserved_run_abandon(
+        "run", "missing-job", "Invalid environment name before submit", technical_non_scientific=True
+    )
+
+    assert store.abandon_args[3] == {
+        "pre_research_decision": False,
+        "technical_non_scientific": True,
+        "original_decision_id": "decision",
+        "original_decision_kind": "ResearchDecision",
+    }
+
+
+def test_legacy_abandonment_replay_allows_reconstructed_decision():
+    store = LegacyAbandonStore()
+    store.objects["run"]["status"] = "cancelled"
+    store.objects["run"]["data"]["legacy_abandonment"] = {
+        "verified_missing_backing_job": True
+    }
+    store.objects["run"]["data"]["decision_id"] = "reconstructed-decision"
+    store.objects["reconstructed-decision"] = {
+        "id": "reconstructed-decision",
+        "project_id": "project",
+        "kind": "ResearchDecision",
+        "status": "SELECTED",
+        "data": {},
+    }
+
+    ResearchBrain(store).legacy_reserved_run_abandon(
+        "run", "missing-job", "No local job was ever submitted"
+    )
+
+    assert store.abandon_args[3]["original_decision_kind"] == "ResearchDecision"
+
+
+def test_legacy_repair_replaces_only_abandoned_pre_decision_provenance():
+    store = LegacyAbandonStore()
+    store.objects["run"]["status"] = "cancelled"
+    store.objects["run"]["data"]["legacy_abandonment"] = {
+        "verified_missing_backing_job": True
+    }
+
+    repaired = ResearchBrain(store).legacy_run_provenance_repair(
+        "run", "agenda", "Repair a pre-ResearchDecision reservation"
+    )
+
+    assert repaired["decision"]["data"]["legacy_provenance"]["superseded_pre_decision_id"] == "prediction"
+    assert repaired["decision"]["data"]["legacy_provenance"]["superseded_pre_decision_kind"] == "Prediction"
+
+
+def test_legacy_repair_rejects_unabandoned_pre_decision_provenance():
+    store = LegacyAbandonStore()
+    store.objects["run"]["status"] = "cancelled"
+
+    with pytest.raises(GPUError, match="prediction"):
+        ResearchBrain(store).legacy_run_provenance_repair("run", "agenda", "No proof")
 
 
 class AssessmentStore:
@@ -290,3 +603,29 @@ def test_nonconclusive_assessment_keeps_agenda_active(transition):
     )
 
     assert store.applied["agenda_status"] == "ACTIVE"
+
+
+def test_assessment_binds_guard_boolean_to_frozen_condition():
+    store = AssessmentStore()
+    brain = ResearchBrain(store)
+
+    brain.result_assess(
+        run_id="run",
+        decision_id="decision",
+        hypothesis_id="hypothesis",
+        agenda_item_id="agenda",
+        prediction_outcome="Guard failed",
+        guard_condition_outcome="FAIL",
+        # Simulate a transport that cannot preserve a Unicode condition key.
+        condition_evaluations={"metric ? 0": False},
+        evidence_supporting=[],
+        evidence_against=[],
+        unexpected_observations=[],
+        alternative_explanations=[],
+        scope="fixture",
+        hypothesis_transition="BLOCKED",
+        rationale="The frozen guard failed",
+        guard_passed=False,
+    )
+
+    assert store.applied["evidence_data"]["condition_evaluations"] == {"metric > 0": False}

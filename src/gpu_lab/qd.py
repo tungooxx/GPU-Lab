@@ -8,6 +8,7 @@ from .research import ResearchStore
 
 
 class HypothesisDraft(BaseModel):
+    statement: str | None = Field(default=None, max_length=20_000)
     mechanism: str = Field(min_length=10, max_length=20_000)
     prediction: str = Field(min_length=5, max_length=10_000)
     kill_condition: str = Field(min_length=5, max_length=10_000)
@@ -18,6 +19,17 @@ class HypothesisDraft(BaseModel):
     information_path: list[str] = Field(default_factory=list, max_length=100)
     scope: str = Field(min_length=1, max_length=10_000)
     scientific_difference: str | None = Field(default=None, max_length=10_000)
+    state_variables: list[str] = Field(default_factory=list, max_length=100)
+    inherited_assumptions: list[str] = Field(default_factory=list, max_length=100)
+    assumptions_removed: list[str] = Field(default_factory=list, max_length=100)
+    supporting_evidence: list[str] = Field(default_factory=list, max_length=100)
+    against_evidence: list[str] = Field(default_factory=list, max_length=100)
+    unique_predictions: list[str] = Field(default_factory=list, max_length=20)
+    cheapest_kill_test: str | None = Field(default=None, max_length=10_000)
+    alternative_explanations: list[str] = Field(default_factory=list, max_length=30)
+    expected_scope: str | dict[str, Any] | None = None
+    novelty_risk: str | None = Field(default=None, max_length=5000)
+    operator_provenance: dict[str, Any] | None = None
     embedding: list[float] | None = Field(default=None, max_length=4096)
 
     @field_validator("embedding")

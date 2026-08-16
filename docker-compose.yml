@@ -26,6 +26,7 @@ services:
       GPU_LAB_LITERATURE_PROVIDER: ${GPU_LAB_LITERATURE_PROVIDER:-disabled}
       GPU_LAB_LITERATURE_WORKER_URL: http://literature-relay:8010
       GPU_LAB_LITERATURE_WORKER_TOKEN: ${GPU_LAB_LITERATURE_WORKER_TOKEN:-}
+      GPU_LAB_RESEARCH_OPERATOR_PROVIDER: ${GPU_LAB_RESEARCH_OPERATOR_PROVIDER:-disabled}
       GPU_LAB_EXECUTABLE_PAPER_PROVIDER: ${GPU_LAB_EXECUTABLE_PAPER_PROVIDER:-disabled}
       GPU_LAB_EXECUTABLE_PAPER_WORKER_URL: http://paper2agent-relay:8020
       GPU_LAB_EXECUTABLE_PAPER_WORKER_TOKEN: ${GPU_LAB_EXECUTABLE_PAPER_WORKER_TOKEN:-}
@@ -43,6 +44,14 @@ services:
       postgres:
         condition: service_healthy
     restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)).get('status') == 'ok'"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
     # The gateway is deliberately not attached to worker networks. Fixed-target relays expose only
     # each authenticated worker API; untrusted workers cannot route arbitrary traffic through them.
     networks: [backend]
