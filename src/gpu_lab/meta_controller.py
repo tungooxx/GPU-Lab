@@ -212,6 +212,31 @@ class MetaResearchController:
         )
         return health
 
+    def _science_vs_meta_schedule(self, project_id: str, opportunity: dict[str, Any]) -> dict[str, Any]:
+        """Reserve capacity for a materially more valuable unresolved science task."""
+        candidates = []
+        for item in self._objects(project_id, "AgendaItem"):
+            if item["status"] not in {"OPEN", "ACTIVE"}:
+                continue
+            data = item["data"]
+            try:
+                priority = float(data.get("importance", 0.0)) * float(data.get("uncertainty", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if data.get("reproduction_required"):
+                priority = max(priority, 0.8)
+            candidates.append({"agenda_item_id": str(item["id"]), "priority": min(1.0, priority), "question": data.get("question", "")})
+        highest = max(candidates, key=lambda item: item["priority"], default=None)
+        meta_value = float(opportunity["data"].get("expected_value_of_improvement", 0.0))
+        severe = int(opportunity["data"].get("severity", 0)) >= 2
+        defer = bool(highest and highest["priority"] >= 0.75 and highest["priority"] >= meta_value + 0.2 and not severe)
+        return {
+            "decision": "DEFER_TO_DOMAIN_SCIENCE" if defer else "META_RESEARCH_WARRANTED",
+            "meta_value": meta_value,
+            "highest_domain_science": highest,
+            "severe_meta_failure": severe,
+        }
+
     def _ensure_meta_records(self, project_id: str, opportunity: dict[str, Any]) -> None:
         """Turn an observed weakness into explicit, non-causal meta-science records.
 
@@ -452,6 +477,23 @@ class MetaResearchController:
                 float(item["data"]["expected_value_of_improvement"]),
             ),
         )
+        scheduling = self._science_vs_meta_schedule(project_id, opportunity)
+        if scheduling["decision"] == "DEFER_TO_DOMAIN_SCIENCE":
+            agenda = next(
+                (
+                    item for item in self._objects(project_id, "MetaResearchAgenda")
+                    if str(item["data"].get("opportunity_id")) == str(opportunity["id"])
+                ),
+                None,
+            )
+            if agenda:
+                self.store.object_update(
+                    str(agenda["id"]),
+                    {"scheduling_decision": scheduling},
+                    "OPEN",
+                    "META_RESEARCH_DEFERRED_FOR_DOMAIN_SCIENCE",
+                )
+            return {"decision": "DEFER_TO_DOMAIN_SCIENCE", "opportunities": opportunities, "scheduling": scheduling}
         if opportunity["data"].get("required_evaluation") == "COMPACT_COMPATIBILITY_BENCHMARK":
             compatibility = self.policy_lab.evaluate_provider_compatibility(
                 project_id,
@@ -587,7 +629,7 @@ class MetaResearchController:
             "META_RESEARCH_COMPLETED",
         )
         decision = "CAMPAIGN_RECOVERED" if recovered_run else "CAMPAIGN_RESUMED" if resumed else "CAMPAIGN_STARTED"
-        return {"decision": decision, "opportunities": opportunities, "campaign": campaign, "literature_request": literature_request, "improvement": result, "promotion_preflight": promotion_preflight, "promoted_policy": promoted}
+        return {"decision": decision, "opportunities": opportunities, "campaign": campaign, "literature_request": literature_request, "improvement": result, "promotion_preflight": promotion_preflight, "promoted_policy": promoted, "scheduling": scheduling}
 
     def monitor_promotions(self, project_id: str) -> list[dict[str, Any]]:
         """Detect severe, repeated post-promotion failures and rollback scoped policy."""

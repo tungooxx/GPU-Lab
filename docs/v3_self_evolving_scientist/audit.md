@@ -73,3 +73,7 @@ trace-grounded `MetaWorldModel` containing competing candidate-generation,
 ranking, and critic explanations. These are explicitly marked
 `HYPOTHESIS_NOT_ESTABLISHED`; they order distinct candidate mechanisms but do
 not convert observational failure patterns into causal claims.
+
+The controller also records an explicit science-vs-meta scheduling decision.
+A materially higher-priority unresolved domain agenda item defers a modest
+meta campaign; repeated severe invalid outcomes can still preempt that deferral.

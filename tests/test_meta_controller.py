@@ -99,6 +99,35 @@ def test_paused_autonomy_never_starts_campaign():
     assert controller.run_once("project")["decision"] == "PAUSED"
 
 
+def test_minor_meta_research_defers_to_a_critical_unresolved_domain_agenda_item():
+    store = Store()
+    controller = MetaResearchController(store, PolicyLab())
+    store.object_create("project", "AgendaItem", {"question": "Resolve critical mechanism", "importance": 1.0, "uncertainty": 0.9}, "FIXTURE", "OPEN")
+    for _ in range(2):
+        store.object_create("project", "ResearchDecisionOutcome", {"label": "LOW_VALUE", "action_type": "DIAGNOSTIC"}, "FIXTURE", "RESULT_INSPECTED")
+
+    result = controller.run_once("project")
+
+    assert result["decision"] == "DEFER_TO_DOMAIN_SCIENCE"
+    assert result["scheduling"]["highest_domain_science"]["question"] == "Resolve critical mechanism"
+    agenda = store.objects_list("project", "MetaResearchAgenda")[0]
+    assert agenda["data"]["scheduling_decision"]["decision"] == "DEFER_TO_DOMAIN_SCIENCE"
+
+
+def test_severe_meta_failure_is_not_deferred_by_domain_science():
+    store = Store()
+    lab = CampaignPolicyLab(store)
+    controller = MetaResearchController(store, lab)
+    store.object_create("project", "AgendaItem", {"question": "Resolve critical mechanism", "importance": 1.0, "uncertainty": 0.9}, "FIXTURE", "OPEN")
+    for _ in range(2):
+        store.object_create("project", "ResearchDecisionOutcome", {"label": "INVALID", "action_type": "TRAINING_RUN"}, "FIXTURE", "RESULT_INSPECTED")
+
+    result = controller.run_once("project")
+
+    assert result["decision"] == "CAMPAIGN_STARTED"
+    assert result["scheduling"]["severe_meta_failure"] is True
+
+
 def test_campaign_records_bounded_budget_and_passes_limits_to_policy_lab():
     store = Store()
     lab = CampaignPolicyLab(store)
