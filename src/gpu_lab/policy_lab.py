@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .brain_bench import BenchmarkDecision, BenchmarkPolicy, BenchmarkSplit, ResearchBrainBench
 from .errors import GPUError
+from .prompt_compiler import CORE_EPISTEMIC_INVARIANTS, PROVIDERS, PromptCompiler
 from .research import ResearchStore, strategy_learning_eligibility
 
 
@@ -34,6 +35,7 @@ class ResearchPolicyData(BaseModel):
     literature_policy: dict[str, Any] = Field(default_factory=dict)
     generalization_policy: dict[str, Any] = Field(default_factory=dict)
     meta_review_policy: dict[str, Any] = Field(default_factory=dict)
+    core_epistemic_invariants: list[str] = Field(default_factory=lambda: list(CORE_EPISTEMIC_INVARIANTS))
     provider_adapters: dict[str, Any] = Field(default_factory=dict)
     known_failure_modes: list[str] = Field(default_factory=list)
     applicability: dict[str, Any] = Field(default_factory=dict)
@@ -80,6 +82,7 @@ class PolicyLabService:
         self.auto_revise = auto_revise
         self.max_revisions = max_revisions
         self.promotion_policy = PromotionPolicy(auto_promote_production=auto_promote_production)
+        self.compiler = PromptCompiler()
 
     def _create(self, project_id: str, kind: str, data: dict[str, Any], event: str, status: str):
         return self.store.object_create(project_id, kind, data, event, status)
@@ -87,10 +90,30 @@ class PolicyLabService:
     def _objects(self, project_id: str, kind: str) -> list[dict[str, Any]]:
         return self.store.objects_list(project_id, kind, limit=None)
 
+    def _compile(self, policy: dict[str, Any], provider: str, runtime: str = "default") -> dict[str, Any]:
+        return self.compiler.compile(policy, provider, runtime)
+
+    def compile_policy(self, policy_id: str, target_provider: str = "GENERIC", target_runtime: str = "default", *, persist: bool = True) -> dict[str, Any]:
+        policy = self.store.object_get(policy_id)
+        if policy["kind"] != "ResearchPolicy":
+            raise GPUError("NOT_A_RESEARCH_POLICY", policy_id)
+        artifact = self._compile(policy, target_provider, target_runtime)
+        if not persist:
+            return artifact
+        existing = next((item for item in self._objects(str(policy["project_id"]), "ResearchPolicyArtifact") if item["data"].get("content_hash") == artifact["content_hash"]), None)
+        if existing:
+            return existing
+        return self._create(str(policy["project_id"]), "ResearchPolicyArtifact", artifact, "RESEARCH_POLICY_PROMPT_COMPILED", "COMPLETED")
+
+    def _compile_production_artifacts(self, policy: dict[str, Any]) -> None:
+        for provider in PROVIDERS:
+            self.compile_policy(str(policy["id"]), provider)
+
     def ensure_production_policy(self, project_id: str) -> dict[str, Any]:
         policies = self._objects(project_id, "ResearchPolicy")
         production = next((p for p in policies if p["status"] == "PRODUCTION"), None)
         if production:
+            self._compile_production_artifacts(production)
             return production
         payload = ResearchPolicyData(
             version=1,
@@ -106,9 +129,9 @@ class PolicyLabService:
             notes="Canonical v2.5 baseline; deterministic v2.2 code remains the implementation source.",
         ).model_dump(mode="json")
         transactional_ensure = getattr(self.store, "production_policy_ensure", None)
-        if callable(transactional_ensure):
-            return transactional_ensure(project_id, payload)
-        return self._create(project_id, "ResearchPolicy", payload, "RESEARCH_POLICY_CREATED", "PRODUCTION")
+        policy = transactional_ensure(project_id, payload) if callable(transactional_ensure) else self._create(project_id, "ResearchPolicy", payload, "RESEARCH_POLICY_CREATED", "PRODUCTION")
+        self._compile_production_artifacts(policy)
+        return policy
 
     def detect_weaknesses(self, project_id: str, component: str | None = None) -> list[dict[str, Any]]:
         outcomes = self._objects(project_id, "ResearchDecisionOutcome")
@@ -192,6 +215,9 @@ class PolicyLabService:
             "affected_policy_sections": ["decision_policy", "critic_policy"],
             "semantic_change": proposed, "semantic_fingerprint": self._fingerprint(proposed),
             "implementation_change": {"type": "POLICY_CONSTRAINT", "enabled": True},
+            "patch_type": "POLICY_SEMANTIC", "semantic_before": {}, "semantic_after": {},
+            "generated_prompt_diff": None, "expected_behavior_change": hypothesis["data"]["expected_benefits"],
+            "unintended_behavior_risks": hypothesis["data"]["possible_harms"], "source": hypothesis["data"]["source_type"],
             "prompt_change": None, "code_change": None, "config_change": None,
             "expected_effect": hypothesis["data"]["expected_benefits"],
             "applicability": hypothesis["data"]["applicability_conditions"], "exclusions": [],
@@ -225,6 +251,20 @@ class PolicyLabService:
         selected = next((a for action_type in preferred for a in actions if a["action_type"] == action_type), actions[0])
         return BenchmarkDecision(selected_action_id=selected["action_id"], considered_null_models=["policy-required-null"])
 
+    def _candidate_prompt(self, policy: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+        self._validate_core_patch(patch)
+        delta = self._policy_delta(patch["data"].get("semantic_change")).model_dump(mode="json")
+        candidate = {**policy, "data": {**policy["data"], **{name: {**policy["data"].get(name, {}), **value} for name, value in delta.items() if value}}}
+        return self._compile(candidate, "GENERIC")
+
+    @staticmethod
+    def _validate_core_patch(patch: dict[str, Any]) -> None:
+        attempted = patch["data"].get("core_epistemic_invariants")
+        if attempted is not None and set(attempted) != set(CORE_EPISTEMIC_INVARIANTS):
+            raise GPUError("CORE_POLICY_INVARIANT_VIOLATION", "ordinary patches cannot alter core epistemic invariants")
+        if patch["data"].get("patch_type") == "CORE_POLICY_CHANGE":
+            raise GPUError("CORE_POLICY_CHANGE_REQUIRES_STRONG_REVIEW", "core policy changes require a separate review path")
+
     def evaluate(self, project_id: str, patch_id: str) -> dict[str, Any]:
         patch = self.store.object_get(patch_id)
         if patch["kind"] != "ResearchPolicyPatch":
@@ -236,6 +276,9 @@ class PolicyLabService:
         implementation = patch["data"].get("implementation_change")
         try:
             self._policy_delta(patch["data"].get("semantic_change"))
+            baseline_policy = self.store.object_get(patch["data"]["base_policy_id"])
+            baseline_prompt = self._compile(baseline_policy, "GENERIC")
+            candidate_prompt = self._candidate_prompt(baseline_policy, patch)
         except GPUError:
             implementation = None
         if not patch["data"].get("semantic_change") or not isinstance(implementation, dict) or not implementation.get("enabled"):
@@ -301,9 +344,10 @@ class PolicyLabService:
                 "held_out": [e.episode_id for e in episodes if e.benchmark_split == BenchmarkSplit.HELD_OUT],
             },
             "models": ["deterministic-policy-runner"], "seeds": [], "results": {"baseline": baseline, "overall": aggregate, "by_split": split_cards},
+            "compiled_prompts": {"baseline": {key: baseline_prompt[key] for key in ("content_hash", "compiled_prompt_tokens")}, "candidate": {key: candidate_prompt[key] for key in ("content_hash", "compiled_prompt_tokens")}},
             "regressions": regressions, "decision": status, "confidence": "LIMITED", "namespace": "BENCHMARK",
         }, "POLICY_EXPERIMENT_COMPLETED", status)
-        updated = self.store.object_update(patch_id, {"experiment_id": str(experiment["id"]), "benchmark_results": aggregate, "regressions": regressions}, status, "POLICY_PATCH_EVALUATED")
+        updated = self.store.object_update(patch_id, {"experiment_id": str(experiment["id"]), "benchmark_results": aggregate, "regressions": regressions, "generated_prompt_diff": {"baseline_hash": baseline_prompt["content_hash"], "candidate_hash": candidate_prompt["content_hash"], "token_delta": candidate_prompt["compiled_prompt_tokens"] - baseline_prompt["compiled_prompt_tokens"]}}, status, "POLICY_PATCH_EVALUATED")
         if status == "REJECTED":
             self._create(project_id, "PolicyNegativeResult", {"proposal": patch_id, "source": "automatic benchmark", "expected_improvement": patch["data"]["expected_effect"], "observed_result": aggregate, "failure_mode": "hard benchmark regression", "regressions": regressions, "benchmark_scope": "development", "models_tested": ["deterministic-policy-runner"], "revisit_condition": "materially different mechanism", "related_policy_patches": [patch_id], "semantic_fingerprint": patch["data"]["semantic_fingerprint"]}, "POLICY_NEGATIVE_RESULT_CREATED", "REJECTED")
         return {"patch": updated, "experiment": experiment, "decision": status}
@@ -321,7 +365,7 @@ class PolicyLabService:
         data["semantic_fingerprint"] = self._fingerprint(data["semantic_change"])
         return self._create(project_id, "ResearchPolicyPatch", data, "POLICY_PATCH_REVISED", "CANDIDATE")
 
-    def improve(self, project_id: str, *, idea: str | None = None, paper: str | None = None, failure: str | None = None, component: str | None = None, search: bool = False) -> dict[str, Any]:
+    def improve(self, project_id: str, *, idea: str | None = None, paper: str | None = None, failure: str | None = None, component: str | None = None, search: bool = False, prompt: bool = False) -> dict[str, Any]:
         policy = self.ensure_production_policy(project_id)
         source_type = "USER_IDEA" if idea else "PAPER" if paper else "BENCHMARK_FAILURE" if failure else "INTERNAL_META_REVIEW"
         problem = idea or failure or (
@@ -332,6 +376,9 @@ class PolicyLabService:
         weaknesses = [] if (idea or paper or failure) else self.detect_weaknesses(project_id, component)
         hypotheses = self._hypotheses_for(project_id, source_type, problem, component or "experiment_selection")
         patches = [self._patch(project_id, policy, h) for h in hypotheses]
+        if prompt:
+            for patch in patches:
+                patch["data"].update({"patch_type": "PROMPT_PRESENTATION", "affected_policy_sections": ["decision_policy"], "prompt_mode": True})
         evaluations = [self.evaluate(project_id, str(p["id"])) for p in patches] if self.auto_evaluate else []
         if self.auto_revise:
             revisions = [
@@ -343,7 +390,7 @@ class PolicyLabService:
             patches.extend(revisions)
             evaluations.extend(self.evaluate(project_id, str(patch["id"])) for patch in revisions)
         supported = [e for e in evaluations if e["decision"] == "SUPPORTED_ON_BENCHMARK"]
-        run = self._create(project_id, "ImprovementRun", {"input": {"idea": idea, "paper": paper, "failure": failure, "component": component, "search": search}, "base_policy_id": str(policy["id"]), "weakness_ids": [str(w["id"]) for w in weaknesses], "hypothesis_ids": [str(h["id"]) for h in hypotheses], "patch_ids": [str(p["id"]) for p in patches], "evaluation_ids": [str(e["experiment"]["id"]) for e in evaluations if e.get("experiment")], "invalid_patch_ids": [str(e["patch"]["id"]) for e in evaluations if e["decision"] == "INVALID_EVALUATION"], "best_supported_patch_id": str(supported[0]["patch"]["id"]) if supported else None, "recommendation": "PROMOTE" if supported else "REJECT_OR_REVISE", "production_unchanged": True, "namespace": "META_RESEARCH"}, "IMPROVEMENT_RUN_COMPLETED", "COMPLETED")
+        run = self._create(project_id, "ImprovementRun", {"input": {"idea": idea, "paper": paper, "failure": failure, "component": component, "search": search, "prompt": prompt}, "base_policy_id": str(policy["id"]), "weakness_ids": [str(w["id"]) for w in weaknesses], "hypothesis_ids": [str(h["id"]) for h in hypotheses], "patch_ids": [str(p["id"]) for p in patches], "evaluation_ids": [str(e["experiment"]["id"]) for e in evaluations if e.get("experiment")], "invalid_patch_ids": [str(e["patch"]["id"]) for e in evaluations if e["decision"] == "INVALID_EVALUATION"], "best_supported_patch_id": str(supported[0]["patch"]["id"]) if supported else None, "recommendation": "PROMOTE" if supported else "REJECT_OR_REVISE", "production_unchanged": True, "namespace": "META_RESEARCH"}, "IMPROVEMENT_RUN_COMPLETED", "COMPLETED")
         return {"improvement_run": run, "production_policy_id": str(policy["id"]), "weaknesses": weaknesses, "hypotheses": hypotheses, "patches": patches, "evaluations": evaluations, "recommendation": run["data"]["recommendation"]}
 
     def promote(self, project_id: str, patch_id: str) -> dict[str, Any]:
@@ -355,12 +402,17 @@ class PolicyLabService:
         current = self.ensure_production_policy(project_id)
         next_version = max([int(p["data"].get("version", 0)) for p in self._objects(project_id, "ResearchPolicy")] or [0]) + 1
         delta = self._policy_delta(patch["data"]["semantic_change"]).model_dump(mode="json")
+        self._validate_core_patch(patch)
         data = {**current["data"], **{section: {**current["data"].get(section, {}), **change} for section, change in delta.items() if change}, "version": next_version, "parent_policy_id": str(current["id"]), "provenance": {"source_type": "POLICY_PATCH", "patch_id": patch_id}, "notes": f"Promoted patch {patch_id}", "applied_patch_ids": [patch_id], "applied_policy_delta": delta}
         transactional_promote = getattr(self.store, "production_policy_promote", None)
         if callable(transactional_promote):
-            return transactional_promote(project_id, str(current["id"]), data)
+            promoted = transactional_promote(project_id, str(current["id"]), data)
+            self._compile_production_artifacts(promoted)
+            return promoted
         self.store.object_update(str(current["id"]), {}, "SUPERSEDED", "RESEARCH_POLICY_SUPERSEDED")
-        return self._create(project_id, "ResearchPolicy", data, "RESEARCH_POLICY_PROMOTED", "PRODUCTION")
+        promoted = self._create(project_id, "ResearchPolicy", data, "RESEARCH_POLICY_PROMOTED", "PRODUCTION")
+        self._compile_production_artifacts(promoted)
+        return promoted
 
     def classify_transfer(
         self,

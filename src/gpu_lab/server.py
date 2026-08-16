@@ -972,8 +972,9 @@ async def improve_start(
     failure: str | None = None,
     component: str | None = None,
     search: bool = False,
+    prompt: bool = False,
 ):
-    """Create bounded policy candidates and evaluate them without changing production policy."""
+    """Create bounded policy candidates; prompt mode compiles candidates before evaluation."""
     if search:
         if settings.gpu_lab_literature_provider != "paperqa-http":
             raise GPUError(
@@ -1001,6 +1002,7 @@ async def improve_start(
         failure=failure,
         component=component,
         search=search,
+        prompt=prompt,
     )
 
 
@@ -1026,6 +1028,15 @@ async def policy_compare(base_policy_id: str, candidate_policy_id: str):
 async def policy_export(policy_id: str, provider: str | None = None):
     """Export a portable policy representation without applying or compiling executable text."""
     return await call(policy_lab().export_policy, policy_id, provider)
+
+
+@mcp.tool()
+async def research_policy_context_get(project_id: str, provider: str = "CHATGPT"):
+    """Return the active compiled policy context; dynamic research state remains in Research OS tools."""
+    policy = await call(policy_lab().ensure_production_policy, project_id)
+    if isinstance(policy, dict) and "error" in policy:
+        return policy
+    return await call(policy_lab().compile_policy, str(policy["id"]), provider)
 
 
 @mcp.tool()

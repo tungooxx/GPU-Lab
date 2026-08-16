@@ -8,6 +8,7 @@ import pytest
 from gpu_lab.brain_bench import BenchmarkDecision, ResearchBrainBench
 from gpu_lab.errors import GPUError
 from gpu_lab.policy_lab import PolicyLabService
+from gpu_lab.prompt_compiler import CORE_EPISTEMIC_INVARIANTS, PromptCompiler
 
 
 class Store:
@@ -241,3 +242,52 @@ def test_policy_evaluation_cannot_mutate_production_science(monkeypatch):
     lab.evaluate("project", result["patches"][0]["id"])
 
     assert store.object_get(science["id"])["data"] == {"name": "production"}
+
+
+def test_production_policy_compiles_immutable_provider_artifacts():
+    store = Store()
+    lab = service(store)
+    policy = lab.ensure_production_policy("project")
+
+    artifact = lab.compile_policy(policy["id"], "CHATGPT")
+
+    assert artifact["kind"] == "ResearchPolicyArtifact"
+    assert "GENERATED FILE" in artifact["data"]["content"]
+    assert artifact["data"]["policy_version"] == 1
+    assert artifact["data"]["compiled_prompt_tokens"] > 0
+    assert {item["data"]["target_provider"] for item in store.items if item["kind"] == "ResearchPolicyArtifact"} >= {"CHATGPT", "CLAUDE", "CODEX", "GENERIC"}
+
+
+def test_prompt_mode_compiles_candidate_before_benchmarking():
+    store = Store()
+    lab = service(store)
+
+    result = lab.improve("project", idea="Improve experiment comparison", prompt=True)
+
+    assert result["improvement_run"]["data"]["input"]["prompt"] is True
+    assert all(patch["data"]["patch_type"] == "PROMPT_PRESENTATION" for patch in result["patches"][:3])
+    assert all("compiled_prompts" in evaluation["experiment"]["data"] for evaluation in result["evaluations"])
+    assert result["improvement_run"]["data"]["production_unchanged"] is True
+
+
+def test_core_invariant_attack_is_rejected_before_benchmark():
+    store = Store()
+    lab = service(store)
+    policy = lab.ensure_production_policy("project")
+    hypothesis = lab._hypotheses_for("project", "USER_IDEA", "problem", "critic")[0]
+    patch = lab._patch("project", policy, hypothesis)
+    patch["data"]["core_epistemic_invariants"] = [CORE_EPISTEMIC_INVARIANTS[0]]
+
+    result = lab.evaluate("project", patch["id"])
+
+    assert result["decision"] == "INVALID_EVALUATION"
+    assert not [item for item in store.items if item["kind"] == "PolicyExperiment"]
+
+
+def test_provider_compilation_preserves_canonical_invariants():
+    policy = {"id": "policy", "data": {"version": 1, "core_epistemic_invariants": list(CORE_EPISTEMIC_INVARIANTS), "decision_policy": {"falsification_first": True}}}
+    compiler = PromptCompiler()
+    outputs = [compiler.compile(policy, provider) for provider in ("GENERIC", "CHATGPT", "CLAUDE", "CODEX")]
+
+    assert len({output["content_hash"] for output in outputs}) == 4
+    assert all("execution is not evidence" in output["content"] for output in outputs)

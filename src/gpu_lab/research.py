@@ -69,6 +69,7 @@ RESEARCH_OBJECT_KINDS = (
     "PolicyNegativeResult",
     "ResearchPolicyWeakness",
     "ImprovementRun",
+    "ResearchPolicyArtifact",
 )
 RESEARCH_OBJECT_STATUSES = {
     "ACTIVE",
