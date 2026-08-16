@@ -425,6 +425,26 @@ class MetaResearchController:
             self.store.object_update(run_id, {"auto_promotion_preflight": promotion_preflight}, "COMPLETED", "POLICY_AUTO_PROMOTION_PREFLIGHT")
             if promotion_preflight["eligible"]:
                 promoted = self.policy_lab.promote(project_id, best_patch)
+                patch = self.store.object_get(best_patch)
+                self.store.object_create(
+                    project_id,
+                    "MetaStrategyPattern",
+                    {
+                        "policy_id": str(promoted["id"]),
+                        "patch_id": best_patch,
+                        "target_component": opportunity["data"]["target_component"],
+                        "scope": promotion_preflight["scope"],
+                        "observed_effect": "BENCHMARK_SUPPORTED_AWAITING_REAL_WORLD_HINDSIGHT",
+                        "mechanism": patch["data"].get("semantic_change"),
+                        "supporting_evidence": [str(promotion_preflight["policy_experiment_id"])],
+                        "counterexamples": [],
+                        "provider_sensitivity": "UNVERIFIED",
+                        "domain_sensitivity": "UNVERIFIED",
+                        "revisit_condition": "Accumulate prospective policy hindsight before reuse beyond the promoted scope.",
+                    },
+                    "META_STRATEGY_PATTERN_CREATED",
+                    "CANDIDATE",
+                )
         return {"decision": "CAMPAIGN_STARTED", "opportunities": opportunities, "campaign": campaign, "literature_request": literature_request, "improvement": result, "promotion_preflight": promotion_preflight, "promoted_policy": promoted}
 
     def monitor_promotions(self, project_id: str) -> list[dict[str, Any]]:

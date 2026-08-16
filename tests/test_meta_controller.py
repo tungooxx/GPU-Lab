@@ -196,6 +196,8 @@ def test_auto_project_runs_closed_meta_cycle_and_promotes_supported_patch():
     assert "methods improve experiment_selection" in result["literature_request"]["data"]["question"]
     assert store.objects_list("project", "MetaWorldModel")
     assert store.objects_list("project", "PolicyExperiment")
+    pattern = store.objects_list("project", "MetaStrategyPattern")[0]
+    assert pattern["data"]["observed_effect"] == "BENCHMARK_SUPPORTED_AWAITING_REAL_WORLD_HINDSIGHT"
     run = store.objects_list("project", "ImprovementRun")[0]
     assert run["data"]["meta_campaign"]["candidate_sources"]["MetaWorldModel"]
     assert run["data"]["meta_campaign"]["candidate_sources"]["LiteratureScoutRequest"]
