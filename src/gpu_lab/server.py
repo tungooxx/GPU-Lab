@@ -32,6 +32,7 @@ from .errors import GPUError
 from .executable_papers import ExecutablePaperService, HttpExecutablePaperProvider
 from .literature import HttpLiteratureProvider, LiteratureService
 from .local_runner import LocalRunner
+from .meta_controller import MetaResearchController
 from .meta_research import MetaResearchService
 from .policy_lab import PolicyLabService
 from .qd import HypothesisQDService
@@ -1874,6 +1875,12 @@ async def autonomy_config_get(project_id: str):
 async def autonomy_config_update(project_id: str, update: dict[str, Any]):
     """Update bounded autonomy settings; default mode remains advisory."""
     return await call(meta_controller().config_update, project_id, update)
+
+
+@mcp.tool()
+async def policy_model_change_detect(project_id: str, provider: str, model: str):
+    """Create a deduplicated compatibility-evaluation opportunity after a model change."""
+    return await call(meta_controller().model_change_detect, project_id, provider, model)
 
 
 @mcp.tool()

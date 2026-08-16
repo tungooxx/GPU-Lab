@@ -65,3 +65,13 @@ def test_auto_project_rolls_back_only_after_repeated_negative_hindsight():
 
     assert len(regressions) == 1
     assert regressions[0]["data"]["rollback_decision"] == "ROLLED_BACK"
+
+
+def test_model_change_creates_one_compatibility_opportunity():
+    store = Store()
+    controller = MetaResearchController(store, PolicyLab())
+
+    created = controller.model_change_detect("project", "openai", "new-model")
+
+    assert created["data"]["required_evaluation"] == "COMPACT_COMPATIBILITY_BENCHMARK"
+    assert controller.model_change_detect("project", "openai", "new-model") is None

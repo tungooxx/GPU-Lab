@@ -102,3 +102,10 @@ class MetaResearchController:
             "recent_regressions": self._objects(project_id, "PolicyRegression")[-10:],
             "benchmark_health": {"policy_experiments": len(self._objects(project_id, "PolicyExperiment")), "benchmark_gaps": len(self._objects(project_id, "BenchmarkGap"))},
         }
+
+    def model_change_detect(self, project_id: str, provider: str, model: str) -> dict[str, Any] | None:
+        """Record provider/model drift as a bounded compatibility-evaluation opportunity."""
+        fingerprint = f"model-change:{provider}:{model}"
+        if any(item["data"].get("fingerprint") == fingerprint for item in self._objects(project_id, "ImprovementOpportunity")):
+            return None
+        return self.store.object_create(project_id, "ImprovementOpportunity", {"source": "MODEL_CHANGE", "target_component": "provider_adapter", "observed_failure": f"Provider/model changed to {provider}:{model}; policy compatibility is unverified.", "supporting_evidence": [], "frequency": 1, "severity": 1, "scientific_cost": 0.0, "compute_cost": 0.0, "confidence": 1.0, "estimated_fixability": 0.5, "expected_value_of_improvement": 0.4, "scope": "PROJECT", "fingerprint": fingerprint, "required_evaluation": "COMPACT_COMPATIBILITY_BENCHMARK"}, "IMPROVEMENT_OPPORTUNITY_CREATED", "CANDIDATE")
