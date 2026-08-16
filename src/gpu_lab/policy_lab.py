@@ -355,6 +355,21 @@ class PolicyLabService:
             ).model_dump(mode="json")
             for split in BenchmarkSplit
         }
+        adversarial_indices = [
+            index
+            for index, episode in enumerate(episodes)
+            if episode.benchmark_split == BenchmarkSplit.HELD_OUT
+            and (
+                episode.evaluation_rubric.require_null_model
+                or episode.bad_next_actions
+                or episode.known_dead_lineages
+                or episode.forbidden_future_records
+            )
+        ]
+        adversarial_cards = [cards[index] for index in adversarial_indices]
+        adversarial_baseline_cards = [baseline_cards[index] for index in adversarial_indices]
+        adversarial = self.bench.aggregate(adversarial_cards).model_dump(mode="json")
+        adversarial_baseline = self.bench.aggregate(adversarial_baseline_cards).model_dump(mode="json")
         hard_rate_metrics = {
             "future_information_leakage_rate",
             "scope_violation_rate",
@@ -367,6 +382,13 @@ class PolicyLabService:
             if aggregate["metrics"].get(name, {}).get("mean") not in (None, 0)
             and aggregate["metrics"][name]["mean"] > baseline["metrics"].get(name, {}).get("mean", 0)
         ]
+        adversarial_regressions = [
+            name
+            for name in hard_rate_metrics
+            if adversarial["metrics"].get(name, {}).get("mean") not in (None, 0)
+            and adversarial["metrics"][name]["mean"] > adversarial_baseline["metrics"].get(name, {}).get("mean", 0)
+        ]
+        regressions.extend(f"adversarial:{name}" for name in adversarial_regressions)
         held_out = split_cards[BenchmarkSplit.HELD_OUT.value]
         held_out_has_data = held_out["scorecards"] > 0
         no_primary_gain = (
@@ -388,7 +410,7 @@ class PolicyLabService:
                 "validation": [e.episode_id for e in episodes if e.benchmark_split == BenchmarkSplit.VALIDATION],
                 "held_out": [e.episode_id for e in episodes if e.benchmark_split == BenchmarkSplit.HELD_OUT],
             },
-            "models": ["deterministic-policy-runner"], "seeds": [], "results": {"baseline": baseline, "overall": aggregate, "by_split": split_cards},
+            "models": ["deterministic-policy-runner"], "seeds": [], "results": {"baseline": baseline, "overall": aggregate, "by_split": split_cards, "adversarial_falsification": {"episode_ids": [episodes[index].episode_id for index in adversarial_indices], "baseline": adversarial_baseline, "candidate": adversarial, "regressions": adversarial_regressions}},
             "compiled_prompts": {"baseline": {key: baseline_prompt[key] for key in ("content_hash", "compiled_prompt_tokens")}, "candidate": {key: candidate_prompt[key] for key in ("content_hash", "compiled_prompt_tokens")}},
             "regressions": regressions, "decision": status, "confidence": "LIMITED", "namespace": "BENCHMARK",
         }, "POLICY_EXPERIMENT_COMPLETED", status)

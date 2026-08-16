@@ -98,3 +98,7 @@ The `policy_health_report` MCP tool now provides the compact v3 operational
 report: production policy and lineage, scoped overrides, adapter candidates,
 benchmark health, real-world calibration, active meta work, recent decisions,
 rollbacks, and known policy failure modes.
+
+Policy evaluation includes an adversarial falsification pass over eligible
+held-out high-risk episodes. New hard regressions versus the frozen baseline
+are stored on the `PolicyExperiment` and block promotion.

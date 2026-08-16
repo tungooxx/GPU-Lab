@@ -240,6 +240,10 @@ def test_candidate_that_regresses_on_held_out_is_rejected(monkeypatch):
     outcome = lab.evaluate("project", patch["id"])
 
     assert outcome["decision"] == "REJECTED"
+    adversarial = outcome["experiment"]["data"]["results"]["adversarial_falsification"]
+    assert patch["id"] == outcome["patch"]["id"]
+    assert adversarial["episode_ids"]
+    assert "adversarial:bad_action_selection_rate" in outcome["experiment"]["data"]["regressions"]
     assert "bad_action_selection_rate" in outcome["experiment"]["data"]["regressions"]
     assert any(item["kind"] == "PolicyNegativeResult" for item in store.items)
 
