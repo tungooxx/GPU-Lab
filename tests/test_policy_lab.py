@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from gpu_lab.brain_bench import BenchmarkDecision, ResearchBrainBench
+from gpu_lab.engineering import EngineeringService
 from gpu_lab.errors import GPUError
 from gpu_lab.policy_lab import PolicyLabService
 from gpu_lab.prompt_compiler import CORE_EPISTEMIC_INVARIANTS, PromptCompiler
@@ -141,6 +142,52 @@ def test_code_bearing_policy_patch_creates_bounded_engineering_task():
 
     assert result["patch"]["status"] == "IMPLEMENTED_UNVERIFIED"
     assert result["engineering_task"]["data"]["scientific_result"] == "NOT_ASSESSED"
+
+
+def test_code_patch_uses_v2_2_engineering_task_contract_when_service_is_available():
+    store = Store()
+    lab = PolicyLabService(store, ResearchBrainBench(Path(__file__).parents[1] / "research_bench"), engineering_service=EngineeringService(store))
+    policy = lab.ensure_production_policy("project")
+    patch = lab._patch("project", policy, lab._hypotheses_for("project", "USER_IDEA", "problem", "critic")[0])
+
+    task = lab.code_patch_prepare("project", patch["id"], {"purpose": "Bound candidate scoring", "files": ["src/gpu_lab/policy_lab.py"], "tests": ["tests/test_policy_lab.py"]})["engineering_task"]
+
+    assert task["data"]["policy_patch_id"] == patch["id"]
+    assert task["data"]["acceptance_tests"] == []
+    assert task["data"]["engineering_invariants"]["scientific_truth_unchanged"] is True
+
+
+def test_code_patch_waits_for_verified_engineering_result_then_auto_evaluates():
+    store = Store()
+    lab = service(store)
+    policy = lab.ensure_production_policy("project")
+    patch = lab._patch("project", policy, lab._hypotheses_for("project", "USER_IDEA", "problem", "critic")[0])
+    task = lab.code_patch_prepare("project", patch["id"], {"purpose": "Bound candidate scoring", "files": ["src/gpu_lab/policy_lab.py"], "tests": ["tests/test_policy_lab.py"]})["engineering_task"]
+
+    assert lab.evaluate("project", patch["id"])["decision"] == "IMPLEMENTATION_REQUIRED"
+    result = store.object_create("project", "EngineeringResult", {"implementation_verification": "VERIFIED_TARGETED"}, "FIXTURE", "COMPLETED")
+    task["data"]["latest_result_id"] = result["id"]
+
+    handoff = lab.code_patch_result_sync("project", task["id"])
+
+    assert handoff["patch"]["data"]["implementation_verified"] is True
+    assert handoff["evaluation"]["decision"] in {"SUPPORTED_ON_BENCHMARK", "REJECTED"}
+
+
+def test_unverified_code_patch_result_is_retained_as_non_scientific_negative_result():
+    store = Store()
+    lab = service(store)
+    policy = lab.ensure_production_policy("project")
+    patch = lab._patch("project", policy, lab._hypotheses_for("project", "USER_IDEA", "problem", "critic")[0])
+    task = lab.code_patch_prepare("project", patch["id"], {"purpose": "Bound candidate scoring", "files": ["src/gpu_lab/policy_lab.py"], "tests": ["tests/test_policy_lab.py"]})["engineering_task"]
+    result = store.object_create("project", "EngineeringResult", {"implementation_verification": "INVALID_IMPLEMENTATION"}, "FIXTURE", "INCONCLUSIVE")
+    task["data"]["latest_result_id"] = result["id"]
+
+    handoff = lab.code_patch_result_sync("project", task["id"])
+
+    assert handoff["decision"] == "IMPLEMENTATION_REJECTED"
+    assert handoff["patch"]["status"] == "REJECTED"
+    assert handoff["negative_result"]["data"]["failure_mode"] == "implementation not verified"
 
 
 def test_policy_patch_cannot_be_evaluated_or_promoted_in_another_project():

@@ -53,8 +53,12 @@ gather evidence candidates when the isolated provider is available.
 
 ## Remaining v3 work
 
-This is not a completion claim. In particular, autonomous code-patch execution
-through EngineeringTask/EngineeringResult, richer causal meta-diagnostics,
-live multi-provider policy evaluation, benchmark-authoring workflow, and
-prospective canary routing remain broader integration work. The deterministic
-benchmark runner should not be represented as live-model or real-world proof.
+This is not a completion claim. Code-bearing policy patches now create a
+bounded v2.2 `EngineeringTask`; a verified `EngineeringResult` automatically
+unlocks the pre-registered benchmark, while invalid implementation evidence is
+retained as a non-scientific policy negative result. An execution agent still
+performs the bounded code change: the controller does not receive arbitrary
+repository-write authority. Richer causal meta-diagnostics, live multi-provider
+policy evaluation, benchmark-authoring workflow, and prospective canary routing
+remain broader integration work. The deterministic benchmark runner should not
+be represented as live-model or real-world proof.

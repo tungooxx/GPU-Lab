@@ -387,6 +387,7 @@ def policy_lab() -> PolicyLabService:
                     auto_revise=settings.gpu_lab_policy_auto_revise,
                     max_revisions=settings.gpu_lab_policy_max_revisions,
                     auto_promote_production=settings.gpu_lab_policy_auto_promote_production,
+                    engineering_service=engineering(),
                 )
     return policy_lab_service
 
@@ -961,8 +962,17 @@ async def engineering_diff_review(task_id: str, review: dict[str, Any]):
 
 @mcp.tool()
 async def engineering_result_record(task_id: str, result: dict[str, Any]):
-    """Record implementation evidence; scientific_result is always NOT_ASSESSED."""
-    return await call(engineering().result_record, task_id, result)
+    """Record implementation evidence and unlock a linked policy benchmark if verified."""
+    recorded = await call(engineering().result_record, task_id, result)
+    if isinstance(recorded, dict) and "error" in recorded:
+        return recorded
+    task = await call(engineering().task_get, task_id)
+    if isinstance(task, dict) and "error" in task:
+        return task
+    if not task.get("data", {}).get("policy_patch_id"):
+        return recorded
+    handoff = await call(policy_lab().code_patch_result_sync, str(task["project_id"]), task_id)
+    return {"engineering_result": recorded, "policy_handoff": handoff}
 
 
 @mcp.tool()

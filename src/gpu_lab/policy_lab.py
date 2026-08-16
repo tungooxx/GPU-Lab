@@ -14,6 +14,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from .brain_bench import BenchmarkDecision, BenchmarkPolicy, BenchmarkSplit, ResearchBrainBench
+from .engineering import EngineeringService
 from .errors import GPUError
 from .prompt_compiler import CORE_EPISTEMIC_INVARIANTS, PROVIDERS, PromptCompiler
 from .research import ResearchStore, strategy_learning_eligibility
@@ -74,6 +75,7 @@ class PolicyLabService:
         auto_revise: bool = True,
         max_revisions: int = 1,
         auto_promote_production: bool = False,
+        engineering_service: EngineeringService | None = None,
     ):
         self.store = store
         self.bench = bench
@@ -83,6 +85,7 @@ class PolicyLabService:
         self.max_revisions = max_revisions
         self.promotion_policy = PromotionPolicy(auto_promote_production=auto_promote_production)
         self.compiler = PromptCompiler()
+        self.engineering_service = engineering_service
 
     def _create(self, project_id: str, kind: str, data: dict[str, Any], event: str, status: str):
         return self.store.object_create(project_id, kind, data, event, status)
@@ -274,6 +277,12 @@ class PolicyLabService:
             raise GPUError("NOT_A_RESEARCH_POLICY_PATCH", patch_id)
         if str(patch["project_id"]) != str(project_id):
             raise GPUError("RESEARCH_PROJECT_MISMATCH", patch_id)
+        if patch["data"].get("engineering_task_id") and not patch["data"].get("implementation_verified"):
+            return {
+                "patch": patch,
+                "decision": "IMPLEMENTATION_REQUIRED",
+                "reason": "ENGINEERING_IMPLEMENTATION_NOT_VERIFIED",
+            }
         if patch["status"] == "REJECTED":
             return {"patch": patch, "decision": "REJECTED", "reason": "duplicate or invalid candidate"}
         implementation = patch["data"].get("implementation_change")
@@ -592,25 +601,34 @@ class PolicyLabService:
         prohibited = {".env", "docker-compose.yml", "src/gpu_lab/research.py"}
         if any(str(path) in prohibited for path in files):
             raise GPUError("POLICY_CODE_CHANGE_CORE_SYSTEM", "core data/security files require stronger review")
-        task = self._create(
-            project_id,
-            "EngineeringTask",
-            {
-                "purpose": purpose,
-                "task_type": "BUG_FIX",
-                "change_request": str(code_change.get("change_request", patch["data"].get("semantic_change", ""))),
-                "relevant_files": [str(path) for path in files],
-                "targeted_tests": [str(test) for test in tests],
-                "broader_tests": ["pytest -q", "ruff check src tests"],
-                "prohibited_changes": sorted(prohibited),
-                "engineering_invariants": {"bounded_policy_patch": True, "scientific_truth_unchanged": True},
-                "implementation_guards": [],
-                "policy_patch_id": patch_id,
-                "scientific_result": "NOT_ASSESSED",
-            },
-            "POLICY_CODE_ENGINEERING_TASK_CREATED",
-            "OPEN",
-        )
+        task_data = {
+            "purpose": purpose,
+            "task_type": "BUG_FIX",
+            "change_request": str(code_change.get("change_request", patch["data"].get("semantic_change", ""))),
+            "relevant_files": [str(path) for path in files],
+            "targeted_tests": [str(test) for test in tests],
+            "broader_tests": ["pytest -q", "ruff check src tests"],
+            "prohibited_changes": sorted(prohibited),
+            "engineering_invariants": {"bounded_policy_patch": True, "scientific_truth_unchanged": True},
+        }
+        if self.engineering_service:
+            task = self.engineering_service.task_create(project_id, **task_data)
+            task = self.store.object_update(
+                str(task["id"]),
+                {"policy_patch_id": patch_id},
+                "OPEN",
+                "POLICY_CODE_ENGINEERING_TASK_LINKED",
+            )
+        else:
+            # Lightweight test stores may not supply the v2.2 service. Keep a
+            # contract-shaped fallback; production always injects the service.
+            task = self._create(
+                project_id,
+                "EngineeringTask",
+                {**task_data, "implementation_guards": [], "policy_patch_id": patch_id, "scientific_result": "NOT_ASSESSED"},
+                "POLICY_CODE_ENGINEERING_TASK_CREATED",
+                "OPEN",
+            )
         updated = self.store.object_update(
             patch_id,
             {"code_change": code_change, "engineering_task_id": str(task["id"]), "implementation_verified": False},
@@ -618,6 +636,62 @@ class PolicyLabService:
             "POLICY_CODE_PATCH_PREPARED",
         )
         return {"patch": updated, "engineering_task": task}
+
+    def code_patch_result_sync(self, project_id: str, task_id: str) -> dict[str, Any] | None:
+        """Advance a code-bearing policy patch only from durable v2.2 evidence.
+
+        Passing implementation checks never counts as policy evidence; it merely
+        unlocks the pre-registered benchmark. This method does not execute code.
+        """
+        task = self.store.object_get(task_id)
+        if task["kind"] != "EngineeringTask" or str(task["project_id"]) != str(project_id):
+            raise GPUError("RESEARCH_PROJECT_MISMATCH", task_id)
+        patch_id = task["data"].get("policy_patch_id")
+        if not patch_id:
+            return None
+        patch = self.store.object_get(str(patch_id))
+        if patch["kind"] != "ResearchPolicyPatch" or str(patch["project_id"]) != str(project_id):
+            raise GPUError("RESEARCH_PROJECT_MISMATCH", str(patch_id))
+        result_id = task["data"].get("latest_result_id")
+        if not result_id:
+            return {"patch": patch, "decision": "IMPLEMENTATION_REQUIRED", "task_id": task_id}
+        result = self.store.object_get(str(result_id))
+        if result["kind"] != "EngineeringResult" or str(result["project_id"]) != str(project_id):
+            raise GPUError("ENGINEERING_RESULT_REQUIRED", str(result_id))
+        verification = result["data"].get("implementation_verification", "UNVERIFIED")
+        ready = verification in {"VERIFIED_TARGETED", "VERIFIED_INTEGRATION", "VERIFIED_REAL_EXECUTION"}
+        if not ready:
+            updated = self.store.object_update(
+                str(patch_id),
+                {"engineering_result_id": str(result_id), "implementation_verified": False, "implementation_failure": verification},
+                "REJECTED",
+                "POLICY_CODE_IMPLEMENTATION_REJECTED",
+            )
+            negative = self._create(
+                project_id,
+                "PolicyNegativeResult",
+                {
+                    "proposal": str(patch_id),
+                    "source": "engineering implementation verification",
+                    "expected_improvement": patch["data"].get("expected_effect"),
+                    "observed_result": {"engineering_result_id": str(result_id), "verification": verification},
+                    "failure_mode": "implementation not verified",
+                    "revisit_condition": "submit a materially different bounded implementation with verified results",
+                    "related_policy_patches": [str(patch_id)],
+                    "semantic_fingerprint": patch["data"].get("semantic_fingerprint"),
+                },
+                "POLICY_NEGATIVE_RESULT_CREATED",
+                "REJECTED",
+            )
+            return {"patch": updated, "decision": "IMPLEMENTATION_REJECTED", "engineering_result": result, "negative_result": negative}
+        updated = self.store.object_update(
+            str(patch_id),
+            {"engineering_result_id": str(result_id), "implementation_verified": True, "implementation_verification": verification},
+            "CANDIDATE",
+            "POLICY_CODE_IMPLEMENTATION_VERIFIED",
+        )
+        evaluation = self.evaluate(project_id, str(patch_id)) if self.auto_evaluate else None
+        return {"patch": updated, "decision": "READY_FOR_EVALUATION", "engineering_result": result, "evaluation": evaluation}
 
     def start_canary(self, project_id: str, candidate_policy_id: str, percentage: int = 10) -> dict[str, Any]:
         """Create a bounded prospective canary plan without changing production policy."""
