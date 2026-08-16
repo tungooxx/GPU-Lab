@@ -467,6 +467,63 @@ class PolicyLabService:
             return self.store.object_update(policy_id, {"rollback_from_policy_id": str(current["id"])}, "PRODUCTION", "RESEARCH_POLICY_ROLLED_BACK")
         return target
 
+    def start_canary(self, project_id: str, candidate_policy_id: str, percentage: int = 10) -> dict[str, Any]:
+        """Create a bounded prospective canary plan without changing production policy."""
+        if not 1 <= percentage <= 50:
+            raise GPUError("POLICY_CANARY_PERCENTAGE_INVALID", "percentage must be between 1 and 50")
+        candidate = self.store.object_get(candidate_policy_id)
+        if candidate["kind"] != "ResearchPolicy" or str(candidate["project_id"]) != str(project_id):
+            raise GPUError("INVALID_POLICY_CANARY_TARGET", candidate_policy_id)
+        production = self.ensure_production_policy(project_id)
+        if str(production["id"]) == candidate_policy_id:
+            raise GPUError("POLICY_CANARY_BASELINE_INVALID", "candidate must differ from current production policy")
+        return self._create(
+            project_id,
+            "PolicyCanary",
+            {
+                "candidate_policy_id": candidate_policy_id,
+                "baseline_policy_id": str(production["id"]),
+                "percentage": percentage,
+                "scope": candidate["data"].get("applicability", {}).get("scope", "PROJECT"),
+                "decision_count": 0,
+                "stop_conditions": ["hard epistemic regression", "severe negative transfer", "cost budget exceeded"],
+            },
+            "POLICY_CANARY_STARTED",
+            "ACTIVE",
+        )
+
+    def record_shadow(
+        self,
+        project_id: str,
+        production_policy_id: str,
+        shadow_policy_id: str,
+        decision_id: str,
+        production_action: dict[str, Any],
+        shadow_action: dict[str, Any],
+        observed_production_result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Persist an observational shadow comparison without inventing B's outcome."""
+        production = self.store.object_get(production_policy_id)
+        shadow = self.store.object_get(shadow_policy_id)
+        if any(item["kind"] != "ResearchPolicy" or str(item["project_id"]) != str(project_id) for item in (production, shadow)):
+            raise GPUError("INVALID_POLICY_SHADOW_TARGET", "policies must belong to project")
+        return self._create(
+            project_id,
+            "PolicyShadowEvaluation",
+            {
+                "production_policy_id": production_policy_id,
+                "shadow_policy_id": shadow_policy_id,
+                "decision_id": decision_id,
+                "production_action": production_action,
+                "shadow_action": shadow_action,
+                "observed_production_result": observed_production_result,
+                "counterfactual_status": "COUNTERFACTUAL_UNKNOWN",
+                "interpretation": "Only the production action's result is observed; the shadow action was not executed.",
+            },
+            "POLICY_SHADOW_RECORDED",
+            "COMPLETED",
+        )
+
     def policy_diff(self, base_policy_id: str, candidate_policy_id: str) -> dict[str, Any]:
         base, candidate = self.store.object_get(base_policy_id), self.store.object_get(candidate_policy_id)
         if base["kind"] != "ResearchPolicy" or candidate["kind"] != "ResearchPolicy":
@@ -523,9 +580,25 @@ class PolicyLabService:
         calibration = None
         if isinstance(predicted, (int, float)) and observed_improvement is not None:
             calibration = observed_improvement - predicted
-        return self.store.object_update(
+        updated = self.store.object_update(
             policy_id,
             {"post_promotion_hindsight": history, "policy_calibration_error": calibration},
             policy["status"],
             "RESEARCH_POLICY_HINDSIGHT_RECORDED",
         )
+        self._create(
+            str(policy["project_id"]),
+            "PolicyHindsight",
+            {
+                "policy_id": policy_id,
+                "predicted_benefit": predicted,
+                "observed_improvement": observed_improvement,
+                "actual_cost": observed_cost,
+                "unexpected_failure": unexpected_failure,
+                "scope": policy["data"].get("applicability", {}).get("scope", "PROJECT"),
+                "calibration_error": calibration,
+            },
+            "RESEARCH_POLICY_HINDSIGHT_RECORDED",
+            "COMPLETED",
+        )
+        return updated

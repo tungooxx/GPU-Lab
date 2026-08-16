@@ -77,6 +77,9 @@ RESEARCH_OBJECT_KINDS = (
     "PolicyRegression",
     "BenchmarkGap",
     "MetaStrategyPattern",
+    "PolicyCanary",
+    "PolicyShadowEvaluation",
+    "PolicyHindsight",
 )
 RESEARCH_OBJECT_STATUSES = {
     "ACTIVE",

@@ -233,6 +233,30 @@ def test_post_promotion_hindsight_is_appended_without_creating_science_records()
 
     assert updated["data"]["post_promotion_hindsight"][0]["observed_improvement"] == 0.2
     assert not [item for item in store.items if item["kind"] in {"WorldModel", "Hypothesis", "EvidenceUnit"}]
+    assert store.objects_list("project", "PolicyHindsight")[0]["data"]["calibration_error"] is None
+
+
+def test_shadow_comparison_preserves_counterfactual_unknown_and_canary_does_not_promote():
+    store = Store()
+    lab = service(store)
+    production = lab.ensure_production_policy("project")
+    candidate = store.object_create(
+        "project",
+        "ResearchPolicy",
+        {**production["data"], "version": 2, "applicability": {"scope": "PROJECT"}},
+        "FIXTURE",
+        "CANDIDATE",
+    )
+
+    canary = lab.start_canary("project", candidate["id"], percentage=10)
+    shadow = lab.record_shadow(
+        "project", production["id"], candidate["id"], "decision-1",
+        {"action_type": "CAUSAL_INTERVENTION"}, {"action_type": "NULL_MODEL_TEST"}, {"label": "HIGH_VALUE"},
+    )
+
+    assert canary["status"] == "ACTIVE"
+    assert lab.ensure_production_policy("project")["id"] == production["id"]
+    assert shadow["data"]["counterfactual_status"] == "COUNTERFACTUAL_UNKNOWN"
 
 
 def test_policy_evaluation_cannot_mutate_production_science(monkeypatch):

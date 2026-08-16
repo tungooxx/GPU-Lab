@@ -1087,6 +1087,35 @@ async def policy_rollback(project_id: str, policy_id: str):
 
 
 @mcp.tool()
+async def policy_canary_start(project_id: str, candidate_policy_id: str, percentage: int = 10):
+    """Start a bounded prospective canary; it does not replace production policy."""
+    return await call(policy_lab().start_canary, project_id, candidate_policy_id, percentage)
+
+
+@mcp.tool()
+async def policy_shadow_record(
+    project_id: str,
+    production_policy_id: str,
+    shadow_policy_id: str,
+    decision_id: str,
+    production_action: dict[str, Any],
+    shadow_action: dict[str, Any],
+    observed_production_result: dict[str, Any] | None = None,
+):
+    """Record a non-executing policy comparison; shadow outcomes remain counterfactually unknown."""
+    return await call(
+        policy_lab().record_shadow,
+        project_id,
+        production_policy_id,
+        shadow_policy_id,
+        decision_id,
+        production_action,
+        shadow_action,
+        observed_production_result,
+    )
+
+
+@mcp.tool()
 async def policy_hindsight_record(
     policy_id: str,
     observed_improvement: float | None,
