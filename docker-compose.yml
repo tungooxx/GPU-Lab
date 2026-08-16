@@ -16,7 +16,12 @@ services:
     networks: [backend]
   gpu-lab:
     build: .
-    env_file: .env
+    # Load the gateway configuration and the mounted research-workspace
+    # environment at container startup. MCP tools never receive filesystem
+    # authority to source either credential file directly.
+    env_file:
+      - .env
+      - ${GPU_LAB_LOCAL_WORKSPACE_HOST:-F:/Newgeneration/VLM}/.env
     environment:
       GPU_LAB_DATA_DIR: /data
       GPU_LAB_DATABASE_URL: sqlite:////data/gpu_lab.db
@@ -60,6 +65,9 @@ services:
     build:
       context: .
       dockerfile: literature.Dockerfile
+    env_file:
+      # Credentials are loaded directly by the isolated worker, never through an MCP tool call.
+      - ${GPU_LAB_LITERATURE_ENV_FILE:-F:/Newgeneration/VLM/.env}
     environment:
       GPU_LAB_LITERATURE_WORKER_TOKEN: ${GPU_LAB_LITERATURE_WORKER_TOKEN:-}
       GPU_LAB_PAPERQA_DIRECTORY: /papers
