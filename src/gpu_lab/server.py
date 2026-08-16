@@ -1945,8 +1945,13 @@ async def research_null_model_test(
 async def research_decision_outcome_assess(
     decision_id: str, assessment: dict, domain: str | None = None
 ):
-    """Persist S_t, A_t, O_t, R_t, S_t+1 and update scoped strategy memory atomically."""
-    return await call(strategy().decision_outcome_assess, decision_id, assessment, domain)
+    """Persist an outcome, then run one bounded event-driven meta-science pass."""
+    result = await call(strategy().decision_outcome_assess, decision_id, assessment, domain)
+    if "error" in result:
+        return result
+    project_id = str(result["outcome"]["project_id"])
+    meta_result = await call(meta_controller().run_once, project_id)
+    return {**result, "meta_research": meta_result}
 
 
 @mcp.tool()
