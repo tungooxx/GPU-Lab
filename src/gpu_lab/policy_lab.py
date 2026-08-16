@@ -454,6 +454,40 @@ class PolicyLabService:
             "POLICY_EXPERIMENT_TRANSFER_CLASSIFIED",
         )
 
+    def evaluate_provider_compatibility(self, project_id: str, provider: str, model: str) -> dict[str, Any]:
+        """Persist a compact adapter-compatibility check without claiming live-model transfer.
+
+        Compiling the canonical policy checks that an adapter can express the
+        invariants.  It is intentionally *not* evidence that the named model
+        follows those instructions; such evidence requires an available model
+        runner and is recorded as cross-model support separately.
+        """
+        policy = self.ensure_production_policy(project_id)
+        normalized = provider.strip().upper()
+        target_provider = {"OPENAI": "OPENAI_API", "ANTHROPIC": "CLAUDE_API"}.get(normalized, normalized)
+        if target_provider not in PROVIDERS:
+            target_provider = "GENERIC"
+        artifact = self.compile_policy(str(policy["id"]), target_provider)
+        return self._create(
+            project_id,
+            "PolicyExperiment",
+            {
+                "baseline_policy_id": str(policy["id"]),
+                "candidate_patch_id": None,
+                "policy_hypothesis_id": None,
+                "benchmark_version": "provider-compatibility-v3",
+                "provider": provider,
+                "model": model,
+                "adapter_provider": target_provider,
+                "compiled_prompt": {key: artifact["data"].get(key) for key in ("content_hash", "compiled_prompt_tokens")},
+                "results": {"adapter_compilation": "PASS", "live_model_evaluation": "UNAVAILABLE"},
+                "transfer_classification": "CROSS_MODEL_UNVERIFIED",
+                "namespace": "BENCHMARK",
+            },
+            "POLICY_COMPATIBILITY_EVALUATED",
+            "CROSS_MODEL_UNVERIFIED",
+        )
+
     def rollback(self, project_id: str, policy_id: str) -> dict[str, Any]:
         target = self.store.object_get(policy_id)
         if target["kind"] != "ResearchPolicy" or str(target["project_id"]) != project_id:

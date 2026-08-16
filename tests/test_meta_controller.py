@@ -32,6 +32,9 @@ class PolicyLab:
     def rollback(self, project_id, policy_id):
         return {"id": policy_id, "status": "PRODUCTION"}
 
+    def evaluate_provider_compatibility(self, project_id, provider, model):
+        return {"id": "compatibility", "data": {"provider": provider, "model": model}}
+
 
 class CampaignPolicyLab(PolicyLab):
     def __init__(self, store):
@@ -109,3 +112,15 @@ def test_model_change_creates_one_compatibility_opportunity():
     assert created["data"]["required_evaluation"] == "COMPACT_COMPATIBILITY_BENCHMARK"
     assert store.objects_list("project", "MetaResearchAgenda")[0]["data"]["required_evaluation"] == "COMPACT_COMPATIBILITY_BENCHMARK"
     assert controller.model_change_detect("project", "openai", "new-model") is None
+
+
+def test_model_change_runs_compatibility_instead_of_mutating_policy():
+    store = Store()
+    controller = MetaResearchController(store, PolicyLab())
+    controller.model_change_detect("project", "openai", "new-model")
+
+    result = controller.run_once("project")
+
+    assert result["decision"] == "COMPATIBILITY_EVALUATED"
+    opportunity = store.objects_list("project", "ImprovementOpportunity")[0]
+    assert opportunity["data"]["compatibility_experiment_id"] == "compatibility"

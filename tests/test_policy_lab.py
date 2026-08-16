@@ -259,6 +259,14 @@ def test_shadow_comparison_preserves_counterfactual_unknown_and_canary_does_not_
     assert shadow["data"]["counterfactual_status"] == "COUNTERFACTUAL_UNKNOWN"
 
 
+def test_provider_compatibility_is_not_claimed_as_cross_model_success():
+    result = service().evaluate_provider_compatibility("project", "openai", "new-model")
+
+    assert result["status"] == "CROSS_MODEL_UNVERIFIED"
+    assert result["data"]["results"]["adapter_compilation"] == "PASS"
+    assert result["data"]["results"]["live_model_evaluation"] == "UNAVAILABLE"
+
+
 def test_policy_evaluation_cannot_mutate_production_science(monkeypatch):
     store = Store()
     lab = service(store)

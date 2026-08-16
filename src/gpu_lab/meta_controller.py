@@ -154,7 +154,14 @@ class MetaResearchController:
 
     def run_once(self, project_id: str) -> dict[str, Any]:
         config = self.config_get(project_id)
-        opportunities = self.detect_opportunities(project_id)
+        self.detect_opportunities(project_id)
+        # Event-driven sources (for example a provider/model change) are
+        # already durable opportunities.  Scheduler passes must consider them
+        # alongside newly detected outcome patterns.
+        opportunities = [
+            item for item in self._objects(project_id, "ImprovementOpportunity")
+            if item["status"] in {"CANDIDATE", "ACTIVE"}
+        ]
         if config["data"].get("paused"):
             return {"decision": "PAUSED", "opportunities": opportunities}
         if not config["data"].get("candidate_budget") or not config["data"].get("benchmark_budget"):
@@ -163,6 +170,19 @@ class MetaResearchController:
         if not viable:
             return {"decision": "NO_CAMPAIGN", "opportunities": opportunities}
         opportunity = max(viable, key=lambda item: item["data"]["expected_value_of_improvement"])
+        if opportunity["data"].get("required_evaluation") == "COMPACT_COMPATIBILITY_BENCHMARK":
+            compatibility = self.policy_lab.evaluate_provider_compatibility(
+                project_id,
+                str(opportunity["data"].get("provider", "GENERIC")),
+                str(opportunity["data"].get("model", "unknown")),
+            )
+            self.store.object_update(
+                str(opportunity["id"]),
+                {"compatibility_experiment_id": str(compatibility["id"])},
+                "COMPLETED",
+                "POLICY_COMPATIBILITY_EVALUATED",
+            )
+            return {"decision": "COMPATIBILITY_EVALUATED", "opportunities": opportunities, "compatibility": compatibility}
         budget = {key: config["data"][key] for key in self.defaults if key != "mode"}
         result = self.policy_lab.improve(
             project_id,
@@ -219,6 +239,6 @@ class MetaResearchController:
         fingerprint = f"model-change:{provider}:{model}"
         if self._find_by_fingerprint(project_id, "ImprovementOpportunity", fingerprint):
             return None
-        opportunity = self.store.object_create(project_id, "ImprovementOpportunity", {"source": "MODEL_CHANGE", "target_component": "provider_adapter", "observed_failure": f"Provider/model changed to {provider}:{model}; policy compatibility is unverified.", "supporting_evidence": [], "frequency": 1, "severity": 1, "scientific_cost": 0.0, "compute_cost": 0.0, "confidence": 1.0, "estimated_fixability": 0.5, "expected_value_of_improvement": 0.4, "scope": "PROJECT", "fingerprint": fingerprint, "required_evaluation": "COMPACT_COMPATIBILITY_BENCHMARK"}, "IMPROVEMENT_OPPORTUNITY_CREATED", "CANDIDATE")
+        opportunity = self.store.object_create(project_id, "ImprovementOpportunity", {"source": "MODEL_CHANGE", "target_component": "provider_adapter", "provider": provider, "model": model, "observed_failure": f"Provider/model changed to {provider}:{model}; policy compatibility is unverified.", "supporting_evidence": [], "frequency": 1, "severity": 1, "scientific_cost": 0.0, "compute_cost": 0.0, "confidence": 1.0, "estimated_fixability": 0.5, "expected_value_of_improvement": 0.4, "scope": "PROJECT", "fingerprint": fingerprint, "required_evaluation": "COMPACT_COMPATIBILITY_BENCHMARK"}, "IMPROVEMENT_OPPORTUNITY_CREATED", "CANDIDATE")
         self._ensure_meta_records(project_id, opportunity)
         return opportunity
