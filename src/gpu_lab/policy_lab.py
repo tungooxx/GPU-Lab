@@ -684,6 +684,7 @@ class PolicyLabService:
         observed_improvement: float | None,
         observed_cost: float | None,
         unexpected_failure: str | None = None,
+        decision_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         """Record post-promotion operational evidence without changing scientific state."""
         policy = self.store.object_get(policy_id)
@@ -692,6 +693,7 @@ class PolicyLabService:
         history = list(policy["data"].get("post_promotion_hindsight", []))
         history.append({
             "recorded_at": datetime.now(UTC).isoformat(),
+            "decision_ids": decision_ids or [],
             "observed_improvement": observed_improvement,
             "observed_cost": observed_cost,
             "unexpected_failure": unexpected_failure,
@@ -711,6 +713,7 @@ class PolicyLabService:
             "PolicyHindsight",
             {
                 "policy_id": policy_id,
+                "decision_ids": decision_ids or [],
                 "predicted_benefit": predicted,
                 "observed_improvement": observed_improvement,
                 "actual_cost": observed_cost,

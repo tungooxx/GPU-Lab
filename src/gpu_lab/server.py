@@ -1202,6 +1202,7 @@ async def policy_hindsight_record(
     observed_improvement: float | None,
     observed_cost: float | None,
     unexpected_failure: str | None = None,
+    decision_ids: list[str] | None = None,
 ):
     """Record post-promotion policy calibration data without changing scientific state."""
     result = await call(
@@ -1210,6 +1211,7 @@ async def policy_hindsight_record(
         observed_improvement,
         observed_cost,
         unexpected_failure,
+        decision_ids,
     )
     if "error" in result:
         return result

@@ -248,9 +248,10 @@ def test_post_promotion_hindsight_is_appended_without_creating_science_records()
     lab = service(store)
     policy = lab.ensure_production_policy("project")
 
-    updated = lab.record_hindsight(policy["id"], observed_improvement=0.2, observed_cost=1.1)
+    updated = lab.record_hindsight(policy["id"], observed_improvement=0.2, observed_cost=1.1, decision_ids=["decision-1"])
 
     assert updated["data"]["post_promotion_hindsight"][0]["observed_improvement"] == 0.2
+    assert updated["data"]["post_promotion_hindsight"][0]["decision_ids"] == ["decision-1"]
     assert not [item for item in store.items if item["kind"] in {"WorldModel", "Hypothesis", "EvidenceUnit"}]
     assert store.objects_list("project", "PolicyHindsight")[0]["data"]["calibration_error"] is None
 
