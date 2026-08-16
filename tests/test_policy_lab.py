@@ -341,6 +341,10 @@ def test_evaluator_tampering_is_rejected_before_benchmark():
 
     assert result["decision"] == "INVALID_EVALUATION"
     assert not [item for item in store.items if item["kind"] == "PolicyExperiment"]
+    audit = store.objects_list("project", "PolicyEvaluationAudit")[0]
+    assert audit["data"]["reason_type"] == "INVALID_POLICY_EXPERIMENT"
+    assert audit["data"]["leakage_audit"] == "PASS"
+    assert audit["data"]["evaluator_integrity"] == "PRESERVED"
 
 
 def test_provider_compilation_preserves_canonical_invariants():

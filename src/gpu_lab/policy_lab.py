@@ -282,8 +282,29 @@ class PolicyLabService:
             baseline_policy = self.store.object_get(patch["data"]["base_policy_id"])
             baseline_prompt = self._compile(baseline_policy, "GENERIC")
             candidate_prompt = self._candidate_prompt(baseline_policy, patch)
-        except GPUError:
-            implementation = None
+        except GPUError as exc:
+            audit = self._create(
+                project_id,
+                "PolicyEvaluationAudit",
+                {
+                    "patch_id": patch_id,
+                    "outcome": "REJECTED_BEFORE_EVALUATION",
+                    "reason_type": exc.error_type,
+                    "reason": exc.message,
+                    "held_out_access": "NONE",
+                    "evaluator_integrity": "PRESERVED",
+                    "leakage_audit": "PASS",
+                },
+                "POLICY_EVALUATOR_FIREWALL_AUDITED",
+                "COMPLETED",
+            )
+            updated = self.store.object_update(
+                patch_id,
+                {"invalid_evaluation_reason": exc.error_type, "evaluation_audit_id": str(audit["id"])},
+                "INVALID_EVALUATION",
+                "POLICY_PATCH_INVALID",
+            )
+            return {"patch": updated, "decision": "INVALID_EVALUATION", "reason": exc.error_type, "audit": audit}
         if not patch["data"].get("semantic_change") or not isinstance(implementation, dict) or not implementation.get("enabled"):
             updated = self.store.object_update(
                 patch_id,
