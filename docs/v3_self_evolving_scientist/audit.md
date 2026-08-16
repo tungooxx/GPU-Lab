@@ -79,6 +79,12 @@ The controller also records an explicit science-vs-meta scheduling decision.
 A materially higher-priority unresolved domain agenda item defers a modest
 meta campaign; repeated severe invalid outcomes can still preempt that deferral.
 
+At every fifth scientific decision, the durable process-only postmortem now
+turns repeated low-value action families into bounded `META_REVIEW`
+opportunities. The `MetaLesson` is merely a trigger: each opportunity retains
+the underlying `ResearchDecisionOutcome` ids and cannot treat derived review
+text as independent evidence.
+
 `tests/test_meta_controller.py` includes an autonomous improvement acceptance
 sequence: repeated LOW_VALUE outcomes launch a project-scoped campaign without
 manual `/improve`, promote a held-out supported policy, record prospective

@@ -78,6 +78,35 @@ async def test_hindsight_event_automatically_checks_calibration_and_regressions(
     assert result["policy_regressions"] == ["regression"]
 
 
+def test_meta_review_creates_bounded_opportunity_from_original_outcome_evidence():
+    store = Store()
+    controller = MetaResearchController(store, PolicyLab())
+    outcomes = [
+        store.object_create(
+            "project",
+            "ResearchDecisionOutcome",
+            {"label": "LOW_VALUE", "action_type": "DIAGNOSTIC"},
+            "FIXTURE",
+            "RESULT_INSPECTED",
+        )
+        for _ in range(2)
+    ]
+    lesson = store.object_create(
+        "project",
+        "MetaLesson",
+        {"repeated_low_value_action_types": ["DIAGNOSTIC"]},
+        "FIXTURE",
+        "COMPLETED",
+    )
+
+    created = controller.postmortem_opportunities("project", lesson["id"])
+
+    assert created[0]["data"]["source"] == "META_REVIEW"
+    assert created[0]["data"]["meta_lesson_id"] == lesson["id"]
+    assert created[0]["data"]["supporting_evidence"] == [item["id"] for item in outcomes]
+    assert controller.postmortem_opportunities("project", lesson["id"]) == []
+
+
 class CampaignPolicyLab(PolicyLab):
     def __init__(self, store):
         self.store = store

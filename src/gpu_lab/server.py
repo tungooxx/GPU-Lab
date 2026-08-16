@@ -457,12 +457,19 @@ async def run_meta_research(project_id: str) -> dict[str, Any]:
     progress = await call(meta_research().progress, project_id)
     decisions = int(progress.get("metrics", {}).get("scientific_decisions_total", 0)) if isinstance(progress, dict) else 0
     postmortem = None
+    postmortem_opportunities = []
     if decisions and decisions % 5 == 0:
         postmortem = await call(meta_research().meta_review, project_id)
+        if "error" not in postmortem:
+            postmortem_opportunities = await call(
+                meta_controller().postmortem_opportunities,
+                project_id,
+                str(postmortem["id"]),
+            )
     result = await call(meta_controller().run_once, project_id)
     request = result.get("literature_request") if isinstance(result, dict) else None
     if not request:
-        return {**result, "postmortem": postmortem}
+        return {**result, "postmortem": postmortem, "postmortem_opportunities": postmortem_opportunities}
     if settings.gpu_lab_literature_provider != "paperqa-http":
         deferred = await call(
             research().object_update,
@@ -471,7 +478,7 @@ async def run_meta_research(project_id: str) -> dict[str, Any]:
             "DEFERRED",
             "LITERATURE_SCOUT_DEFERRED",
         )
-        return {**result, "postmortem": postmortem, "literature_scout": {"status": "DEFERRED", "request": deferred}}
+        return {**result, "postmortem": postmortem, "postmortem_opportunities": postmortem_opportunities, "literature_scout": {"status": "DEFERRED", "request": deferred}}
     gathered = await call(literature().gather, project_id, request["data"]["question"])
     if "error" in gathered:
         deferred = await call(
@@ -481,7 +488,7 @@ async def run_meta_research(project_id: str) -> dict[str, Any]:
             "DEFERRED",
             "LITERATURE_SCOUT_DEFERRED",
         )
-        return {**result, "postmortem": postmortem, "literature_scout": {"status": "UNAVAILABLE", "request": deferred}}
+        return {**result, "postmortem": postmortem, "postmortem_opportunities": postmortem_opportunities, "literature_scout": {"status": "UNAVAILABLE", "request": deferred}}
     completed = await call(
         research().object_update,
         str(request["id"]),
@@ -495,7 +502,7 @@ async def run_meta_research(project_id: str) -> dict[str, Any]:
         str(request["id"]),
         [str(item["id"]) for item in gathered.get("evidence", [])],
     )
-    return {**result, "postmortem": postmortem, "literature_scout": {"status": "COMPLETED", "request": completed, "gathered": gathered, "policy_transfers": transfers}}
+    return {**result, "postmortem": postmortem, "postmortem_opportunities": postmortem_opportunities, "literature_scout": {"status": "COMPLETED", "request": completed, "gathered": gathered, "policy_transfers": transfers}}
 
 
 def executable_papers() -> ExecutablePaperService:

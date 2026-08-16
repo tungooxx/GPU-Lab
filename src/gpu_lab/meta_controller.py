@@ -511,6 +511,65 @@ class MetaResearchController:
             return existing
         return self.store.object_create(project_id, "PolicyRankerReadiness", {"fingerprint": fingerprint, **payload}, "POLICY_RANKER_READINESS_ASSESSED", "COMPLETED")
 
+    def postmortem_opportunities(self, project_id: str, lesson_id: str) -> list[dict[str, Any]]:
+        """Turn a bounded meta-review pattern into evidence-backed opportunities.
+
+        The derived MetaLesson is only a trigger. The opportunity preserves the
+        original outcome ids, so it cannot be mistaken for independent evidence.
+        """
+        lesson = self.store.object_get(lesson_id)
+        if lesson["kind"] != "MetaLesson" or str(lesson["project_id"]) != str(project_id):
+            raise GPUError("META_LESSON_REQUIRED", lesson_id)
+        outcomes = self._objects(project_id, "ResearchDecisionOutcome")
+        created = []
+        for action in lesson["data"].get("repeated_low_value_action_types", [])[:3]:
+            evidence = [
+                str(item["id"])
+                for item in outcomes
+                if str(item["data"].get("action_type", "UNKNOWN")) == str(action)
+                and item["data"].get("label") in {"LOW_VALUE", "ZERO_INFORMATION", "REDUNDANT", "PREMATURE", "INVALID"}
+            ]
+            if len(evidence) < 2 or any(
+                item["status"] in {"CANDIDATE", "ACTIVE"}
+                and str(item["data"].get("action_type", "")) == str(action)
+                for item in self._objects(project_id, "ImprovementOpportunity")
+            ):
+                continue
+            fingerprint = f"meta-review:{lesson_id}:{action}"
+            if self._find_by_fingerprint(project_id, "ImprovementOpportunity", fingerprint):
+                continue
+            severity = sum(
+                self.store.object_get(item_id)["data"].get("label") in {"PREMATURE", "INVALID"}
+                for item_id in evidence
+            )
+            opportunity = self.store.object_create(
+                project_id,
+                "ImprovementOpportunity",
+                {
+                    "source": "META_REVIEW",
+                    "meta_lesson_id": lesson_id,
+                    "target_component": "experiment_selection",
+                    "action_type": str(action),
+                    "observed_failure": f"Meta-review confirmed repeated low-value {action} decisions.",
+                    "supporting_evidence": evidence,
+                    "frequency": len(evidence),
+                    "severity": severity,
+                    "scientific_cost": len(evidence),
+                    "compute_cost": 0.0,
+                    "confidence": min(0.95, 0.35 + len(evidence) * 0.15),
+                    "estimated_fixability": 0.5,
+                    "expected_value_of_improvement": round((len(evidence) + severity * 2) * 0.2, 3),
+                    "scope": "PROJECT",
+                    "fingerprint": fingerprint,
+                    "derived_trigger": "MetaLesson; original outcomes retained as supporting evidence.",
+                },
+                "IMPROVEMENT_OPPORTUNITY_CREATED",
+                "CANDIDATE",
+            )
+            self._ensure_meta_records(project_id, opportunity)
+            created.append(opportunity)
+        return created
+
     def detect_opportunities(self, project_id: str) -> list[dict[str, Any]]:
         outcomes = self._objects(project_id, "ResearchDecisionOutcome")
         grouped: dict[str, list[dict[str, Any]]] = {}
@@ -529,7 +588,7 @@ class MetaResearchController:
                 continue
             frequency, severity = len(records), sum(record["data"].get("label") in {"PREMATURE", "INVALID"} for record in records)
             expected_value = round((frequency + severity * 2) * 0.2, 3)
-            opportunity = self.store.object_create(project_id, "ImprovementOpportunity", {"source": "DECISION_OUTCOME", "target_component": "experiment_selection", "observed_failure": f"Repeated {action} decisions have low or invalid information value.", "supporting_evidence": [str(r["id"]) for r in records], "frequency": frequency, "severity": severity, "scientific_cost": frequency, "compute_cost": 0.0, "confidence": min(0.95, 0.3 + frequency * 0.15), "estimated_fixability": 0.5, "expected_value_of_improvement": expected_value, "scope": "PROJECT", "fingerprint": fingerprint}, "IMPROVEMENT_OPPORTUNITY_CREATED", "CANDIDATE")
+            opportunity = self.store.object_create(project_id, "ImprovementOpportunity", {"source": "DECISION_OUTCOME", "target_component": "experiment_selection", "action_type": action, "observed_failure": f"Repeated {action} decisions have low or invalid information value.", "supporting_evidence": [str(r["id"]) for r in records], "frequency": frequency, "severity": severity, "scientific_cost": frequency, "compute_cost": 0.0, "confidence": min(0.95, 0.3 + frequency * 0.15), "estimated_fixability": 0.5, "expected_value_of_improvement": expected_value, "scope": "PROJECT", "fingerprint": fingerprint}, "IMPROVEMENT_OPPORTUNITY_CREATED", "CANDIDATE")
             self._ensure_meta_records(project_id, opportunity)
             opportunities.append(opportunity)
         return opportunities
