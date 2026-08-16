@@ -2216,6 +2216,63 @@ class ResearchStore:
                     "VALUES(%s,%s,'ResearchDecisionOutcome','RESULT_INSPECTED',%s,%s)",
                     (outcome_id, project_id, json.dumps(materialized_outcome), now),
                 )
+
+            # A failure-analysis decision is a terminal inspection of its linked
+            # failed run, even though it deliberately produces no scientific
+            # evidence. Preserve the execution status and add the normal
+            # inspection marker so INSPECT_FAILURE is not selected indefinitely.
+            technically_inspected_runs: list[dict[str, Any]] = []
+            try:
+                run_ids = sorted(
+                    {
+                        str(uuid.UUID(str(run_id)))
+                        for run_id in outcome_data.get("experiment_run_ids", [])
+                    }
+                )
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise GPUError("INVALID_RESEARCH_OBJECT_ID", str(exc)) from exc
+            if run_ids:
+                cur.execute(
+                    "SELECT id,project_id,kind,status,data FROM research_objects "
+                    "WHERE id=ANY(%s::uuid[]) FOR UPDATE",
+                    (run_ids,),
+                )
+                runs = {str(item["id"]): item for item in cur.fetchall()}
+                for run_id in run_ids:
+                    run = runs.get(run_id)
+                    if not run:
+                        raise GPUError("RESEARCH_OBJECT_NOT_FOUND", run_id)
+                    if run["kind"] != "ExperimentRun":
+                        raise GPUError("NOT_AN_EXPERIMENTRUN", run_id)
+                    if str(run["project_id"]) != project_id:
+                        raise GPUError("RESEARCH_PROJECT_MISMATCH", run_id)
+                    if run["status"] not in {"failed", "cancelled", "unknown"}:
+                        continue
+                    if run["data"].get("inspection") is not None:
+                        continue
+                    inspection_data = {
+                        "inspection_kind": "TECHNICAL_FAILURE",
+                        "decision_id": decision_id,
+                        "decision_outcome_id": str(outcome_id),
+                        "assessed_at": now.isoformat(),
+                        "execution_status": run["status"],
+                        "scientific_result": "NOT_ASSESSED",
+                    }
+                    run_data = _json_document({**run["data"], "inspection": inspection_data})
+                    cur.execute(
+                        "UPDATE research_objects SET data=%s WHERE id=%s",
+                        (json.dumps(run_data), run_id),
+                    )
+                    self._event(
+                        cur,
+                        project_id,
+                        "EXPERIMENT_FAILURE_INSPECTED",
+                        run_id,
+                        inspection_data,
+                    )
+                    technically_inspected_runs.append(
+                        {"id": run_id, "status": run["status"], "data": run_data}
+                    )
             self._event(
                 cur,
                 project_id,
@@ -2600,6 +2657,7 @@ class ResearchStore:
                 "data": after_situation_data,
             },
             "strategy_patterns": patterns,
+            "technically_inspected_experiment_runs": technically_inspected_runs,
         }
 
     @staticmethod
