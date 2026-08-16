@@ -1004,6 +1004,12 @@ async def policy_compare(base_policy_id: str, candidate_policy_id: str):
 
 
 @mcp.tool()
+async def policy_export(policy_id: str, provider: str | None = None):
+    """Export a portable policy representation without applying or compiling executable text."""
+    return await call(policy_lab().export_policy, policy_id, provider)
+
+
+@mcp.tool()
 async def policy_experiment_get(policy_experiment_id: str):
     """Retrieve an isolated meta-research PolicyExperiment."""
     return await call(research().object_get, policy_experiment_id)

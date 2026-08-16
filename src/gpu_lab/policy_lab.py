@@ -373,3 +373,30 @@ class PolicyLabService:
             raise GPUError("NOT_A_RESEARCH_POLICY", "Both IDs must be ResearchPolicy records")
         changed = {key: {"from": base["data"].get(key), "to": candidate["data"].get(key)} for key in sorted(set(base["data"]) | set(candidate["data"])) if base["data"].get(key) != candidate["data"].get(key)}
         return {"base_policy_id": base_policy_id, "candidate_policy_id": candidate_policy_id, "changes": changed}
+
+    def export_policy(self, policy_id: str, provider: str | None = None) -> dict[str, Any]:
+        """Export a portable semantic policy; adapters are data, never instructions to execute."""
+        policy = self.store.object_get(policy_id)
+        if policy["kind"] != "ResearchPolicy":
+            raise GPUError("NOT_A_RESEARCH_POLICY", policy_id)
+        adapter_name = (provider or "generic").strip().lower()
+        adapter = policy["data"].get("provider_adapters", {}).get(adapter_name, {})
+        experiments = self._objects(str(policy["project_id"]), "PolicyExperiment")
+        scorecards = [
+            {"id": str(experiment["id"]), "decision": experiment["data"].get("decision"), "results": experiment["data"].get("results")}
+            for experiment in experiments
+            if experiment["data"].get("baseline_policy_id") == policy_id
+        ]
+        return {
+            "policy_id": policy_id,
+            "version": policy["data"].get("version"),
+            "semantic_policy": {
+                key: value
+                for key, value in policy["data"].items()
+                if key.endswith("_policy") or key in {"applicability", "known_failure_modes"}
+            },
+            "provider_compiled_form": {"provider": adapter_name, "adapter": adapter},
+            "benchmark_scorecards": scorecards,
+            "provenance": policy["data"].get("provenance", {}),
+            "known_limitations": policy["data"].get("known_failure_modes", []),
+        }

@@ -180,3 +180,16 @@ def test_improve_records_invalid_patch_without_assuming_an_experiment(monkeypatc
 
     assert len(result["improvement_run"]["data"]["invalid_patch_ids"]) == 3
     assert result["improvement_run"]["data"]["evaluation_ids"] == []
+
+
+def test_policy_export_is_provider_neutral_and_does_not_mutate_policy():
+    store = Store()
+    lab = service(store)
+    policy = lab.ensure_production_policy("project")
+    policy["data"]["provider_adapters"] = {"codex": {"format": "structured"}}
+
+    exported = lab.export_policy(policy["id"], "codex")
+
+    assert exported["provider_compiled_form"] == {"provider": "codex", "adapter": {"format": "structured"}}
+    assert exported["semantic_policy"]["decision_policy"]["falsification_first"] is True
+    assert policy["status"] == "PRODUCTION"
