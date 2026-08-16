@@ -53,6 +53,13 @@ def test_user_idea_auto_evaluates_and_leaves_production_unchanged():
     assert all(item["data"]["namespace"] == "BENCHMARK" for item in store.items if item["kind"] == "PolicyExperiment")
 
 
+def test_improvement_budget_bounds_candidates_and_revisions():
+    result = service().improve("project", idea="Improve discrimination", candidate_budget=1, max_revisions=0)
+
+    assert len(result["hypotheses"]) == 1
+    assert result["improvement_run"]["data"]["budget"] == {"candidate_budget": 1, "max_revisions": 0}
+
+
 def test_duplicate_failed_policy_is_rejected_before_evaluation():
     store = Store()
     lab = service(store)

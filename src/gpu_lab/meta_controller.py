@@ -12,7 +12,18 @@ class MetaResearchController:
 
     def __init__(self, store, policy_lab, *, mode: str = "ADVISORY", candidate_budget: int = 3, benchmark_budget: int = 6, literature_budget: int = 1):
         self.store, self.policy_lab = store, policy_lab
-        self.defaults = {"mode": mode, "candidate_budget": candidate_budget, "benchmark_budget": benchmark_budget, "literature_budget": literature_budget, "max_revision_rounds": 3}
+        self.defaults = {
+            "mode": mode,
+            "candidate_budget": candidate_budget,
+            "benchmark_budget": benchmark_budget,
+            "literature_budget": literature_budget,
+            "max_revision_rounds": 3,
+            "token_budget": 12_000,
+            "llm_call_budget": 12,
+            "engineering_budget": 0,
+            "wall_clock_iteration_budget": 3,
+            "gpu_budget": 0.0,
+        }
 
     def _objects(self, project_id: str, kind: str) -> list[dict[str, Any]]:
         return self.store.objects_list(project_id, kind, limit=None)
@@ -82,12 +93,22 @@ class MetaResearchController:
 
     def config_update(self, project_id: str, update: dict[str, Any]) -> dict[str, Any]:
         config = self.config_get(project_id)
-        allowed = {"mode", "paused", "pinned_policy_id", "candidate_budget", "benchmark_budget", "literature_budget", "max_revision_rounds"}
+        allowed = {
+            "mode", "paused", "pinned_policy_id", "candidate_budget", "benchmark_budget",
+            "literature_budget", "max_revision_rounds", "token_budget", "llm_call_budget",
+            "engineering_budget", "wall_clock_iteration_budget", "gpu_budget",
+        }
         if not isinstance(update, dict) or set(update) - allowed:
             raise GPUError("POLICY_AUTONOMY_CONFIG_INVALID", "unsupported autonomy setting")
         mode = str(update.get("mode", config["data"]["mode"])).upper()
         if mode not in {"ADVISORY", "AUTO_PROJECT", "AUTO_DOMAIN", "AUTO_GLOBAL"}:
             raise GPUError("POLICY_AUTONOMY_MODE_INVALID", mode)
+        non_negative = {
+            "candidate_budget", "benchmark_budget", "literature_budget", "max_revision_rounds",
+            "token_budget", "llm_call_budget", "engineering_budget", "wall_clock_iteration_budget", "gpu_budget",
+        }
+        if any(not isinstance(update[key], (int, float)) or isinstance(update[key], bool) or update[key] < 0 for key in non_negative & set(update)):
+            raise GPUError("POLICY_AUTONOMY_CONFIG_INVALID", "budgets must be non-negative numbers")
         return self.store.object_update(str(config["id"]), update, "ACTIVE", "POLICY_AUTONOMY_CONFIG_UPDATED")
 
     def detect_opportunities(self, project_id: str) -> list[dict[str, Any]]:
@@ -118,12 +139,23 @@ class MetaResearchController:
         opportunities = self.detect_opportunities(project_id)
         if config["data"].get("paused"):
             return {"decision": "PAUSED", "opportunities": opportunities}
+        if not config["data"].get("candidate_budget") or not config["data"].get("benchmark_budget"):
+            return {"decision": "BUDGET_EXHAUSTED", "opportunities": opportunities}
         viable = [item for item in opportunities if item["data"]["expected_value_of_improvement"] >= 0.4]
         if not viable:
             return {"decision": "NO_CAMPAIGN", "opportunities": opportunities}
         opportunity = max(viable, key=lambda item: item["data"]["expected_value_of_improvement"])
-        result = self.policy_lab.improve(project_id, failure=opportunity["data"]["observed_failure"], component=opportunity["data"]["target_component"])
-        self.store.object_update(str(opportunity["id"]), {"improvement_run_id": str(result["improvement_run"]["id"])}, "COMPLETED", "META_RESEARCH_STARTED")
+        budget = {key: config["data"][key] for key in self.defaults if key != "mode"}
+        result = self.policy_lab.improve(
+            project_id,
+            failure=opportunity["data"]["observed_failure"],
+            component=opportunity["data"]["target_component"],
+            candidate_budget=int(config["data"]["candidate_budget"]),
+            max_revisions=int(config["data"]["max_revision_rounds"]),
+        )
+        run_id = str(result["improvement_run"]["id"])
+        self.store.object_update(run_id, {"meta_campaign": {"trigger": str(opportunity["id"]), "target_component": opportunity["data"]["target_component"], "scope": opportunity["data"]["scope"], "budget": budget, "stop_conditions": ["candidate budget exhausted", "benchmark budget exhausted", "hard epistemic regression", "revision limit reached"]}}, "COMPLETED", "META_RESEARCH_BUDGET_RECORDED")
+        self.store.object_update(str(opportunity["id"]), {"improvement_run_id": run_id}, "COMPLETED", "META_RESEARCH_STARTED")
         promoted = None
         best_patch = result["improvement_run"]["data"].get("best_supported_patch_id")
         if config["data"]["mode"] == "AUTO_PROJECT" and result["recommendation"] == "PROMOTE" and best_patch:

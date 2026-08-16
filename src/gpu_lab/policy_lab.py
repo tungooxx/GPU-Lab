@@ -191,13 +191,13 @@ class PolicyLabService:
             "regression_risks": ["scope_error_rate", "expected_cost"], "cost_expectation": "LOW",
         }
 
-    def _hypotheses_for(self, project_id: str, source_type: str, problem: str, component: str) -> list[dict[str, Any]]:
+    def _hypotheses_for(self, project_id: str, source_type: str, problem: str, component: str, *, limit: int = 3) -> list[dict[str, Any]]:
         changes = [
             "Require an explicit hypothesis-outcome matrix for competing mechanisms.",
             "Require a runner-up action comparison before selecting repeated diagnostics.",
             "Require a null-focused critic when a cheap falsifier is available.",
         ]
-        return [self._create(project_id, "PolicyHypothesis", self._hypothesis_payload(source_type, problem, change, component), "POLICY_HYPOTHESIS_CREATED", "CANDIDATE") for change in changes]
+        return [self._create(project_id, "PolicyHypothesis", self._hypothesis_payload(source_type, problem, change, component), "POLICY_HYPOTHESIS_CREATED", "CANDIDATE") for change in changes[:limit]]
 
     def _duplicate_negative(self, project_id: str, semantic_change: str) -> dict[str, Any] | None:
         fingerprint = self._fingerprint(semantic_change)
@@ -355,9 +355,9 @@ class PolicyLabService:
             self._create(project_id, "PolicyNegativeResult", {"proposal": patch_id, "source": "automatic benchmark", "expected_improvement": patch["data"]["expected_effect"], "observed_result": aggregate, "failure_mode": "hard benchmark regression", "regressions": regressions, "benchmark_scope": "development", "models_tested": ["deterministic-policy-runner"], "revisit_condition": "materially different mechanism", "related_policy_patches": [patch_id], "semantic_fingerprint": patch["data"]["semantic_fingerprint"]}, "POLICY_NEGATIVE_RESULT_CREATED", "REJECTED")
         return {"patch": updated, "experiment": experiment, "decision": status}
 
-    def _revise(self, project_id: str, rejected_patch: dict[str, Any]) -> dict[str, Any] | None:
+    def _revise(self, project_id: str, rejected_patch: dict[str, Any], *, max_revisions: int | None = None) -> dict[str, Any] | None:
         revision = int(rejected_patch["data"].get("revision_count", 0)) + 1
-        if revision > self.max_revisions:
+        if revision > (self.max_revisions if max_revisions is None else max_revisions):
             return None
         data = {
             **rejected_patch["data"],
@@ -368,7 +368,11 @@ class PolicyLabService:
         data["semantic_fingerprint"] = self._fingerprint(data["semantic_change"])
         return self._create(project_id, "ResearchPolicyPatch", data, "POLICY_PATCH_REVISED", "CANDIDATE")
 
-    def improve(self, project_id: str, *, idea: str | None = None, paper: str | None = None, failure: str | None = None, component: str | None = None, search: bool = False, prompt: bool = False) -> dict[str, Any]:
+    def improve(self, project_id: str, *, idea: str | None = None, paper: str | None = None, failure: str | None = None, component: str | None = None, search: bool = False, prompt: bool = False, candidate_budget: int | None = None, max_revisions: int | None = None) -> dict[str, Any]:
+        if candidate_budget is not None and candidate_budget < 1:
+            raise GPUError("POLICY_CANDIDATE_BUDGET_EXHAUSTED", "candidate_budget must be at least one")
+        if max_revisions is not None and max_revisions < 0:
+            raise GPUError("POLICY_REVISION_BUDGET_INVALID", "max_revisions must be non-negative")
         policy = self.ensure_production_policy(project_id)
         source_type = "USER_IDEA" if idea else "PAPER" if paper else "BENCHMARK_FAILURE" if failure else "INTERNAL_META_REVIEW"
         problem = idea or failure or (
@@ -377,7 +381,7 @@ class PolicyLabService:
             else "Repeated closed-cycle low-value research decisions"
         )
         weaknesses = [] if (idea or paper or failure) else self.detect_weaknesses(project_id, component)
-        hypotheses = self._hypotheses_for(project_id, source_type, problem, component or "experiment_selection")
+        hypotheses = self._hypotheses_for(project_id, source_type, problem, component or "experiment_selection", limit=candidate_budget or 3)
         patches = [self._patch(project_id, policy, h) for h in hypotheses]
         if prompt:
             for patch in patches:
@@ -385,7 +389,7 @@ class PolicyLabService:
         evaluations = [self.evaluate(project_id, str(p["id"])) for p in patches] if self.auto_evaluate else []
         if self.auto_revise:
             revisions = [
-                self._revise(project_id, evaluation["patch"])
+                self._revise(project_id, evaluation["patch"], max_revisions=max_revisions)
                 for evaluation in evaluations
                 if evaluation["decision"] == "REJECTED"
             ]
@@ -393,7 +397,7 @@ class PolicyLabService:
             patches.extend(revisions)
             evaluations.extend(self.evaluate(project_id, str(patch["id"])) for patch in revisions)
         supported = [e for e in evaluations if e["decision"] == "SUPPORTED_ON_BENCHMARK"]
-        run = self._create(project_id, "ImprovementRun", {"input": {"idea": idea, "paper": paper, "failure": failure, "component": component, "search": search, "prompt": prompt}, "base_policy_id": str(policy["id"]), "weakness_ids": [str(w["id"]) for w in weaknesses], "hypothesis_ids": [str(h["id"]) for h in hypotheses], "patch_ids": [str(p["id"]) for p in patches], "evaluation_ids": [str(e["experiment"]["id"]) for e in evaluations if e.get("experiment")], "invalid_patch_ids": [str(e["patch"]["id"]) for e in evaluations if e["decision"] == "INVALID_EVALUATION"], "best_supported_patch_id": str(supported[0]["patch"]["id"]) if supported else None, "recommendation": "PROMOTE" if supported else "REJECT_OR_REVISE", "production_unchanged": True, "namespace": "META_RESEARCH"}, "IMPROVEMENT_RUN_COMPLETED", "COMPLETED")
+        run = self._create(project_id, "ImprovementRun", {"input": {"idea": idea, "paper": paper, "failure": failure, "component": component, "search": search, "prompt": prompt}, "budget": {"candidate_budget": candidate_budget or 3, "max_revisions": self.max_revisions if max_revisions is None else max_revisions}, "base_policy_id": str(policy["id"]), "weakness_ids": [str(w["id"]) for w in weaknesses], "hypothesis_ids": [str(h["id"]) for h in hypotheses], "patch_ids": [str(p["id"]) for p in patches], "evaluation_ids": [str(e["experiment"]["id"]) for e in evaluations if e.get("experiment")], "invalid_patch_ids": [str(e["patch"]["id"]) for e in evaluations if e["decision"] == "INVALID_EVALUATION"], "best_supported_patch_id": str(supported[0]["patch"]["id"]) if supported else None, "recommendation": "PROMOTE" if supported else "REJECT_OR_REVISE", "production_unchanged": True, "namespace": "META_RESEARCH"}, "IMPROVEMENT_RUN_COMPLETED", "COMPLETED")
         return {"improvement_run": run, "production_policy_id": str(policy["id"]), "weaknesses": weaknesses, "hypotheses": hypotheses, "patches": patches, "evaluations": evaluations, "recommendation": run["data"]["recommendation"]}
 
     def promote(self, project_id: str, patch_id: str) -> dict[str, Any]:

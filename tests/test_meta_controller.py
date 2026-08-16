@@ -33,6 +33,17 @@ class PolicyLab:
         return {"id": policy_id, "status": "PRODUCTION"}
 
 
+class CampaignPolicyLab(PolicyLab):
+    def __init__(self, store):
+        self.store = store
+        self.kwargs = None
+
+    def improve(self, project_id, **kwargs):
+        self.kwargs = kwargs
+        run = self.store.object_create(project_id, "ImprovementRun", {"best_supported_patch_id": None}, "FIXTURE", "COMPLETED")
+        return {"recommendation": "REJECT_OR_REVISE", "improvement_run": run}
+
+
 def test_recurring_bad_outcomes_create_one_durable_opportunity():
     store = Store()
     controller = MetaResearchController(store, PolicyLab())
@@ -58,6 +69,22 @@ def test_paused_autonomy_never_starts_campaign():
         store.object_create("project", "ResearchDecisionOutcome", {"label": "INVALID", "action_type": "TRAINING_RUN"}, "FIXTURE", "RESULT_INSPECTED")
 
     assert controller.run_once("project")["decision"] == "PAUSED"
+
+
+def test_campaign_records_bounded_budget_and_passes_limits_to_policy_lab():
+    store = Store()
+    lab = CampaignPolicyLab(store)
+    controller = MetaResearchController(store, lab)
+    controller.config_update("project", {"candidate_budget": 1, "max_revision_rounds": 0, "token_budget": 100})
+    for _ in range(2):
+        store.object_create("project", "ResearchDecisionOutcome", {"label": "LOW_VALUE", "action_type": "DIAGNOSTIC"}, "FIXTURE", "RESULT_INSPECTED")
+
+    result = controller.run_once("project")
+
+    assert result["decision"] == "CAMPAIGN_STARTED"
+    assert lab.kwargs["candidate_budget"] == 1
+    run = store.objects_list("project", "ImprovementRun")[0]
+    assert run["data"]["meta_campaign"]["budget"]["token_budget"] == 100
 
 
 def test_auto_project_rolls_back_only_after_repeated_negative_hindsight():
