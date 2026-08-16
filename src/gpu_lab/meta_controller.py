@@ -49,6 +49,68 @@ class MetaResearchController:
             "PolicyNegativeResult": [str(item["id"]) for item in self._objects(project_id, "PolicyNegativeResult")[-10:]],
         }
 
+    def _diagnose_opportunity(self, project_id: str, opportunity: dict[str, Any]) -> dict[str, Any]:
+        """Persist competing, explicitly non-causal explanations before patching."""
+        fingerprint = f"meta-diagnosis:{opportunity['id']}"
+        existing = self._find_by_fingerprint(project_id, "MetaWorldModel", fingerprint)
+        if existing:
+            return existing
+        evidence_ids = {str(item) for item in opportunity["data"].get("supporting_evidence", [])}
+        outcomes = [
+            item for item in self._objects(project_id, "ResearchDecisionOutcome")
+            if str(item["id"]) in evidence_ids
+        ]
+        labels = [str(item["data"].get("label", "UNKNOWN")) for item in outcomes]
+        severe = sum(label in {"INVALID", "PREMATURE"} for label in labels)
+        repeated_action = len({str(item["data"].get("action_type", "UNKNOWN")) for item in outcomes}) <= 1
+        candidates = [
+            {
+                "component": "candidate_generation",
+                "mechanism": "Candidate generation may lack decisive interventions.",
+                "diagnostic_score": 0.6 if repeated_action else 0.35,
+                "evidence_basis": "Repeated action-family selection across observed failures." if repeated_action else "Action-family diversity is not yet diagnostic.",
+            },
+            {
+                "component": "ranking",
+                "mechanism": "Ranking may overweight low-cost diagnostics over discrimination value.",
+                "diagnostic_score": round(min(0.8, 0.35 + 0.1 * len(outcomes)), 2),
+                "evidence_basis": "Repeated low-information selected actions require a ranking comparison.",
+            },
+            {
+                "component": "critic",
+                "mechanism": "The critic may fail to reject a cheap available falsifier or scope risk.",
+                "diagnostic_score": round(min(0.85, 0.3 + 0.2 * severe), 2),
+                "evidence_basis": "Invalid or premature outcomes are critic-relevant only as an investigatory signal.",
+            },
+        ]
+        candidates.sort(key=lambda item: (-item["diagnostic_score"], item["component"]))
+        return self.store.object_create(
+            project_id,
+            "MetaWorldModel",
+            {
+                "fingerprint": fingerprint,
+                "scope": opportunity["data"].get("scope", "PROJECT"),
+                "relationships": [
+                    {
+                        "from": candidate["component"],
+                        "to": "observed_research_failure",
+                        "observation": candidate["mechanism"],
+                        "causal_status": "HYPOTHESIS_NOT_ESTABLISHED",
+                    }
+                    for candidate in candidates
+                ],
+                "evidence": sorted(evidence_ids),
+                "confidence": max(candidate["diagnostic_score"] for candidate in candidates),
+                "counterexamples": [],
+                "unresolved_relationships": ["Competing component explanations require blinded policy evaluation; correlation is not causation."],
+                "diagnostic_hypotheses": candidates,
+                "provider_sensitivity": "UNVERIFIED",
+                "domain_sensitivity": "UNVERIFIED",
+            },
+            "META_POLICY_CAUSES_DIAGNOSED",
+            "CANDIDATE",
+        )
+
     def _prepare_literature_scout(self, project_id: str, opportunity: dict[str, Any], literature_budget: int) -> dict[str, Any] | None:
         """Create a finite, problem-driven literature brief before any retrieval happens."""
         if literature_budget < 1:
@@ -405,6 +467,8 @@ class MetaResearchController:
             return {"decision": "COMPATIBILITY_EVALUATED", "opportunities": opportunities, "compatibility": compatibility}
         budget = {key: config["data"][key] for key in self.defaults if key != "mode"}
         source_context = self._candidate_sources(project_id, opportunity)
+        diagnosis = self._diagnose_opportunity(project_id, opportunity)
+        source_context["MetaWorldModel"] = [*source_context["MetaWorldModel"], str(diagnosis["id"])]
         literature_request = self._prepare_literature_scout(project_id, opportunity, int(config["data"]["literature_budget"]))
         if literature_request:
             source_context["LiteratureScoutRequest"] = [str(literature_request["id"])]
@@ -465,6 +529,7 @@ class MetaResearchController:
                 candidate_budget=int(config["data"]["candidate_budget"]),
                 max_revisions=int(config["data"]["max_revision_rounds"]),
                 source_context=source_context,
+                diagnostic_hypotheses=diagnosis["data"]["diagnostic_hypotheses"],
             )
         run_id = str(result["improvement_run"]["id"])
         self.store.object_update(

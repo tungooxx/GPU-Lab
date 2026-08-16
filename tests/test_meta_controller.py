@@ -72,6 +72,23 @@ def test_recurring_bad_outcomes_create_one_durable_opportunity():
     assert controller.detect_opportunities("project") == []
 
 
+def test_campaign_persists_competing_noncausal_component_diagnosis_before_patch_generation():
+    store = Store()
+    lab = CampaignPolicyLab(store)
+    controller = MetaResearchController(store, lab)
+    for _ in range(2):
+        store.object_create("project", "ResearchDecisionOutcome", {"label": "INVALID", "action_type": "DIAGNOSTIC"}, "FIXTURE", "RESULT_INSPECTED")
+
+    result = controller.run_once("project")
+
+    diagnoses = [item for item in store.objects_list("project", "MetaWorldModel") if item["data"].get("diagnostic_hypotheses")]
+    assert result["decision"] == "CAMPAIGN_STARTED"
+    assert len(diagnoses) == 1
+    assert {item["component"] for item in diagnoses[0]["data"]["diagnostic_hypotheses"]} == {"candidate_generation", "ranking", "critic"}
+    assert all(item["causal_status"] == "HYPOTHESIS_NOT_ESTABLISHED" for item in diagnoses[0]["data"]["relationships"])
+    assert lab.kwargs["diagnostic_hypotheses"] == diagnoses[0]["data"]["diagnostic_hypotheses"]
+
+
 def test_paused_autonomy_never_starts_campaign():
     store = Store()
     controller = MetaResearchController(store, PolicyLab())

@@ -68,6 +68,21 @@ def test_improvement_keeps_meta_source_provenance_on_hypotheses_and_run():
     assert result["improvement_run"]["data"]["source_context"]["MetaLesson"] == ["lesson-1"]
 
 
+def test_improvement_preserves_competing_diagnostic_mechanisms_on_policy_hypotheses():
+    result = service().improve(
+        "project",
+        idea="Improve discrimination",
+        diagnostic_hypotheses=[
+            {"component": "critic", "mechanism": "critic omission", "diagnostic_score": 0.8},
+            {"component": "ranking", "mechanism": "ranking trade-off", "diagnostic_score": 0.6},
+        ],
+    )
+
+    assert result["hypotheses"][0]["data"]["diagnostic_hypothesis"]["component"] == "critic"
+    assert result["hypotheses"][1]["data"]["diagnostic_hypothesis"]["component"] == "ranking"
+    assert result["improvement_run"]["data"]["diagnostic_hypotheses"][0]["mechanism"] == "critic omission"
+
+
 def test_policy_tournament_ranks_multiple_supported_candidates_without_combining_them():
     store = Store()
     lab = service(store)

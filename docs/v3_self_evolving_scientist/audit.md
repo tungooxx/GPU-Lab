@@ -67,3 +67,9 @@ Meta-campaign claims are restart-durable: a restarted controller resumes a
 claimed campaign, reuses a linked completed `ImprovementRun` when present, and
 finishes promotion idempotently. This covers controller restart recovery, not
 durable recovery of an external code executor or unavailable provider.
+
+Before an autonomous campaign asks the policy lab for patches, it persists a
+trace-grounded `MetaWorldModel` containing competing candidate-generation,
+ranking, and critic explanations. These are explicitly marked
+`HYPOTHESIS_NOT_ESTABLISHED`; they order distinct candidate mechanisms but do
+not convert observational failure patterns into causal claims.

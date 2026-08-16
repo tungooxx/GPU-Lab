@@ -183,7 +183,7 @@ class PolicyLabService:
         return "Compare a proposed action with a mechanistically distinct runner-up before selection."
 
     @staticmethod
-    def _hypothesis_payload(source_type: str, observed_problem: str, change: str, component: str, source_ids: list[str] | None = None) -> dict[str, Any]:
+    def _hypothesis_payload(source_type: str, observed_problem: str, change: str, component: str, source_ids: list[str] | None = None, diagnostic_hypothesis: dict[str, Any] | None = None) -> dict[str, Any]:
         return {
             "source_type": source_type, "source_ids": source_ids or [], "observed_problem": observed_problem,
             "proposed_change": change, "mechanism_of_improvement": "Makes the decision constraint explicit before action selection.",
@@ -192,15 +192,25 @@ class PolicyLabService:
             "possible_harms": ["additional reasoning cost", "unnecessary structure in simple cases"],
             "affected_components": [component], "benchmark_predictions": {"strong_next_action_accuracy": "non-decreasing"},
             "regression_risks": ["scope_error_rate", "expected_cost"], "cost_expectation": "LOW",
+            "diagnostic_hypothesis": diagnostic_hypothesis or {},
         }
 
-    def _hypotheses_for(self, project_id: str, source_type: str, problem: str, component: str, *, limit: int = 3, source_ids: list[str] | None = None) -> list[dict[str, Any]]:
-        changes = [
-            "Require an explicit hypothesis-outcome matrix for competing mechanisms.",
-            "Require a runner-up action comparison before selecting repeated diagnostics.",
-            "Require a null-focused critic when a cheap falsifier is available.",
+    def _hypotheses_for(self, project_id: str, source_type: str, problem: str, component: str, *, limit: int = 3, source_ids: list[str] | None = None, diagnostic_hypotheses: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+        changes = {
+            "candidate_generation": "Require an explicit hypothesis-outcome matrix for competing mechanisms.",
+            "ranking": "Require a runner-up action comparison before selecting repeated diagnostics.",
+            "critic": "Require a null-focused critic when a cheap falsifier is available.",
+        }
+        diagnostics = diagnostic_hypotheses or [
+            {"component": "candidate_generation", "mechanism": "candidate diversity"},
+            {"component": "ranking", "mechanism": "ranking trade-off"},
+            {"component": "critic", "mechanism": "critic omission"},
         ]
-        return [self._create(project_id, "PolicyHypothesis", self._hypothesis_payload(source_type, problem, change, component, source_ids), "POLICY_HYPOTHESIS_CREATED", "CANDIDATE") for change in changes[:limit]]
+        distinct = [item for item in diagnostics if item.get("component") in changes]
+        return [
+            self._create(project_id, "PolicyHypothesis", self._hypothesis_payload(source_type, problem, changes[item["component"]], component, source_ids, item), "POLICY_HYPOTHESIS_CREATED", "CANDIDATE")
+            for item in distinct[:limit]
+        ]
 
     def _duplicate_negative(self, project_id: str, semantic_change: str) -> dict[str, Any] | None:
         fingerprint = self._fingerprint(semantic_change)
@@ -425,7 +435,7 @@ class PolicyLabService:
             "COMPLETED",
         )
 
-    def improve(self, project_id: str, *, idea: str | None = None, paper: str | None = None, failure: str | None = None, component: str | None = None, search: bool = False, prompt: bool = False, candidate_budget: int | None = None, max_revisions: int | None = None, source_context: dict[str, list[str]] | None = None) -> dict[str, Any]:
+    def improve(self, project_id: str, *, idea: str | None = None, paper: str | None = None, failure: str | None = None, component: str | None = None, search: bool = False, prompt: bool = False, candidate_budget: int | None = None, max_revisions: int | None = None, source_context: dict[str, list[str]] | None = None, diagnostic_hypotheses: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         if candidate_budget is not None and candidate_budget < 1:
             raise GPUError("POLICY_CANDIDATE_BUDGET_EXHAUSTED", "candidate_budget must be at least one")
         if max_revisions is not None and max_revisions < 0:
@@ -439,7 +449,7 @@ class PolicyLabService:
         )
         weaknesses = [] if (idea or paper or failure) else self.detect_weaknesses(project_id, component)
         source_ids = sorted({item for values in (source_context or {}).values() for item in values})
-        hypotheses = self._hypotheses_for(project_id, source_type, problem, component or "experiment_selection", limit=candidate_budget or 3, source_ids=source_ids)
+        hypotheses = self._hypotheses_for(project_id, source_type, problem, component or "experiment_selection", limit=candidate_budget or 3, source_ids=source_ids, diagnostic_hypotheses=diagnostic_hypotheses)
         patches = [self._patch(project_id, policy, h) for h in hypotheses]
         if prompt:
             for patch in patches:
@@ -457,7 +467,7 @@ class PolicyLabService:
         supported = [e for e in evaluations if e["decision"] == "SUPPORTED_ON_BENCHMARK"]
         tournament = self._tournament(project_id, supported)
         best_patch_id = tournament["data"]["winner_patch_id"] if tournament else str(supported[0]["patch"]["id"]) if supported else None
-        run = self._create(project_id, "ImprovementRun", {"input": {"idea": idea, "paper": paper, "failure": failure, "component": component, "search": search, "prompt": prompt}, "source_context": source_context or {}, "budget": {"candidate_budget": candidate_budget or 3, "max_revisions": self.max_revisions if max_revisions is None else max_revisions}, "base_policy_id": str(policy["id"]), "weakness_ids": [str(w["id"]) for w in weaknesses], "hypothesis_ids": [str(h["id"]) for h in hypotheses], "patch_ids": [str(p["id"]) for p in patches], "evaluation_ids": [str(e["experiment"]["id"]) for e in evaluations if e.get("experiment")], "invalid_patch_ids": [str(e["patch"]["id"]) for e in evaluations if e["decision"] == "INVALID_EVALUATION"], "tournament_id": str(tournament["id"]) if tournament else None, "best_supported_patch_id": best_patch_id, "recommendation": "PROMOTE" if supported else "REJECT_OR_REVISE", "production_unchanged": True, "namespace": "META_RESEARCH"}, "IMPROVEMENT_RUN_COMPLETED", "COMPLETED")
+        run = self._create(project_id, "ImprovementRun", {"input": {"idea": idea, "paper": paper, "failure": failure, "component": component, "search": search, "prompt": prompt}, "source_context": source_context or {}, "diagnostic_hypotheses": diagnostic_hypotheses or [], "budget": {"candidate_budget": candidate_budget or 3, "max_revisions": self.max_revisions if max_revisions is None else max_revisions}, "base_policy_id": str(policy["id"]), "weakness_ids": [str(w["id"]) for w in weaknesses], "hypothesis_ids": [str(h["id"]) for h in hypotheses], "patch_ids": [str(p["id"]) for p in patches], "evaluation_ids": [str(e["experiment"]["id"]) for e in evaluations if e.get("experiment")], "invalid_patch_ids": [str(e["patch"]["id"]) for e in evaluations if e["decision"] == "INVALID_EVALUATION"], "tournament_id": str(tournament["id"]) if tournament else None, "best_supported_patch_id": best_patch_id, "recommendation": "PROMOTE" if supported else "REJECT_OR_REVISE", "production_unchanged": True, "namespace": "META_RESEARCH"}, "IMPROVEMENT_RUN_COMPLETED", "COMPLETED")
         return {"improvement_run": run, "production_policy_id": str(policy["id"]), "weaknesses": weaknesses, "hypotheses": hypotheses, "patches": patches, "evaluations": evaluations, "tournament": tournament, "recommendation": run["data"]["recommendation"]}
 
     def promote(self, project_id: str, patch_id: str) -> dict[str, Any]:
