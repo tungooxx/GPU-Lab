@@ -751,6 +751,7 @@ class MetaResearchController:
         for policy in self._objects(project_id, "ResearchPolicy"):
             if policy["status"] != "PRODUCTION":
                 continue
+            scope = str(policy["data"].get("applicability", {}).get("scope", "PROJECT")).upper()
             hindsight = policy["data"].get("post_promotion_hindsight", [])
             failures = [item for item in hindsight if item.get("unexpected_failure") or (isinstance(item.get("observed_improvement"), (int, float)) and item["observed_improvement"] < 0)]
             if len(failures) < 2:
@@ -758,13 +759,13 @@ class MetaResearchController:
             fingerprint = f"policy-regression:{policy['id']}:{len(failures)}"
             if self._find_by_fingerprint(project_id, "PolicyRegression", fingerprint):
                 continue
-            regression = self.store.object_create(project_id, "PolicyRegression", {"fingerprint": fingerprint, "policy_id": str(policy["id"]), "expected_behavior": "non-regressing scoped research behavior", "observed_behavior": "repeated negative post-promotion hindsight", "supporting_decisions": [], "severity": "HIGH", "confidence": min(0.95, 0.5 + len(failures) * 0.1), "affected_scope": "PROJECT", "rollback_decision": "PENDING", "revisit_condition": "new causal diagnosis required"}, "POLICY_REGRESSION_DETECTED", "CANDIDATE")
+            regression = self.store.object_create(project_id, "PolicyRegression", {"fingerprint": fingerprint, "policy_id": str(policy["id"]), "expected_behavior": "non-regressing scoped research behavior", "observed_behavior": "repeated negative post-promotion hindsight", "supporting_decisions": [], "severity": "HIGH", "confidence": min(0.95, 0.5 + len(failures) * 0.1), "affected_scope": scope, "rollback_decision": "PENDING", "revisit_condition": "new causal diagnosis required"}, "POLICY_REGRESSION_DETECTED", "CANDIDATE")
             self.store.object_create(
                 project_id,
                 "MetaWorldModel",
                 {
                     "fingerprint": fingerprint,
-                    "scope": "PROJECT",
+                    "scope": scope,
                     "relationships": [{"from": f"policy:{policy['id']}", "to": "real_world_policy_hindsight", "observation": "Repeated negative hindsight after promotion", "causal_status": "UNRESOLVED"}],
                     "evidence": [str(regression["id"])],
                     "confidence": regression["data"]["confidence"],
@@ -776,8 +777,24 @@ class MetaResearchController:
                 "META_WORLD_MODEL_UPDATED",
                 "ACTIVE",
             )
+            agenda_fingerprint = f"post-rollback-agenda:{regression['id']}"
+            self.store.object_create(
+                project_id,
+                "MetaResearchAgenda",
+                {
+                    "fingerprint": agenda_fingerprint,
+                    "question": "Why did the historical policy benchmark fail to predict this production regression?",
+                    "policy_regression_id": str(regression["id"]),
+                    "priority": regression["data"]["confidence"],
+                    "scope": scope,
+                    "status_reason": "Rollback requires a causal benchmark-calibration diagnosis before reuse.",
+                    "required_evaluation": "BENCHMARK_CALIBRATION_DIAGNOSIS",
+                },
+                "META_RESEARCH_AGENDA_CREATED",
+                "OPEN",
+            )
             parent = policy["data"].get("parent_policy_id")
-            if config["data"]["mode"] == "AUTO_PROJECT" and parent and not config["data"].get("pinned_policy_id"):
+            if config["data"].get("mode") == f"AUTO_{scope}" and parent and not config["data"].get("pinned_policy_id"):
                 restored = self.policy_lab.rollback(project_id, str(parent))
                 self.store.object_update(str(regression["id"]), {"rollback_decision": "ROLLED_BACK", "restored_policy_id": str(restored["id"])}, "COMPLETED", "POLICY_ROLLED_BACK")
                 self.store.object_create(

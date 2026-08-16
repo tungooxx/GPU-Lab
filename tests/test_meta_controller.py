@@ -178,6 +178,34 @@ def test_policy_pin_prevents_automatic_rollback():
     assert regression["data"]["rollback_decision"] == "PENDING"
 
 
+def test_domain_policy_regression_rolls_back_in_matching_autonomy_mode_and_opens_calibration_agenda():
+    store = Store()
+    parent = store.object_create("project", "ResearchPolicy", {}, "FIXTURE", "SUPERSEDED")
+    store.object_create(
+        "project",
+        "ResearchPolicy",
+        {
+            "parent_policy_id": parent["id"],
+            "applicability": {"scope": "DOMAIN"},
+            "post_promotion_hindsight": [
+                {"observed_improvement": -0.2, "unexpected_failure": "negative transfer"},
+                {"observed_improvement": -0.1, "unexpected_failure": "negative transfer"},
+            ],
+        },
+        "FIXTURE",
+        "PRODUCTION",
+    )
+    controller = MetaResearchController(store, PolicyLab(), mode="AUTO_DOMAIN")
+
+    regression = controller.monitor_promotions("project")[0]
+
+    assert regression["data"]["affected_scope"] == "DOMAIN"
+    assert regression["data"]["rollback_decision"] == "ROLLED_BACK"
+    agenda = store.objects_list("project", "MetaResearchAgenda")[-1]
+    assert agenda["data"]["policy_regression_id"] == regression["id"]
+    assert agenda["data"]["required_evaluation"] == "BENCHMARK_CALIBRATION_DIAGNOSIS"
+
+
 def test_user_feedback_requires_actual_outcome_evidence_before_campaign_candidate():
     store = Store()
     controller = MetaResearchController(store, PolicyLab())
