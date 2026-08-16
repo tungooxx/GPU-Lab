@@ -181,6 +181,17 @@ def test_meta_state_exposes_candidates_and_provider_compatibility():
     assert state["model_provider_compatibility"][0]["data"]["provider"] == "openai"
 
 
+def test_meta_state_reports_benchmark_composition_when_bench_available():
+    store = Store()
+    lab = PolicyLabService(store, ResearchBrainBench(Path(__file__).parents[1] / "research_bench"))
+
+    health = MetaResearchController(store, lab).state_get("project")["benchmark_health"]
+
+    assert health["episodes"] > 0
+    assert health["domain_distribution"]
+    assert health["split_distribution"]
+
+
 def test_auto_project_runs_closed_meta_cycle_and_promotes_supported_patch():
     store = Store()
     lab = PolicyLabService(store, ResearchBrainBench(Path(__file__).parents[1] / "research_bench"))

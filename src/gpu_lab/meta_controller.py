@@ -117,6 +117,39 @@ class MetaResearchController:
             "policy_experiment_id": str(experiment["id"]) if experiment else None,
         }
 
+    def _benchmark_health(self, project_id: str) -> dict[str, Any]:
+        health = {
+            "policy_experiments": len(self._objects(project_id, "PolicyExperiment")),
+            "benchmark_gaps": len(self._objects(project_id, "BenchmarkGap")),
+            "evaluation_audits": len(self._objects(project_id, "PolicyEvaluationAudit")),
+        }
+        bench = getattr(self.policy_lab, "bench", None)
+        if bench is None:
+            return health
+        episodes = bench.load_all()
+        domains: dict[str, int] = {}
+        action_types: dict[str, int] = {}
+        splits: dict[str, int] = {}
+        episode_ids: list[str] = []
+        for episode in episodes:
+            domains[episode.domain] = domains.get(episode.domain, 0) + 1
+            split = str(episode.benchmark_split.value)
+            splits[split] = splits.get(split, 0) + 1
+            episode_ids.append(episode.episode_id)
+            for action in episode.candidate_actions:
+                action_types[action.action_type] = action_types.get(action.action_type, 0) + 1
+        health.update(
+            {
+                "episodes": len(episodes),
+                "domain_distribution": domains,
+                "action_distribution": action_types,
+                "split_distribution": splits,
+                "duplicated_episode_ids": sorted({item for item in episode_ids if episode_ids.count(item) > 1}),
+                "leakage_audit_status": "RECORDED" if health["evaluation_audits"] else "NO_REJECTIONS_RECORDED",
+            }
+        )
+        return health
+
     def _ensure_meta_records(self, project_id: str, opportunity: dict[str, Any]) -> None:
         """Turn an observed weakness into explicit, non-causal meta-science records.
 
@@ -566,7 +599,7 @@ class MetaResearchController:
             "active_runs": [item for item in self._objects(project_id, "ImprovementRun") if item["status"] not in {"COMPLETED", "REJECTED"}],
             "policy_candidates": [item for item in self._objects(project_id, "ResearchPolicyPatch") if item["status"] in {"CANDIDATE", "SUPPORTED_ON_BENCHMARK", "CROSS_PROJECT_SUPPORTED", "CROSS_MODEL_SUPPORTED", "RECOMMENDED_FOR_PROMOTION"}],
             "recent_regressions": self._objects(project_id, "PolicyRegression")[-10:],
-            "benchmark_health": {"policy_experiments": len(self._objects(project_id, "PolicyExperiment")), "benchmark_gaps": len(self._objects(project_id, "BenchmarkGap"))},
+            "benchmark_health": self._benchmark_health(project_id),
             "model_provider_compatibility": compatibility[-10:],
         }
 
