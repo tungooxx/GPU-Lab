@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 
+from gpu_lab.brain_bench import ResearchBrainBench
 from gpu_lab.meta_controller import MetaResearchController
+from gpu_lab.policy_lab import PolicyLabService
 
 
 class Store:
@@ -17,6 +20,9 @@ class Store:
     def objects_list(self, project_id, kind, limit=None):
         values = [item for item in self.items if item["project_id"] == project_id and item["kind"] == kind]
         return values if limit is None else values[:limit]
+
+    def object_get(self, object_id):
+        return next(item for item in self.items if item["id"] == object_id)
 
     def object_update(self, object_id, update, status, event):
         item = next(item for item in self.items if item["id"] == object_id)
@@ -124,3 +130,18 @@ def test_model_change_runs_compatibility_instead_of_mutating_policy():
     assert result["decision"] == "COMPATIBILITY_EVALUATED"
     opportunity = store.objects_list("project", "ImprovementOpportunity")[0]
     assert opportunity["data"]["compatibility_experiment_id"] == "compatibility"
+
+
+def test_auto_project_runs_closed_meta_cycle_and_promotes_supported_patch():
+    store = Store()
+    lab = PolicyLabService(store, ResearchBrainBench(Path(__file__).parents[1] / "research_bench"))
+    controller = MetaResearchController(store, lab, mode="AUTO_PROJECT")
+    for _ in range(2):
+        store.object_create("project", "ResearchDecisionOutcome", {"label": "LOW_VALUE", "action_type": "DIAGNOSTIC"}, "FIXTURE", "RESULT_INSPECTED")
+
+    result = controller.run_once("project")
+
+    assert result["decision"] == "CAMPAIGN_STARTED"
+    assert result["promoted_policy"]["status"] == "PRODUCTION"
+    assert store.objects_list("project", "MetaWorldModel")
+    assert store.objects_list("project", "PolicyExperiment")
