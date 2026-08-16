@@ -262,6 +262,25 @@ def test_auto_project_runs_closed_meta_cycle_and_promotes_supported_patch():
     assert store.objects_list("project", "MetaResearchCampaign")[0]["status"] == "COMPLETED"
 
 
+def test_end_to_end_autonomous_improvement_promotes_and_survives_positive_real_hindsight():
+    store = Store()
+    lab = PolicyLabService(store, ResearchBrainBench(Path(__file__).parents[1] / "research_bench"))
+    controller = MetaResearchController(store, lab, mode="AUTO_PROJECT")
+    for _ in range(2):
+        store.object_create("project", "ResearchDecisionOutcome", {"label": "LOW_VALUE", "action_type": "DIAGNOSTIC"}, "FIXTURE", "RESULT_INSPECTED")
+
+    campaign = controller.run_once("project")
+    promoted = campaign["promoted_policy"]
+    lab.record_hindsight(promoted["id"], observed_improvement=0.2, observed_cost=1.0, decision_ids=["prospective-decision-1"])
+    lab.record_hindsight(promoted["id"], observed_improvement=0.1, observed_cost=1.1, decision_ids=["prospective-decision-2"])
+
+    assert campaign["decision"] == "CAMPAIGN_STARTED"
+    assert promoted["status"] == "PRODUCTION"
+    assert controller.monitor_promotions("project") == []
+    assert len(store.objects_list("project", "PolicyHindsight")) == 2
+    assert not store.objects_list("project", "PolicyRegression")
+
+
 def test_active_campaign_resumes_after_interruption_without_creating_a_second_claim():
     store = Store()
     controller = MetaResearchController(store, CampaignPolicyLab(store))
