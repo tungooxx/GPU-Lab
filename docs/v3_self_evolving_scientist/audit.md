@@ -144,3 +144,6 @@ local runner enabled. The isolated Literature relay returned PaperQA `ready`.
 The isolated Paper2Agent relay was reachable but reported `needs_credentials`
 with credentials not configured, so no live engineering-executor task was
 submitted or simulated.
+PostgreSQL was reachable read-only with durable `research_objects` and
+`research_events` rows present. No live service restart was performed because
+it would interrupt the running user deployment.
