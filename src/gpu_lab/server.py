@@ -1508,10 +1508,11 @@ async def research_decision_create(
     env: dict[str, str] | None = None,
     python_env: str | None = None,
 ):
-    """Create the ResearchDecision required by research_experiment_execute.
+    """Create a compact execution handoff containing the required decision_id.
 
-    Use this before immediately executing a preregistered experiment. Pass the
-    returned decision_id to research_experiment_execute with the same bound command.
+    Full Brain-step detail remains durable and can be read with
+    research_object_get. Pass decision_id to research_experiment_execute with
+    the same bound command.
     """
     step = await call(brain().brain_step, project_id)
     if "error" in step:
@@ -1525,9 +1526,16 @@ async def research_decision_create(
         step["decision_id"],
         fingerprint,
     )
+    handoff = {
+        "decision_id": step["decision_id"],
+        "experiment_id": experiment_id,
+        "action_fingerprint": fingerprint,
+        "next_tool": "research_experiment_execute",
+        "detail_hint": "Use research_object_get with decision_id for the complete persisted Brain trace.",
+    }
     if "error" in binding:
-        return {**step, "execution_binding_error": binding["error"]}
-    return {**step, "execution_binding": binding["data"]["execution_binding"]}
+        return {**handoff, "execution_binding_error": binding["error"]}
+    return {**handoff, "execution_binding": binding["data"]["execution_binding"]}
 
 
 @mcp.tool()
