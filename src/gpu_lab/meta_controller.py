@@ -84,6 +84,24 @@ class MetaResearchController:
                 "META_RESEARCH_AGENDA_CREATED",
                 "OPEN",
             )
+        if not self._find_by_fingerprint(project_id, "BenchmarkGap", fingerprint):
+            # A failure that generated this opportunity is contaminated for the
+            # current candidate.  It can seed a later benchmark episode only.
+            self.store.object_create(
+                project_id,
+                "BenchmarkGap",
+                {
+                    "fingerprint": fingerprint,
+                    "observed_failure": data["observed_failure"],
+                    "supporting_evidence": data.get("supporting_evidence", []),
+                    "scope": data.get("scope", "PROJECT"),
+                    "candidate_evaluation_eligibility": "FUTURE_BENCHMARK_ONLY",
+                    "excluded_from_improvement_opportunity_id": str(opportunity["id"]),
+                    "reason": "Gap discovered from the same evidence that generated the policy candidate.",
+                },
+                "BENCHMARK_GAP_DISCOVERED",
+                "CANDIDATE",
+            )
 
     def config_get(self, project_id: str) -> dict[str, Any]:
         configs = self._objects(project_id, "PolicyAutonomyConfig")
