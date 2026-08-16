@@ -1087,6 +1087,12 @@ async def policy_rollback(project_id: str, policy_id: str):
 
 
 @mcp.tool()
+async def policy_pin(project_id: str, policy_id: str | None = None):
+    """Pin a project policy (or clear the pin) to constrain autonomous policy changes."""
+    return await call(meta_controller().policy_pin, project_id, policy_id)
+
+
+@mcp.tool()
 async def policy_canary_start(project_id: str, candidate_policy_id: str, percentage: int = 10):
     """Start a bounded prospective canary; it does not replace production policy."""
     return await call(policy_lab().start_canary, project_id, candidate_policy_id, percentage)

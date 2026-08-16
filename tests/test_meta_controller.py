@@ -112,6 +112,17 @@ def test_auto_project_rolls_back_only_after_repeated_negative_hindsight():
     assert controller.monitor_promotions("project") == []
 
 
+def test_policy_pin_prevents_automatic_rollback():
+    store = Store()
+    policy = store.object_create("project", "ResearchPolicy", {"parent_policy_id": "parent", "post_promotion_hindsight": [{"observed_improvement": -0.1}, {"unexpected_failure": "scope regression"}]}, "FIXTURE", "PRODUCTION")
+    controller = MetaResearchController(store, PolicyLab(), mode="AUTO_PROJECT")
+    controller.policy_pin("project", policy["id"])
+
+    regression = controller.monitor_promotions("project")[0]
+
+    assert regression["data"]["rollback_decision"] == "PENDING"
+
+
 def test_model_change_creates_one_compatibility_opportunity():
     store = Store()
     controller = MetaResearchController(store, PolicyLab())

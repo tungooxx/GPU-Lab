@@ -142,7 +142,17 @@ class MetaResearchController:
         }
         if any(not isinstance(update[key], (int, float)) or isinstance(update[key], bool) or update[key] < 0 for key in non_negative & set(update)):
             raise GPUError("POLICY_AUTONOMY_CONFIG_INVALID", "budgets must be non-negative numbers")
+        pinned = update.get("pinned_policy_id")
+        if pinned is not None:
+            getter = getattr(self.store, "object_get", None)
+            policy = getter(str(pinned)) if callable(getter) else None
+            if policy is not None and (policy["kind"] != "ResearchPolicy" or str(policy["project_id"]) != str(project_id)):
+                raise GPUError("POLICY_PIN_INVALID", "pinned policy must belong to the project")
         return self.store.object_update(str(config["id"]), update, "ACTIVE", "POLICY_AUTONOMY_CONFIG_UPDATED")
+
+    def policy_pin(self, project_id: str, policy_id: str | None) -> dict[str, Any]:
+        """Persist an operator override without deleting autonomous conclusions."""
+        return self.config_update(project_id, {"pinned_policy_id": policy_id})
 
     def detect_opportunities(self, project_id: str) -> list[dict[str, Any]]:
         outcomes = self._objects(project_id, "ResearchDecisionOutcome")
