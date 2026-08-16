@@ -1038,6 +1038,23 @@ async def policy_rollback(project_id: str, policy_id: str):
 
 
 @mcp.tool()
+async def policy_hindsight_record(
+    policy_id: str,
+    observed_improvement: float | None,
+    observed_cost: float | None,
+    unexpected_failure: str | None = None,
+):
+    """Record post-promotion policy calibration data without changing scientific state."""
+    return await call(
+        policy_lab().record_hindsight,
+        policy_id,
+        observed_improvement,
+        observed_cost,
+        unexpected_failure,
+    )
+
+
+@mcp.tool()
 async def evidence_family_create(
     project_id: str,
     origin_type: str,

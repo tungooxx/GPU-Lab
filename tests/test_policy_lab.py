@@ -193,3 +193,14 @@ def test_policy_export_is_provider_neutral_and_does_not_mutate_policy():
     assert exported["provider_compiled_form"] == {"provider": "codex", "adapter": {"format": "structured"}}
     assert exported["semantic_policy"]["decision_policy"]["falsification_first"] is True
     assert policy["status"] == "PRODUCTION"
+
+
+def test_post_promotion_hindsight_is_appended_without_creating_science_records():
+    store = Store()
+    lab = service(store)
+    policy = lab.ensure_production_policy("project")
+
+    updated = lab.record_hindsight(policy["id"], observed_improvement=0.2, observed_cost=1.1)
+
+    assert updated["data"]["post_promotion_hindsight"][0]["observed_improvement"] == 0.2
+    assert not [item for item in store.items if item["kind"] in {"WorldModel", "Hypothesis", "EvidenceUnit"}]

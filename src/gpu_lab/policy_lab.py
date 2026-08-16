@@ -400,3 +400,32 @@ class PolicyLabService:
             "provenance": policy["data"].get("provenance", {}),
             "known_limitations": policy["data"].get("known_failure_modes", []),
         }
+
+    def record_hindsight(
+        self,
+        policy_id: str,
+        observed_improvement: float | None,
+        observed_cost: float | None,
+        unexpected_failure: str | None = None,
+    ) -> dict[str, Any]:
+        """Record post-promotion operational evidence without changing scientific state."""
+        policy = self.store.object_get(policy_id)
+        if policy["kind"] != "ResearchPolicy":
+            raise GPUError("NOT_A_RESEARCH_POLICY", policy_id)
+        history = list(policy["data"].get("post_promotion_hindsight", []))
+        history.append({
+            "recorded_at": datetime.now(UTC).isoformat(),
+            "observed_improvement": observed_improvement,
+            "observed_cost": observed_cost,
+            "unexpected_failure": unexpected_failure,
+        })
+        predicted = policy["data"].get("benchmark_results", {}).get("strong_next_action_recall")
+        calibration = None
+        if isinstance(predicted, (int, float)) and observed_improvement is not None:
+            calibration = observed_improvement - predicted
+        return self.store.object_update(
+            policy_id,
+            {"post_promotion_hindsight": history, "policy_calibration_error": calibration},
+            policy["status"],
+            "RESEARCH_POLICY_HINDSIGHT_RECORDED",
+        )
