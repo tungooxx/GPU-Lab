@@ -399,7 +399,11 @@ def cockpit() -> CockpitController:
     if cockpit_controller_service is None:
         with _singleton_lock:
             if cockpit_controller_service is None:
-                cockpit_controller_service = CockpitController(research(), lab())
+                cockpit_controller_service = CockpitController(
+                    research(), lab(),
+                    max_turns_per_work_item=settings.gpu_lab_worker_max_turns_per_work_item,
+                    max_consecutive_continues=settings.gpu_lab_worker_max_consecutive_continues,
+                )
     return cockpit_controller_service
 
 

@@ -54,6 +54,8 @@ class Settings(BaseSettings):
     auto_continue_enabled: bool = False
     live_browser_preview_enabled: bool = False
     chatgpt_web_profile_root: Path = Path("/var/lib/gpu-lab/chatgpt-web")
+    gpu_lab_worker_max_turns_per_work_item: int = Field(default=20, ge=1, le=100)
+    gpu_lab_worker_max_consecutive_continues: int = Field(default=3, ge=1, le=20)
     gpu_lab_cockpit_password: str | None = None
     gpu_lab_cockpit_session_secret: str | None = None
     fastmcp_host: str = "127.0.0.1"

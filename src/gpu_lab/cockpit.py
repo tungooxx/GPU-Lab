@@ -29,9 +29,12 @@ WAKE_STATUSES = {"PENDING", "DISPATCHED", "COMPLETED", "CANCELLED", "FAILED"}
 class CockpitController:
     """Persist project controls and browser-worker operations without scientific authority."""
 
-    def __init__(self, store: ResearchStore, lab: LabController | None = None):
+    def __init__(self, store: ResearchStore, lab: LabController | None = None,
+                 max_turns_per_work_item: int = 20, max_consecutive_continues: int = 3):
         self.store = store
         self.lab = lab or LabController(store)
+        self.max_turns_per_work_item = max_turns_per_work_item
+        self.max_consecutive_continues = max_consecutive_continues
         self._migrate()
 
     @staticmethod
@@ -230,6 +233,17 @@ class CockpitController:
             if work_item_id and current != str(work_item_id):
                 raise GPUError("LAB_TURN_WORK_NOT_OWNED", work_item_id)
             work_item_id = work_item_id or current
+            if outcome == "CONTINUE":
+                if work_item_id:
+                    cur.execute("SELECT count(*) AS count FROM lab_worker_turns WHERE worker_session_id=%s AND work_item_id=%s", (session_id, work_item_id))
+                    if cur.fetchone()["count"] >= self.max_turns_per_work_item:
+                        outcome = "HUMAN_REQUIRED"
+                        summary = f"Continuation limit reached for work item: {summary}"
+                cur.execute("SELECT outcome FROM lab_worker_turns WHERE worker_session_id=%s ORDER BY created_at DESC LIMIT %s", (session_id, self.max_consecutive_continues))
+                previous = cur.fetchall()
+                if len(previous) == self.max_consecutive_continues and all(item["outcome"] == "CONTINUE" for item in previous):
+                    outcome = "HUMAN_REQUIRED"
+                    summary = f"Consecutive continuation limit reached: {summary}"
             cur.execute("INSERT INTO lab_worker_turns(id,project_id,worker_id,worker_session_id,work_item_id,outcome,summary,status,created_at) VALUES(%s,%s,%s,%s,%s,%s,%s,'REPORTED',%s)", (turn_id, project_id, worker_id, session_id, work_item_id, outcome, summary[:4000], now))
             cur.execute("SELECT autopilot_enabled,auto_continue_enabled,paused FROM lab_project_controls WHERE project_id=%s", (project_id,))
             controls = cur.fetchone() or {"autopilot_enabled": False, "auto_continue_enabled": False, "paused": False}
