@@ -1214,7 +1214,7 @@ async def improve_start(
         literature_service = await call(literature)
         if isinstance(literature_service, dict) and "error" in literature_service:
             return literature_service
-        literature_result = await call(literature_service.search,
+        literature_result = await call(literature_service.provider.search,
             "Research methods for this measured policy weakness; return competing methods, "
             "limitations, and negative evidence where available: " + weakness_query
         )

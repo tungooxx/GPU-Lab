@@ -1,5 +1,7 @@
 import uuid
 
+import pytest
+
 from gpu_lab import server
 from gpu_lab.server import (
     _compact_brain_step,
@@ -15,6 +17,43 @@ def test_vast_status_tool_has_provider_specific_name():
 
     assert "vast_gpu_status" in names
     assert "gpu_status" not in names
+
+
+@pytest.mark.asyncio
+async def test_improve_start_search_uses_resolved_literature_provider(monkeypatch):
+    class Candidate:
+        source_excerpt = "candidate evidence"
+
+    class Result:
+        def __init__(self):
+            self.answer = "provider answer"
+            self.evidence_candidates = [Candidate()]
+
+    class Provider:
+        async def search(self, query, filters=None):
+            assert "measured policy weakness" in query
+            assert filters is None
+            return Result()
+
+    class Literature:
+        provider = Provider()
+
+    class PolicyLab:
+        def improve(self, project_id, **kwargs):
+            return {"project_id": project_id, "paper": kwargs["paper"]}
+
+    async def direct_call(fn, *args, **kwargs):
+        result = fn(*args, **kwargs)
+        return await result if hasattr(result, "__await__") else result
+
+    monkeypatch.setattr(server.settings, "gpu_lab_literature_provider", "paperqa-http")
+    monkeypatch.setattr(server, "literature", lambda: Literature())
+    monkeypatch.setattr(server, "policy_lab", lambda: PolicyLab())
+    monkeypatch.setattr(server, "call", direct_call)
+
+    assert await server.improve_start("project-1", idea="better selection", search=True) == {
+        "project_id": "project-1", "paper": "provider answer"
+    }
 
 
 def test_monitor_prioritises_active_jobs_over_newer_history():
