@@ -28,10 +28,12 @@ def main() -> None:
     )
     report = cockpit.turn_report(project_id, worker_id, session_id, "CONTINUE", "Smoke continuation")
     assert report["wake_request_id"]
+    claimed = cockpit.wake_claim_next(project_id)
+    assert claimed and claimed["id"] == report["wake_request_id"]
     restarted = CockpitController(ResearchStore(os.environ["GPU_LAB_TEST_DATABASE_URL"]))
     state = restarted.state_get(project_id, session_id)
     assert state["controls"]["autopilot_enabled"] is True
-    assert state["pending_wake_requests"][0]["id"] == report["wake_request_id"]
+    assert state["pending_wake_requests"] == []
     print("COCKPIT_SMOKE_OK")
     print(f"project={project_id} worker={worker_id} wake={report['wake_request_id']} paused={controls['paused']}")
 

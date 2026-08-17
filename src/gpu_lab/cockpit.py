@@ -36,6 +36,7 @@ class CockpitController:
         self.max_turns_per_work_item = max_turns_per_work_item
         self.max_consecutive_continues = max_consecutive_continues
         self._migrate()
+        self.recover_inflight_wakes()
 
     @staticmethod
     def _now() -> datetime:
@@ -290,3 +291,14 @@ class CockpitController:
             cur.execute("UPDATE lab_worker_wake_requests SET status=%s,completed_at=%s,failure_reason=%s WHERE id=%s", (status, now, (failure_reason or "")[:2000] or None, wake_id))
             self.store._event(cur, wake["project_id"], "WORKER_WAKE_FAILED" if failure_reason else "WORKER_WAKE_COMPLETED", wake_id, {"failure_reason": bool(failure_reason)})
         return {"wake_id": wake_id, "status": status}
+
+    def recover_inflight_wakes(self) -> dict[str, int]:
+        """Fail closed after a controller restart so an unconfirmed prompt is never duplicated."""
+        now, recovered = self._now(), 0
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id,project_id FROM lab_worker_wake_requests WHERE status='DISPATCHED' FOR UPDATE SKIP LOCKED")
+            for wake in cur.fetchall():
+                cur.execute("UPDATE lab_worker_wake_requests SET status='FAILED',completed_at=%s,failure_reason='CONTROLLER_RESTART_UNCONFIRMED_DISPATCH' WHERE id=%s", (now, wake["id"]))
+                self.store._event(cur, wake["project_id"], "WORKER_WAKE_FAILED", wake["id"], {"failure_reason": "CONTROLLER_RESTART_UNCONFIRMED_DISPATCH"})
+                recovered += 1
+        return {"recovered": recovered}
