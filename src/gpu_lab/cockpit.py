@@ -219,3 +219,36 @@ class CockpitController:
             cur.execute("UPDATE research_worker_sessions SET status=%s,last_heartbeat_at=%s WHERE id=%s", (status, now, session_id))
             self.store._event(cur, project_id, "LAB_TURN_REPORTED", turn_id, {"worker_id": worker_id, "work_item_id": work_item_id, "outcome": outcome, "wake_request_id": wake_id})
         return {"turn_id": turn_id, "outcome": outcome, "wake_request_id": wake_id}
+
+    def wake_claim_next(self, project_id: str | None = None) -> dict[str, Any] | None:
+        """Atomically hand one pending operational wake to a runtime dispatcher."""
+        now = self._now()
+        with self.store._connect() as conn, conn.cursor() as cur:
+            sql = "SELECT * FROM lab_worker_wake_requests WHERE status='PENDING'"
+            args: list[Any] = []
+            if project_id:
+                sql += " AND project_id=%s"
+                args.append(project_id)
+            sql += " ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1"
+            cur.execute(sql, args)
+            wake = cur.fetchone()
+            if not wake:
+                return None
+            cur.execute("SELECT autopilot_enabled,auto_continue_enabled,paused FROM lab_project_controls WHERE project_id=%s", (wake["project_id"],))
+            controls = cur.fetchone() or {"autopilot_enabled": False, "auto_continue_enabled": False, "paused": False}
+            if not controls["autopilot_enabled"] or not controls["auto_continue_enabled"] or controls["paused"]:
+                return None
+            cur.execute("UPDATE lab_worker_wake_requests SET status='DISPATCHED',dispatched_at=%s WHERE id=%s", (now, wake["id"]))
+            self.store._event(cur, wake["project_id"], "WORKER_WAKE_DISPATCHED", wake["id"], {"worker_id": str(wake["worker_id"])})
+            return self.lab._record(wake)
+
+    def wake_finish(self, wake_id: str, *, failure_reason: str | None = None) -> dict[str, Any]:
+        now, status = self._now(), "FAILED" if failure_reason else "COMPLETED"
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT project_id FROM lab_worker_wake_requests WHERE id=%s FOR UPDATE", (wake_id,))
+            wake = cur.fetchone()
+            if not wake:
+                raise GPUError("WORKER_WAKE_NOT_FOUND", wake_id)
+            cur.execute("UPDATE lab_worker_wake_requests SET status=%s,completed_at=%s,failure_reason=%s WHERE id=%s", (status, now, (failure_reason or "")[:2000] or None, wake_id))
+            self.store._event(cur, wake["project_id"], "WORKER_WAKE_FAILED" if failure_reason else "WORKER_WAKE_COMPLETED", wake_id, {"failure_reason": bool(failure_reason)})
+        return {"wake_id": wake_id, "status": status}

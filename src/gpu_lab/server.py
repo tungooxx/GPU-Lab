@@ -24,6 +24,7 @@ from starlette.types import ASGIApp
 from .brain import ResearchBrain
 from .brain_bench import BenchmarkPolicy, ResearchBrainBench
 from .branches import ExperimentBranchService
+from .browser_scheduler import BrowserWakeDispatcher
 from .cockpit import CockpitController
 from .cockpit_auth import issue_session, password_matches, verify_session
 from .cockpit_dashboard import COCKPIT_HTML
@@ -68,6 +69,7 @@ settings, service, research_store, research_brain, brain_bench_service, epistemi
 )
 meta_controller_service: MetaResearchController | None = None
 cockpit_controller_service: CockpitController | None = None
+browser_wake_dispatcher: BrowserWakeDispatcher | None = None
 _singleton_lock = threading.RLock()
 embedding_service: EmbeddingService | None = None
 engineering_service: EngineeringService | None = None
@@ -399,6 +401,15 @@ def cockpit() -> CockpitController:
             if cockpit_controller_service is None:
                 cockpit_controller_service = CockpitController(research(), lab())
     return cockpit_controller_service
+
+
+def browser_dispatcher() -> BrowserWakeDispatcher:
+    global browser_wake_dispatcher
+    if browser_wake_dispatcher is None:
+        with _singleton_lock:
+            if browser_wake_dispatcher is None:
+                browser_wake_dispatcher = BrowserWakeDispatcher(cockpit(), settings.chatgpt_web_profile_root)
+    return browser_wake_dispatcher
 
 
 def engineering() -> EngineeringService:
@@ -1119,6 +1130,16 @@ async def lab_turn_report(
     """Persist one bounded worker-turn outcome; CONTINUE can queue one idempotent wake only."""
     return await call(cockpit().turn_report, project_id, worker_id, session_id, outcome,
                       summary, work_item_id)
+
+
+@mcp.tool()
+async def browser_wake_dispatch(project_id: str | None = None):
+    """Dispatch one durable continuation only when browser bridge and auto-continue are enabled."""
+    if not settings.chatgpt_web_bridge_enabled:
+        raise GPUError("CHATGPT_WEB_BRIDGE_DISABLED", "Set CHATGPT_WEB_BRIDGE_ENABLED=true")
+    if not settings.auto_continue_enabled:
+        raise GPUError("AUTO_CONTINUE_DISABLED", "Set AUTO_CONTINUE_ENABLED=true")
+    return await call(browser_dispatcher().dispatch_one, project_id)
 
 
 @mcp.tool()
