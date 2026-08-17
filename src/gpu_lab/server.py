@@ -3307,6 +3307,30 @@ async def activity(_: Request):
     return JSONResponse(svc().repo.list_audit(100))
 
 
+@mcp.custom_route("/monitor", methods=["GET"], include_in_schema=False)
+async def monitor(_: Request):
+    """Return real local-job state and GPU telemetry for the dashboard."""
+    if not settings.gpu_lab_enable_local_runner:
+        return JSONResponse({"enabled": False, "jobs": [], "gpus": []})
+    try:
+        gpus = await local.gpu_metrics()
+        gpu_error = None
+    except GPUError as exc:
+        gpus = []
+        gpu_error = exc.message
+    jobs = []
+    for job in svc().repo.list_jobs(instance_id="local", limit=30):
+        jobs.append(
+            {
+                **local.job_status(job.job_id),
+                "name": job.name,
+                "started_at": job.started_at.isoformat() if job.started_at else None,
+                "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+            }
+        )
+    return JSONResponse({"enabled": True, "jobs": jobs, "gpus": gpus, "gpu_error": gpu_error})
+
+
 def _research_map_payload(project_id: str) -> dict[str, Any]:
     """Return the smallest evidence-bearing WorldModel view needed by the dashboard."""
     models = research().objects_list(project_id, "WorldModel", limit=1)

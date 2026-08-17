@@ -62,6 +62,25 @@ def test_local_job_environment_excludes_gateway_secrets(monkeypatch, tmp_path):
     } & environment.keys()
 
 
+def test_parse_gpu_metrics_keeps_only_complete_numeric_nvidia_rows():
+    metrics = LocalRunner._parse_gpu_metrics(
+        "0, NVIDIA RTX 4090, 24564, 12000, 87, 64\n"
+        "malformed row\n"
+        "1, NVIDIA RTX 4090, unknown, 200, 5, 41\n"
+    )
+
+    assert metrics == [
+        {
+            "index": 0,
+            "name": "NVIDIA RTX 4090",
+            "memory_total_mb": 24564,
+            "memory_used_mb": 12000,
+            "utilization_percent": 87,
+            "temperature_c": 64,
+        }
+    ]
+
+
 def test_mcp_wildcard_accept_header_allows_json_response():
     headers = [(b"accept", b"text/html, */*"), (b"content-type", b"application/json")]
 
