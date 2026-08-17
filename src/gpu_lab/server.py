@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qs
 
 from mcp.server.fastmcp import FastMCP
@@ -51,6 +51,24 @@ from .strategy import ResearchStrategyService
 from .terminal import TERMINAL_HTML
 
 logger = logging.getLogger(__name__)
+
+
+def _source_sha(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+_RUNTIME_SOURCE_PATHS = {
+    name: Path(__file__).with_name(name)
+    for name in ("server.py", "brain.py", "research.py", "lab.py")
+}
+# Captured at module import, before any MCP request creates the singleton Brain.
+# This detects source mounts changing underneath a long-lived Python process;
+# dynamic reload is intentionally avoided because it can split live singleton
+# state across incompatible class definitions.
+_LOADED_SOURCE_SHAS = {name: _source_sha(path) for name, path in _RUNTIME_SOURCE_PATHS.items()}
 
 settings, service, research_store, research_brain, brain_bench_service, epistemic_service, literature_service, executable_paper_service, qd_service, branch_service, meta_research_service, strategy_service, policy_lab_service, lab_controller_service = (
     Settings(),
@@ -112,6 +130,7 @@ _READ_ONLY_TOOLS = {
     "lab_workers_list",
     "lab_work_list",
     "lab_message_list",
+    "runtime_code_version",
     "research_benchmark_list",
     "research_benchmark_episode_get",
     "research_benchmark_policy_run",
@@ -463,6 +482,21 @@ def brain() -> ResearchBrain:
             if research_brain is None:
                 research_brain = ResearchBrain(research())
     return research_brain
+
+
+def _runtime_code_version() -> dict[str, Any]:
+    """Report the process-loaded and current-on-disk Research OS source hashes."""
+    files = {
+        name: {"loaded_sha256": loaded, "disk_sha256": _source_sha(_RUNTIME_SOURCE_PATHS[name])}
+        for name, loaded in _LOADED_SOURCE_SHAS.items()
+    }
+    drifted = [name for name, values in files.items() if values["loaded_sha256"] != values["disk_sha256"]]
+    return {"files": files, "code_drift": bool(drifted), "drifted_files": drifted,
+            "reload_policy": "restart_required_for_consistent_singleton_runtime"}
+
+
+def _research_runtime_has_code_drift() -> bool:
+    return any(_LOADED_SOURCE_SHAS[name] != _source_sha(path) for name, path in _RUNTIME_SOURCE_PATHS.items())
 
 
 def brain_bench() -> ResearchBrainBench:
@@ -993,9 +1027,15 @@ async def research_state_get(project_id: str, limit: int = 10, as_of: str | None
 
 
 @mcp.tool()
+async def runtime_code_version():
+    """Show whether this long-lived MCP process differs from its mounted source code."""
+    return _runtime_code_version()
+
+
+@mcp.tool()
 async def lab_join(
     project_id: str,
-    runtime_type: str,
+    runtime_type: Literal["CHATGPT_WEB", "OPENAI_API", "CLAUDE_API", "CODEX", "LOCAL_AGENT", "OTHER"],
     worker_id: str | None = None,
     worker_name: str | None = None,
     capabilities: dict[str, Any] | None = None,
@@ -1075,9 +1115,17 @@ async def lab_work_start(work_item_id: str, worker_id: str, session_id: str):
 
 
 @mcp.tool()
-async def lab_work_release(work_item_id: str, worker_id: str, session_id: str, reason: str = "RELEASED"):
+async def lab_work_release(work_item_id: str, worker_id: str, session_id: str,
+                           reason: str = "RELEASED", dependencies: list[dict] | None = None):
     """Release only work owned by this session; GPU execution is never cancelled."""
-    return await call(lab().release_work, work_item_id, worker_id, session_id, reason)
+    return await call(lab().release_work, work_item_id, worker_id, session_id, reason, dependencies)
+
+
+@mcp.tool()
+async def lab_work_block(work_item_id: str, worker_id: str, session_id: str,
+                         dependencies: list[dict], reason: str = "WAITING_DEPENDENCY"):
+    """Release owned work into a dependency-gated state that cannot be claimed early."""
+    return await call(lab().block_work, work_item_id, worker_id, session_id, dependencies, reason)
 
 
 @mcp.tool()
@@ -1840,6 +1888,15 @@ async def research_decision_create(
     research_object_get. Pass decision_id to research_experiment_execute with
     the same bound command.
     """
+    if _research_runtime_has_code_drift():
+        return {
+            "error": {
+                "type": "RESEARCH_RUNTIME_CODE_DRIFT",
+                "message": "Mounted Research OS source differs from the code loaded by this MCP process; restart is required before creating a decision.",
+                "retryable": False,
+            },
+            "runtime": _runtime_code_version(),
+        }
     step = await call(brain().brain_step, project_id)
     if "error" in step:
         return step
@@ -3460,6 +3517,49 @@ async def research_experiment_sync(run_id: str | None = None, job_id: str | None
         "run": updated,
     }
     return response
+
+
+@mcp.tool()
+async def research_experiment_reconcile_orphan(
+    run_id: str,
+    rationale: str,
+    terminal_status: Literal["TECHNICAL_CANCELLED", "TECHNICAL_ORPHANED"] = "TECHNICAL_ORPHANED",
+    technical_non_scientific: bool = False,
+):
+    """Close a submitted canonical run only after the local executor proves it cannot be live.
+
+    This records operations bookkeeping, never a scientific result.  It refuses
+    runs with canonical artifacts or a live local job.
+    """
+    if not technical_non_scientific:
+        return {"error": {"type": "TECHNICAL_NON_SCIENTIFIC_CONFIRMATION_REQUIRED", "message": "Set technical_non_scientific=true after confirming this is not scientific evidence."}}
+    mapping = await call(research().run_resolve, run_id)
+    if "error" in mapping:
+        return mapping
+    job_id = mapping["job_id"]
+    outcome = await call(local.job_status, job_id)
+    if "error" in outcome:
+        runner_status = "missing" if outcome["error"].get("type") == "JOB_NOT_FOUND" else "unknown"
+    else:
+        runner_status = outcome.get("status", "unknown")
+    if runner_status in {"queued", "running", "completed", "failed"}:
+        return {
+            "error": {"type": "EXPERIMENT_RUN_NOT_ORPHANED", "message": f"Local job is {runner_status}; reconciliation would be unsafe."},
+            "run_id": run_id,
+            "job_id": job_id,
+            "runner_status": runner_status,
+        }
+    reconciled = await call(
+        research().run_reconcile_orphan,
+        run_id,
+        job_id,
+        terminal_status,
+        runner_status,
+        rationale,
+    )
+    if "error" in reconciled:
+        return reconciled
+    return {"run_id": run_id, "job_id": job_id, "runner_status": runner_status, "technical_non_scientific": True, "run": reconciled}
 
 
 @mcp.tool()

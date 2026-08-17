@@ -154,11 +154,15 @@ class ResearchBrain:
         for key, value in state["canonical_state"].items():
             if isinstance(value, list):
                 snapshot[key] = [
-                    {
-                        field: str(item[field]) if field == "id" else item[field]
-                        for field in ("id", "kind", "status")
-                        if field in item
-                    }
+                    (
+                        {
+                            field: str(item[field]) if field == "id" else item[field]
+                            for field in ("id", "kind", "status")
+                            if field in item
+                        }
+                        if isinstance(item, dict)
+                        else item
+                    )
                     for item in value
                 ]
             else:
@@ -401,7 +405,22 @@ class ResearchBrain:
             *(related_contradiction_ids or []),
         ]
         self._validate_references(agenda["project_id"], references)
-        experiments = candidate_experiments or []
+        experiments = []
+        for raw_candidate in candidate_experiments or []:
+            # Normalize the accepted AgendaItem shorthand at the write boundary.
+            # Older callers supplied a singular ``prediction`` and a top-level
+            # experiment ID; downstream action construction requires the plural
+            # outcome list and a payload-bound experiment ID.
+            candidate = dict(raw_candidate)
+            if not candidate.get("predicted_outcomes"):
+                prediction = candidate.get("prediction")
+                if isinstance(prediction, str) and prediction.strip():
+                    candidate["predicted_outcomes"] = [prediction.strip()]
+            payload = dict(candidate.get("payload") or {})
+            if candidate.get("experiment_id") and not payload.get("experiment_id"):
+                payload["experiment_id"] = candidate["experiment_id"]
+            candidate["payload"] = payload
+            experiments.append(candidate)
         for candidate in experiments:
             if "action_type" not in candidate:
                 raise GPUError("INVALID_RESEARCH_ACTION_TYPE", "Candidate action_type is required")
@@ -1370,7 +1389,7 @@ class ResearchBrain:
             **temporal,
         )
         unfinished = self.store.experiment_run_first(
-            project_id, {"RESERVED", "running", "unknown"}, **temporal
+            project_id, {"RESERVED", "running", "unknown"}, inspected=False, **temporal
         )
         failed_uninspected = self.store.experiment_run_first(
             project_id, {"failed", "cancelled"}, inspected=False, **temporal
@@ -1630,9 +1649,15 @@ class ResearchBrain:
                 action_type=item["action_type"],
                 question_addressed=item.get("question_addressed", question),
                 hypotheses_discriminated=item.get("hypotheses_discriminated", hypothesis_ids),
-                predicted_outcomes=item.get("predicted_outcomes", []),
+                predicted_outcomes=(
+                    item.get("predicted_outcomes")
+                    or ([item["prediction"].strip()] if isinstance(item.get("prediction"), str) and item["prediction"].strip() else [])
+                ),
                 required_resources=item.get("required_resources", []),
-                payload=item.get("payload", {}),
+                payload={
+                    **item.get("payload", {}),
+                    **({"experiment_id": item["experiment_id"]} if item.get("experiment_id") and not item.get("payload", {}).get("experiment_id") else {}),
+                },
                 available=item.get("available", True),
                 blocked_reason=item.get("blocked_reason"),
                 score=ActionScore(

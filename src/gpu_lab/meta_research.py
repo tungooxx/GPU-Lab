@@ -118,6 +118,7 @@ class MetaResearchService:
             str(item["id"])
             for item in runs
             if item["status"] in RECOVERABLE_RUN_STATUSES
+            and ResearchStore.experiment_run_is_operationally_active(item)
         ]
         uninspected = [
             str(item["id"])

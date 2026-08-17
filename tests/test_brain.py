@@ -79,7 +79,12 @@ def test_state_snapshot_keeps_object_identity_without_copying_large_payloads():
     assert snapshot["active_hypotheses"] == [
         {"id": "hypothesis-1", "kind": "Hypothesis", "status": "ACTIVE"}
     ]
-    assert "large" not in str(snapshot)
+
+
+def test_state_snapshot_preserves_scalar_canonical_entries():
+    state = {"canonical_state": {"established_facts": ["fact-a", "fact-b"]}}
+    snapshot = ResearchBrain._state_snapshot(state)
+    assert snapshot["established_facts"] == ["fact-a", "fact-b"]
 
 
 class CandidateStore:

@@ -143,6 +143,8 @@ RESEARCH_OBJECT_STATUSES = {
     "failed",
     "running",
     "unknown",
+    "TECHNICAL_CANCELLED",
+    "TECHNICAL_ORPHANED",
 }
 
 # Orthogonal epistemic classifications. These are metadata about the role and
@@ -3726,6 +3728,39 @@ class ResearchStore:
             cur.execute(sql, args)
             return cur.fetchone()
 
+    @staticmethod
+    def run_has_terminal_technical_inspection(run: dict[str, Any]) -> bool:
+        """Whether a run has already been closed as non-scientific operations work.
+
+        A failed launch must not be reintroduced as scientific work merely because
+        an older runner record still says ``unknown`` or ``running``.  Keep this
+        deliberately narrow: ordinary completed scientific results remain subject
+        to normal result inspection.
+        """
+        if run.get("status") in {"TECHNICAL_CANCELLED", "TECHNICAL_ORPHANED"}:
+            return True
+        data = run.get("data") or {}
+        inspection = data.get("inspection")
+        if not isinstance(inspection, dict):
+            return False
+        outcome = str(inspection.get("prediction_outcome", ""))
+        return bool(
+            inspection.get("technical_non_scientific") is True
+            or outcome.startswith("TECHNICAL_")
+            or (
+                inspection.get("scientific_result") == "NOT_ASSESSED"
+                and inspection.get("actual_information_gain") in {"ZERO", "INVALID"}
+            )
+        )
+
+    @classmethod
+    def experiment_run_is_operationally_active(cls, run: dict[str, Any]) -> bool:
+        """Single canonical predicate for an execution that can still be recovered."""
+        return (
+            run.get("status") in {"ACTIVE", "RESERVED", "running", "unknown", "RUNNING"}
+            and not cls.run_has_terminal_technical_inspection(run)
+        )
+
     def references_get(
         self, identifiers: list[str], as_of: datetime | str | None = None
     ) -> dict[str, dict]:
@@ -3821,11 +3856,13 @@ class ResearchStore:
                 "active_hypotheses": by_kind("Hypothesis", {"ACTIVE", "SURVIVES_INITIAL_TEST"}),
                 "refuted_lineages": by_kind("Hypothesis", {"REFUTED"}),
                 "completed_experiments": by_kind("ExperimentRun", {"completed"}),
-                "active_experiments": by_kind(
-                    "ExperimentRun", {"ACTIVE", "RESERVED", "running", "unknown"}
-                ),
+                "active_experiments": [
+                    item
+                    for item in by_kind("ExperimentRun")
+                    if self.experiment_run_is_operationally_active(item)
+                ],
                 "terminal_non_success_experiments": by_kind(
-                    "ExperimentRun", {"failed", "cancelled"}
+                    "ExperimentRun", {"failed", "cancelled", "TECHNICAL_CANCELLED", "TECHNICAL_ORPHANED"}
                 ),
                 "open_experiments": by_kind("Experiment", {"ACTIVE"}),
                 "reproduction_status": by_kind("Reproduction"),
@@ -4141,7 +4178,10 @@ class ResearchStore:
             run = cur.fetchone()
             if not run or run["kind"] != "ExperimentRun":
                 raise GPUError("EXPERIMENT_RUN_NOT_FOUND", run_id)
-            if run["status"] in {"completed", "failed", "cancelled", "RESULT_INSPECTED"}:
+            if run["status"] in {
+                "completed", "failed", "cancelled", "RESULT_INSPECTED",
+                "TECHNICAL_CANCELLED", "TECHNICAL_ORPHANED",
+            }:
                 return {
                     "id": run_id,
                     "status": run["status"],
@@ -4166,6 +4206,65 @@ class ResearchStore:
             )
             self._event(cur, run["project_id"], event, run_id, result)
         return {"id": run_id, "status": status, "data": data}
+
+    def run_reconcile_orphan(
+        self,
+        run_id: str,
+        job_id: str,
+        terminal_status: str,
+        runner_status: str,
+        rationale: str,
+    ) -> dict:
+        """Terminally close a submitted run proved to be a non-scientific orphan.
+
+        This is intentionally stricter than normal sync: it cannot discard a
+        canonical artifact, a live job, or an unsubmitted reservation.
+        """
+        if terminal_status not in {"TECHNICAL_CANCELLED", "TECHNICAL_ORPHANED"}:
+            raise GPUError("INVALID_TECHNICAL_TERMINAL_STATUS", terminal_status)
+        if runner_status not in {"cancelled", "missing", "unknown"}:
+            raise GPUError("RUNNER_STATUS_NOT_ORPHANED", runner_status)
+        if not rationale.strip():
+            raise GPUError("TECHNICAL_RECONCILIATION_RATIONALE_REQUIRED", run_id)
+        now = datetime.now(UTC)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,project_id,kind,status,data FROM research_objects WHERE id=%s FOR UPDATE",
+                (run_id,),
+            )
+            run = cur.fetchone()
+            if not run or run["kind"] != "ExperimentRun":
+                raise GPUError("EXPERIMENT_RUN_NOT_FOUND", run_id)
+            if run["data"].get("job_id") != job_id:
+                raise GPUError("EXPERIMENT_RUN_JOB_MISMATCH", job_id)
+            if not run["data"].get("submission_status"):
+                raise GPUError("EXPERIMENT_RUN_NOT_SUBMITTED", run_id)
+            if run["status"] in {"completed", "RESULT_INSPECTED"}:
+                raise GPUError("EXPERIMENT_RUN_ALREADY_SCIENTIFICALLY_FINAL", run_id)
+            if run["status"] in {"TECHNICAL_CANCELLED", "TECHNICAL_ORPHANED"}:
+                return {"id": run_id, "status": run["status"], "data": run["data"], "idempotent_replay": True}
+            cur.execute(
+                "SELECT 1 FROM research_objects WHERE project_id=%s AND kind='Artifact' "
+                "AND data->>'run_id'=%s LIMIT 1",
+                (run["project_id"], run_id),
+            )
+            if cur.fetchone():
+                raise GPUError("EXPERIMENT_RUN_ARTIFACT_PRESENT", run_id)
+            inspection = {
+                "mode": "TECHNICAL_ORPHAN_RECONCILIATION",
+                "technical_non_scientific": True,
+                "scientific_result": "NOT_ASSESSED",
+                "prediction_outcome": "TECHNICAL_STALE_DUPLICATE_NO_RESULT",
+                "actual_information_gain": "ZERO",
+                "recorded_at": now.isoformat(),
+                "rationale": rationale.strip(),
+                "runner_status": runner_status,
+            }
+            data = {**run["data"], "inspection": inspection, "technical_reconciliation": inspection}
+            cur.execute("UPDATE research_objects SET status=%s,data=%s WHERE id=%s", (terminal_status, json.dumps(data), run_id))
+            cur.execute("UPDATE research_execution_attempts SET status=%s,updated_at=%s WHERE run_id=%s", (terminal_status, now, run_id))
+            self._event(cur, run["project_id"], "EXPERIMENT_RUN_TECHNICALLY_RECONCILED", run_id, {"status": terminal_status, "runner_status": runner_status, "rationale": rationale.strip()})
+        return {"id": run_id, "status": terminal_status, "data": data, "idempotent_replay": False}
 
     def legacy_reserved_run_abandon(
         self, run_id: str, job_id: str, rationale: str, provenance: dict[str, Any]
