@@ -1083,6 +1083,12 @@ async def lab_controls_get(project_id: str):
 
 
 @mcp.tool()
+async def cockpit_state_get(project_id: str, session_id: str | None = None):
+    """Read the compact canonical/operational cockpit projection for one project."""
+    return await call(cockpit().state_get, project_id, session_id)
+
+
+@mcp.tool()
 async def lab_controls_set(
     project_id: str, worker_id: str, session_id: str,
     autopilot_enabled: bool | None = None, auto_continue_enabled: bool | None = None,
@@ -3677,6 +3683,17 @@ async def cockpit_login(request: Request):
     response.set_cookie(_COCKPIT_COOKIE, token, max_age=28_800, httponly=True,
                         secure=request.url.scheme == "https", samesite="strict", path="/")
     return response
+
+
+@mcp.custom_route("/cockpit/state", methods=["GET"], include_in_schema=False)
+async def cockpit_state(request: Request):
+    project_id = request.query_params.get("project_id", "").strip()
+    if not project_id:
+        return JSONResponse({"error": "project_id is required"}, status_code=400)
+    try:
+        return JSONResponse(ResearchBrain._json_safe(cockpit().state_get(project_id)))
+    except GPUError as error:
+        return JSONResponse({"error": error.message, "type": error.error_type}, status_code=400)
 
 
 @mcp.custom_route("/", methods=["GET"], include_in_schema=False)

@@ -163,6 +163,37 @@ class CockpitController:
             self.store._event(cur, runtime["project_id"], "BROWSER_RUNTIME_STATUS_CHANGED", runtime_id, {"status": status, "error": bool(error)})
         return self.runtime_get(runtime_id)
 
+    def state_get(self, project_id: str, session_id: str | None = None) -> dict[str, Any]:
+        """Build a compact cockpit projection from durable operational state."""
+        lab_state = self.lab.state_get(project_id, session_id)
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,worker_id,worker_session_id,status,conversation_url,last_seen_at,last_error "
+                "FROM lab_worker_runtimes WHERE project_id=%s ORDER BY updated_at DESC",
+                (project_id,),
+            )
+            runtimes = [self.lab._record(row) for row in cur.fetchall()]
+            cur.execute(
+                "SELECT id,worker_id,worker_session_id,work_item_id,outcome,summary,status,created_at "
+                "FROM lab_worker_turns WHERE project_id=%s ORDER BY created_at DESC LIMIT 30",
+                (project_id,),
+            )
+            turns = [self.lab._record(row) for row in cur.fetchall()]
+            cur.execute(
+                "SELECT id,worker_id,worker_session_id,work_item_id,reason,status,created_at "
+                "FROM lab_worker_wake_requests WHERE project_id=%s AND status IN ('PENDING','DISPATCHED') "
+                "ORDER BY created_at DESC LIMIT 30",
+                (project_id,),
+            )
+            wakes = [self.lab._record(row) for row in cur.fetchall()]
+        return {
+            "lab_state": lab_state,
+            "controls": self.controls_get(project_id),
+            "browser_runtimes": runtimes,
+            "recent_turns": turns,
+            "pending_wake_requests": wakes,
+        }
+
     def turn_report(self, project_id: str, worker_id: str, session_id: str, outcome: str,
                     summary: str, work_item_id: str | None = None) -> dict[str, Any]:
         outcome = str(outcome).upper()
