@@ -26,6 +26,7 @@ from .brain_bench import BenchmarkPolicy, ResearchBrainBench
 from .branches import ExperimentBranchService
 from .cockpit import CockpitController
 from .cockpit_auth import issue_session, password_matches, verify_session
+from .cockpit_dashboard import COCKPIT_HTML
 from .config import Settings
 from .dashboard import DASHBOARD_HTML
 from .discovery import breakthrough_signal, local_search_collapse_diagnosis
@@ -3698,7 +3699,7 @@ async def cockpit_state(request: Request):
 
 @mcp.custom_route("/", methods=["GET"], include_in_schema=False)
 async def dashboard(_: Request):
-    return HTMLResponse(DASHBOARD_HTML)
+    return HTMLResponse(COCKPIT_HTML if settings.lab_ui_enabled else DASHBOARD_HTML)
 
 
 def http_app():
