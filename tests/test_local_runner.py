@@ -94,6 +94,7 @@ def test_job_status_can_skip_expensive_log_reading(tmp_path):
     jobdir = runner.workspace / ".gpu-lab" / "jobs" / job.job_id
     jobdir.mkdir(parents=True)
     (jobdir / "stdout.log").write_text("large output is deliberately omitted")
+    (jobdir / "exit_code").write_text("0")
 
     status = runner.job_status(job.job_id, include_logs=False)
 
