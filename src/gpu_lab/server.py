@@ -23,6 +23,7 @@ from starlette.types import ASGIApp
 from .brain import ResearchBrain
 from .brain_bench import BenchmarkPolicy, ResearchBrainBench
 from .branches import ExperimentBranchService
+from .cockpit import CockpitController
 from .config import Settings
 from .dashboard import DASHBOARD_HTML
 from .discovery import breakthrough_signal, local_search_collapse_diagnosis
@@ -63,6 +64,7 @@ settings, service, research_store, research_brain, brain_bench_service, epistemi
     None,
 )
 meta_controller_service: MetaResearchController | None = None
+cockpit_controller_service: CockpitController | None = None
 _singleton_lock = threading.RLock()
 embedding_service: EmbeddingService | None = None
 engineering_service: EngineeringService | None = None
@@ -353,6 +355,15 @@ def lab() -> LabController:
             if lab_controller_service is None:
                 lab_controller_service = LabController(research())
     return lab_controller_service
+
+
+def cockpit() -> CockpitController:
+    global cockpit_controller_service
+    if cockpit_controller_service is None:
+        with _singleton_lock:
+            if cockpit_controller_service is None:
+                cockpit_controller_service = CockpitController(research(), lab())
+    return cockpit_controller_service
 
 
 def engineering() -> EngineeringService:
@@ -1029,6 +1040,44 @@ async def lab_message_list(project_id: str, worker_id: str, role: str | None = N
 async def lab_message_mark_read(project_id: str, worker_id: str, session_id: str, message_ids: list[str]):
     """Acknowledge messages visible to this project-scoped active worker session."""
     return await call(lab().message_mark_read, project_id, worker_id, session_id, message_ids)
+
+
+@mcp.tool()
+async def lab_controls_get(project_id: str):
+    """Read project autopilot, auto-continue, and scheduling-pause controls."""
+    return await call(cockpit().controls_get, project_id)
+
+
+@mcp.tool()
+async def lab_controls_set(
+    project_id: str, worker_id: str, session_id: str,
+    autopilot_enabled: bool | None = None, auto_continue_enabled: bool | None = None,
+    paused: bool | None = None,
+):
+    """Change only scheduling controls; this never cancels an active GPU experiment."""
+    return await call(cockpit().controls_set, project_id, worker_id, session_id,
+                      autopilot_enabled=autopilot_enabled,
+                      auto_continue_enabled=auto_continue_enabled, paused=paused)
+
+
+@mcp.tool()
+async def browser_runtime_attach(
+    project_id: str, worker_id: str, session_id: str, conversation_url: str | None = None,
+    browser_profile_key: str | None = None,
+):
+    """Persist a server-side ChatGPT Web runtime attachment; no browser cookie is returned."""
+    return await call(cockpit().runtime_attach, project_id, worker_id, session_id,
+                      conversation_url, browser_profile_key)
+
+
+@mcp.tool()
+async def lab_turn_report(
+    project_id: str, worker_id: str, session_id: str, outcome: str, summary: str = "",
+    work_item_id: str | None = None,
+):
+    """Persist one bounded worker-turn outcome; CONTINUE can queue one idempotent wake only."""
+    return await call(cockpit().turn_report, project_id, worker_id, session_id, outcome,
+                      summary, work_item_id)
 
 
 @mcp.tool()

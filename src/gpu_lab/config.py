@@ -48,6 +48,13 @@ class Settings(BaseSettings):
     gpu_lab_executable_paper_worker_token: str | None = None
     gpu_lab_approval_secret: str | None = None
     gpu_lab_denied_mcp_client_cidrs: str = ""
+    lab_ui_enabled: bool = False
+    chatgpt_web_bridge_enabled: bool = False
+    autopilot_enabled: bool = False
+    auto_continue_enabled: bool = False
+    live_browser_preview_enabled: bool = False
+    gpu_lab_cockpit_password: str | None = None
+    gpu_lab_cockpit_session_secret: str | None = None
     fastmcp_host: str = "127.0.0.1"
     fastmcp_port: int = 8000
 
