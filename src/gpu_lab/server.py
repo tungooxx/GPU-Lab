@@ -3320,9 +3320,12 @@ async def monitor(_: Request):
         gpu_error = exc.message
     jobs = []
     for job in svc().repo.list_jobs(instance_id="local", limit=30):
+        status = local.job_status(job.job_id, include_logs=False)
         jobs.append(
             {
-                **local.job_status(job.job_id),
+                "job_id": status["job_id"],
+                "status": status["status"],
+                "exit_code": status["exit_code"],
                 "name": job.name,
                 "started_at": job.started_at.isoformat() if job.started_at else None,
                 "completed_at": job.completed_at.isoformat() if job.completed_at else None,

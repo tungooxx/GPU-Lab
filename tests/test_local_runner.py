@@ -81,6 +81,25 @@ def test_parse_gpu_metrics_keeps_only_complete_numeric_nvidia_rows():
     ]
 
 
+def test_job_status_can_skip_expensive_log_reading(tmp_path):
+    runner = _runner(tmp_path)
+    job = Job(
+        job_id="local_status_without_logs",
+        instance_id="local",
+        repo_path=str(runner.workspace),
+        command="echo done",
+        status="completed",
+    )
+    runner.repo.save_job(job)
+    jobdir = runner.workspace / ".gpu-lab" / "jobs" / job.job_id
+    jobdir.mkdir(parents=True)
+    (jobdir / "stdout.log").write_text("large output is deliberately omitted")
+
+    status = runner.job_status(job.job_id, include_logs=False)
+
+    assert status == {"job_id": job.job_id, "status": "completed", "exit_code": None}
+
+
 def test_mcp_wildcard_accept_header_allows_json_response():
     headers = [(b"accept", b"text/html, */*"), (b"content-type", b"application/json")]
 

@@ -347,7 +347,7 @@ class LocalRunner:
         content = file.read_bytes()[:limit]
         return {"job_id": job_id, "path": path, "truncated": file.stat().st_size > limit, "content": content.decode(errors="replace")}
 
-    def job_status(self, job_id: str) -> dict:
+    def job_status(self, job_id: str, include_logs: bool = True) -> dict:
         job = self.repo.get_job(job_id)
         if not job or job.instance_id != "local":
             raise GPUError("JOB_NOT_FOUND", f"No local job named {job_id}")
@@ -407,11 +407,14 @@ class LocalRunner:
                 except OSError:
                     job.status = "unknown"
         self.repo.save_job(job)
-        logs = ""
-        for file in (jobdir / "stdout.log", jobdir / "stderr.log"):
-            if file.exists():
-                logs += file.read_text(errors="replace")[-65536:]
-        return {"job_id": job_id, "status": job.status, "exit_code": job.exit_code, "logs_tail": logs}
+        result = {"job_id": job_id, "status": job.status, "exit_code": job.exit_code}
+        if include_logs:
+            logs = ""
+            for file in (jobdir / "stdout.log", jobdir / "stderr.log"):
+                if file.exists():
+                    logs += file.read_text(errors="replace")[-65536:]
+            result["logs_tail"] = logs
+        return result
 
     def reconcile_jobs(self) -> dict[str, int]:
         """Refresh persisted non-final jobs after a gateway start or restart."""
