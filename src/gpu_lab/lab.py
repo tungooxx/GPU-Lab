@@ -1,0 +1,461 @@
+"""Durable, project-scoped coordination for multiple Research OS workers.
+
+Lab control is deliberately operational: scientific truth continues to live in
+ResearchStore objects, evidence pathways, and the v3.1 Brain.
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from .errors import GPUError
+from .research import ResearchStore
+
+RUNTIME_TYPES = {"CHATGPT_WEB", "OPENAI_API", "CLAUDE_API", "CODEX", "LOCAL_AGENT", "OTHER"}
+SESSION_STATUSES = {"ACTIVE", "BUSY", "WAITING", "IDLE", "DISCONNECTED", "EXPIRED"}
+WORK_STATUSES = {
+    "READY", "CLAIMED", "RUNNING", "WAITING_DEPENDENCY", "BLOCKED", "COMPLETED",
+    "FAILED", "CANCELLED", "INVALIDATED",
+}
+ACTIVE_WORK_STATUSES = {"READY", "CLAIMED", "RUNNING", "WAITING_DEPENDENCY", "BLOCKED"}
+MESSAGE_TYPES = {
+    "REQUEST_REVIEW", "REQUEST_DATA", "REQUEST_IMPLEMENTATION", "SHARE_FINDING",
+    "CHALLENGE_INTERPRETATION", "HANDOFF", "BLOCKER", "CROSS_PROJECT_RELEVANCE",
+    "COORDINATION", "INFORMATION",
+}
+
+
+class LabController:
+    """Coordinate workers without becoming a second scientific truth store."""
+
+    def __init__(self, store: ResearchStore, lease_seconds: int = 300):
+        self.store = store
+        self.lease_seconds = lease_seconds
+        self._migrate()
+
+    def _migrate(self) -> None:
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext('gpu_lab_lab_worker_migration'))")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS research_workers (
+                    id UUID PRIMARY KEY, display_name TEXT UNIQUE NOT NULL,
+                    worker_type TEXT NOT NULL, capabilities JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    enabled BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS research_worker_sessions (
+                    id UUID PRIMARY KEY, worker_id UUID NOT NULL REFERENCES research_workers(id),
+                    runtime_type TEXT NOT NULL, runtime_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    current_project_id UUID REFERENCES research_projects(id), current_work_item_id UUID,
+                    active_role TEXT, status TEXT NOT NULL, joined_at TIMESTAMPTZ NOT NULL,
+                    last_heartbeat_at TIMESTAMPTZ NOT NULL, disconnected_at TIMESTAMPTZ,
+                    active_policy_version TEXT, active_brain_version TEXT, context_version JSONB NOT NULL DEFAULT '{}'::jsonb
+                );
+                CREATE INDEX IF NOT EXISTS research_worker_sessions_project_active_idx
+                    ON research_worker_sessions(current_project_id,last_heartbeat_at DESC);
+                CREATE TABLE IF NOT EXISTS lab_work_items (
+                    id UUID PRIMARY KEY, project_id UUID NOT NULL REFERENCES research_projects(id),
+                    kind TEXT NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL,
+                    scientific_role TEXT NOT NULL, status TEXT NOT NULL, priority DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    expected_value DOUBLE PRECISION, estimated_cost DOUBLE PRECISION,
+                    created_by UUID REFERENCES research_workers(id), assigned_worker_id UUID REFERENCES research_workers(id),
+                    assigned_session_id UUID REFERENCES research_worker_sessions(id), lease_id UUID,
+                    parent_work_item_id UUID REFERENCES lab_work_items(id), branch_id UUID,
+                    related_refs JSONB NOT NULL DEFAULT '{}'::jsonb, equivalence_key TEXT,
+                    blocked_reason TEXT, invalidated_reason TEXT,
+                    created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL, completed_at TIMESTAMPTZ
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS lab_work_items_active_equivalence_unique
+                    ON lab_work_items(project_id,equivalence_key)
+                    WHERE equivalence_key IS NOT NULL AND status IN ('READY','CLAIMED','RUNNING','WAITING_DEPENDENCY','BLOCKED');
+                CREATE INDEX IF NOT EXISTS lab_work_items_project_status_priority_idx
+                    ON lab_work_items(project_id,status,priority DESC,created_at);
+                CREATE TABLE IF NOT EXISTS lab_work_dependencies (
+                    id UUID PRIMARY KEY, work_item_id UUID NOT NULL REFERENCES lab_work_items(id) ON DELETE CASCADE,
+                    target_type TEXT NOT NULL, target_id TEXT NOT NULL, required_statuses JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    invalidating_statuses JSONB NOT NULL DEFAULT '[]'::jsonb, description TEXT NOT NULL DEFAULT '',
+                    created_at TIMESTAMPTZ NOT NULL, UNIQUE(work_item_id,target_type,target_id)
+                );
+                CREATE TABLE IF NOT EXISTS lab_work_leases (
+                    id UUID PRIMARY KEY, work_item_id UUID NOT NULL REFERENCES lab_work_items(id),
+                    worker_id UUID NOT NULL REFERENCES research_workers(id),
+                    worker_session_id UUID NOT NULL REFERENCES research_worker_sessions(id),
+                    acquired_at TIMESTAMPTZ NOT NULL, heartbeat_at TIMESTAMPTZ NOT NULL,
+                    expires_at TIMESTAMPTZ NOT NULL, released_at TIMESTAMPTZ, release_reason TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS lab_work_leases_one_active_per_work
+                    ON lab_work_leases(work_item_id) WHERE released_at IS NULL;
+                CREATE TABLE IF NOT EXISTS lab_messages (
+                    id UUID PRIMARY KEY, project_id UUID NOT NULL REFERENCES research_projects(id),
+                    from_worker_id UUID NOT NULL REFERENCES research_workers(id),
+                    to_worker_id UUID REFERENCES research_workers(id), to_role TEXT, broadcast_scope TEXT,
+                    message_type TEXT NOT NULL, subject TEXT NOT NULL, body TEXT NOT NULL,
+                    reference_ids JSONB NOT NULL DEFAULT '[]'::jsonb, priority INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ NOT NULL, read_at TIMESTAMPTZ, resolved_at TIMESTAMPTZ
+                );
+                CREATE INDEX IF NOT EXISTS lab_messages_recipient_idx
+                    ON lab_messages(project_id,to_worker_id,created_at DESC);
+            """)
+
+    @staticmethod
+    def _now() -> datetime:
+        return datetime.now(UTC)
+
+    @staticmethod
+    def _validate(value: str, allowed: set[str], label: str) -> str:
+        normalized = str(value).upper()
+        if normalized not in allowed:
+            raise GPUError(f"INVALID_{label}", normalized)
+        return normalized
+
+    @staticmethod
+    def _record(row: dict | None) -> dict | None:
+        if not row:
+            return None
+        return {key: (str(value) if isinstance(value, uuid.UUID) else value) for key, value in row.items()}
+
+    def _event(self, cur, project_id: str, event_type: str, subject_id: str | None, payload: dict) -> None:
+        self.store._event(cur, project_id, event_type, subject_id, payload)
+
+    def _worker(self, cur, worker_id: str) -> dict:
+        cur.execute("SELECT * FROM research_workers WHERE id=%s AND enabled=TRUE", (worker_id,))
+        worker = cur.fetchone()
+        if not worker:
+            raise GPUError("LAB_WORKER_NOT_FOUND", worker_id)
+        return worker
+
+    def join(self, worker_id: str | None, worker_name: str | None, runtime_type: str,
+             project_id: str, capabilities: dict[str, Any] | None = None,
+             runtime_metadata: dict[str, Any] | None = None, session_id: str | None = None) -> dict:
+        runtime_type = self._validate(runtime_type, RUNTIME_TYPES, "LAB_RUNTIME_TYPE")
+        if not worker_id and not worker_name:
+            raise GPUError("LAB_WORKER_IDENTITY_REQUIRED", "worker_id or worker_name is required")
+        now = self._now()
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM research_projects WHERE id=%s", (project_id,))
+            if not cur.fetchone():
+                raise GPUError("RESEARCH_PROJECT_NOT_FOUND", project_id)
+            if worker_id:
+                worker = self._worker(cur, worker_id)
+            else:
+                cur.execute("SELECT * FROM research_workers WHERE display_name=%s FOR UPDATE", (worker_name,))
+                worker = cur.fetchone()
+                if not worker:
+                    worker_id = str(uuid.uuid4())
+                    cur.execute("INSERT INTO research_workers(id,display_name,worker_type,capabilities,enabled,created_at) VALUES(%s,%s,%s,%s,TRUE,%s)",
+                                (worker_id, worker_name, runtime_type, json.dumps(capabilities or {}), now))
+                    cur.execute("SELECT * FROM research_workers WHERE id=%s", (worker_id,))
+                    worker = cur.fetchone()
+            recovered = False
+            if session_id:
+                cur.execute("SELECT * FROM research_worker_sessions WHERE id=%s AND worker_id=%s FOR UPDATE", (session_id, worker["id"]))
+                session = cur.fetchone()
+                if session:
+                    recovered = True
+                    cur.execute("UPDATE research_worker_sessions SET runtime_type=%s,runtime_metadata=%s,current_project_id=%s,status='ACTIVE',last_heartbeat_at=%s,disconnected_at=NULL WHERE id=%s",
+                                (runtime_type, json.dumps(runtime_metadata or {}), project_id, now, session_id))
+                else:
+                    session_id = None
+            if not session_id:
+                session_id = str(uuid.uuid4())
+                cur.execute("INSERT INTO research_worker_sessions(id,worker_id,runtime_type,runtime_metadata,current_project_id,status,joined_at,last_heartbeat_at,context_version) VALUES(%s,%s,%s,%s,%s,'ACTIVE',%s,%s,'{}')",
+                            (session_id, worker["id"], runtime_type, json.dumps(runtime_metadata or {}), project_id, now, now))
+            self._event(cur, project_id, "WORKER_SESSION_RECOVERED" if recovered else "WORKER_JOINED", None,
+                        {"worker_id": str(worker["id"]), "session_id": session_id, "runtime_type": runtime_type})
+        return {"worker": self._record(worker), "session_id": session_id, "recovered": recovered,
+                "lab_state": self.state_get(project_id, session_id)}
+
+    def create_work(self, project_id: str, kind: str, title: str, description: str,
+                    scientific_role: str, created_by: str | None = None, priority: float = 0,
+                    expected_value: float | None = None, estimated_cost: float | None = None,
+                    related_refs: dict[str, Any] | None = None, dependencies: list[dict] | None = None,
+                    equivalence_key: str | None = None, parent_work_item_id: str | None = None) -> dict:
+        now, ident = self._now(), str(uuid.uuid4())
+        dependencies = dependencies or []
+        with self.store._connect() as conn, conn.cursor() as cur:
+            if created_by:
+                self._worker(cur, created_by)
+            cur.execute("SELECT id FROM research_projects WHERE id=%s", (project_id,))
+            if not cur.fetchone():
+                raise GPUError("RESEARCH_PROJECT_NOT_FOUND", project_id)
+            status = "WAITING_DEPENDENCY" if dependencies else "READY"
+            try:
+                cur.execute("INSERT INTO lab_work_items(id,project_id,kind,title,description,scientific_role,status,priority,expected_value,estimated_cost,created_by,parent_work_item_id,related_refs,equivalence_key,created_at,updated_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                            (ident, project_id, kind, title, description, scientific_role, status, priority, expected_value, estimated_cost, created_by, parent_work_item_id, json.dumps(related_refs or {}), equivalence_key, now, now))
+            except Exception as exc:
+                if getattr(exc, "sqlstate", None) == "23505":
+                    raise GPUError("LAB_EQUIVALENT_WORK_ACTIVE", equivalence_key or title) from exc
+                raise
+            for dependency in dependencies:
+                target_type = str(dependency.get("target_type", "RESEARCH_OBJECT")).upper()
+                target_id = str(dependency.get("target_id", ""))
+                if not target_id:
+                    raise GPUError("LAB_DEPENDENCY_TARGET_REQUIRED", "target_id")
+                cur.execute("INSERT INTO lab_work_dependencies(id,work_item_id,target_type,target_id,required_statuses,invalidating_statuses,description,created_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",
+                            (str(uuid.uuid4()), ident, target_type, target_id, json.dumps(dependency.get("required_statuses", [])), json.dumps(dependency.get("invalidating_statuses", [])), str(dependency.get("description", "")), now))
+            self._event(cur, project_id, "WORK_ITEM_CREATED", ident, {"kind": kind, "title": title, "status": status})
+        self.resolve_dependencies(project_id)
+        return self.work_get(ident)
+
+    def work_get(self, work_item_id: str) -> dict:
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM lab_work_items WHERE id=%s", (work_item_id,))
+            item = cur.fetchone()
+            if not item:
+                raise GPUError("LAB_WORK_NOT_FOUND", work_item_id)
+            cur.execute("SELECT target_type,target_id,required_statuses,invalidating_statuses,description FROM lab_work_dependencies WHERE work_item_id=%s ORDER BY created_at", (work_item_id,))
+            result = self._record(item)
+            result["dependencies"] = cur.fetchall()
+            return result
+
+    def work_list(self, project_id: str, statuses: list[str] | None = None, limit: int = 100) -> list[dict]:
+        with self.store._connect() as conn, conn.cursor() as cur:
+            sql, args = "SELECT * FROM lab_work_items WHERE project_id=%s", [project_id]
+            if statuses:
+                normalized = [self._validate(status, WORK_STATUSES, "LAB_WORK_STATUS") for status in statuses]
+                sql += " AND status=ANY(%s)"
+                args.append(normalized)
+            sql += " ORDER BY priority DESC,created_at LIMIT %s"
+            args.append(min(max(1, limit), 500))
+            cur.execute(sql, args)
+            return [self._record(row) for row in cur.fetchall()]
+
+    def _dependency_status(self, cur, project_id: str, dependency: dict) -> tuple[bool, bool, str]:
+        """Return (satisfied, invalidated, explanation) for one typed dependency."""
+        target_type, target_id = dependency["target_type"], dependency["target_id"]
+        if target_type == "WORK_ITEM":
+            cur.execute("SELECT status FROM lab_work_items WHERE id=%s AND project_id=%s", (target_id, project_id))
+        elif target_type in {"RESEARCH_OBJECT", "EXPERIMENT_RUN", "ENGINEERING_RESULT", "RESEARCH_DECISION", "EVIDENCE_UNIT", "ARTIFACT"}:
+            kind = {"EXPERIMENT_RUN": "ExperimentRun", "ENGINEERING_RESULT": "EngineeringResult", "RESEARCH_DECISION": "ResearchDecision", "EVIDENCE_UNIT": "EvidenceUnit", "ARTIFACT": "Artifact"}.get(target_type)
+            sql = "SELECT status FROM research_objects WHERE id=%s AND project_id=%s"
+            args: list[Any] = [target_id, project_id]
+            if kind:
+                sql += " AND kind=%s"
+                args.append(kind)
+            cur.execute(sql, args)
+        else:
+            return False, False, f"unsupported dependency type {target_type}"
+        row = cur.fetchone()
+        if not row:
+            return False, False, f"dependency target {target_id} is unavailable"
+        status = row["status"]
+        invalidating = dependency["invalidating_statuses"] or []
+        if status in invalidating:
+            return False, True, f"dependency {target_id} entered invalidating status {status}"
+        required = dependency["required_statuses"] or []
+        return (not required or status in required), False, f"dependency {target_id} is {status}"
+
+    def resolve_dependencies(self, project_id: str) -> dict[str, int]:
+        """Move eligible waiting work to READY and invalidate deterministic stale work."""
+        changed = {"ready": 0, "invalidated": 0}
+        now = self._now()
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM lab_work_items WHERE project_id=%s AND status IN ('WAITING_DEPENDENCY','BLOCKED','READY','CLAIMED','RUNNING') FOR UPDATE", (project_id,))
+            items = cur.fetchall()
+            for item in items:
+                cur.execute("SELECT * FROM lab_work_dependencies WHERE work_item_id=%s", (item["id"],))
+                dependencies = cur.fetchall()
+                if not dependencies:
+                    continue
+                outcomes = [self._dependency_status(cur, project_id, dependency) for dependency in dependencies]
+                invalidations = [detail for _, invalidated, detail in outcomes if invalidated]
+                if invalidations and item["status"] in ACTIVE_WORK_STATUSES:
+                    cur.execute("UPDATE lab_work_items SET status='INVALIDATED',invalidated_reason=%s,updated_at=%s,completed_at=%s WHERE id=%s", ("; ".join(invalidations), now, now, item["id"]))
+                    self._event(cur, project_id, "WORK_ITEM_INVALIDATED", item["id"], {"reason": invalidations})
+                    changed["invalidated"] += 1
+                    continue
+                if all(satisfied for satisfied, _, _ in outcomes) and item["status"] in {"WAITING_DEPENDENCY", "BLOCKED"}:
+                    cur.execute("UPDATE lab_work_items SET status='READY',blocked_reason=NULL,updated_at=%s WHERE id=%s", (now, item["id"]))
+                    self._event(cur, project_id, "WORK_DEPENDENCY_RESOLVED", item["id"], {})
+                    self._event(cur, project_id, "WORK_ITEM_READY", item["id"], {})
+                    changed["ready"] += 1
+        return changed
+
+    def claim_work(self, work_item_id: str, worker_id: str, session_id: str,
+                   role: str | None = None, lease_seconds: int | None = None) -> dict:
+        """Atomically claim one READY item; concurrent callers cannot both win."""
+        now = self._now()
+        expiry = now + timedelta(seconds=max(30, lease_seconds or self.lease_seconds))
+        lease_id = str(uuid.uuid4())
+        with self.store._connect() as conn, conn.cursor() as cur:
+            self._worker(cur, worker_id)
+            cur.execute("SELECT * FROM research_worker_sessions WHERE id=%s AND worker_id=%s FOR UPDATE", (session_id, worker_id))
+            session = cur.fetchone()
+            if not session or session["status"] in {"DISCONNECTED", "EXPIRED"}:
+                raise GPUError("LAB_SESSION_NOT_ACTIVE", session_id)
+            cur.execute("SELECT project_id FROM lab_work_items WHERE id=%s", (work_item_id,))
+            target = cur.fetchone()
+            if not target:
+                raise GPUError("LAB_WORK_NOT_FOUND", work_item_id)
+            if str(session["current_project_id"]) != str(target["project_id"]):
+                raise GPUError("LAB_PROJECT_MISMATCH", work_item_id)
+            self.resolve_dependencies(str(target["project_id"]))
+            cur.execute("UPDATE lab_work_items SET status='CLAIMED',assigned_worker_id=%s,assigned_session_id=%s,lease_id=%s,updated_at=%s WHERE id=%s AND status='READY' RETURNING *", (worker_id, session_id, lease_id, now, work_item_id))
+            item = cur.fetchone()
+            if not item:
+                raise GPUError("LAB_WORK_NOT_CLAIMABLE", work_item_id)
+            cur.execute("INSERT INTO lab_work_leases(id,work_item_id,worker_id,worker_session_id,acquired_at,heartbeat_at,expires_at) VALUES(%s,%s,%s,%s,%s,%s,%s)", (lease_id, work_item_id, worker_id, session_id, now, now, expiry))
+            cur.execute("UPDATE research_worker_sessions SET current_work_item_id=%s,active_role=%s,status='BUSY',last_heartbeat_at=%s WHERE id=%s", (work_item_id, role or item["scientific_role"], now, session_id))
+            self._event(cur, item["project_id"], "WORK_CLAIMED", work_item_id, {"worker_id": worker_id, "session_id": session_id, "lease_id": lease_id, "role": role or item["scientific_role"]})
+            result = self._record(item)
+            result["lease_id"] = lease_id
+            result["lease_expires_at"] = expiry
+            return result
+
+    def heartbeat(self, session_id: str, work_item_id: str | None = None, lease_seconds: int | None = None) -> dict:
+        now = self._now()
+        expiry = now + timedelta(seconds=max(30, lease_seconds or self.lease_seconds))
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM research_worker_sessions WHERE id=%s FOR UPDATE", (session_id,))
+            session = cur.fetchone()
+            if not session:
+                raise GPUError("LAB_SESSION_NOT_FOUND", session_id)
+            cur.execute("UPDATE research_worker_sessions SET status='BUSY' WHERE id=%s", (session_id,)) if work_item_id else None
+            cur.execute("UPDATE research_worker_sessions SET last_heartbeat_at=%s WHERE id=%s", (now, session_id))
+            if work_item_id:
+                cur.execute("UPDATE lab_work_leases SET heartbeat_at=%s,expires_at=%s WHERE work_item_id=%s AND worker_session_id=%s AND released_at IS NULL RETURNING id", (now, expiry, work_item_id, session_id))
+                if not cur.fetchone():
+                    raise GPUError("LAB_LEASE_NOT_OWNED", work_item_id)
+            return {"session_id": session_id, "work_item_id": work_item_id, "heartbeat_at": now, "expires_at": expiry if work_item_id else None}
+
+    def release_work(self, work_item_id: str, worker_id: str, session_id: str, reason: str = "RELEASED") -> dict:
+        now = self._now()
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM lab_work_items WHERE id=%s FOR UPDATE", (work_item_id,))
+            item = cur.fetchone()
+            if not item:
+                raise GPUError("LAB_WORK_NOT_FOUND", work_item_id)
+            if str(item["assigned_worker_id"]) != str(worker_id) or str(item["assigned_session_id"]) != str(session_id):
+                raise GPUError("LAB_WORK_NOT_OWNED", work_item_id)
+            cur.execute("UPDATE lab_work_leases SET released_at=%s,release_reason=%s WHERE id=%s AND released_at IS NULL", (now, reason, item["lease_id"]))
+            cur.execute("UPDATE lab_work_items SET status='READY',assigned_worker_id=NULL,assigned_session_id=NULL,lease_id=NULL,updated_at=%s WHERE id=%s", (now, work_item_id))
+            cur.execute("UPDATE research_worker_sessions SET current_work_item_id=NULL,active_role=NULL,status='ACTIVE',last_heartbeat_at=%s WHERE id=%s", (now, session_id))
+            self._event(cur, item["project_id"], "WORK_RELEASED", work_item_id, {"worker_id": worker_id, "reason": reason})
+        return self.work_get(work_item_id)
+
+    def complete_work(self, work_item_id: str, worker_id: str, session_id: str,
+                      summary: str = "", output_object_ids: list[str] | None = None) -> dict:
+        now = self._now()
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM lab_work_items WHERE id=%s FOR UPDATE", (work_item_id,))
+            item = cur.fetchone()
+            if not item:
+                raise GPUError("LAB_WORK_NOT_FOUND", work_item_id)
+            if str(item["assigned_worker_id"]) != str(worker_id) or str(item["assigned_session_id"]) != str(session_id):
+                raise GPUError("LAB_WORK_NOT_OWNED", work_item_id)
+            cur.execute("UPDATE lab_work_leases SET released_at=%s,release_reason='COMPLETED' WHERE id=%s AND released_at IS NULL", (now, item["lease_id"]))
+            cur.execute("UPDATE lab_work_items SET status='COMPLETED',completed_at=%s,updated_at=%s WHERE id=%s", (now, now, work_item_id))
+            cur.execute("UPDATE research_worker_sessions SET current_work_item_id=NULL,active_role=NULL,status='ACTIVE',last_heartbeat_at=%s WHERE id=%s", (now, session_id))
+            self._event(cur, item["project_id"], "WORK_COMPLETED", work_item_id, {"worker_id": worker_id, "summary": summary[:4000], "output_object_ids": output_object_ids or []})
+        self.resolve_dependencies(str(item["project_id"]))
+        return self.work_get(work_item_id)
+
+    def recover_stale_leases(self, project_id: str | None = None) -> dict[str, int]:
+        """Release abandoned intellectual work without cancelling external execution."""
+        now, recovered = self._now(), 0
+        with self.store._connect() as conn, conn.cursor() as cur:
+            sql = "SELECT l.*,w.project_id,w.kind FROM lab_work_leases l JOIN lab_work_items w ON w.id=l.work_item_id WHERE l.released_at IS NULL AND l.expires_at<%s"
+            args: list[Any] = [now]
+            if project_id:
+                sql += " AND w.project_id=%s"
+                args.append(project_id)
+            sql += " FOR UPDATE SKIP LOCKED"
+            cur.execute(sql, args)
+            for lease in cur.fetchall():
+                cur.execute("UPDATE lab_work_leases SET released_at=%s,release_reason='LEASE_EXPIRED' WHERE id=%s", (now, lease["id"]))
+                cur.execute("UPDATE research_worker_sessions SET status='EXPIRED',disconnected_at=%s,current_work_item_id=NULL,active_role=NULL WHERE id=%s AND last_heartbeat_at<%s", (now, lease["worker_session_id"], lease["expires_at"]))
+                # Work ownership expires. The corresponding ExperimentRun is intentionally untouched.
+                cur.execute("UPDATE lab_work_items SET status='READY',assigned_worker_id=NULL,assigned_session_id=NULL,lease_id=NULL,updated_at=%s,blocked_reason=%s WHERE id=%s AND status IN ('CLAIMED','RUNNING')", (now, "Previous worker lease expired; external execution, if any, continues.", lease["work_item_id"]))
+                self._event(cur, lease["project_id"], "WORK_RELEASED", lease["work_item_id"], {"reason": "LEASE_EXPIRED", "worker_id": str(lease["worker_id"])})
+                self._event(cur, lease["project_id"], "WORKER_DISCONNECTED", None, {"worker_id": str(lease["worker_id"]), "session_id": str(lease["worker_session_id"])})
+                recovered += 1
+        return {"recovered": recovered}
+
+    def message_send(self, project_id: str, from_worker_id: str, message_type: str,
+                     subject: str, body: str, to_worker_id: str | None = None,
+                     to_role: str | None = None, reference_ids: list[str] | None = None,
+                     priority: int = 0, broadcast_scope: str | None = None) -> dict:
+        message_type = self._validate(message_type, MESSAGE_TYPES, "LAB_MESSAGE_TYPE")
+        now, ident = self._now(), str(uuid.uuid4())
+        with self.store._connect() as conn, conn.cursor() as cur:
+            self._worker(cur, from_worker_id)
+            if to_worker_id:
+                self._worker(cur, to_worker_id)
+            cur.execute("INSERT INTO lab_messages(id,project_id,from_worker_id,to_worker_id,to_role,broadcast_scope,message_type,subject,body,reference_ids,priority,created_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        (ident, project_id, from_worker_id, to_worker_id, to_role, broadcast_scope, message_type, subject[:500], body[:8000], json.dumps(reference_ids or []), priority, now))
+            # A message is advisory only. It never updates an evidence or scientific object.
+            self._event(cur, project_id, "LAB_MESSAGE_SENT", None, {"message_id": ident, "from_worker_id": from_worker_id, "to_worker_id": to_worker_id, "message_type": message_type, "reference_ids": reference_ids or []})
+        return {"id": ident, "project_id": project_id, "message_type": message_type, "created_at": now}
+
+    def message_list(self, project_id: str, worker_id: str, role: str | None = None,
+                     unread_only: bool = False, limit: int = 100) -> list[dict]:
+        with self.store._connect() as conn, conn.cursor() as cur:
+            sql = "SELECT * FROM lab_messages WHERE project_id=%s AND (to_worker_id IS NULL OR to_worker_id=%s"
+            args: list[Any] = [project_id, worker_id]
+            if role:
+                sql += " OR to_role=%s"
+                args.append(role)
+            sql += ")"
+            if unread_only:
+                sql += " AND read_at IS NULL"
+            sql += " ORDER BY priority DESC,created_at DESC LIMIT %s"
+            args.append(min(max(1, limit), 500))
+            cur.execute(sql, args)
+            return [self._record(row) for row in cur.fetchall()]
+
+    def _active_workers(self, project_id: str) -> list[dict]:
+        threshold = self._now() - timedelta(seconds=self.lease_seconds)
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT s.id AS session_id,s.worker_id,w.display_name,s.status,s.active_role,s.current_work_item_id,s.last_heartbeat_at FROM research_worker_sessions s JOIN research_workers w ON w.id=s.worker_id WHERE s.current_project_id=%s AND s.status NOT IN ('DISCONNECTED','EXPIRED') AND s.last_heartbeat_at>=%s ORDER BY s.last_heartbeat_at DESC", (project_id, threshold))
+            return [self._record(row) for row in cur.fetchall()]
+
+    def state_get(self, project_id: str, session_id: str | None = None, since: str | None = None) -> dict:
+        self.recover_stale_leases(project_id)
+        self.resolve_dependencies(project_id)
+        project = self.store.project_get(project_id)
+        state = self.store.state_get(project_id)
+        objects = state.get("objects", [])
+        worlds = [item for item in objects if item["kind"] == "WorldModel"]
+        policies = [item for item in objects if item["kind"] == "ResearchPolicy" and item["status"] == "PRODUCTION"]
+        decisions = [item for item in objects if item["kind"] == "ResearchDecision"]
+        events = self.store.events(project_id, 30)
+        if since:
+            events = [event for event in events if event["created_at"].isoformat() > since]
+        worker_id = None
+        role = None
+        if session_id:
+            with self.store._connect() as conn, conn.cursor() as cur:
+                cur.execute("SELECT worker_id,active_role FROM research_worker_sessions WHERE id=%s AND current_project_id=%s", (session_id, project_id))
+                session = cur.fetchone()
+                if session:
+                    worker_id, role = str(session["worker_id"]), session["active_role"]
+        return {
+            "project": {"id": str(project["id"]), "name": project["name"]},
+            "research_state_version": len([item for item in objects if item["kind"] == "ResearchState"]),
+            "world_model_version": str(worlds[0]["id"]) if worlds else None,
+            "research_policy_version": policies[0]["data"].get("version") if policies else None,
+            "brain_policy_version": decisions[0]["data"].get("brain_policy_version") if decisions else None,
+            "active_workers": self._active_workers(project_id),
+            "ready_work_items": self.work_list(project_id, ["READY"], 30),
+            "blocked_work_items": self.work_list(project_id, ["BLOCKED", "WAITING_DEPENDENCY"], 30),
+            "running_work_items": self.work_list(project_id, ["CLAIMED", "RUNNING"], 30),
+            "recent_events": [{**event, "subject_id": str(event["subject_id"]) if event["subject_id"] else None} for event in events],
+            "unread_messages": self.message_list(project_id, worker_id, role, True, 30) if worker_id else [],
+            "gpu_activity": [item for item in objects if item["kind"] == "ExperimentRun" and item["status"] in {"running", "unknown", "RESERVED"}][:30],
+            "lab_budget": {},
+        }
+
+    def sync(self, session_id: str, project_id: str, since: str | None = None,
+             current_work_item_id: str | None = None) -> dict:
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT worker_id,current_work_item_id FROM research_worker_sessions WHERE id=%s AND current_project_id=%s FOR UPDATE", (session_id, project_id))
+            session = cur.fetchone()
+            if not session:
+                raise GPUError("LAB_SESSION_NOT_FOUND", session_id)
+            now = self._now()
+            cur.execute("UPDATE research_worker_sessions SET last_heartbeat_at=%s WHERE id=%s", (now, session_id))
+        state = self.state_get(project_id, session_id, since)
+        old_work_reassigned = bool(current_work_item_id and current_work_item_id != str(session["current_work_item_id"] or ""))
+        return {"session_id": session_id, "old_work_reassigned": old_work_reassigned, "lab_state": state}

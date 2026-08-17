@@ -31,6 +31,7 @@ from .engineering import CodingExecutionPolicy, EngineeringService
 from .epistemics import EpistemicService
 from .errors import GPUError
 from .executable_papers import ExecutablePaperService, HttpExecutablePaperProvider
+from .lab import LabController
 from .literature import HttpLiteratureProvider, LiteratureService
 from .local_runner import LocalRunner
 from .meta_controller import MetaResearchController
@@ -45,8 +46,9 @@ from .terminal import TERMINAL_HTML
 
 logger = logging.getLogger(__name__)
 
-settings, service, research_store, research_brain, brain_bench_service, epistemic_service, literature_service, executable_paper_service, qd_service, branch_service, meta_research_service, strategy_service, policy_lab_service = (
+settings, service, research_store, research_brain, brain_bench_service, epistemic_service, literature_service, executable_paper_service, qd_service, branch_service, meta_research_service, strategy_service, policy_lab_service, lab_controller_service = (
     Settings(),
+    None,
     None,
     None,
     None,
@@ -95,6 +97,11 @@ _READ_ONLY_TOOLS = {
     "activity_recent",
     "research_state_get",
     "research_object_get",
+    "lab_state_get",
+    "lab_sync",
+    "lab_workers_list",
+    "lab_work_list",
+    "lab_message_list",
     "research_benchmark_list",
     "research_benchmark_episode_get",
     "research_benchmark_policy_run",
@@ -337,6 +344,15 @@ def research() -> ResearchStore:
             if research_store is None:
                 research_store = ResearchStore(settings.gpu_lab_research_database_url)
     return research_store
+
+
+def lab() -> LabController:
+    global lab_controller_service
+    if lab_controller_service is None:
+        with _singleton_lock:
+            if lab_controller_service is None:
+                lab_controller_service = LabController(research())
+    return lab_controller_service
 
 
 def engineering() -> EngineeringService:
@@ -889,6 +905,112 @@ async def research_state_get(project_id: str, limit: int = 10, as_of: str | None
     if "error" in state:
         return state
     return _compact_research_state(state, limit)
+
+
+@mcp.tool()
+async def lab_join(
+    project_id: str,
+    runtime_type: str,
+    worker_id: str | None = None,
+    worker_name: str | None = None,
+    capabilities: dict[str, Any] | None = None,
+    runtime_metadata: dict[str, Any] | None = None,
+    session_id: str | None = None,
+):
+    """Register or recover a durable worker session and return compact shared LabState."""
+    return await call(
+        lab().join,
+        worker_id,
+        worker_name,
+        runtime_type,
+        project_id,
+        capabilities,
+        runtime_metadata,
+        session_id,
+    )
+
+
+@mcp.tool()
+async def lab_state_get(project_id: str, session_id: str | None = None):
+    """Read compact project-scoped operational state; it is not a second scientific truth store."""
+    return await call(lab().state_get, project_id, session_id)
+
+
+@mcp.tool()
+async def lab_sync(
+    session_id: str, project_id: str, since: str | None = None, current_work_item_id: str | None = None
+):
+    """Incrementally synchronize one worker with shared events, work, leases, and messages."""
+    return await call(lab().sync, session_id, project_id, since, current_work_item_id)
+
+
+@mcp.tool()
+async def lab_workers_list(project_id: str):
+    """List active workers for this project only."""
+    return await call(lab()._active_workers, project_id)
+
+
+@mcp.tool()
+async def lab_work_list(project_id: str, statuses: list[str] | None = None, limit: int = 100):
+    """List project-scoped WorkItems, optionally by operational status."""
+    return await call(lab().work_list, project_id, statuses, limit)
+
+
+@mcp.tool()
+async def lab_work_create(
+    project_id: str, kind: str, title: str, description: str, scientific_role: str,
+    created_by: str | None = None, priority: float = 0, expected_value: float | None = None,
+    estimated_cost: float | None = None, related_refs: dict[str, Any] | None = None,
+    dependencies: list[dict] | None = None, equivalence_key: str | None = None,
+    parent_work_item_id: str | None = None,
+):
+    """Create dependency-aware project work; equivalent active work is rejected."""
+    return await call(lab().create_work, project_id, kind, title, description, scientific_role,
+                      created_by, priority, expected_value, estimated_cost, related_refs,
+                      dependencies, equivalence_key, parent_work_item_id)
+
+
+@mcp.tool()
+async def lab_work_claim(work_item_id: str, worker_id: str, session_id: str,
+                         role: str | None = None, lease_seconds: int | None = None):
+    """Atomically claim one READY WorkItem and create its renewable lease."""
+    return await call(lab().claim_work, work_item_id, worker_id, session_id, role, lease_seconds)
+
+
+@mcp.tool()
+async def lab_work_release(work_item_id: str, worker_id: str, session_id: str, reason: str = "RELEASED"):
+    """Release only work owned by this session; GPU execution is never cancelled."""
+    return await call(lab().release_work, work_item_id, worker_id, session_id, reason)
+
+
+@mcp.tool()
+async def lab_work_complete(work_item_id: str, worker_id: str, session_id: str,
+                            summary: str = "", output_object_ids: list[str] | None = None):
+    """Complete owned work after its canonical scientific or engineering outputs were persisted."""
+    return await call(lab().complete_work, work_item_id, worker_id, session_id, summary, output_object_ids)
+
+
+@mcp.tool()
+async def lab_heartbeat(session_id: str, work_item_id: str | None = None, lease_seconds: int | None = None):
+    """Refresh a lightweight worker/session heartbeat and, optionally, its owned lease."""
+    return await call(lab().heartbeat, session_id, work_item_id, lease_seconds)
+
+
+@mcp.tool()
+async def lab_message_send(project_id: str, from_worker_id: str, message_type: str, subject: str,
+                           body: str, to_worker_id: str | None = None, to_role: str | None = None,
+                           reference_ids: list[str] | None = None, priority: int = 0,
+                           broadcast_scope: str | None = None):
+    """Send advisory worker communication; it cannot alter scientific evidence or beliefs."""
+    return await call(lab().message_send, project_id, from_worker_id, message_type, subject, body,
+                      to_worker_id, to_role, reference_ids, priority, broadcast_scope)
+
+
+@mcp.tool()
+async def lab_message_list(project_id: str, worker_id: str, role: str | None = None,
+                           unread_only: bool = False, limit: int = 100):
+    """Retrieve project-scoped worker messages without loading chat histories."""
+    return await call(lab().message_list, project_id, worker_id, role, unread_only, limit)
 
 
 @mcp.tool()
