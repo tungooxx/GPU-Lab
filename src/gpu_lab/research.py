@@ -195,9 +195,16 @@ def classify_decision_data(data: dict[str, Any]) -> dict[str, str]:
     """Deterministically classify a decision while preserving legacy fields."""
     selected = data.get("selected_action", {}) if isinstance(data.get("selected_action"), dict) else {}
     action = str(selected.get("action_type", data.get("action_type", "UNKNOWN"))).upper()
+    process_only = isinstance(selected.get("payload"), dict) and (
+        selected["payload"].get("non_executing_discovery_candidate") is True
+        or selected["payload"].get("non_scientific_process_action") is True
+        or selected["payload"].get("does_not_authorize_execution") is True
+    )
     legacy = data.get("legacy_provenance")
     role = str(data.get("decision_role") or "").upper()
-    if role not in DECISION_ROLES:
+    if process_only or action == "PORTFOLIO_REFINEMENT":
+        role = "ADMINISTRATIVE_RECOVERY"
+    elif role not in DECISION_ROLES:
         if isinstance(legacy, dict) and legacy.get("reconstructed"):
             role = "LEGACY_BACKFILL"
         elif isinstance(selected.get("payload"), dict) and selected["payload"].get("mode") in {"INSPECT_RESULT", "INSPECT_FAILURE", "RECOVER_UNFINISHED"}:
@@ -212,7 +219,9 @@ def classify_decision_data(data: dict[str, Any]) -> dict[str, str]:
             # learning until deterministic backfill can identify its role.
             role = "LEGACY_BACKFILL" if not data.get("brain_policy_version") else "SCIENTIFIC_ACTION"
     scientific_role = str(data.get("scientific_role") or "").upper()
-    if scientific_role not in SCIENTIFIC_ROLES:
+    if process_only or action == "PORTFOLIO_REFINEMENT":
+        scientific_role = "NOT_SCIENTIFIC"
+    elif scientific_role not in SCIENTIFIC_ROLES:
         if role in {"LEGACY_BACKFILL", "ADMINISTRATIVE_RECOVERY", "SYSTEM_VERIFICATION", "PROVIDER_CONTRACT_TEST", "BENCHMARK_EVALUATION"}:
             scientific_role = "NOT_SCIENTIFIC"
         elif action == "REPRODUCTION":

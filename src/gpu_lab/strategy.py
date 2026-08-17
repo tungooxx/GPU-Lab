@@ -500,11 +500,16 @@ class ResearchStrategyService:
         result = []
         for candidate in candidates:
             base = float(candidate["priority"])
+            process_only = bool(
+                candidate.get("payload", {}).get("non_executing_discovery_candidate")
+                or candidate.get("payload", {}).get("non_scientific_process_action")
+                or candidate.get("payload", {}).get("does_not_authorize_execution")
+            )
             positive_adjustment = 0.0
             negative_adjustment = 0.0
             pattern_ids = []
             counterexamples = []
-            if not hard_gate:
+            if not hard_gate and not process_only:
                 for pattern in action_history.get(candidate["action_type"], []):
                     pattern_ids.append(pattern["id"])
                     successes = int(pattern["historical_successes"])
@@ -514,7 +519,7 @@ class ResearchStrategyService:
                     negative_adjustment -= min(failures, 4) * 0.12 * applicability_weight
                     counterexamples.extend(pattern["counterexamples"])
             diminishing_adjustment = 0.0
-            if not hard_gate and telemetry["flag"] == "DIMINISHING_RETURNS":
+            if not hard_gate and not process_only and telemetry["flag"] == "DIMINISHING_RETURNS":
                 repeated_type = any(
                     pattern.get("action_type") == candidate["action_type"]
                     for pattern in retrieval["applied"]
@@ -528,7 +533,7 @@ class ResearchStrategyService:
                 0.1,
                 1 + positive_adjustment + negative_adjustment + diminishing_adjustment,
             )
-            final = base if hard_gate else round(base * multiplier, 6)
+            final = base if hard_gate or process_only else round(base * multiplier, 6)
             result.append(
                 {
                     **candidate,
@@ -542,6 +547,7 @@ class ResearchStrategyService:
                     "final_priority": final,
                     "scoring_policy_version": SCORING_POLICY_VERSION,
                     "hard_gate_preserved": hard_gate,
+                    "strategy_learning_excluded": process_only,
                 }
             )
         return result

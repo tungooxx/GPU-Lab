@@ -75,6 +75,28 @@ def test_missing_decision_context_fails_closed():
     assert result["exclusions"] == ["DECISION_CONTEXT_MISSING"]
 
 
+def test_nonexecuting_discovery_candidate_never_teaches_strategy_memory():
+    decision = {
+        "data": {
+            "decision_role": "SCIENTIFIC_ACTION",
+            "scientific_role": "DIAGNOSTIC",
+            "learning_namespace": "PRODUCTION_SCIENCE",
+            "cycle_status": "CLOSED",
+            "selected_action": {
+                "action_type": "LITERATURE_SEARCH",
+                "payload": {"non_executing_discovery_candidate": True},
+            },
+        }
+    }
+
+    classification = classify_decision_data(decision["data"])
+    eligibility = strategy_learning_eligibility(decision, _outcome())
+
+    assert classification["decision_role"] == "ADMINISTRATIVE_RECOVERY"
+    assert classification["scientific_role"] == "NOT_SCIENTIFIC"
+    assert eligibility["eligible"] is False
+
+
 class _AuditStore:
     def object_get(self, object_id):
         assert object_id == "decision-1"
