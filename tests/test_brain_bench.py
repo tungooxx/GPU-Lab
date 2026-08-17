@@ -16,6 +16,7 @@ from gpu_lab.brain_bench import (
 from gpu_lab.errors import GPUError
 
 BENCH_ROOT = Path(__file__).parents[1] / "research_bench"
+V31_BENCH_ROOT = Path(__file__).parents[1] / "research_bench_v31"
 
 
 def test_all_historical_episodes_validate_and_have_sourced_provenance():
@@ -77,6 +78,27 @@ def test_algorithmic_policy_baselines_are_deterministic_and_distinct():
     assert random_one == random_two
 
 
+def test_v31_benchmark_policy_prefers_distant_option_only_when_context_requires_it():
+    episode = ResearchBrainBench(BENCH_ROOT).load_episode("after_stage4.json")
+    episode.v31_context = {"expected_search_regime": "DIVERGENT_SEARCH"}
+    episode.candidate_actions[0].scientific_distance = "NEAR"
+    episode.candidate_actions[1].scientific_distance = "FAR"
+    decision = ResearchBrainBench.baseline_decision(
+        episode, BenchmarkPolicy.BRAIN_V3_1_DISCOVERY_SEARCH
+    )
+    assert decision.selected_action_id == episode.candidate_actions[1].action_id
+
+
+def test_all_nine_v31_frozen_regressions_select_the_expected_policy_action():
+    episodes = ResearchBrainBench(V31_BENCH_ROOT).load_all()
+    assert len(episodes) == 9
+    for episode in episodes:
+        decision = ResearchBrainBench.baseline_decision(
+            episode, BenchmarkPolicy.BRAIN_V3_1_DISCOVERY_SEARCH
+        )
+        assert decision.selected_action_id in episode.strong_next_actions
+
+
 def test_structured_policy_runner_never_receives_hidden_future_state():
     episode = ResearchBrainBench(BENCH_ROOT).load_episode("before_ejc.json")
     seen = {}
@@ -101,6 +123,7 @@ def test_v1_v15_and_v2_policies_run_on_blinded_visible_state():
         BenchmarkPolicy.CURRENT_BRAIN_V1,
         BenchmarkPolicy.BRAIN_V1_5,
         BenchmarkPolicy.BRAIN_V2_STRATEGY_AUGMENTED,
+        BenchmarkPolicy.BRAIN_V3_1_DISCOVERY_SEARCH,
     ):
         decision = ResearchBrainBench.baseline_decision(episode, policy)
         assert decision.selected_action_id in {

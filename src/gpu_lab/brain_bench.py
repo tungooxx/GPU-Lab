@@ -32,6 +32,7 @@ class BenchmarkPolicy(StrEnum):
     RANDOM_VALID_ACTION = "RANDOM_VALID_ACTION"
     BRAIN_V1_5 = "BRAIN_v1_5"
     BRAIN_V2_STRATEGY_AUGMENTED = "BRAIN_v2_STRATEGY_AUGMENTED"
+    BRAIN_V3_1_DISCOVERY_SEARCH = "BRAIN_v3.1_DISCOVERY_SEARCH"
 
 
 class SourceProvenance(BaseModel):
@@ -64,6 +65,7 @@ class BenchmarkAction(BaseModel):
     execution_risk: float = Field(default=0.0, ge=0.0)
     tags: list[str] = Field(default_factory=list)
     prediction: str | None = None
+    scientific_distance: str | None = None
 
     @property
     def total_cost(self) -> float:
@@ -105,6 +107,7 @@ class BenchmarkEpisode(BaseModel):
     forbidden_future_records: list[str] = Field(default_factory=list)
     source_provenance: list[SourceProvenance] = Field(min_length=1)
     evaluation_rubric: EvaluationRubric = Field(default_factory=EvaluationRubric)
+    v31_context: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("cutoff_timestamp")
     @classmethod
@@ -151,6 +154,7 @@ class BenchmarkEpisode(BaseModel):
                 )
                 for action in self.candidate_actions
             ],
+            "v31_context": self.v31_context,
         }
 
 
@@ -336,6 +340,31 @@ class ResearchBrainBench:
                 else [],
                 strategy_reused=True,
             )
+        if policy == BenchmarkPolicy.BRAIN_V3_1_DISCOVERY_SEARCH:
+            context = payload.get("v31_context", {})
+            regime = str(context.get("expected_search_regime", "EXPLOIT"))
+            if context.get("single_path_prerequisite"):
+                selected = next(
+                    (item for item in actions if item["action_type"] in {"ARTIFACT_ANALYSIS", "REPRODUCTION"}),
+                    actions[0],
+                )
+            else:
+                preferred = (
+                    ["ORTHOGONAL", "FAR", "MID", "NEAR"]
+                    if regime == "PARADIGM_RESET"
+                    else ["FAR", "ORTHOGONAL", "MID", "NEAR"]
+                    if regime == "DIVERGENT_SEARCH"
+                    else ["MID", "NEAR", "FAR", "ORTHOGONAL"]
+                )
+                selected = next(
+                    (item for distance in preferred for item in actions if item.get("scientific_distance") == distance),
+                    actions[0],
+                )
+            return BenchmarkDecision(
+                selected_action_id=selected["action_id"],
+                retrieved_record_ids=sorted(dead),
+                strategy_reused=True,
+            )
         if policy == BenchmarkPolicy.LLM_DIRECT_WITHOUT_STRUCTURED_MEMORY:
             selected = min(actions, key=lambda item: item["action_id"])
             return BenchmarkDecision(selected_action_id=selected["action_id"])
@@ -378,6 +407,7 @@ class ResearchBrainBench:
             BenchmarkPolicy.CURRENT_BRAIN_V1,
             BenchmarkPolicy.BRAIN_V1_5,
             BenchmarkPolicy.BRAIN_V2_STRATEGY_AUGMENTED,
+            BenchmarkPolicy.BRAIN_V3_1_DISCOVERY_SEARCH,
             BenchmarkPolicy.LLM_DIRECT_WITHOUT_STRUCTURED_MEMORY,
         } and runner is None:
             return cls.builtin_policy_decision(episode, policy)
@@ -399,6 +429,7 @@ class ResearchBrainBench:
             BenchmarkPolicy.RANDOM_VALID_ACTION,
             BenchmarkPolicy.BRAIN_V1_5,
             BenchmarkPolicy.BRAIN_V2_STRATEGY_AUGMENTED,
+            BenchmarkPolicy.BRAIN_V3_1_DISCOVERY_SEARCH,
         ]
         episodes = self.load_all()
         results = {}

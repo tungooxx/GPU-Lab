@@ -25,6 +25,7 @@ from .brain_bench import BenchmarkPolicy, ResearchBrainBench
 from .branches import ExperimentBranchService
 from .config import Settings
 from .dashboard import DASHBOARD_HTML
+from .discovery import breakthrough_signal
 from .embeddings import EmbeddingService, LocalHashEmbeddingProvider
 from .engineering import CodingExecutionPolicy, EngineeringService
 from .epistemics import EpistemicService
@@ -743,6 +744,10 @@ def _compact_brain_step(result: dict[str, Any], limit: int = 10) -> dict[str, An
         "research_situation": result.get("research_situation"),
         "strategy_patterns_retrieved": result.get("strategy_patterns_retrieved"),
         "agenda_diminishing_returns": result.get("agenda_diminishing_returns"),
+        "candidate_portfolio": result.get("candidate_portfolio"),
+        "frontier_gap": result.get("frontier_gap"),
+        "stagnation_state": result.get("stagnation_state"),
+        "state_freshness": result.get("state_freshness"),
         "candidate_actions": result["candidate_actions"][:limit],
         "selected_action": result["selected_action"],
         "reason": result.get("reason"),
@@ -1478,6 +1483,34 @@ async def brain_step(project_id: str, as_of: str | None = None):
     if "error" in result:
         return result
     return _compact_brain_step(result)
+
+
+@mcp.tool()
+async def brain_preview(project_id: str):
+    """Return a non-mutating v3.1 decision preview from current canonical state."""
+    result = await call(brain().brain_step, project_id, None, False)
+    if "error" in result:
+        return result
+    return _compact_brain_step(result)
+
+
+@mcp.tool()
+async def breakthrough_signal_record(
+    project_id: str,
+    hypothesis_status: str,
+    improved_dimensions: list[str],
+    regressed_dimensions: list[str],
+    evidence_family_ids: list[str] | None = None,
+    decision_id: str | None = None,
+):
+    """Record strategic discovery value without changing hypothesis scientific status."""
+    signal = breakthrough_signal(
+        hypothesis_status=hypothesis_status,
+        improved_dimensions=improved_dimensions,
+        regressed_dimensions=regressed_dimensions,
+        evidence_family_ids=evidence_family_ids,
+    )
+    return await call(research().breakthrough_signal_record, project_id, signal, decision_id)
 
 
 def _execution_action_fingerprint(

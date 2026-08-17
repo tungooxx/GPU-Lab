@@ -46,6 +46,8 @@ RESEARCH_OBJECT_KINDS = (
     "ResearchAgenda",
     "AgendaItem",
     "HypothesisPortfolio",
+    "CandidatePortfolio",
+    "BreakthroughSignal",
     "HypothesisNiche",
     "ExperimentBranch",
     "ExperimentNode",
@@ -1910,6 +1912,7 @@ class ResearchStore:
         selected_index: int,
         decision_data: dict[str, Any],
         situation_data: dict[str, Any] | None = None,
+        portfolio_data: dict[str, Any] | None = None,
     ) -> dict:
         """Persist one Brain step's situation, candidates, and decision atomically."""
         if not candidates or not 0 <= selected_index < len(candidates):
@@ -1918,6 +1921,7 @@ class ResearchStore:
         candidate_ids = [uuid.uuid4() for _ in candidates]
         decision_id = uuid.uuid4()
         situation_id = uuid.uuid4() if situation_data is not None else None
+        portfolio_id = uuid.uuid4() if portfolio_data is not None else None
         persisted = _json_document(
             [
                 {**candidate, "id": str(candidate_id)}
@@ -1930,6 +1934,7 @@ class ResearchStore:
                 **classify_decision_data(decision_data),
                 "cycle_status": classify_decision_data(decision_data)["cycle_status"],
                 "research_situation_id": str(situation_id) if situation_id else None,
+                "candidate_portfolio_id": str(portfolio_id) if portfolio_id else None,
                 "candidate_action_ids": [str(item) for item in candidate_ids],
                 "candidate_actions": persisted,
                 "selected_action": persisted[selected_index],
@@ -1951,6 +1956,26 @@ class ResearchStore:
                     "RESEARCH_SITUATION_CREATED",
                     situation_id,
                     persisted_situation,
+                )
+            if portfolio_id is not None and portfolio_data is not None:
+                persisted_portfolio = _json_document(
+                    {
+                        **portfolio_data,
+                        "created_from_decision_id": str(decision_id),
+                        "generated_candidate_ids": [str(item) for item in candidate_ids],
+                    }
+                )
+                cur.execute(
+                    "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                    "VALUES(%s,%s,'CandidatePortfolio','ACTIVE',%s,%s)",
+                    (portfolio_id, project_id, json.dumps(persisted_portfolio), now),
+                )
+                self._event(
+                    cur,
+                    project_id,
+                    "CANDIDATE_PORTFOLIO_CREATED",
+                    portfolio_id,
+                    persisted_portfolio,
                 )
             for candidate, candidate_id in zip(candidates, candidate_ids, strict=True):
                 cur.execute(
@@ -1977,6 +2002,31 @@ class ResearchStore:
                 decision_id,
                 materialized,
             )
+            regime = materialized.get("search_regime")
+            if regime:
+                self._event(
+                    cur,
+                    project_id,
+                    "SEARCH_REGIME_CHANGED",
+                    decision_id,
+                    {
+                        "search_regime": regime,
+                        "reason": materialized.get("search_regime_reason", []),
+                        "candidate_portfolio_id": str(portfolio_id) if portfolio_id else None,
+                    },
+                )
+            if regime == "PARADIGM_RESET":
+                self._event(
+                    cur,
+                    project_id,
+                    "PARADIGM_RESET_TRIGGERED",
+                    decision_id,
+                    {
+                        "candidate_portfolio_id": str(portfolio_id) if portfolio_id else None,
+                        "frontier_gap": materialized.get("frontier_gap", {}),
+                        "stagnation_state": materialized.get("stagnation_state", {}),
+                    },
+                )
         return {
             "decision": {
                 "id": str(decision_id),
@@ -2000,7 +2050,40 @@ class ResearchStore:
                 if situation_id is not None and situation_data is not None
                 else None
             ),
+            "portfolio": (
+                {
+                    "id": str(portfolio_id),
+                    "project_id": project_id,
+                    "kind": "CandidatePortfolio",
+                    "status": "ACTIVE",
+                    "data": _json_document(
+                        {
+                            **portfolio_data,
+                            "created_from_decision_id": str(decision_id),
+                            "generated_candidate_ids": [str(item) for item in candidate_ids],
+                        }
+                    ),
+                }
+                if portfolio_id is not None and portfolio_data is not None
+                else None
+            ),
         }
+
+    def breakthrough_signal_record(
+        self, project_id: str, signal: dict[str, Any], decision_id: str | None = None
+    ) -> dict[str, Any]:
+        """Persist strategic discovery value without mutating hypothesis status."""
+        data = _json_document(
+            {
+                **signal,
+                "decision_id": decision_id,
+                "scientific_truth_independent": True,
+                "recording_policy": "brain-v3.1-discovery-search-v1",
+            }
+        )
+        if signal.get("hypothesis_status") == "SUPPORTED" and signal.get("type") == "PARTIAL_METRIC_BREAKTHROUGH":
+            raise GPUError("BREAKTHROUGH_CANNOT_RECLASSIFY_HYPOTHESIS", "Record a partial breakthrough without changing scientific truth")
+        return self.object_create(project_id, "BreakthroughSignal", data, "BREAKTHROUGH_SIGNAL_RECORDED")
 
     def epistemic_reclassification(self, project_id: str | None = None) -> dict[str, Any]:
         """Classify legacy decision records without changing scientific observations.
@@ -3704,6 +3787,18 @@ class ResearchStore:
                     (project_id, cutoff),
                 )
             objects = cur.fetchall()
+            cur.execute(
+                "SELECT MAX(created_at) AS latest_scientific_event_at, COUNT(*) AS event_count "
+                "FROM research_events WHERE project_id=%s",
+                (project_id,),
+            )
+            event_freshness = cur.fetchone()
+            cur.execute(
+                "SELECT MAX(created_at) AS latest_object_at, COUNT(*) AS object_count "
+                "FROM research_objects WHERE project_id=%s",
+                (project_id,),
+            )
+            object_freshness = cur.fetchone()
             by_kind = lambda kind, statuses=None: [item for item in objects if item["kind"] == kind and (not statuses or item["status"] in statuses)]
             canonical = {
                 "research_question": row["question"],
@@ -3734,9 +3829,30 @@ class ResearchStore:
                 "highest_value_unknown": row["state"].get("highest_value_unknown"),
                 "next_discriminating_experiments": row["state"].get("next_discriminating_experiments", []),
             }
+            world_models = by_kind("WorldModel")
+            world_version = (
+                world_models[0]["data"].get("version") if world_models else None
+            )
+            freshness = {
+                "canonical_source": "research_objects_and_immutable_events",
+                "project_state_role": "CACHE_ONLY",
+                "research_state_version": int(object_freshness["object_count"] or 0),
+                "world_model_version": world_version,
+                "state_updated_at": (
+                    object_freshness["latest_object_at"].isoformat()
+                    if object_freshness["latest_object_at"] else None
+                ),
+                "latest_scientific_event_at": (
+                    event_freshness["latest_scientific_event_at"].isoformat()
+                    if event_freshness["latest_scientific_event_at"] else None
+                ),
+                "scientific_event_count": int(event_freshness["event_count"] or 0),
+            }
             return {
                 **row,
                 "canonical_state": canonical,
+                "state_freshness": freshness,
+                "project_state_cache": row["state"],
                 "objects": objects,
                 "as_of": cutoff.isoformat() if cutoff is not None else None,
             }
