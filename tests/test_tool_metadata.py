@@ -1,7 +1,13 @@
 import uuid
 
 from gpu_lab import server
-from gpu_lab.server import _compact_brain_step, _compact_research_state, _safe_request_id, mcp
+from gpu_lab.server import (
+    _compact_brain_step,
+    _compact_research_state,
+    _prioritise_monitor_jobs,
+    _safe_request_id,
+    mcp,
+)
 
 
 def test_vast_status_tool_has_provider_specific_name():
@@ -9,6 +15,19 @@ def test_vast_status_tool_has_provider_specific_name():
 
     assert "vast_gpu_status" in names
     assert "gpu_status" not in names
+
+
+def test_monitor_prioritises_active_jobs_over_newer_history():
+    class Job:
+        def __init__(self, job_id):
+            self.job_id = job_id
+
+    active = Job("running-current")
+    result = _prioritise_monitor_jobs(
+        [active], [], [Job("history-newer"), active, Job("history-older")], limit=2
+    )
+
+    assert [job.job_id for job in result] == ["running-current", "history-newer"]
 
 
 def test_research_decision_creation_is_explicitly_discoverable():

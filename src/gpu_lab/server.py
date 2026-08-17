@@ -3307,6 +3307,19 @@ async def activity(_: Request):
     return JSONResponse(svc().repo.list_audit(100))
 
 
+def _prioritise_monitor_jobs(running: list, queued: list, recent: list, limit: int = 30) -> list:
+    """Keep active jobs visible even when historical status writes are newer."""
+    selected = []
+    seen = set()
+    for job in [*running, *queued, *recent]:
+        if job.job_id not in seen:
+            selected.append(job)
+            seen.add(job.job_id)
+        if len(selected) == limit:
+            break
+    return selected
+
+
 @mcp.custom_route("/monitor", methods=["GET"], include_in_schema=False)
 async def monitor(_: Request):
     """Return real local-job state and GPU telemetry for the dashboard."""
@@ -3318,8 +3331,14 @@ async def monitor(_: Request):
     except GPUError as exc:
         gpus = []
         gpu_error = exc.message
+    repository = svc().repo
+    selected_jobs = _prioritise_monitor_jobs(
+        repository.list_jobs(instance_id="local", status="running", limit=30),
+        repository.list_jobs(instance_id="local", status="queued", limit=30),
+        repository.list_jobs(instance_id="local", limit=30),
+    )
     jobs = []
-    for job in svc().repo.list_jobs(instance_id="local", limit=30):
+    for job in selected_jobs:
         status = local.job_status(job.job_id, include_logs=False)
         jobs.append(
             {
