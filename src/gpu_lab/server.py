@@ -25,7 +25,7 @@ from .brain_bench import BenchmarkPolicy, ResearchBrainBench
 from .branches import ExperimentBranchService
 from .config import Settings
 from .dashboard import DASHBOARD_HTML
-from .discovery import breakthrough_signal
+from .discovery import breakthrough_signal, local_search_collapse_diagnosis
 from .embeddings import EmbeddingService, LocalHashEmbeddingProvider
 from .engineering import CodingExecutionPolicy, EngineeringService
 from .epistemics import EpistemicService
@@ -1097,6 +1097,18 @@ async def improve_start(
 async def improve_status(improvement_run_id: str):
     """Retrieve a durable improvement run and its recommendation."""
     return await call(research().object_get, improvement_run_id)
+
+
+@mcp.tool()
+async def improve_local_search_collapse_diagnose(project_id: str):
+    """Return an advisory LOCAL_SEARCH_COLLAPSE diagnosis without modifying policy or science."""
+    portfolios = await call(research().objects_list, project_id, "CandidatePortfolio", limit=None)
+    decisions = await call(research().objects_list, project_id, "ResearchDecision", limit=None)
+    if isinstance(portfolios, dict) and "error" in portfolios:
+        return portfolios
+    if isinstance(decisions, dict) and "error" in decisions:
+        return decisions
+    return local_search_collapse_diagnosis(portfolios, decisions)
 
 
 @mcp.tool()

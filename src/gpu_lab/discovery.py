@@ -196,3 +196,41 @@ def breakthrough_signal(
         "evidence_family_ids": evidence_family_ids or [],
         "scientific_truth_independent": True,
     }
+
+
+def local_search_collapse_diagnosis(
+    portfolios: list[dict[str, Any]], decisions: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Advisory /improve signal; it never changes policy or scientific state."""
+    open_ended = [
+        item.get("data", item)
+        for item in portfolios
+        if item.get("data", item).get("portfolio_type") == "OPEN_ENDED_DISCOVERY"
+    ]
+    collapsed = [
+        item for item in open_ended if len(item.get("valid_candidate_indexes", [])) <= 1
+    ]
+    local_only = [
+        item
+        for item in open_ended
+        if not (item.get("distance_coverage", {}).get("FAR") or item.get("distance_coverage", {}).get("ORTHOGONAL"))
+    ]
+    legacy = [item.get("data", item) for item in decisions if item.get("data", item).get("brain_policy_version") != BRAIN_POLICY_VERSION]
+    detected = bool(collapsed or local_only)
+    evidence = {
+        "open_ended_portfolio_count": len(open_ended),
+        "single_candidate_open_decisions": len(collapsed),
+        "missing_far_or_orthogonal_coverage": len(local_only),
+        "legacy_policy_decisions_seen": len(legacy),
+    }
+    return {
+        "diagnosis": "LOCAL_SEARCH_COLLAPSE" if detected else "NO_LOCAL_SEARCH_COLLAPSE_DETECTED",
+        "detected": detected,
+        "evidence": evidence,
+        "recommendation": (
+            "Require a v3.1 CandidatePortfolio and inspect distance/frontier/stagnation provenance before selecting another local descendant."
+            if detected
+            else "No advisory policy change recommended from the observed portfolio history."
+        ),
+        "advisory_only": True,
+    }

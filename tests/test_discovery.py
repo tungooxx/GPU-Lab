@@ -5,6 +5,7 @@ from gpu_lab.discovery import (
     choose_regime,
     classify_scientific_distance,
     frontier_gap,
+    local_search_collapse_diagnosis,
     portfolio_critique,
     stagnation_state,
 )
@@ -64,3 +65,12 @@ def test_partial_breakthrough_never_changes_refuted_hypothesis_truth():
     assert signal["hypothesis_status"] == "REFUTED"
     assert signal["discovery_value"] == "HIGH"
     assert len(signal["branch_recommendations"]) >= 3
+
+
+def test_improve_diagnosis_flags_only_open_ended_local_portfolio_collapse():
+    diagnosis = local_search_collapse_diagnosis(
+        [{"data": {"portfolio_type": "OPEN_ENDED_DISCOVERY", "valid_candidate_indexes": [0], "distance_coverage": {"NEAR": 1}}}],
+        [],
+    )
+    assert diagnosis["diagnosis"] == "LOCAL_SEARCH_COLLAPSE"
+    assert diagnosis["advisory_only"]
