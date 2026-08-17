@@ -11,19 +11,21 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.types import ASGIApp
 
 from .brain import ResearchBrain
 from .brain_bench import BenchmarkPolicy, ResearchBrainBench
 from .branches import ExperimentBranchService
 from .cockpit import CockpitController
+from .cockpit_auth import issue_session, password_matches, verify_session
 from .config import Settings
 from .dashboard import DASHBOARD_HTML
 from .discovery import breakthrough_signal, local_search_collapse_diagnosis
@@ -270,6 +272,38 @@ class McpClientNetworkPolicyMiddleware(BaseHTTPMiddleware):
         ):
             return JSONResponse({"error": "MCP client network is not authorized"}, status_code=403)
         return await call_next(request)
+
+
+_COCKPIT_COOKIE = "gpu_lab_cockpit"
+_COCKPIT_PROTECTED_PATHS = {"/", "/activity", "/monitor", "/research-map", "/terminal", "/terminal/activity", "/terminal/jobs"}
+
+
+def _cockpit_is_protected(path: str) -> bool:
+    return path in _COCKPIT_PROTECTED_PATHS or path.startswith("/cockpit/")
+
+
+def _cockpit_session(request: Request):
+    secret = settings.gpu_lab_cockpit_session_secret
+    return verify_session(secret, request.cookies.get(_COCKPIT_COOKIE)) if secret else None
+
+
+class CockpitAuthMiddleware(BaseHTTPMiddleware):
+    """Require a signed private-operator session for the human cockpit only."""
+
+    async def dispatch(self, request: Request, call_next):
+        if not settings.lab_ui_enabled or not _cockpit_is_protected(request.url.path):
+            return await call_next(request)
+        if request.url.path == "/cockpit/login":
+            return await call_next(request)
+        if not settings.gpu_lab_cockpit_password or not settings.gpu_lab_cockpit_session_secret:
+            return JSONResponse({"error": "Cockpit authentication is not configured"}, status_code=503)
+        session = _cockpit_session(request)
+        if session:
+            request.state.cockpit_session = session
+            return await call_next(request)
+        if request.method in {"GET", "HEAD"} and "text/html" in request.headers.get("accept", ""):
+            return RedirectResponse("/cockpit/login", status_code=303)
+        return JSONResponse({"error": "Cockpit authentication required"}, status_code=401)
 
 
 class McpRequestObservabilityMiddleware(BaseHTTPMiddleware):
@@ -3619,6 +3653,32 @@ async def terminal_jobs(_: Request):
     return JSONResponse(jobs)
 
 
+@mcp.custom_route("/cockpit/login", methods=["GET"], include_in_schema=False)
+async def cockpit_login_page(_: Request):
+    """Render the private-operator login form without disclosing configuration."""
+    if not settings.lab_ui_enabled:
+        return JSONResponse({"error": "Cockpit is disabled"}, status_code=404)
+    return HTMLResponse("""<!doctype html><title>Chucky Lab login</title><meta name=viewport content=width=device-width,initial-scale=1><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#08101d;color:#e6edf8;font:16px system-ui}form{width:min(360px,90vw);padding:28px;border:1px solid #29415f;border-radius:14px;background:#101c2e}input,button{box-sizing:border-box;width:100%;padding:11px;margin-top:10px;border-radius:8px;border:1px solid #405b80}input{background:#091321;color:#fff}button{background:#3d76ee;color:#fff;font-weight:700}</style><form method=post action=/cockpit/login><h1>Chucky Lab</h1><p>Private operator access</p><label>Password<input name=password type=password required autofocus autocomplete=current-password></label><button>Open cockpit</button></form>""")
+
+
+@mcp.custom_route("/cockpit/login", methods=["POST"], include_in_schema=False)
+async def cockpit_login(request: Request):
+    if not settings.lab_ui_enabled or not settings.gpu_lab_cockpit_password or not settings.gpu_lab_cockpit_session_secret:
+        return JSONResponse({"error": "Cockpit authentication is not configured"}, status_code=503)
+    origin = request.headers.get("origin")
+    host = request.headers.get("host", "")
+    if origin and origin.rstrip("/") not in {f"https://{host}", f"http://{host}"}:
+        return JSONResponse({"error": "Invalid login origin"}, status_code=403)
+    form = parse_qs((await request.body()).decode("utf-8", "replace"))
+    if not password_matches(settings.gpu_lab_cockpit_password, (form.get("password") or [None])[0]):
+        return HTMLResponse("Invalid password", status_code=401)
+    token, _ = issue_session(settings.gpu_lab_cockpit_session_secret)
+    response = RedirectResponse("/", status_code=303)
+    response.set_cookie(_COCKPIT_COOKIE, token, max_age=28_800, httponly=True,
+                        secure=request.url.scheme == "https", samesite="strict", path="/")
+    return response
+
+
 @mcp.custom_route("/", methods=["GET"], include_in_schema=False)
 async def dashboard(_: Request):
     return HTMLResponse(DASHBOARD_HTML)
@@ -3630,6 +3690,7 @@ def http_app():
     app.add_middleware(McpAcceptCompatibilityMiddleware)
     app.add_middleware(McpClientNetworkPolicyMiddleware)
     app.add_middleware(McpRequestObservabilityMiddleware)
+    app.add_middleware(CockpitAuthMiddleware)
     return app
 
 
