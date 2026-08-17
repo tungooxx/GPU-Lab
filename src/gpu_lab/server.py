@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import hashlib
 import hmac
 import inspect
@@ -70,6 +71,8 @@ settings, service, research_store, research_brain, brain_bench_service, epistemi
 meta_controller_service: MetaResearchController | None = None
 cockpit_controller_service: CockpitController | None = None
 browser_wake_dispatcher: BrowserWakeDispatcher | None = None
+browser_wake_loop_thread: threading.Thread | None = None
+browser_wake_loop_stop = threading.Event()
 _singleton_lock = threading.RLock()
 embedding_service: EmbeddingService | None = None
 engineering_service: EngineeringService | None = None
@@ -414,6 +417,27 @@ def browser_dispatcher() -> BrowserWakeDispatcher:
             if browser_wake_dispatcher is None:
                 browser_wake_dispatcher = BrowserWakeDispatcher(cockpit(), settings.chatgpt_web_profile_root)
     return browser_wake_dispatcher
+
+
+def start_browser_wake_loop() -> None:
+    """Start the opt-in, bounded autonomous continuation loop exactly once."""
+    global browser_wake_loop_thread
+    if browser_wake_loop_thread and browser_wake_loop_thread.is_alive():
+        return
+
+    def run() -> None:
+        while not browser_wake_loop_stop.is_set():
+            try:
+                result = asyncio.run(browser_dispatcher().dispatch_one())
+                if result.get("dispatched"):
+                    logger.info("Dispatched browser worker wake wake_id=%s", result.get("wake_id"))
+            except Exception:
+                logger.exception("Browser wake loop failed; it will retry after the configured interval")
+            browser_wake_loop_stop.wait(settings.gpu_lab_browser_wake_poll_seconds)
+
+    browser_wake_loop_stop.clear()
+    browser_wake_loop_thread = threading.Thread(target=run, name="browser-wake-loop", daemon=True)
+    browser_wake_loop_thread.start()
 
 
 def engineering() -> EngineeringService:
@@ -3778,6 +3802,8 @@ def main():
     reconciliation = local.reconcile_jobs()
     if reconciliation["reconciled"]:
         logger.info("Reconciled persisted local jobs at startup: %s", reconciliation)
+    if settings.chatgpt_web_bridge_enabled and settings.autopilot_enabled and settings.auto_continue_enabled:
+        start_browser_wake_loop()
     if args.transport == "streamable-http":
         import uvicorn
 
