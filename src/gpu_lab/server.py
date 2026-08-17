@@ -937,6 +937,12 @@ async def lab_state_get(project_id: str, session_id: str | None = None):
 
 
 @mcp.tool()
+async def lab_budget_set(project_id: str, worker_id: str, session_id: str, limits: dict[str, Any]):
+    """Set project-level worker and compute concurrency limits for Lab Control."""
+    return await call(lab().budget_set, project_id, worker_id, session_id, limits)
+
+
+@mcp.tool()
 async def lab_sync(
     session_id: str, project_id: str, since: str | None = None, current_work_item_id: str | None = None
 ):
@@ -962,12 +968,12 @@ async def lab_work_create(
     created_by: str | None = None, priority: float = 0, expected_value: float | None = None,
     estimated_cost: float | None = None, related_refs: dict[str, Any] | None = None,
     dependencies: list[dict] | None = None, equivalence_key: str | None = None,
-    parent_work_item_id: str | None = None,
+    parent_work_item_id: str | None = None, created_session_id: str | None = None,
 ):
     """Create dependency-aware project work; equivalent active work is rejected."""
     return await call(lab().create_work, project_id, kind, title, description, scientific_role,
                       created_by, priority, expected_value, estimated_cost, related_refs,
-                      dependencies, equivalence_key, parent_work_item_id)
+                      dependencies, equivalence_key, parent_work_item_id, created_session_id)
 
 
 @mcp.tool()
@@ -975,6 +981,12 @@ async def lab_work_claim(work_item_id: str, worker_id: str, session_id: str,
                          role: str | None = None, lease_seconds: int | None = None):
     """Atomically claim one READY WorkItem and create its renewable lease."""
     return await call(lab().claim_work, work_item_id, worker_id, session_id, role, lease_seconds)
+
+
+@mcp.tool()
+async def lab_work_start(work_item_id: str, worker_id: str, session_id: str):
+    """Mark work already claimed by this session as actively running."""
+    return await call(lab().start_work, work_item_id, worker_id, session_id)
 
 
 @mcp.tool()
@@ -997,12 +1009,12 @@ async def lab_heartbeat(session_id: str, work_item_id: str | None = None, lease_
 
 
 @mcp.tool()
-async def lab_message_send(project_id: str, from_worker_id: str, message_type: str, subject: str,
+async def lab_message_send(project_id: str, from_worker_id: str, from_session_id: str, message_type: str, subject: str,
                            body: str, to_worker_id: str | None = None, to_role: str | None = None,
                            reference_ids: list[str] | None = None, priority: int = 0,
                            broadcast_scope: str | None = None):
     """Send advisory worker communication; it cannot alter scientific evidence or beliefs."""
-    return await call(lab().message_send, project_id, from_worker_id, message_type, subject, body,
+    return await call(lab().message_send, project_id, from_worker_id, from_session_id, message_type, subject, body,
                       to_worker_id, to_role, reference_ids, priority, broadcast_scope)
 
 
@@ -1011,6 +1023,12 @@ async def lab_message_list(project_id: str, worker_id: str, role: str | None = N
                            unread_only: bool = False, limit: int = 100):
     """Retrieve project-scoped worker messages without loading chat histories."""
     return await call(lab().message_list, project_id, worker_id, role, unread_only, limit)
+
+
+@mcp.tool()
+async def lab_message_mark_read(project_id: str, worker_id: str, session_id: str, message_ids: list[str]):
+    """Acknowledge messages visible to this project-scoped active worker session."""
+    return await call(lab().message_mark_read, project_id, worker_id, session_id, message_ids)
 
 
 @mcp.tool()

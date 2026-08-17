@@ -21,17 +21,18 @@ def test_two_workers_claim_distinct_work_and_messages_are_not_evidence():
     first = lab.join(None, "worker-a", "CHATGPT_WEB", project_id)
     second = lab.join(None, "worker-b", "CODEX", project_id)
     first_worker, second_worker = first["worker"]["id"], second["worker"]["id"]
-    work_a = lab.create_work(project_id, "LITERATURE", "Read evidence", "Independent retrieval", "LITERATURE_RESEARCHER", first_worker)
-    work_b = lab.create_work(project_id, "REVIEW", "Review result", "Independent review", "ADVERSARIAL_REVIEWER", second_worker)
+    work_a = lab.create_work(project_id, "LITERATURE", "Read evidence", "Independent retrieval", "LITERATURE_RESEARCHER", first_worker, created_session_id=first["session_id"])
+    work_b = lab.create_work(project_id, "REVIEW", "Review result", "Independent review", "ADVERSARIAL_REVIEWER", second_worker, created_session_id=second["session_id"])
 
     lab.claim_work(work_a["id"], first_worker, first["session_id"])
+    assert lab.start_work(work_a["id"], first_worker, first["session_id"])["status"] == "RUNNING"
     state_b = lab.state_get(project_id, second["session_id"])
     assert {item["id"] for item in state_b["running_work_items"]} == {work_a["id"]}
     with pytest.raises(GPUError, match="LAB_WORK_NOT_CLAIMABLE"):
         lab.claim_work(work_a["id"], second_worker, second["session_id"])
     assert lab.claim_work(work_b["id"], second_worker, second["session_id"])["id"] == work_b["id"]
 
-    lab.message_send(project_id, first_worker, "SHARE_FINDING", "Opinion", "H1 is definitely correct")
+    lab.message_send(project_id, first_worker, first["session_id"], "SHARE_FINDING", "Opinion", "H1 is definitely correct")
     assert lab.message_list(project_id, second_worker)
     assert store.objects_list(project_id, "Hypothesis", limit=None) == []
 
@@ -44,7 +45,7 @@ def test_atomic_claim_and_dependency_reactivation_survive_store_restart():
     project_id = project["project_id"]
     first = lab.join(None, "atomic-a", "CHATGPT_WEB", project_id)
     second = lab.join(None, "atomic-b", "CODEX", project_id)
-    work = lab.create_work(project_id, "REVIEW", "One canonical task", "Must only claim once", "ADVERSARIAL_REVIEWER")
+    work = lab.create_work(project_id, "REVIEW", "One canonical task", "Must only claim once", "ADVERSARIAL_REVIEWER", first["worker"]["id"], created_session_id=first["session_id"])
     barrier = threading.Barrier(2)
 
     def claim(joined):
@@ -61,8 +62,49 @@ def test_atomic_claim_and_dependency_reactivation_survive_store_restart():
     assert results.count("LAB_WORK_NOT_CLAIMABLE") == 1
 
     run = store.object_create(project_id, "ExperimentRun", {"label": "simulated"}, "EXPERIMENT_STARTED", "running")
-    waiting = lab.create_work(project_id, "INSPECT_RESULT", "Inspect simulated run", "Wait for result", "RESULT_INSPECTOR", dependencies=[{"target_type": "EXPERIMENT_RUN", "target_id": run["id"], "required_statuses": ["completed"]}])
+    waiting = lab.create_work(project_id, "INSPECT_RESULT", "Inspect simulated run", "Wait for result", "RESULT_INSPECTOR", first["worker"]["id"], dependencies=[{"target_type": "EXPERIMENT_RUN", "target_id": run["id"], "required_statuses": ["completed"]}], created_session_id=first["session_id"])
     assert waiting["status"] == "WAITING_DEPENDENCY"
     store.object_update(run["id"], {}, "completed", "EXPERIMENT_COMPLETED")
     assert lab.resolve_dependencies(project_id)["ready"] == 1
     assert LabController(ResearchStore(TEST_DATABASE_URL)).work_get(waiting["id"])["status"] == "READY"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_budget_and_expired_lease_release_work_without_touching_experiment():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store, lease_seconds=30)
+    project = store.project_create(f"lab-budget-{time.time_ns()}", "Budget and lease")
+    project_id = project["project_id"]
+    first = lab.join(None, "budget-a", "CHATGPT_WEB", project_id)
+    second = lab.join(None, "budget-b", "CODEX", project_id)
+    lab.budget_set(project_id, first["worker"]["id"], first["session_id"], {"max_active_workers": 1})
+    first_work = lab.create_work(project_id, "REVIEW", "First", "First", "ADVERSARIAL_REVIEWER", first["worker"]["id"], created_session_id=first["session_id"])
+    second_work = lab.create_work(project_id, "REVIEW", "Second", "Second", "ADVERSARIAL_REVIEWER", second["worker"]["id"], created_session_id=second["session_id"])
+    lab.claim_work(first_work["id"], first["worker"]["id"], first["session_id"])
+    with pytest.raises(GPUError, match="LAB_WORKER_BUDGET_EXCEEDED"):
+        lab.claim_work(second_work["id"], second["worker"]["id"], second["session_id"])
+
+    # Lease recovery releases only coordination ownership; the external run remains canonical and running.
+    run = store.object_create(project_id, "ExperimentRun", {"label": "must-not-cancel"}, "EXPERIMENT_STARTED", "running")
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE lab_work_leases SET expires_at=NOW() - INTERVAL '1 second' WHERE work_item_id=%s", (first_work["id"],))
+    assert lab.recover_stale_leases(project_id)["recovered"] == 1
+    assert lab.work_get(first_work["id"])["status"] == "READY"
+    assert store.object_get(run["id"])["status"] == "running"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_project_scope_and_message_acknowledgement_require_active_session():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    one = store.project_create(f"lab-scope-one-{time.time_ns()}", "One")["project_id"]
+    two = store.project_create(f"lab-scope-two-{time.time_ns()}", "Two")["project_id"]
+    sender = lab.join(None, "scope-sender", "CODEX", one)
+    recipient = lab.join(None, "scope-recipient", "CHATGPT_WEB", one)
+    outsider = lab.join(None, "scope-outsider", "OTHER", two)
+    message = lab.message_send(one, sender["worker"]["id"], sender["session_id"], "REQUEST_REVIEW", "Scope", "Project one only", to_worker_id=recipient["worker"]["id"])
+    assert lab.message_list(two, outsider["worker"]["id"]) == []
+    assert lab.message_mark_read(one, recipient["worker"]["id"], recipient["session_id"], [message["id"]]) == {"marked_read": 1}
+    assert lab.message_list(one, recipient["worker"]["id"], unread_only=True) == []
+    with pytest.raises(GPUError, match="LAB_MESSAGE_RECIPIENT_NOT_IN_PROJECT"):
+        lab.message_send(one, sender["worker"]["id"], sender["session_id"], "REQUEST_REVIEW", "Bad", "No cross-project recipient", to_worker_id=outsider["worker"]["id"])

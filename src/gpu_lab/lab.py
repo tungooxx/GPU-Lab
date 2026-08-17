@@ -97,6 +97,10 @@ class LabController:
                 );
                 CREATE INDEX IF NOT EXISTS lab_messages_recipient_idx
                     ON lab_messages(project_id,to_worker_id,created_at DESC);
+                CREATE TABLE IF NOT EXISTS lab_project_budgets (
+                    project_id UUID PRIMARY KEY REFERENCES research_projects(id),
+                    limits JSONB NOT NULL DEFAULT '{}'::jsonb, updated_at TIMESTAMPTZ NOT NULL
+                );
             """)
 
     @staticmethod
@@ -125,6 +129,83 @@ class LabController:
         if not worker:
             raise GPUError("LAB_WORKER_NOT_FOUND", worker_id)
         return worker
+
+    def _session(self, cur, session_id: str, worker_id: str, project_id: str) -> dict:
+        cur.execute(
+            "SELECT * FROM research_worker_sessions WHERE id=%s AND worker_id=%s "
+            "AND current_project_id=%s FOR UPDATE",
+            (session_id, worker_id, project_id),
+        )
+        session = cur.fetchone()
+        if not session or session["status"] in {"DISCONNECTED", "EXPIRED"}:
+            raise GPUError("LAB_SESSION_NOT_ACTIVE", session_id)
+        return session
+
+    def budget_set(self, project_id: str, worker_id: str, session_id: str,
+                   limits: dict[str, Any]) -> dict:
+        allowed = {
+            "max_active_workers", "max_parallel_branches", "max_concurrent_gpu_runs",
+            "max_concurrent_training_runs", "max_concurrent_expensive_llm_tasks",
+            "project_compute_budget", "project_llm_budget",
+        }
+        if not isinstance(limits, dict) or set(limits) - allowed:
+            raise GPUError("INVALID_LAB_BUDGET", "Unsupported LabBudget field")
+        if any(not isinstance(value, (int, float)) or value < 0 for value in limits.values()):
+            raise GPUError("INVALID_LAB_BUDGET", "Budget values must be non-negative numbers")
+        now = self._now()
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM research_projects WHERE id=%s", (project_id,))
+            if not cur.fetchone():
+                raise GPUError("RESEARCH_PROJECT_NOT_FOUND", project_id)
+            self._worker(cur, worker_id)
+            self._session(cur, session_id, worker_id, project_id)
+            cur.execute(
+                "INSERT INTO lab_project_budgets(project_id,limits,updated_at) VALUES(%s,%s,%s) "
+                "ON CONFLICT(project_id) DO UPDATE SET limits=EXCLUDED.limits,updated_at=EXCLUDED.updated_at",
+                (project_id, json.dumps(limits), now),
+            )
+            self._event(cur, project_id, "LAB_BUDGET_UPDATED", None, {"limits": limits})
+        return {"project_id": project_id, "limits": limits, "updated_at": now}
+
+    def _budget(self, cur, project_id: str) -> dict[str, Any]:
+        cur.execute("SELECT limits FROM lab_project_budgets WHERE project_id=%s", (project_id,))
+        row = cur.fetchone()
+        return row["limits"] if row else {}
+
+    def _enforce_claim_budget(self, cur, project_id: str, item: dict, session_id: str) -> None:
+        limits = self._budget(cur, project_id)
+        active = ("CLAIMED", "RUNNING")
+        max_workers = int(limits.get("max_active_workers", 0) or 0)
+        if max_workers:
+            cur.execute("SELECT count(DISTINCT assigned_session_id) AS count FROM lab_work_items WHERE project_id=%s AND status=ANY(%s) AND assigned_session_id<>%s", (project_id, list(active), session_id))
+            if cur.fetchone()["count"] >= max_workers:
+                raise GPUError("LAB_WORKER_BUDGET_EXCEEDED", "max_active_workers")
+        max_branches = int(limits.get("max_parallel_branches", 0) or 0)
+        if max_branches:
+            cur.execute("SELECT count(*) AS count FROM lab_work_items WHERE project_id=%s AND status=ANY(%s)", (project_id, list(active)))
+            if cur.fetchone()["count"] >= max_branches:
+                raise GPUError("LAB_BRANCH_BUDGET_EXCEEDED", "max_parallel_branches")
+        kind = item["kind"].upper()
+        max_gpu = int(limits.get("max_concurrent_gpu_runs", 0) or 0)
+        if max_gpu and kind in {"RUN_EXPERIMENT", "TRAINING_RUN"}:
+            cur.execute("SELECT count(*) AS count FROM research_objects WHERE project_id=%s AND kind='ExperimentRun' AND status IN ('running','RESERVED','unknown')", (project_id,))
+            if cur.fetchone()["count"] >= max_gpu:
+                raise GPUError("LAB_GPU_BUDGET_EXCEEDED", "max_concurrent_gpu_runs")
+        max_training = int(limits.get("max_concurrent_training_runs", 0) or 0)
+        if max_training and kind == "TRAINING_RUN":
+            cur.execute("SELECT count(*) AS count FROM lab_work_items WHERE project_id=%s AND kind='TRAINING_RUN' AND status=ANY(%s)", (project_id, list(active)))
+            if cur.fetchone()["count"] >= max_training:
+                raise GPUError("LAB_TRAINING_BUDGET_EXCEEDED", "max_concurrent_training_runs")
+        max_llm = int(limits.get("max_concurrent_expensive_llm_tasks", 0) or 0)
+        if max_llm and kind in {"EXPENSIVE_LLM_TASK", "LLM_EVALUATION", "LLM_REVIEW"}:
+            cur.execute("SELECT count(*) AS count FROM lab_work_items WHERE project_id=%s AND kind=ANY(%s) AND status=ANY(%s)", (project_id, ["EXPENSIVE_LLM_TASK", "LLM_EVALUATION", "LLM_REVIEW"], list(active)))
+            if cur.fetchone()["count"] >= max_llm:
+                raise GPUError("LAB_LLM_BUDGET_EXCEEDED", "max_concurrent_expensive_llm_tasks")
+        compute_budget = float(limits.get("project_compute_budget", 0) or 0)
+        if compute_budget and item.get("estimated_cost") is not None:
+            cur.execute("SELECT COALESCE(sum(estimated_cost), 0) AS cost FROM lab_work_items WHERE project_id=%s AND status=ANY(%s)", (project_id, list(active)))
+            if float(cur.fetchone()["cost"]) + float(item["estimated_cost"]) > compute_budget:
+                raise GPUError("LAB_COMPUTE_BUDGET_EXCEEDED", "project_compute_budget")
 
     def join(self, worker_id: str | None, worker_name: str | None, runtime_type: str,
              project_id: str, capabilities: dict[str, Any] | None = None,
@@ -171,15 +252,18 @@ class LabController:
                     scientific_role: str, created_by: str | None = None, priority: float = 0,
                     expected_value: float | None = None, estimated_cost: float | None = None,
                     related_refs: dict[str, Any] | None = None, dependencies: list[dict] | None = None,
-                    equivalence_key: str | None = None, parent_work_item_id: str | None = None) -> dict:
+                    equivalence_key: str | None = None, parent_work_item_id: str | None = None,
+                    created_session_id: str | None = None) -> dict:
         now, ident = self._now(), str(uuid.uuid4())
         dependencies = dependencies or []
         with self.store._connect() as conn, conn.cursor() as cur:
-            if created_by:
-                self._worker(cur, created_by)
             cur.execute("SELECT id FROM research_projects WHERE id=%s", (project_id,))
             if not cur.fetchone():
                 raise GPUError("RESEARCH_PROJECT_NOT_FOUND", project_id)
+            if not created_by or not created_session_id:
+                raise GPUError("LAB_WORK_CREATOR_SESSION_REQUIRED", "created_by and created_session_id")
+            self._worker(cur, created_by)
+            self._session(cur, created_session_id, created_by, project_id)
             status = "WAITING_DEPENDENCY" if dependencies else "READY"
             try:
                 cur.execute("INSERT INTO lab_work_items(id,project_id,kind,title,description,scientific_role,status,priority,expected_value,estimated_cost,created_by,parent_work_item_id,related_refs,equivalence_key,created_at,updated_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
@@ -193,6 +277,8 @@ class LabController:
                 target_id = str(dependency.get("target_id", ""))
                 if not target_id:
                     raise GPUError("LAB_DEPENDENCY_TARGET_REQUIRED", "target_id")
+                if target_type not in {"WORK_ITEM", "RESEARCH_OBJECT", "EXPERIMENT_RUN", "ENGINEERING_RESULT", "RESEARCH_DECISION", "EVIDENCE_UNIT", "ARTIFACT"}:
+                    raise GPUError("LAB_DEPENDENCY_TYPE_INVALID", target_type)
                 cur.execute("INSERT INTO lab_work_dependencies(id,work_item_id,target_type,target_id,required_statuses,invalidating_statuses,description,created_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",
                             (str(uuid.uuid4()), ident, target_type, target_id, json.dumps(dependency.get("required_statuses", [])), json.dumps(dependency.get("invalidating_statuses", [])), str(dependency.get("description", "")), now))
             self._event(cur, project_id, "WORK_ITEM_CREATED", ident, {"kind": kind, "title": title, "status": status})
@@ -281,17 +367,14 @@ class LabController:
         lease_id = str(uuid.uuid4())
         with self.store._connect() as conn, conn.cursor() as cur:
             self._worker(cur, worker_id)
-            cur.execute("SELECT * FROM research_worker_sessions WHERE id=%s AND worker_id=%s FOR UPDATE", (session_id, worker_id))
-            session = cur.fetchone()
-            if not session or session["status"] in {"DISCONNECTED", "EXPIRED"}:
-                raise GPUError("LAB_SESSION_NOT_ACTIVE", session_id)
-            cur.execute("SELECT project_id FROM lab_work_items WHERE id=%s", (work_item_id,))
+            cur.execute("SELECT project_id,kind,estimated_cost FROM lab_work_items WHERE id=%s", (work_item_id,))
             target = cur.fetchone()
             if not target:
                 raise GPUError("LAB_WORK_NOT_FOUND", work_item_id)
+            session = self._session(cur, session_id, worker_id, str(target["project_id"]))
             if str(session["current_project_id"]) != str(target["project_id"]):
                 raise GPUError("LAB_PROJECT_MISMATCH", work_item_id)
-            self.resolve_dependencies(str(target["project_id"]))
+            self._enforce_claim_budget(cur, str(target["project_id"]), target, session_id)
             cur.execute("UPDATE lab_work_items SET status='CLAIMED',assigned_worker_id=%s,assigned_session_id=%s,lease_id=%s,updated_at=%s WHERE id=%s AND status='READY' RETURNING *", (worker_id, session_id, lease_id, now, work_item_id))
             item = cur.fetchone()
             if not item:
@@ -320,6 +403,23 @@ class LabController:
                     raise GPUError("LAB_LEASE_NOT_OWNED", work_item_id)
             return {"session_id": session_id, "work_item_id": work_item_id, "heartbeat_at": now, "expires_at": expiry if work_item_id else None}
 
+    def start_work(self, work_item_id: str, worker_id: str, session_id: str) -> dict:
+        """Mark an owned claim as running without changing scientific state."""
+        now = self._now()
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM lab_work_items WHERE id=%s FOR UPDATE", (work_item_id,))
+            item = cur.fetchone()
+            if not item:
+                raise GPUError("LAB_WORK_NOT_FOUND", work_item_id)
+            self._session(cur, session_id, worker_id, str(item["project_id"]))
+            if str(item["assigned_worker_id"]) != str(worker_id) or str(item["assigned_session_id"]) != str(session_id):
+                raise GPUError("LAB_WORK_NOT_OWNED", work_item_id)
+            if item["status"] not in {"CLAIMED", "RUNNING"}:
+                raise GPUError("LAB_WORK_NOT_STARTABLE", work_item_id)
+            cur.execute("UPDATE lab_work_items SET status='RUNNING',updated_at=%s WHERE id=%s", (now, work_item_id))
+            self._event(cur, item["project_id"], "WORK_STARTED", work_item_id, {"worker_id": worker_id, "session_id": session_id})
+        return self.work_get(work_item_id)
+
     def release_work(self, work_item_id: str, worker_id: str, session_id: str, reason: str = "RELEASED") -> dict:
         now = self._now()
         with self.store._connect() as conn, conn.cursor() as cur:
@@ -327,6 +427,7 @@ class LabController:
             item = cur.fetchone()
             if not item:
                 raise GPUError("LAB_WORK_NOT_FOUND", work_item_id)
+            self._session(cur, session_id, worker_id, str(item["project_id"]))
             if str(item["assigned_worker_id"]) != str(worker_id) or str(item["assigned_session_id"]) != str(session_id):
                 raise GPUError("LAB_WORK_NOT_OWNED", work_item_id)
             cur.execute("UPDATE lab_work_leases SET released_at=%s,release_reason=%s WHERE id=%s AND released_at IS NULL", (now, reason, item["lease_id"]))
@@ -343,6 +444,7 @@ class LabController:
             item = cur.fetchone()
             if not item:
                 raise GPUError("LAB_WORK_NOT_FOUND", work_item_id)
+            self._session(cur, session_id, worker_id, str(item["project_id"]))
             if str(item["assigned_worker_id"]) != str(worker_id) or str(item["assigned_session_id"]) != str(session_id):
                 raise GPUError("LAB_WORK_NOT_OWNED", work_item_id)
             cur.execute("UPDATE lab_work_leases SET released_at=%s,release_reason='COMPLETED' WHERE id=%s AND released_at IS NULL", (now, item["lease_id"]))
@@ -373,7 +475,7 @@ class LabController:
                 recovered += 1
         return {"recovered": recovered}
 
-    def message_send(self, project_id: str, from_worker_id: str, message_type: str,
+    def message_send(self, project_id: str, from_worker_id: str, from_session_id: str, message_type: str,
                      subject: str, body: str, to_worker_id: str | None = None,
                      to_role: str | None = None, reference_ids: list[str] | None = None,
                      priority: int = 0, broadcast_scope: str | None = None) -> dict:
@@ -381,8 +483,12 @@ class LabController:
         now, ident = self._now(), str(uuid.uuid4())
         with self.store._connect() as conn, conn.cursor() as cur:
             self._worker(cur, from_worker_id)
+            self._session(cur, from_session_id, from_worker_id, project_id)
             if to_worker_id:
                 self._worker(cur, to_worker_id)
+                cur.execute("SELECT 1 FROM research_worker_sessions WHERE worker_id=%s AND current_project_id=%s AND status NOT IN ('DISCONNECTED','EXPIRED')", (to_worker_id, project_id))
+                if not cur.fetchone():
+                    raise GPUError("LAB_MESSAGE_RECIPIENT_NOT_IN_PROJECT", to_worker_id)
             cur.execute("INSERT INTO lab_messages(id,project_id,from_worker_id,to_worker_id,to_role,broadcast_scope,message_type,subject,body,reference_ids,priority,created_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                         (ident, project_id, from_worker_id, to_worker_id, to_role, broadcast_scope, message_type, subject[:500], body[:8000], json.dumps(reference_ids or []), priority, now))
             # A message is advisory only. It never updates an evidence or scientific object.
@@ -404,6 +510,17 @@ class LabController:
             args.append(min(max(1, limit), 500))
             cur.execute(sql, args)
             return [self._record(row) for row in cur.fetchall()]
+
+    def message_mark_read(self, project_id: str, worker_id: str, session_id: str,
+                          message_ids: list[str]) -> dict[str, int]:
+        """Acknowledge only messages that are visible to this active project session."""
+        if not message_ids:
+            return {"marked_read": 0}
+        now = self._now()
+        with self.store._connect() as conn, conn.cursor() as cur:
+            session = self._session(cur, session_id, worker_id, project_id)
+            cur.execute("UPDATE lab_messages SET read_at=%s WHERE project_id=%s AND id=ANY(%s) AND read_at IS NULL AND (to_worker_id IS NULL OR to_worker_id=%s OR to_role=%s)", (now, project_id, message_ids, worker_id, session["active_role"]))
+            return {"marked_read": cur.rowcount}
 
     def _active_workers(self, project_id: str) -> list[dict]:
         threshold = self._now() - timedelta(seconds=self.lease_seconds)
@@ -444,7 +561,7 @@ class LabController:
             "recent_events": [{**event, "subject_id": str(event["subject_id"]) if event["subject_id"] else None} for event in events],
             "unread_messages": self.message_list(project_id, worker_id, role, True, 30) if worker_id else [],
             "gpu_activity": [item for item in objects if item["kind"] == "ExperimentRun" and item["status"] in {"running", "unknown", "RESERVED"}][:30],
-            "lab_budget": {},
+            "lab_budget": self._lab_budget_get(project_id),
         }
 
     def sync(self, session_id: str, project_id: str, since: str | None = None,
@@ -459,3 +576,7 @@ class LabController:
         state = self.state_get(project_id, session_id, since)
         old_work_reassigned = bool(current_work_item_id and current_work_item_id != str(session["current_work_item_id"] or ""))
         return {"session_id": session_id, "old_work_reassigned": old_work_reassigned, "lab_state": state}
+
+    def _lab_budget_get(self, project_id: str) -> dict[str, Any]:
+        with self.store._connect() as conn, conn.cursor() as cur:
+            return self._budget(cur, project_id)
