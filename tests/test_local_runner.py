@@ -98,7 +98,7 @@ def test_job_status_can_skip_expensive_log_reading(tmp_path):
 
     status = runner.job_status(job.job_id, include_logs=False)
 
-    assert status == {"job_id": job.job_id, "status": "completed", "exit_code": None}
+    assert status == {"job_id": job.job_id, "status": "completed", "exit_code": 0}
 
 
 def test_mcp_wildcard_accept_header_allows_json_response():
