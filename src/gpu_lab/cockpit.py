@@ -116,6 +116,30 @@ class CockpitController:
             self.store._event(cur, project_id, "LAB_PROJECT_CONTROLS_UPDATED", None, values)
         return {"project_id": project_id, **values, "updated_at": now}
 
+    def controls_set_operator(self, project_id: str, *, autopilot_enabled: bool | None = None,
+                              auto_continue_enabled: bool | None = None,
+                              paused: bool | None = None) -> dict[str, Any]:
+        """Apply a human-authenticated cockpit control update without impersonating a worker."""
+        if all(value is None for value in (autopilot_enabled, auto_continue_enabled, paused)):
+            raise GPUError("LAB_CONTROL_UPDATE_EMPTY", "Specify at least one project control")
+        if any(value is not None and not isinstance(value, bool) for value in (autopilot_enabled, auto_continue_enabled, paused)):
+            raise GPUError("LAB_CONTROL_INVALID", "Controls must be booleans")
+        now = self._now()
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM research_projects WHERE id=%s", (project_id,))
+            if not cur.fetchone():
+                raise GPUError("RESEARCH_PROJECT_NOT_FOUND", project_id)
+            cur.execute("SELECT autopilot_enabled,auto_continue_enabled,paused FROM lab_project_controls WHERE project_id=%s FOR UPDATE", (project_id,))
+            prior = cur.fetchone() or {"autopilot_enabled": False, "auto_continue_enabled": False, "paused": False}
+            values = {
+                "autopilot_enabled": prior["autopilot_enabled"] if autopilot_enabled is None else autopilot_enabled,
+                "auto_continue_enabled": prior["auto_continue_enabled"] if auto_continue_enabled is None else auto_continue_enabled,
+                "paused": prior["paused"] if paused is None else paused,
+            }
+            cur.execute("INSERT INTO lab_project_controls(project_id,autopilot_enabled,auto_continue_enabled,paused,updated_at) VALUES(%s,%s,%s,%s,%s) ON CONFLICT(project_id) DO UPDATE SET autopilot_enabled=EXCLUDED.autopilot_enabled,auto_continue_enabled=EXCLUDED.auto_continue_enabled,paused=EXCLUDED.paused,updated_at=EXCLUDED.updated_at", (project_id, values["autopilot_enabled"], values["auto_continue_enabled"], values["paused"], now))
+            self.store._event(cur, project_id, "LAB_PROJECT_CONTROLS_UPDATED", None, {**values, "actor": "COCKPIT_OPERATOR"})
+        return {"project_id": project_id, **values, "updated_at": now}
+
     @staticmethod
     def _conversation_url(url: str | None) -> str | None:
         if url is None:

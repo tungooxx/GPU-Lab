@@ -3718,6 +3718,37 @@ async def cockpit_state(request: Request):
         return JSONResponse({"error": error.message, "type": error.error_type}, status_code=400)
 
 
+@mcp.custom_route("/cockpit/session", methods=["GET"], include_in_schema=False)
+async def cockpit_session(request: Request):
+    session = _cockpit_session(request)
+    if not session:
+        return JSONResponse({"error": "Cockpit authentication required"}, status_code=401)
+    return JSONResponse({"csrf_token": session.csrf_token})
+
+
+@mcp.custom_route("/cockpit/controls", methods=["POST"], include_in_schema=False)
+async def cockpit_controls(request: Request):
+    session = _cockpit_session(request)
+    if not session or not hmac.compare_digest(request.headers.get("x-csrf-token", ""), session.csrf_token):
+        return JSONResponse({"error": "Invalid CSRF token"}, status_code=403)
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise GPUError("LAB_CONTROL_INVALID", "JSON object required")
+        project_id = str(payload.get("project_id", "")).strip()
+        if not project_id:
+            raise GPUError("RESEARCH_PROJECT_NOT_FOUND", "project_id is required")
+        result = cockpit().controls_set_operator(
+            project_id,
+            autopilot_enabled=payload.get("autopilot_enabled"),
+            auto_continue_enabled=payload.get("auto_continue_enabled"),
+            paused=payload.get("paused"),
+        )
+        return JSONResponse(ResearchBrain._json_safe(result))
+    except GPUError as error:
+        return JSONResponse({"error": error.message, "type": error.error_type}, status_code=400)
+
+
 @mcp.custom_route("/", methods=["GET"], include_in_schema=False)
 async def dashboard(_: Request):
     return HTMLResponse(COCKPIT_HTML if settings.lab_ui_enabled else DASHBOARD_HTML)
