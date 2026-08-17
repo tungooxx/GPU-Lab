@@ -745,6 +745,8 @@ def _compact_brain_step(result: dict[str, Any], limit: int = 10) -> dict[str, An
         "strategy_patterns_retrieved": result.get("strategy_patterns_retrieved"),
         "agenda_diminishing_returns": result.get("agenda_diminishing_returns"),
         "candidate_portfolio": result.get("candidate_portfolio"),
+        "brain_policy_version": result.get("brain_policy_version"),
+        "search_regime": result.get("search_regime"),
         "frontier_gap": result.get("frontier_gap"),
         "stagnation_state": result.get("stagnation_state"),
         "state_freshness": result.get("state_freshness"),

@@ -107,12 +107,16 @@ def test_brain_step_summary_excludes_large_scientific_state_payloads():
         "dead_ideas_retrieved": [],
         "candidate_actions": [],
         "selected_action": {"action_type": "ARTIFACT_ANALYSIS"},
+        "brain_policy_version": "brain-v3.1-discovery-search-v1",
+        "search_regime": "DIVERGENT_SEARCH",
     }
 
     compact = _compact_brain_step(result)
 
     assert compact["scientific_state"]["active_hypotheses"][0]["data"] == {}
     assert "large" not in str(compact)
+    assert compact["brain_policy_version"] == "brain-v3.1-discovery-search-v1"
+    assert compact["search_regime"] == "DIVERGENT_SEARCH"
 
 
 def test_brain_step_summary_preserves_scalar_canonical_entries():
