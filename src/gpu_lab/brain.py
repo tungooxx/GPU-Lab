@@ -65,6 +65,7 @@ ACTION_TYPES = {
     "MATCHED_CONTROL",
     "RANDOM_CONTROL",
     "MAGNITUDE_MATCHED_CONTROL",
+    "PORTFOLIO_REFINEMENT",
 }
 EXECUTABLE_ACTIONS = {
     "REPRODUCTION",
@@ -570,6 +571,28 @@ class ResearchBrain:
                 multiplier = 0.35 if distance == "NEAR" else 1.3 if distance in {"FAR", "ORTHOGONAL"} else 0.8
             candidate["strategic_priority_multiplier"] = multiplier
             candidate["priority"] = round(float(candidate["priority"]) * multiplier, 6)
+        # Fallback ideas are deliberate portfolio members, not executable or
+        # self-justifying research actions.  Selecting them was the v3.1-v1
+        # local-search loop: a zero-information cycle could lead to another
+        # non-executing fallback with no concrete preregistered design.
+        if not prerequisite and not any(
+            not item.get("payload", {}).get("non_executing_discovery_candidate", False)
+            and item.get("available", True)
+            for item in candidates
+        ):
+            refinement = ActionCandidate(
+                action_type="PORTFOLIO_REFINEMENT",
+                question_addressed=agenda_item["data"]["question"],
+                hypotheses_discriminated=[str(item["id"]) for item in hypotheses],
+                predicted_outcomes=["Convert a scientifically distant idea into a concrete, preregisterable candidate before a new decision."],
+                required_resources=["human scientific review", "existing evidence"],
+                payload={"mode": "REQUIRES_CONCRETE_PREREGISTERED_CANDIDATE", "non_scientific_process_action": True, "does_not_authorize_execution": True},
+                score=ActionScore(scientific_importance=1, expected_discrimination=1, expected_information_gain=1, feasibility=5, compute_cost=0.1, engineering_cost=0.2, execution_risk=0.1, decision_relevance=1),
+            ).checked().persisted_data()
+            refinement.update(classify_scientific_distance(refinement, baseline))
+            refinement["generation_source"] = "PORTFOLIO_GOVERNANCE"
+            refinement["strategic_priority_multiplier"] = 1.0
+            candidates.append(refinement)
         portfolio = {
             "project_id": project_id,
             "agenda_item_id": str(agenda_item["id"]),
@@ -701,7 +724,13 @@ class ResearchBrain:
             agenda_telemetry,
             hard_gate,
         )
-        selected_index = max(range(len(candidate_data)), key=lambda index: candidate_data[index]["priority"])
+        selectable = [
+            index
+            for index, item in enumerate(candidate_data)
+            if not item.get("payload", {}).get("non_executing_discovery_candidate", False)
+            and item.get("available", True)
+        ]
+        selected_index = max(selectable, key=lambda index: candidate_data[index]["priority"])
         selected = candidate_data[selected_index]
         runner_ups = sorted(
             (
@@ -1532,6 +1561,8 @@ class ResearchBrain:
                     required_resources=["literature provider"],
                     payload={
                         "mode": "ALTERNATIVE_ACTION",
+                        "non_executing_discovery_candidate": True,
+                        "does_not_authorize_execution": True,
                         "blocked_actions": [
                             {
                                 "action_type": item.get("action_type"),

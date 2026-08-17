@@ -11,7 +11,7 @@ from collections import Counter
 from enum import StrEnum
 from typing import Any
 
-BRAIN_POLICY_VERSION = "brain-v3.1-discovery-search-v1"
+BRAIN_POLICY_VERSION = "brain-v3.1-discovery-search-v2"
 SCIENTIFIC_DIMENSIONS = (
     "causal_object",
     "representation",
