@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from gpu_lab.cockpit import CockpitController
 from gpu_lab.errors import GPUError
 from gpu_lab.lab import LabController
 from gpu_lab.research import ResearchStore
@@ -32,9 +33,31 @@ def test_two_workers_claim_distinct_work_and_messages_are_not_evidence():
         lab.claim_work(work_a["id"], second_worker, second["session_id"])
     assert lab.claim_work(work_b["id"], second_worker, second["session_id"])["id"] == work_b["id"]
 
+
     lab.message_send(project_id, first_worker, first["session_id"], "SHARE_FINDING", "Opinion", "H1 is definitely correct")
     assert lab.message_list(project_id, second_worker)
     assert store.objects_list(project_id, "Hypothesis", limit=None) == []
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_browser_runtime_marks_first_successful_connection_attached():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    cockpit = CockpitController(store, lab)
+    project = store.project_create(f"cockpit-runtime-{time.time_ns()}", "Runtime attachment")
+    joined = lab.join(None, "browser-worker", "CHATGPT_WEB", project["project_id"])
+
+    runtime = cockpit.runtime_attach(
+        project["project_id"],
+        joined["worker"]["id"],
+        joined["session_id"],
+        "https://chatgpt.com/c/demo",
+    )
+    assert runtime["attached_at"] is None
+
+    connected = cockpit.runtime_status(runtime["id"], "READY")
+
+    assert connected["attached_at"] is not None
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")

@@ -20,6 +20,9 @@ WEB_STATUSES = {
     "UNATTACHED", "STARTING", "LOGIN_REQUIRED", "READY", "PROMPT_SUBMITTED",
     "RESPONSE_IN_PROGRESS", "RESPONSE_COMPLETE", "IDLE", "ERROR", "DISCONNECTED",
 }
+ATTACHED_WEB_STATUSES = {
+    "LOGIN_REQUIRED", "READY", "PROMPT_SUBMITTED", "RESPONSE_IN_PROGRESS", "RESPONSE_COMPLETE", "IDLE",
+}
 TURN_OUTCOMES = {
     "CONTINUE", "WAITING_DEPENDENCY", "IDLE", "BLOCKED", "REPLAN", "HUMAN_REQUIRED", "ERROR",
 }
@@ -187,7 +190,12 @@ class CockpitController:
             runtime = cur.fetchone()
             if not runtime:
                 raise GPUError("BROWSER_RUNTIME_NOT_FOUND", runtime_id)
-            cur.execute("UPDATE lab_worker_runtimes SET status=%s,last_error=%s,last_seen_at=%s,updated_at=%s WHERE id=%s", (status, (error or "")[:2000] or None, now, now, runtime_id))
+            cur.execute(
+                "UPDATE lab_worker_runtimes SET status=%s,last_error=%s,last_seen_at=%s,"
+                "attached_at=CASE WHEN %s THEN COALESCE(attached_at,%s) ELSE attached_at END,"
+                "updated_at=%s WHERE id=%s",
+                (status, (error or "")[:2000] or None, now, status in ATTACHED_WEB_STATUSES, now, now, runtime_id),
+            )
             self.store._event(cur, runtime["project_id"], "BROWSER_RUNTIME_STATUS_CHANGED", runtime_id, {"status": status, "error": bool(error)})
         return self.runtime_get(runtime_id)
 
