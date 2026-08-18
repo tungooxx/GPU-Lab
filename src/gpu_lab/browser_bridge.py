@@ -27,7 +27,7 @@ class ResearchWorkerRuntime(Protocol):
 class ChatGPTWebPlaywrightRuntime:
     """Server-side persistent-profile adapter for one worker conversation."""
 
-    def __init__(self, profile_dir: Path, *, headless: bool = False):
+    def __init__(self, profile_dir: Path, *, headless: bool = True):
         self.profile_dir = profile_dir
         self.headless = headless
         self._playwright = None

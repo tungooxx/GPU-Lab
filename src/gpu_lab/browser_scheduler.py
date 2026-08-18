@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from pathlib import Path
 
 from .browser_bridge import ChatGPTWebPlaywrightRuntime, ResearchWorkerRuntime
 from .cockpit import CockpitController
 from .errors import GPUError
+
+logger = logging.getLogger(__name__)
 
 
 class BrowserWakeDispatcher:
@@ -25,6 +28,8 @@ class BrowserWakeDispatcher:
         if not wake:
             return {"dispatched": False, "reason": "NO_ELIGIBLE_WAKE"}
         wake_id = wake["id"]
+        runtime_row: dict | None = None
+        runtime: ResearchWorkerRuntime | None = None
         try:
             runtime_row = self._runtime_for_session(wake["worker_session_id"])
             runtime = self._runtimes.get(runtime_row["id"])
@@ -45,9 +50,22 @@ class BrowserWakeDispatcher:
             self.cockpit.runtime_status(runtime_row["id"], "RESPONSE_IN_PROGRESS")
             self.cockpit.wake_finish(wake_id)
             return {"dispatched": True, "wake_id": wake_id, "runtime_id": runtime_row["id"]}
-        except GPUError as exc:
-            self.cockpit.wake_finish(wake_id, failure_reason=exc.error_type)
-            return {"dispatched": False, "wake_id": wake_id, "error": exc.response()["error"]}
+        except Exception as exc:  # noqa: BLE001 - Playwright exceptions have no stable shared base class.
+            error_type = exc.error_type if isinstance(exc, GPUError) else "BROWSER_DISPATCH_FAILED"
+            if runtime_row:
+                try:
+                    self.cockpit.runtime_status(runtime_row["id"], "ERROR", error_type)
+                except Exception:  # pragma: no cover - preserve durable wake cleanup
+                    logger.exception("Could not record browser runtime dispatch failure")
+                self._runtimes.pop(runtime_row["id"], None)
+            if runtime:
+                try:
+                    await runtime.close()
+                except Exception:  # pragma: no cover - best-effort browser cleanup
+                    logger.exception("Could not close failed browser runtime")
+            self.cockpit.wake_finish(wake_id, failure_reason=error_type)
+            error = exc.response()["error"] if isinstance(exc, GPUError) else error_type
+            return {"dispatched": False, "wake_id": wake_id, "error": error}
 
     def _runtime_for_session(self, session_id: str) -> dict:
         with self.cockpit.store._connect() as conn, conn.cursor() as cur:

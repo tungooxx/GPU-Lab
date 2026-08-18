@@ -3952,6 +3952,10 @@ def main():
     # Complete schema migration/recovery before accepting MCP traffic so read-only tools remain
     # read-only even on their first request.
     initialize_research_runtime()
+    if settings.gpu_lab_research_database_url:
+        recovered_wakes = cockpit().recover_inflight_wakes()
+        if recovered_wakes["recovered"]:
+            logger.info("Failed unconfirmed browser wake dispatches at startup: %s", recovered_wakes)
     reconciliation = local.reconcile_jobs()
     if reconciliation["reconciled"]:
         logger.info("Reconciled persisted local jobs at startup: %s", reconciliation)

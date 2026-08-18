@@ -9,6 +9,7 @@ from gpu_lab.errors import GPUError
 async def test_browser_runtime_reports_disconnected_without_starting_browser(tmp_path):
     runtime = ChatGPTWebPlaywrightRuntime(tmp_path / "private-profile")
 
+    assert runtime.headless is True
     assert await runtime.health() == {"status": "DISCONNECTED"}
     await runtime.pause()
     with pytest.raises(GPUError) as error:
@@ -55,3 +56,37 @@ async def test_wake_dispatcher_resyncs_before_one_bounded_browser_turn(tmp_path)
     assert "Re-sync LabState first" in runtime.prompt
     assert cockpit.statuses == [("runtime-1", "PROMPT_SUBMITTED", None), ("runtime-1", "RESPONSE_IN_PROGRESS", None)]
     assert cockpit.finished == [("wake-1", None)]
+
+
+@pytest.mark.asyncio
+async def test_wake_dispatcher_records_non_gpu_browser_failure(tmp_path):
+    class Cockpit:
+        def __init__(self):
+            self.statuses = []
+            self.finished = []
+
+        def wake_claim_next(self, project_id=None):
+            return {"id": "wake-1", "worker_session_id": "session-1", "work_item_id": "work-1"}
+
+        def runtime_status(self, runtime_id, status, error=None):
+            self.statuses.append((runtime_id, status, error))
+
+        def wake_finish(self, wake_id, failure_reason=None):
+            self.finished.append((wake_id, failure_reason))
+
+    class Runtime:
+        async def attach(self, conversation_url):
+            raise RuntimeError("TargetClosedError")
+
+        async def close(self):
+            pass
+
+    cockpit = Cockpit()
+    dispatcher = BrowserWakeDispatcher(cockpit, tmp_path, runtime_factory=lambda _: Runtime())
+    dispatcher._runtime_for_session = lambda _: {"id": "runtime-1", "worker_id": "worker-1"}
+
+    result = await dispatcher.dispatch_one()
+
+    assert result == {"dispatched": False, "wake_id": "wake-1", "error": "BROWSER_DISPATCH_FAILED"}
+    assert cockpit.statuses == [("runtime-1", "ERROR", "BROWSER_DISPATCH_FAILED")]
+    assert cockpit.finished == [("wake-1", "BROWSER_DISPATCH_FAILED")]
