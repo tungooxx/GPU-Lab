@@ -1129,6 +1129,22 @@ async def lab_work_block(work_item_id: str, worker_id: str, session_id: str,
 
 
 @mcp.tool()
+async def lab_work_attach_experiment_run(
+    work_item_id: str, worker_id: str, session_id: str, run_id: str
+):
+    """Detach an owned execution WorkItem onto a live canonical ExperimentRun."""
+    return await call(lab().attach_experiment_run, work_item_id, worker_id, session_id, run_id)
+
+
+@mcp.tool()
+async def lab_work_repair_dependencies(
+    work_item_id: str, worker_id: str, session_id: str, dependencies: list[dict], rationale: str
+):
+    """Repair a legacy READY item into a dependency-gated state with an audit event."""
+    return await call(lab().repair_dependencies, work_item_id, worker_id, session_id, dependencies, rationale)
+
+
+@mcp.tool()
 async def lab_work_complete(work_item_id: str, worker_id: str, session_id: str,
                             summary: str = "", output_object_ids: list[str] | None = None):
     """Complete owned work after its canonical scientific or engineering outputs were persisted."""
@@ -3294,6 +3310,9 @@ async def research_experiment_execute(
     python_env: str | None = None,
     execution_attempt_uuid: str | None = None,
     engineering_task_id: str | None = None,
+    lab_work_item_id: str | None = None,
+    lab_worker_id: str | None = None,
+    lab_session_id: str | None = None,
 ):
     """Run a preregistered experiment with a ResearchDecision created by research_decision_create.
 
@@ -3400,7 +3419,32 @@ async def research_experiment_execute(
             "mapping_error": mapping["error"],
             "retry_safe": True,
         }
-    return {**mapping, "job": job, "retry_safe": True}
+    attachment = None
+    if any(value is not None for value in (lab_work_item_id, lab_worker_id, lab_session_id)):
+        if not all((lab_work_item_id, lab_worker_id, lab_session_id)):
+            return {
+                **mapping,
+                "job": job,
+                "retry_safe": True,
+                "lab_attachment_error": {
+                    "type": "LAB_ATTACHMENT_ARGUMENTS_REQUIRED",
+                    "message": "lab_work_item_id, lab_worker_id, and lab_session_id must be provided together.",
+                },
+            }
+        attachment = await call(
+            lab().attach_experiment_run,
+            lab_work_item_id,
+            lab_worker_id,
+            lab_session_id,
+            mapping["run_id"],
+        )
+    response = {**mapping, "job": job, "retry_safe": True}
+    if attachment is not None:
+        if "error" in attachment:
+            response["lab_attachment_error"] = attachment["error"]
+        else:
+            response["lab_work_item"] = attachment
+    return response
 
 
 @mcp.tool()
@@ -3516,6 +3560,14 @@ async def research_experiment_sync(run_id: str | None = None, job_id: str | None
         "status": updated.get("status", research_status),
         "run": updated,
     }
+    if response["status"] in {
+        "completed", "failed", "cancelled", "TECHNICAL_CANCELLED", "TECHNICAL_ORPHANED"
+    }:
+        lifecycle = await call(lab().experiment_run_terminal, canonical_run_id, response["status"])
+        if "error" in lifecycle:
+            response["lab_lifecycle_error"] = lifecycle["error"]
+        else:
+            response["lab_lifecycle"] = lifecycle
     return response
 
 
@@ -3559,7 +3611,8 @@ async def research_experiment_reconcile_orphan(
     )
     if "error" in reconciled:
         return reconciled
-    return {"run_id": run_id, "job_id": job_id, "runner_status": runner_status, "technical_non_scientific": True, "run": reconciled}
+    lifecycle = await call(lab().experiment_run_terminal, run_id, reconciled["status"])
+    return {"run_id": run_id, "job_id": job_id, "runner_status": runner_status, "technical_non_scientific": True, "run": reconciled, "lab_lifecycle": lifecycle}
 
 
 @mcp.tool()

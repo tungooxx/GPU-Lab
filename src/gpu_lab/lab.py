@@ -17,10 +17,10 @@ from .research import ResearchStore
 RUNTIME_TYPES = {"CHATGPT_WEB", "OPENAI_API", "CLAUDE_API", "CODEX", "LOCAL_AGENT", "OTHER"}
 SESSION_STATUSES = {"ACTIVE", "BUSY", "WAITING", "IDLE", "DISCONNECTED", "EXPIRED"}
 WORK_STATUSES = {
-    "READY", "CLAIMED", "RUNNING", "RUNNING_DETACHED", "WAITING_DEPENDENCY", "BLOCKED", "COMPLETED",
+    "READY", "CLAIMED", "RUNNING", "RUNNING_DETACHED", "RESULT_READY", "WAITING_DEPENDENCY", "BLOCKED", "COMPLETED",
     "FAILED", "CANCELLED", "INVALIDATED",
 }
-ACTIVE_WORK_STATUSES = {"READY", "CLAIMED", "RUNNING", "RUNNING_DETACHED", "WAITING_DEPENDENCY", "BLOCKED"}
+ACTIVE_WORK_STATUSES = {"READY", "CLAIMED", "RUNNING", "RUNNING_DETACHED", "RESULT_READY", "WAITING_DEPENDENCY", "BLOCKED"}
 MESSAGE_TYPES = {
     "REQUEST_REVIEW", "REQUEST_DATA", "REQUEST_IMPLEMENTATION", "SHARE_FINDING",
     "CHALLENGE_INTERPRETATION", "HANDOFF", "BLOCKER", "CROSS_PROJECT_RELEVANCE",
@@ -67,9 +67,10 @@ class LabController:
                     blocked_reason TEXT, invalidated_reason TEXT,
                     created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL, completed_at TIMESTAMPTZ
                 );
-                CREATE UNIQUE INDEX IF NOT EXISTS lab_work_items_active_equivalence_unique
+                DROP INDEX IF EXISTS lab_work_items_active_equivalence_unique;
+                CREATE UNIQUE INDEX lab_work_items_active_equivalence_unique
                     ON lab_work_items(project_id,equivalence_key)
-                    WHERE equivalence_key IS NOT NULL AND status IN ('READY','CLAIMED','RUNNING','WAITING_DEPENDENCY','BLOCKED');
+                    WHERE equivalence_key IS NOT NULL AND status IN ('READY','CLAIMED','RUNNING','RUNNING_DETACHED','RESULT_READY','WAITING_DEPENDENCY','BLOCKED');
                 CREATE INDEX IF NOT EXISTS lab_work_items_project_status_priority_idx
                     ON lab_work_items(project_id,status,priority DESC,created_at);
                 CREATE TABLE IF NOT EXISTS lab_work_dependencies (
@@ -475,6 +476,80 @@ class LabController:
             raise GPUError("LAB_DEPENDENCY_REQUIRED", work_item_id)
         return self.release_work(work_item_id, worker_id, session_id, reason, dependencies)
 
+    def attach_experiment_run(
+        self, work_item_id: str, worker_id: str, session_id: str, run_id: str
+    ) -> dict:
+        """Detach an owned execution WorkItem onto its canonical ExperimentRun.
+
+        Once attached, the item is intentionally not READY: execution ownership
+        is represented by the immutable run, not a renewable chat-worker lease.
+        """
+        now = self._now()
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM lab_work_items WHERE id=%s FOR UPDATE", (work_item_id,))
+            item = cur.fetchone()
+            if not item:
+                raise GPUError("LAB_WORK_NOT_FOUND", work_item_id)
+            self._session(cur, session_id, worker_id, str(item["project_id"]))
+            if str(item["assigned_worker_id"]) != str(worker_id) or str(item["assigned_session_id"]) != str(session_id):
+                raise GPUError("LAB_WORK_NOT_OWNED", work_item_id)
+            if item["status"] not in {"CLAIMED", "RUNNING"}:
+                raise GPUError("LAB_WORK_NOT_ATTACHABLE", item["status"])
+            cur.execute("SELECT status,data FROM research_objects WHERE id=%s AND project_id=%s AND kind='ExperimentRun'", (run_id, item["project_id"]))
+            run = cur.fetchone()
+            if not run:
+                raise GPUError("EXPERIMENT_RUN_NOT_FOUND", run_id)
+            if not self.store.experiment_run_is_operationally_active(run):
+                raise GPUError("EXPERIMENT_RUN_NOT_ACTIVE", run_id)
+            refs = {**(item["related_refs"] or {}), "experiment_run_id": run_id}
+            cur.execute("UPDATE lab_work_leases SET released_at=%s,release_reason='EXPERIMENT_RUN_ATTACHED' WHERE id=%s AND released_at IS NULL", (now, item["lease_id"]))
+            cur.execute("UPDATE lab_work_items SET status='RUNNING_DETACHED',related_refs=%s,assigned_worker_id=NULL,assigned_session_id=NULL,lease_id=NULL,blocked_reason=%s,updated_at=%s WHERE id=%s", (json.dumps(refs), "Canonical ExperimentRun is executing; this WorkItem cannot be claimed.", now, work_item_id))
+            cur.execute("UPDATE research_worker_sessions SET current_work_item_id=NULL,active_role=NULL,status='ACTIVE',last_heartbeat_at=%s WHERE id=%s", (now, session_id))
+            self._event(cur, item["project_id"], "WORK_ITEM_EXPERIMENT_ATTACHED", work_item_id, {"run_id": run_id, "worker_id": worker_id})
+        return self.work_get(work_item_id)
+
+    def experiment_run_terminal(self, run_id: str, run_status: str) -> dict[str, int]:
+        """Move attached execution WorkItems to result-ready after canonical sync."""
+        if run_status not in {"completed", "failed", "cancelled", "TECHNICAL_CANCELLED", "TECHNICAL_ORPHANED"}:
+            return {"result_ready": 0}
+        now, changed = self._now(), 0
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM lab_work_items WHERE (related_refs->>'experiment_run_id'=%s "
+                "OR related_refs->>'run_id'=%s OR related_refs->'experiment_run_ids' ? %s "
+                "OR related_refs->'run_ids' ? %s) AND status IN ('CLAIMED','RUNNING','RUNNING_DETACHED','READY') FOR UPDATE",
+                (run_id, run_id, run_id, run_id),
+            )
+            for item in cur.fetchall():
+                cur.execute("UPDATE lab_work_leases SET released_at=%s,release_reason='EXPERIMENT_TERMINAL' WHERE work_item_id=%s AND released_at IS NULL", (now, item["id"]))
+                cur.execute("UPDATE lab_work_items SET status='RESULT_READY',assigned_worker_id=NULL,assigned_session_id=NULL,lease_id=NULL,blocked_reason=%s,updated_at=%s WHERE id=%s", (f"Canonical ExperimentRun {run_status}; inspect before any follow-up execution.", now, item["id"]))
+                self._event(cur, item["project_id"], "WORK_ITEM_RESULT_READY", item["id"], {"run_id": run_id, "run_status": run_status})
+                changed += 1
+        return {"result_ready": changed}
+
+    def repair_dependencies(
+        self, work_item_id: str, worker_id: str, session_id: str, dependencies: list[dict], rationale: str
+    ) -> dict:
+        """Repair a legacy unblocked item without pretending it was never READY."""
+        if not dependencies:
+            raise GPUError("LAB_DEPENDENCY_REQUIRED", work_item_id)
+        if not rationale.strip():
+            raise GPUError("LAB_DEPENDENCY_REPAIR_RATIONALE_REQUIRED", work_item_id)
+        now = self._now()
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM lab_work_items WHERE id=%s FOR UPDATE", (work_item_id,))
+            item = cur.fetchone()
+            if not item:
+                raise GPUError("LAB_WORK_NOT_FOUND", work_item_id)
+            self._session(cur, session_id, worker_id, str(item["project_id"]))
+            if item["status"] not in {"READY", "WAITING_DEPENDENCY", "BLOCKED"}:
+                raise GPUError("LAB_WORK_NOT_REPAIRABLE", item["status"])
+            self._replace_dependencies(cur, work_item_id, dependencies, now)
+            cur.execute("UPDATE lab_work_items SET status='WAITING_DEPENDENCY',blocked_reason=%s,updated_at=%s WHERE id=%s", (rationale.strip(), now, work_item_id))
+            self._event(cur, item["project_id"], "WORK_ITEM_DEPENDENCIES_REPAIRED", work_item_id, {"rationale": rationale.strip(), "dependency_count": len(dependencies)})
+        self.resolve_dependencies(str(item["project_id"]))
+        return self.work_get(work_item_id)
+
     def complete_work(self, work_item_id: str, worker_id: str, session_id: str,
                       summary: str = "", output_object_ids: list[str] | None = None) -> dict:
         now = self._now()
@@ -610,6 +685,7 @@ class LabController:
             "ready_work_items": self.work_list(project_id, ["READY"], 30),
             "blocked_work_items": self.work_list(project_id, ["BLOCKED", "WAITING_DEPENDENCY"], 30),
             "running_work_items": self.work_list(project_id, ["CLAIMED", "RUNNING", "RUNNING_DETACHED"], 30),
+            "result_ready_work_items": self.work_list(project_id, ["RESULT_READY"], 30),
             "recent_events": [{**event, "subject_id": str(event["subject_id"]) if event["subject_id"] else None} for event in events],
             "unread_messages": self.message_list(project_id, worker_id, role, True, 30) if worker_id else [],
             "gpu_activity": [

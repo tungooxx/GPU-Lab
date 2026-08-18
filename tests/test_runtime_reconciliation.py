@@ -50,11 +50,17 @@ class _MissingLocal:
         return {"error": {"type": "JOB_NOT_FOUND"}}
 
 
+class _LabLifecycle:
+    def experiment_run_terminal(self, _run_id, _status):
+        return {"result_ready": 0}
+
+
 @pytest.mark.asyncio
 async def test_orphan_reconciliation_requires_explicit_non_scientific_confirmation(monkeypatch):
     research = _OrphanResearch()
     monkeypatch.setattr(server, "research", lambda: research)
     monkeypatch.setattr(server, "local", _MissingLocal())
+    monkeypatch.setattr(server, "lab", lambda: _LabLifecycle())
 
     blocked = await server.research_experiment_reconcile_orphan("run-id", "dead worker")
     assert blocked["error"]["type"] == "TECHNICAL_NON_SCIENTIFIC_CONFIRMATION_REQUIRED"

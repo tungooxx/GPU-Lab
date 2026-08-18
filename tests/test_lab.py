@@ -94,6 +94,26 @@ def test_budget_and_expired_lease_release_work_without_touching_experiment():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_attached_execution_cannot_return_to_ready_after_worker_disconnect():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store, lease_seconds=30)
+    project_id = store.project_create(f"lab-attachment-{time.time_ns()}", "Attached execution")["project_id"]
+    joined = lab.join(None, "attached-worker", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    run = store.object_create(project_id, "ExperimentRun", {"label": "canonical"}, "EXPERIMENT_STARTED", "running")
+    work = lab.create_work(project_id, "TRAINING_RUN", "Run canonical", "Launch once", "EXECUTION", worker_id, created_session_id=session_id)
+    lab.claim_work(work["id"], worker_id, session_id)
+    attached = lab.attach_experiment_run(work["id"], worker_id, session_id, run["id"])
+    assert attached["status"] == "RUNNING_DETACHED"
+    assert attached["related_refs"]["experiment_run_id"] == run["id"]
+    assert lab.work_list(project_id, ["READY"]) == []
+
+    assert lab.experiment_run_terminal(run["id"], "completed") == {"result_ready": 1}
+    assert lab.work_get(work["id"])["status"] == "RESULT_READY"
+    assert lab.work_list(project_id, ["READY"]) == []
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_project_scope_and_message_acknowledgement_require_active_session():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)
