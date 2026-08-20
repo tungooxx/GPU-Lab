@@ -189,6 +189,10 @@ def test_scientific_gate_authority_preflight_unlock_and_supersession():
     resolved = lab.gate_resolve(gate["id"], worker_id, session_id, "PASS", first["id"], rationale="Semantic review passed")
     assert resolved["gate"]["status"] == "PASS"
     assert lab.work_get(dependent["id"])["status"] == "READY"
+    repeated = lab.gate_resolve(gate["id"], worker_id, session_id, "PASS", first["id"])
+    assert repeated["idempotent"] is True
+    with pytest.raises(GPUError, match="ALREADY_RESOLVED"):
+        lab.gate_resolve(gate["id"], worker_id, session_id, "FAIL", first["id"])
 
     obsolete = lab.create_work(
         project_id, "REVIEW", "Obsolete E1 follow-up", "Bound to E1", "RESULT_INSPECTOR",

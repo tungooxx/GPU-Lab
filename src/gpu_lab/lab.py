@@ -461,6 +461,14 @@ class LabController:
             self._session(cur, session_id, worker_id, str(gate["project_id"]))
             if gate["status"] in {"SUPERSEDED", "INVALID"}:
                 raise GPUError("SCIENTIFIC_GATE_NOT_RESOLVABLE", gate["status"])
+            if gate["status"] in {"PASS", "FAIL"}:
+                if gate["status"] != semantic_status:
+                    raise GPUError("SCIENTIFIC_GATE_ALREADY_RESOLVED", gate["status"])
+                return {
+                    "gate": self._record(gate) or {},
+                    "dependency_changes": {"ready": 0, "invalidated": 0},
+                    "idempotent": True,
+                }
             if not gate["deterministic_preflight_id"]:
                 raise GPUError("SCIENTIFIC_GATE_PREFLIGHT_REQUIRED", gate_id)
             cur.execute("SELECT status FROM lab_deterministic_preflights WHERE id=%s", (gate["deterministic_preflight_id"],))

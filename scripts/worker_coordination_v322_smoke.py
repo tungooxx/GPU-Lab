@@ -54,6 +54,7 @@ def main() -> None:
     assert lab.preflight_run(gate_two["id"], third["worker"]["id"], third["session_id"], {"repo": True, "checkpoint": True, "tokenizer": True})["preflight"]["status"] == "PASS"
     lab.complete_work(reclaimed["id"], third["worker"]["id"], third["session_id"], summary="Semantic review passed")
     assert lab.gate_resolve(gate_two["id"], third["worker"]["id"], third["session_id"], "PASS", reclaimed["id"], rationale="semantic review passed")["gate"]["status"] == "PASS"
+    assert lab.gate_resolve(gate_two["id"], third["worker"]["id"], third["session_id"], "PASS", reclaimed["id"])["idempotent"] is True
     assert lab.work_get(downstream["id"])["status"] == "READY"
     assert cockpit.wake_ready_work(project_id, [downstream["id"]]) == {"queued": 1}
     assert cockpit.wake_ready_work(project_id, [downstream["id"]]) == {"queued": 0}
