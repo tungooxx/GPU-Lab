@@ -1098,13 +1098,14 @@ async def lab_work_create(
     authority_key: str | None = None, gate_id: str | None = None,
     canonical_subject_version: str | None = None, authority_status: str = "SUPPORTING",
     subject_id: str | None = None, recovery_policy: dict[str, Any] | None = None,
+    dormant_until_dependencies: bool = False,
 ):
     """Create dependency-aware project work; authoritative gate work is idempotently reused."""
     return await call(lab().create_work, project_id, kind, title, description, scientific_role,
                       created_by, priority, expected_value, estimated_cost, related_refs,
                       dependencies, equivalence_key, parent_work_item_id, created_session_id,
                       authority_key, gate_id, canonical_subject_version, authority_status,
-                      subject_id, recovery_policy)
+                      subject_id, recovery_policy, dormant_until_dependencies)
 
 
 @mcp.tool()

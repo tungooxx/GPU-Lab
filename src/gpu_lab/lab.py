@@ -550,10 +550,13 @@ class LabController:
                     created_session_id: str | None = None, authority_key: str | None = None,
                     gate_id: str | None = None, canonical_subject_version: str | None = None,
                     authority_status: str = "SUPPORTING", subject_id: str | None = None,
-                    recovery_policy: dict[str, Any] | None = None) -> dict:
+                    recovery_policy: dict[str, Any] | None = None,
+                    dormant_until_dependencies: bool = False) -> dict:
         now, ident = self._now(), str(uuid.uuid4())
         dependencies = dependencies or []
         authority_status = self._validate(authority_status, AUTHORITY_STATUSES, "LAB_WORK_AUTHORITY_STATUS")
+        if dormant_until_dependencies and not dependencies:
+            raise GPUError("LAB_DORMANT_WORK_DEPENDENCY_REQUIRED", "A dormant conditional branch needs dependencies")
         existing_id: str | None = None
         with self.store._connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT id FROM research_projects WHERE id=%s", (project_id,))
@@ -594,7 +597,7 @@ class LabController:
             if existing_id:
                 self._event(cur, project_id, "WORK_ITEM_AUTHORITY_REUSED", existing_id, {"authority_key": authority_key, "gate_id": gate_id})
                 return self._work_record(cur, existing_id)
-            status = "WAITING_DEPENDENCY" if dependencies else "READY"
+            status = "DORMANT" if dormant_until_dependencies else ("WAITING_DEPENDENCY" if dependencies else "READY")
             try:
                 cur.execute(
                     "INSERT INTO lab_work_items(id,project_id,kind,title,description,scientific_role,status,priority,expected_value,estimated_cost,"
@@ -625,6 +628,7 @@ class LabController:
             self._event(cur, project_id, "WORK_ITEM_CREATED", ident, {
                 "kind": kind, "title": title, "status": status, "gate_id": gate_id,
                 "authority_key": authority_key, "authority_status": authority_status,
+                "dormant_until_dependencies": dormant_until_dependencies,
             })
         self.resolve_dependencies(project_id)
         return self.work_get(ident)
@@ -730,7 +734,7 @@ class LabController:
         changed = {"ready": 0, "invalidated": 0}
         now = self._now()
         with self.store._connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT * FROM lab_work_items WHERE project_id=%s AND status IN ('WAITING_DEPENDENCY','BLOCKED','READY','CLAIMED','RUNNING') FOR UPDATE", (project_id,))
+            cur.execute("SELECT * FROM lab_work_items WHERE project_id=%s AND status IN ('DORMANT','WAITING_DEPENDENCY','BLOCKED','READY','CLAIMED','RUNNING') FOR UPDATE", (project_id,))
             items = cur.fetchall()
             for item in items:
                 cur.execute("SELECT * FROM lab_work_dependencies WHERE work_item_id=%s", (item["id"],))
@@ -744,7 +748,7 @@ class LabController:
                     self._event(cur, project_id, "WORK_ITEM_INVALIDATED", item["id"], {"reason": invalidations})
                     changed["invalidated"] += 1
                     continue
-                if all(satisfied for satisfied, _, _ in outcomes) and item["status"] in {"WAITING_DEPENDENCY", "BLOCKED"}:
+                if all(satisfied for satisfied, _, _ in outcomes) and item["status"] in {"DORMANT", "WAITING_DEPENDENCY", "BLOCKED"}:
                     cur.execute("UPDATE lab_work_items SET status='READY',blocked_reason=NULL,updated_at=%s WHERE id=%s", (now, item["id"]))
                     self._event(cur, project_id, "WORK_DEPENDENCY_RESOLVED", item["id"], {})
                     self._event(cur, project_id, "WORK_ITEM_READY", item["id"], {})

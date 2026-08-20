@@ -44,8 +44,8 @@ def main() -> None:
     assert reclaimed["id"] == review_two["id"]
     event(timeline, "expired worker B lease; worker C reclaimed the same E2 canonical WorkItem")
 
-    downstream = lab.create_work(project_id, "GENERALIZATION", "E2 conditional probe", "Await gate PASS", "SCIENTIST", third["worker"]["id"], dependencies=[{"target_type": "SCIENTIFIC_GATE", "target_id": gate_two["id"], "required_statuses": ["PASS"]}], created_session_id=third["session_id"])
-    assert downstream["status"] == "WAITING_DEPENDENCY"
+    downstream = lab.create_work(project_id, "GENERALIZATION", "E2 conditional probe", "Await gate PASS", "SCIENTIST", third["worker"]["id"], dependencies=[{"target_type": "SCIENTIFIC_GATE", "target_id": gate_two["id"], "required_statuses": ["PASS"]}], created_session_id=third["session_id"], dormant_until_dependencies=True)
+    assert downstream["status"] == "DORMANT"
     assert lab.preflight_run(gate_two["id"], third["worker"]["id"], third["session_id"], {"repo": True, "checkpoint": True, "tokenizer": True})["preflight"]["status"] == "PASS"
     lab.complete_work(reclaimed["id"], third["worker"]["id"], third["session_id"], summary="Semantic review passed")
     assert lab.gate_resolve(gate_two["id"], third["worker"]["id"], third["session_id"], "PASS", reclaimed["id"], rationale="semantic review passed")["gate"]["status"] == "PASS"

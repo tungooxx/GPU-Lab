@@ -154,9 +154,9 @@ def test_scientific_gate_authority_preflight_unlock_and_supersession():
     dependent = lab.create_work(
         project_id, "GENERALIZATION", "Conditional next work", "Wait for gate", "SCIENTIST",
         worker_id, dependencies=[{"target_type": "SCIENTIFIC_GATE", "target_id": gate["id"], "required_statuses": ["PASS"]}],
-        created_session_id=session_id,
+        created_session_id=session_id, dormant_until_dependencies=True,
     )
-    assert dependent["status"] == "WAITING_DEPENDENCY"
+    assert dependent["status"] == "DORMANT"
     failed = lab.preflight_run(gate["id"], worker_id, session_id, {"checkpoint": False, "tokenizer": True})
     assert failed["preflight"]["status"] == "FAIL"
     with pytest.raises(GPUError, match="PREFLIGHT_NOT_PASS"):
