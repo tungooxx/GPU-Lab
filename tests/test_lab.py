@@ -61,6 +61,24 @@ def test_browser_runtime_marks_first_successful_connection_attached():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_ready_work_wake_is_deduplicated():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    cockpit = CockpitController(store, lab)
+    project_id = store.project_create(f"cockpit-wake-{time.time_ns()}", "Wake deduplication")["project_id"]
+    joined = lab.join(None, "wake-worker", "CHATGPT_WEB", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    cockpit.controls_set(project_id, worker_id, session_id, autopilot_enabled=True, auto_continue_enabled=True)
+    runtime = cockpit.runtime_attach(project_id, worker_id, session_id, "https://chatgpt.com/c/wake-test")
+    cockpit.runtime_status(runtime["id"], "READY")
+    work = lab.create_work(project_id, "REVIEW", "Ready review", "Wake once", "RESULT_INSPECTOR", worker_id, created_session_id=session_id)
+
+    assert cockpit.wake_ready_work(project_id, [work["id"]]) == {"queued": 1}
+    assert cockpit.wake_ready_work(project_id, [work["id"]]) == {"queued": 0}
+    assert len(cockpit.state_get(project_id)["pending_wake_requests"]) == 1
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_atomic_claim_and_dependency_reactivation_survive_store_restart():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)
