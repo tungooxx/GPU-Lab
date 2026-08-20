@@ -125,11 +125,13 @@ class LabController:
                     canonical_subject_version TEXT NOT NULL, authority_key TEXT NOT NULL,
                     authoritative_work_item_id UUID REFERENCES lab_work_items(id),
                     deterministic_preflight_id UUID, semantic_review_work_item_id UUID REFERENCES lab_work_items(id),
+                    semantic_review_required BOOLEAN NOT NULL DEFAULT TRUE,
                     status TEXT NOT NULL, coordination_version TEXT NOT NULL,
                     superseded_by UUID REFERENCES scientific_gates(id), invalidation_reason TEXT,
                     created_at TIMESTAMPTZ NOT NULL, resolved_at TIMESTAMPTZ,
                     UNIQUE(project_id, gate_key, scientific_object_id, canonical_subject_version)
                 );
+                ALTER TABLE scientific_gates ADD COLUMN IF NOT EXISTS semantic_review_required BOOLEAN NOT NULL DEFAULT TRUE;
                 CREATE UNIQUE INDEX IF NOT EXISTS scientific_gates_active_authority_key_unique
                     ON scientific_gates(project_id, authority_key)
                     WHERE status NOT IN ('SUPERSEDED', 'INVALID');
@@ -307,6 +309,7 @@ class LabController:
     def gate_ensure(
         self, project_id: str, gate_key: str, scientific_object_id: str,
         canonical_subject_version: str, worker_id: str, session_id: str,
+        semantic_review_required: bool = True,
     ) -> dict:
         """Create or return one durable, version-bound scientific gate."""
         gate_key = gate_key.strip().upper()
@@ -316,6 +319,7 @@ class LabController:
         now = self._now()
         with self.store._connect() as conn, conn.cursor() as cur:
             self._session(cur, session_id, worker_id, project_id)
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (authority_key,))
             cur.execute(
                 "SELECT * FROM scientific_gates WHERE project_id=%s AND gate_key=%s AND scientific_object_id=%s "
                 "AND canonical_subject_version=%s FOR UPDATE",
@@ -325,16 +329,20 @@ class LabController:
             if existing:
                 return self._record(existing) or {}
             ident = str(uuid.uuid4())
+            if not isinstance(semantic_review_required, bool):
+                raise GPUError("SCIENTIFIC_GATE_SEMANTIC_REVIEW_REQUIRED_INVALID", str(semantic_review_required))
             cur.execute(
                 "INSERT INTO scientific_gates(id,project_id,gate_key,scientific_object_id,canonical_subject_version,"
-                "authority_key,status,coordination_version,created_at) VALUES(%s,%s,%s,%s,%s,%s,'PENDING',%s,%s) RETURNING *",
-                (ident, project_id, gate_key, scientific_object_id, canonical_subject_version, authority_key, COORDINATION_VERSION, now),
+                "authority_key,status,coordination_version,semantic_review_required,created_at) "
+                "VALUES(%s,%s,%s,%s,%s,%s,'PENDING',%s,%s,%s) RETURNING *",
+                (ident, project_id, gate_key, scientific_object_id, canonical_subject_version, authority_key,
+                 COORDINATION_VERSION, semantic_review_required, now),
             )
             gate = cur.fetchone()
             self._event(cur, project_id, "SCIENTIFIC_GATE_CREATED", ident, {
                 "gate_key": gate_key, "scientific_object_id": scientific_object_id,
                 "canonical_subject_version": canonical_subject_version, "authority_key": authority_key,
-                "coordination_version": COORDINATION_VERSION,
+                "coordination_version": COORDINATION_VERSION, "semantic_review_required": semantic_review_required,
             })
             return self._record(gate) or {}
 
@@ -459,11 +467,15 @@ class LabController:
             preflight = cur.fetchone()
             if not preflight or preflight["status"] != "PASS":
                 raise GPUError("SCIENTIFIC_GATE_PREFLIGHT_NOT_PASS", gate_id)
+            if gate["semantic_review_required"] and not semantic_review_work_item_id:
+                raise GPUError("SCIENTIFIC_GATE_SEMANTIC_REVIEW_REQUIRED", gate_id)
             if semantic_review_work_item_id:
                 cur.execute("SELECT status,gate_id FROM lab_work_items WHERE id=%s AND project_id=%s", (semantic_review_work_item_id, gate["project_id"]))
                 review = cur.fetchone()
                 if not review or str(review["gate_id"] or "") != str(gate_id):
                     raise GPUError("SCIENTIFIC_GATE_REVIEW_MISMATCH", semantic_review_work_item_id)
+                if review["status"] != "COMPLETED":
+                    raise GPUError("SCIENTIFIC_GATE_REVIEW_NOT_COMPLETED", semantic_review_work_item_id)
             cur.execute(
                 "UPDATE scientific_gates SET status=%s,semantic_review_work_item_id=COALESCE(%s,semantic_review_work_item_id),resolved_at=%s WHERE id=%s",
                 (semantic_status, semantic_review_work_item_id, now, gate_id),
@@ -564,6 +576,7 @@ class LabController:
             if authority_status == "AUTHORITATIVE":
                 if not authority_key or not gate_id or not canonical_subject_version:
                     raise GPUError("LAB_WORK_AUTHORITY_IDENTITY_REQUIRED", "authority_key, gate_id, canonical_subject_version")
+                cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (authority_key,))
                 cur.execute(
                     "SELECT id FROM lab_work_items WHERE project_id=%s AND authority_key=%s "
                     "AND authority_status='AUTHORITATIVE' AND status=ANY(%s) FOR UPDATE",

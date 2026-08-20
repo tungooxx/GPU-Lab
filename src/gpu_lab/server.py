@@ -1110,12 +1110,12 @@ async def lab_work_create(
 @mcp.tool()
 async def scientific_gate_ensure(
     project_id: str, gate_key: str, scientific_object_id: str, canonical_subject_version: str,
-    worker_id: str, session_id: str,
+    worker_id: str, session_id: str, semantic_review_required: bool = True,
 ):
     """Idempotently create or retrieve one authority-bound ScientificGate."""
     return await call(
         lab().gate_ensure, project_id, gate_key, scientific_object_id,
-        canonical_subject_version, worker_id, session_id,
+        canonical_subject_version, worker_id, session_id, semantic_review_required,
     )
 
 

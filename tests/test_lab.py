@@ -7,7 +7,7 @@ import pytest
 
 from gpu_lab.cockpit import CockpitController
 from gpu_lab.errors import GPUError
-from gpu_lab.lab import LabController
+from gpu_lab.lab import ACTIVE_WORK_STATUSES, LabController
 from gpu_lab.research import ResearchStore
 
 TEST_DATABASE_URL = os.getenv("GPU_LAB_TEST_DATABASE_URL")
@@ -164,17 +164,51 @@ def test_scientific_gate_authority_preflight_unlock_and_supersession():
 
     passed = lab.preflight_run(gate["id"], worker_id, session_id, {"checkpoint": True, "tokenizer": True})
     assert passed["preflight"]["status"] == "PASS"
-    resolved = lab.gate_resolve(gate["id"], worker_id, session_id, "PASS", rationale="Semantic review passed")
+    with pytest.raises(GPUError, match="SEMANTIC_REVIEW_REQUIRED"):
+        lab.gate_resolve(gate["id"], worker_id, session_id, "PASS")
+    claimed_review = lab.claim_work(first["id"], worker_id, session_id)
+    lab.complete_work(claimed_review["id"], worker_id, session_id, summary="Semantic review passed")
+    resolved = lab.gate_resolve(gate["id"], worker_id, session_id, "PASS", first["id"], rationale="Semantic review passed")
     assert resolved["gate"]["status"] == "PASS"
     assert lab.work_get(dependent["id"])["status"] == "READY"
 
-    claimed = lab.claim_work(first["id"], worker_id, session_id)
+    obsolete = lab.create_work(
+        project_id, "REVIEW", "Obsolete E1 follow-up", "Bound to E1", "RESULT_INSPECTOR",
+        worker_id, related_refs={"experiment_id": "experiment-v1"}, created_session_id=session_id,
+    )
+    claimed = lab.claim_work(obsolete["id"], worker_id, session_id)
     successor = lab.gate_ensure(project_id, "RESULT_ASSESSMENT", "experiment-v2", "v2", worker_id, session_id)
     summary = lab.supersede_subject(project_id, "experiment-v1", "experiment-v2", "Corrected canonical experiment", worker_id, session_id, successor["id"])
     assert summary["work_items_superseded"] == 1
-    assert lab.work_get(first["id"])["status"] == "SUPERSEDED"
+    assert lab.work_get(first["id"])["status"] == "COMPLETED"
+    assert lab.work_get(obsolete["id"])["status"] == "SUPERSEDED"
     synced = lab.sync(session_id, project_id, current_work_item_id=claimed["id"], expected_work_version=claimed["work_version"])
     assert synced["lease_state"] == "LEASE_LOST"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_concurrent_gate_authority_creation_reuses_one_work_item():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-gate-concurrent-{time.time_ns()}", "Concurrent gate authority")["project_id"]
+    first = lab.join(None, "concurrent-gate-a", "CODEX", project_id)
+    second = lab.join(None, "concurrent-gate-b", "LOCAL_AGENT", project_id)
+    gate = lab.gate_ensure(project_id, "RESULT_ASSESSMENT", "experiment", "v1", first["worker"]["id"], first["session_id"])
+    barrier = threading.Barrier(2)
+
+    def ensure(joined):
+        barrier.wait()
+        controller = LabController(ResearchStore(TEST_DATABASE_URL))
+        return controller.gate_work_ensure(
+            gate["id"], "REVIEW", "Canonical review", "One authority", "RESULT_INSPECTOR",
+            joined["worker"]["id"], joined["session_id"],
+        )["id"]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        result = list(executor.map(ensure, (first, second)))
+    assert result[0] == result[1]
+    authorities = lab.work_list(project_id, list(ACTIVE_WORK_STATUSES))
+    assert [item["id"] for item in authorities if item["authority_status"] == "AUTHORITATIVE"] == [result[0]]
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
