@@ -137,6 +137,47 @@ def test_attached_execution_cannot_return_to_ready_after_worker_disconnect():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_scientific_gate_authority_preflight_unlock_and_supersession():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store, lease_seconds=30)
+    project_id = store.project_create(f"lab-gates-{time.time_ns()}", "Gate coordination")["project_id"]
+    worker = lab.join(None, "gate-worker", "CODEX", project_id)
+    worker_id, session_id = worker["worker"]["id"], worker["session_id"]
+
+    gate = lab.gate_ensure(project_id, "RESULT_ASSESSMENT", "experiment-v1", "v1", worker_id, session_id)
+    assert lab.gate_ensure(project_id, "RESULT_ASSESSMENT", "experiment-v1", "v1", worker_id, session_id)["id"] == gate["id"]
+    first = lab.gate_work_ensure(gate["id"], "REVIEW", "Canonical review", "Review E1", "RESULT_INSPECTOR", worker_id, session_id)
+    second = lab.gate_work_ensure(gate["id"], "REVIEW", "Duplicate review", "Must reuse", "RESULT_INSPECTOR", worker_id, session_id)
+    assert first["id"] == second["id"]
+    assert first["authority_status"] == "AUTHORITATIVE"
+
+    dependent = lab.create_work(
+        project_id, "GENERALIZATION", "Conditional next work", "Wait for gate", "SCIENTIST",
+        worker_id, dependencies=[{"target_type": "SCIENTIFIC_GATE", "target_id": gate["id"], "required_statuses": ["PASS"]}],
+        created_session_id=session_id,
+    )
+    assert dependent["status"] == "WAITING_DEPENDENCY"
+    failed = lab.preflight_run(gate["id"], worker_id, session_id, {"checkpoint": False, "tokenizer": True})
+    assert failed["preflight"]["status"] == "FAIL"
+    with pytest.raises(GPUError, match="PREFLIGHT_NOT_PASS"):
+        lab.gate_resolve(gate["id"], worker_id, session_id, "PASS")
+
+    passed = lab.preflight_run(gate["id"], worker_id, session_id, {"checkpoint": True, "tokenizer": True})
+    assert passed["preflight"]["status"] == "PASS"
+    resolved = lab.gate_resolve(gate["id"], worker_id, session_id, "PASS", rationale="Semantic review passed")
+    assert resolved["gate"]["status"] == "PASS"
+    assert lab.work_get(dependent["id"])["status"] == "READY"
+
+    claimed = lab.claim_work(first["id"], worker_id, session_id)
+    successor = lab.gate_ensure(project_id, "RESULT_ASSESSMENT", "experiment-v2", "v2", worker_id, session_id)
+    summary = lab.supersede_subject(project_id, "experiment-v1", "experiment-v2", "Corrected canonical experiment", worker_id, session_id, successor["id"])
+    assert summary["work_items_superseded"] == 1
+    assert lab.work_get(first["id"])["status"] == "SUPERSEDED"
+    synced = lab.sync(session_id, project_id, current_work_item_id=claimed["id"], expected_work_version=claimed["work_version"])
+    assert synced["lease_state"] == "LEASE_LOST"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_project_scope_and_message_acknowledgement_require_active_session():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)

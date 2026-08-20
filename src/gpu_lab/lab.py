@@ -6,6 +6,7 @@ ResearchStore objects, evidence pathways, and the v3.1 Brain.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -18,9 +19,16 @@ RUNTIME_TYPES = {"CHATGPT_WEB", "OPENAI_API", "CLAUDE_API", "CODEX", "LOCAL_AGEN
 SESSION_STATUSES = {"ACTIVE", "BUSY", "WAITING", "IDLE", "DISCONNECTED", "EXPIRED"}
 WORK_STATUSES = {
     "READY", "CLAIMED", "RUNNING", "RUNNING_DETACHED", "RESULT_READY", "WAITING_DEPENDENCY", "BLOCKED", "COMPLETED",
-    "FAILED", "CANCELLED", "INVALIDATED",
+    "FAILED", "CANCELLED", "INVALIDATED", "SUPERSEDED", "DORMANT", "REPLAN_REQUIRED",
 }
-ACTIVE_WORK_STATUSES = {"READY", "CLAIMED", "RUNNING", "RUNNING_DETACHED", "RESULT_READY", "WAITING_DEPENDENCY", "BLOCKED"}
+ACTIVE_WORK_STATUSES = {
+    "READY", "CLAIMED", "RUNNING", "RUNNING_DETACHED", "RESULT_READY", "WAITING_DEPENDENCY", "BLOCKED",
+    "REPLAN_REQUIRED",
+}
+AUTHORITY_STATUSES = {"AUTHORITATIVE", "SUPPORTING", "RECOVERY_TEMPLATE", "OBSOLETE", "SUPERSEDED"}
+GATE_STATUSES = {"PENDING", "PREFLIGHT_FAILED", "AWAITING_SEMANTIC_REVIEW", "PASS", "FAIL", "INVALID", "SUPERSEDED"}
+PREFLIGHT_STATUSES = {"PASS", "FAIL"}
+COORDINATION_VERSION = "lab-coordination-v3.2.2-gates-v1"
 MESSAGE_TYPES = {
     "REQUEST_REVIEW", "REQUEST_DATA", "REQUEST_IMPLEMENTATION", "SHARE_FINDING",
     "CHALLENGE_INTERPRETATION", "HANDOFF", "BLOCKER", "CROSS_PROJECT_RELEVANCE",
@@ -102,6 +110,44 @@ class LabController:
                     project_id UUID PRIMARY KEY REFERENCES research_projects(id),
                     limits JSONB NOT NULL DEFAULT '{}'::jsonb, updated_at TIMESTAMPTZ NOT NULL
                 );
+                ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS authority_key TEXT;
+                ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS gate_id UUID;
+                ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS canonical_subject_version TEXT;
+                ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS authority_status TEXT NOT NULL DEFAULT 'SUPPORTING';
+                ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS subject_id TEXT;
+                ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS superseded_by UUID;
+                ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS invalidated_at TIMESTAMPTZ;
+                ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS work_version INTEGER NOT NULL DEFAULT 1;
+                ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS recovery_policy JSONB NOT NULL DEFAULT '{}'::jsonb;
+                CREATE TABLE IF NOT EXISTS scientific_gates (
+                    id UUID PRIMARY KEY, project_id UUID NOT NULL REFERENCES research_projects(id),
+                    gate_key TEXT NOT NULL, scientific_object_id TEXT NOT NULL,
+                    canonical_subject_version TEXT NOT NULL, authority_key TEXT NOT NULL,
+                    authoritative_work_item_id UUID REFERENCES lab_work_items(id),
+                    deterministic_preflight_id UUID, semantic_review_work_item_id UUID REFERENCES lab_work_items(id),
+                    status TEXT NOT NULL, coordination_version TEXT NOT NULL,
+                    superseded_by UUID REFERENCES scientific_gates(id), invalidation_reason TEXT,
+                    created_at TIMESTAMPTZ NOT NULL, resolved_at TIMESTAMPTZ,
+                    UNIQUE(project_id, gate_key, scientific_object_id, canonical_subject_version)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS scientific_gates_active_authority_key_unique
+                    ON scientific_gates(project_id, authority_key)
+                    WHERE status NOT IN ('SUPERSEDED', 'INVALID');
+                CREATE TABLE IF NOT EXISTS lab_deterministic_preflights (
+                    id UUID PRIMARY KEY, project_id UUID NOT NULL REFERENCES research_projects(id),
+                    gate_id UUID NOT NULL REFERENCES scientific_gates(id),
+                    scientific_object_id TEXT NOT NULL, canonical_subject_version TEXT NOT NULL,
+                    subject_hash TEXT NOT NULL, checks JSONB NOT NULL, failures JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    warnings JSONB NOT NULL DEFAULT '[]'::jsonb, result_hash TEXT NOT NULL,
+                    status TEXT NOT NULL, validator_version TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL,
+                    UNIQUE(project_id, scientific_object_id, canonical_subject_version, subject_hash, validator_version)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS lab_work_items_active_authority_unique
+                    ON lab_work_items(project_id, authority_key)
+                    WHERE authority_key IS NOT NULL AND authority_status='AUTHORITATIVE'
+                    AND status IN ('READY','CLAIMED','RUNNING','RUNNING_DETACHED','RESULT_READY','WAITING_DEPENDENCY','BLOCKED','REPLAN_REQUIRED');
+                CREATE INDEX IF NOT EXISTS lab_work_items_gate_idx ON lab_work_items(gate_id,status,created_at);
+                CREATE INDEX IF NOT EXISTS scientific_gates_project_status_idx ON scientific_gates(project_id,status,created_at);
             """)
 
     @staticmethod
@@ -123,6 +169,15 @@ class LabController:
 
     def _event(self, cur, project_id: str, event_type: str, subject_id: str | None, payload: dict) -> None:
         self.store._event(cur, project_id, event_type, subject_id, payload)
+
+    @staticmethod
+    def authority_key(project_id: str, scientific_object_id: str, canonical_subject_version: str, gate_key: str) -> str:
+        """Return the stable identity for one current scientific transition."""
+        return ":".join((str(project_id), str(scientific_object_id), str(canonical_subject_version), str(gate_key).upper()))
+
+    @staticmethod
+    def _canonical_json_hash(value: Any) -> str:
+        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
 
     def _worker(self, cur, worker_id: str) -> dict:
         cur.execute("SELECT * FROM research_workers WHERE id=%s AND enabled=TRUE", (worker_id,))
@@ -249,14 +304,245 @@ class LabController:
         return {"worker": self._record(worker), "session_id": session_id, "recovered": recovered,
                 "lab_state": self.state_get(project_id, session_id)}
 
+    def gate_ensure(
+        self, project_id: str, gate_key: str, scientific_object_id: str,
+        canonical_subject_version: str, worker_id: str, session_id: str,
+    ) -> dict:
+        """Create or return one durable, version-bound scientific gate."""
+        gate_key = gate_key.strip().upper()
+        if not gate_key or not scientific_object_id or not canonical_subject_version:
+            raise GPUError("SCIENTIFIC_GATE_IDENTITY_REQUIRED", "gate_key, scientific_object_id, and canonical_subject_version")
+        authority_key = self.authority_key(project_id, scientific_object_id, canonical_subject_version, gate_key)
+        now = self._now()
+        with self.store._connect() as conn, conn.cursor() as cur:
+            self._session(cur, session_id, worker_id, project_id)
+            cur.execute(
+                "SELECT * FROM scientific_gates WHERE project_id=%s AND gate_key=%s AND scientific_object_id=%s "
+                "AND canonical_subject_version=%s FOR UPDATE",
+                (project_id, gate_key, scientific_object_id, canonical_subject_version),
+            )
+            existing = cur.fetchone()
+            if existing:
+                return self._record(existing) or {}
+            ident = str(uuid.uuid4())
+            cur.execute(
+                "INSERT INTO scientific_gates(id,project_id,gate_key,scientific_object_id,canonical_subject_version,"
+                "authority_key,status,coordination_version,created_at) VALUES(%s,%s,%s,%s,%s,%s,'PENDING',%s,%s) RETURNING *",
+                (ident, project_id, gate_key, scientific_object_id, canonical_subject_version, authority_key, COORDINATION_VERSION, now),
+            )
+            gate = cur.fetchone()
+            self._event(cur, project_id, "SCIENTIFIC_GATE_CREATED", ident, {
+                "gate_key": gate_key, "scientific_object_id": scientific_object_id,
+                "canonical_subject_version": canonical_subject_version, "authority_key": authority_key,
+                "coordination_version": COORDINATION_VERSION,
+            })
+            return self._record(gate) or {}
+
+    def gate_get(self, gate_id: str) -> dict:
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM scientific_gates WHERE id=%s", (gate_id,))
+            gate = cur.fetchone()
+            if not gate:
+                raise GPUError("SCIENTIFIC_GATE_NOT_FOUND", gate_id)
+            result = self._record(gate) or {}
+            if gate["deterministic_preflight_id"]:
+                cur.execute("SELECT * FROM lab_deterministic_preflights WHERE id=%s", (gate["deterministic_preflight_id"],))
+                result["deterministic_preflight"] = self._record(cur.fetchone())
+            return result
+
+    def gate_work_ensure(
+        self, gate_id: str, kind: str, title: str, description: str, scientific_role: str,
+        worker_id: str, session_id: str, priority: float = 0, expected_value: float | None = None,
+        estimated_cost: float | None = None, dependencies: list[dict] | None = None,
+        recovery_policy: dict[str, Any] | None = None,
+    ) -> dict:
+        """Create or reuse the sole active authoritative WorkItem for a ScientificGate."""
+        gate = self.gate_get(gate_id)
+        if gate["status"] in {"SUPERSEDED", "INVALID", "PASS", "FAIL"}:
+            raise GPUError("SCIENTIFIC_GATE_NOT_ACTIONABLE", gate["status"])
+        refs = {"scientific_object_id": gate["scientific_object_id"], "gate_id": gate_id}
+        return self.create_work(
+            gate["project_id"], kind, title, description, scientific_role,
+            worker_id, priority, expected_value, estimated_cost, refs, dependencies,
+            gate["authority_key"], None, session_id, gate["authority_key"], gate_id,
+            gate["canonical_subject_version"], "AUTHORITATIVE", gate["scientific_object_id"], recovery_policy,
+        )
+
+    @staticmethod
+    def _normalize_preflight_checks(checks: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        if not checks:
+            raise GPUError("PREFLIGHT_CHECKS_REQUIRED", "At least one deterministic check is required")
+        normalized: dict[str, dict[str, Any]] = {}
+        for name, value in checks.items():
+            if not isinstance(name, str) or not name.strip():
+                raise GPUError("PREFLIGHT_CHECK_NAME_INVALID", str(name))
+            if isinstance(value, bool):
+                normalized[name] = {"passed": value}
+            elif isinstance(value, dict) and isinstance(value.get("passed"), bool):
+                normalized[name] = {key: value[key] for key in sorted(value)}
+            else:
+                raise GPUError("PREFLIGHT_CHECK_INVALID", name)
+        return {name: normalized[name] for name in sorted(normalized)}
+
+    def preflight_run(
+        self, gate_id: str, worker_id: str, session_id: str, checks: dict[str, Any],
+        validator_version: str = COORDINATION_VERSION,
+    ) -> dict:
+        """Persist one immutable deterministic readiness result for a gate subject version."""
+        normalized = self._normalize_preflight_checks(checks)
+        now = self._now()
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM scientific_gates WHERE id=%s FOR UPDATE", (gate_id,))
+            gate = cur.fetchone()
+            if not gate:
+                raise GPUError("SCIENTIFIC_GATE_NOT_FOUND", gate_id)
+            self._session(cur, session_id, worker_id, str(gate["project_id"]))
+            if gate["status"] in {"SUPERSEDED", "INVALID", "PASS", "FAIL"}:
+                raise GPUError("SCIENTIFIC_GATE_NOT_PREFLIGHTABLE", gate["status"])
+            subject = {
+                "scientific_object_id": gate["scientific_object_id"],
+                "canonical_subject_version": gate["canonical_subject_version"],
+                "checks": normalized,
+            }
+            subject_hash = self._canonical_json_hash(subject)
+            cur.execute(
+                "SELECT * FROM lab_deterministic_preflights WHERE project_id=%s AND scientific_object_id=%s "
+                "AND canonical_subject_version=%s AND subject_hash=%s AND validator_version=%s",
+                (gate["project_id"], gate["scientific_object_id"], gate["canonical_subject_version"], subject_hash, validator_version),
+            )
+            result = cur.fetchone()
+            reused = result is not None
+            if not result:
+                failures = [name for name, value in normalized.items() if not value["passed"]]
+                warnings = [name for name, value in normalized.items() if value.get("warning")]
+                status = "FAIL" if failures else "PASS"
+                result_hash = self._canonical_json_hash({**subject, "status": status, "validator_version": validator_version})
+                ident = str(uuid.uuid4())
+                cur.execute(
+                    "INSERT INTO lab_deterministic_preflights(id,project_id,gate_id,scientific_object_id,"
+                    "canonical_subject_version,subject_hash,checks,failures,warnings,result_hash,status,validator_version,created_at) "
+                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *",
+                    (ident, gate["project_id"], gate_id, gate["scientific_object_id"], gate["canonical_subject_version"], subject_hash,
+                     json.dumps(normalized), json.dumps(failures), json.dumps(warnings), result_hash, status, validator_version, now),
+                )
+                result = cur.fetchone()
+            next_status = "AWAITING_SEMANTIC_REVIEW" if result["status"] == "PASS" else "PREFLIGHT_FAILED"
+            cur.execute(
+                "UPDATE scientific_gates SET deterministic_preflight_id=%s,status=%s,resolved_at=NULL WHERE id=%s",
+                (result["id"], next_status, gate_id),
+            )
+            self._event(cur, gate["project_id"], "DETERMINISTIC_PREFLIGHT_REUSED" if reused else "DETERMINISTIC_PREFLIGHT_COMPLETED", result["id"], {
+                "gate_id": gate_id, "status": result["status"], "subject_hash": subject_hash,
+                "validator_version": validator_version,
+            })
+            self._event(cur, gate["project_id"], "SCIENTIFIC_GATE_PREFLIGHT_FAILED" if result["status"] == "FAIL" else "SCIENTIFIC_GATE_PREFLIGHT_PASSED", gate_id, {"preflight_id": str(result["id"])})
+        return {"gate": self.gate_get(gate_id), "preflight": self._record(result), "reused": reused}
+
+    def gate_resolve(
+        self, gate_id: str, worker_id: str, session_id: str, semantic_status: str,
+        semantic_review_work_item_id: str | None = None, rationale: str = "",
+    ) -> dict:
+        """Record scientific review outcome only after deterministic preflight has passed."""
+        semantic_status = self._validate(semantic_status, {"PASS", "FAIL", "INVALID"}, "SCIENTIFIC_GATE_STATUS")
+        now = self._now()
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM scientific_gates WHERE id=%s FOR UPDATE", (gate_id,))
+            gate = cur.fetchone()
+            if not gate:
+                raise GPUError("SCIENTIFIC_GATE_NOT_FOUND", gate_id)
+            self._session(cur, session_id, worker_id, str(gate["project_id"]))
+            if gate["status"] in {"SUPERSEDED", "INVALID"}:
+                raise GPUError("SCIENTIFIC_GATE_NOT_RESOLVABLE", gate["status"])
+            if not gate["deterministic_preflight_id"]:
+                raise GPUError("SCIENTIFIC_GATE_PREFLIGHT_REQUIRED", gate_id)
+            cur.execute("SELECT status FROM lab_deterministic_preflights WHERE id=%s", (gate["deterministic_preflight_id"],))
+            preflight = cur.fetchone()
+            if not preflight or preflight["status"] != "PASS":
+                raise GPUError("SCIENTIFIC_GATE_PREFLIGHT_NOT_PASS", gate_id)
+            if semantic_review_work_item_id:
+                cur.execute("SELECT status,gate_id FROM lab_work_items WHERE id=%s AND project_id=%s", (semantic_review_work_item_id, gate["project_id"]))
+                review = cur.fetchone()
+                if not review or str(review["gate_id"] or "") != str(gate_id):
+                    raise GPUError("SCIENTIFIC_GATE_REVIEW_MISMATCH", semantic_review_work_item_id)
+            cur.execute(
+                "UPDATE scientific_gates SET status=%s,semantic_review_work_item_id=COALESCE(%s,semantic_review_work_item_id),resolved_at=%s WHERE id=%s",
+                (semantic_status, semantic_review_work_item_id, now, gate_id),
+            )
+            self._event(cur, gate["project_id"], "SCIENTIFIC_GATE_RESOLVED", gate_id, {
+                "status": semantic_status, "semantic_review_work_item_id": semantic_review_work_item_id,
+                "rationale": rationale[:4000],
+            })
+        dependency_changes = self.resolve_dependencies(str(gate["project_id"]))
+        return {"gate": self.gate_get(gate_id), "dependency_changes": dependency_changes}
+
+    def supersede_subject(
+        self, project_id: str, old_subject_id: str, new_subject_id: str, rationale: str,
+        worker_id: str, session_id: str, successor_gate_id: str | None = None,
+    ) -> dict[str, int]:
+        """Historically preserve but operationally retire work bound to a replaced subject."""
+        if not old_subject_id or not new_subject_id or not rationale.strip():
+            raise GPUError("SCIENTIFIC_SUPERSESSION_IDENTITY_REQUIRED", "old_subject_id, new_subject_id, and rationale")
+        now, superseded = self._now(), 0
+        with self.store._connect() as conn, conn.cursor() as cur:
+            self._session(cur, session_id, worker_id, project_id)
+            if successor_gate_id:
+                cur.execute("SELECT id FROM scientific_gates WHERE id=%s AND project_id=%s", (successor_gate_id, project_id))
+                if not cur.fetchone():
+                    raise GPUError("SCIENTIFIC_GATE_NOT_FOUND", successor_gate_id)
+            cur.execute(
+                "SELECT * FROM lab_work_items WHERE project_id=%s AND status=ANY(%s) AND (subject_id=%s "
+                "OR related_refs->>'experiment_id'=%s OR related_refs->>'experiment_run_id'=%s "
+                "OR related_refs->>'run_id'=%s) FOR UPDATE",
+                (project_id, list(ACTIVE_WORK_STATUSES), old_subject_id, old_subject_id, old_subject_id, old_subject_id),
+            )
+            for item in cur.fetchall():
+                cur.execute(
+                    "UPDATE lab_work_leases SET released_at=%s,release_reason='SUBJECT_SUPERSEDED' "
+                    "WHERE work_item_id=%s AND released_at IS NULL",
+                    (now, item["id"]),
+                )
+                cur.execute(
+                    "UPDATE lab_work_items SET status='SUPERSEDED',authority_status='SUPERSEDED',superseded_by=%s,"
+                    "invalidated_reason=%s,invalidated_at=%s,assigned_worker_id=NULL,assigned_session_id=NULL,"
+                    "lease_id=NULL,work_version=work_version+1,updated_at=%s WHERE id=%s",
+                    (successor_gate_id, rationale[:4000], now, now, item["id"]),
+                )
+                cur.execute(
+                    "UPDATE research_worker_sessions SET current_work_item_id=NULL,active_role=NULL,status='ACTIVE',"
+                    "last_heartbeat_at=%s WHERE current_work_item_id=%s",
+                    (now, item["id"]),
+                )
+                self._event(cur, project_id, "WORK_ITEM_SUPERSEDED", item["id"], {
+                    "old_subject_id": old_subject_id, "new_subject_id": new_subject_id,
+                    "successor_gate_id": successor_gate_id, "rationale": rationale[:4000],
+                })
+                superseded += 1
+            cur.execute(
+                "UPDATE scientific_gates SET status='SUPERSEDED',superseded_by=%s,invalidation_reason=%s,resolved_at=%s "
+                "WHERE project_id=%s AND scientific_object_id=%s AND status NOT IN ('SUPERSEDED','INVALID')",
+                (successor_gate_id, rationale[:4000], now, project_id, old_subject_id),
+            )
+            self._event(cur, project_id, "SCIENTIFIC_SUBJECT_SUPERSEDED", None, {
+                "old_subject_id": old_subject_id, "new_subject_id": new_subject_id,
+                "successor_gate_id": successor_gate_id, "work_items_superseded": superseded,
+                "rationale": rationale[:4000],
+            })
+        dependency_changes = self.resolve_dependencies(project_id)
+        return {"work_items_superseded": superseded, **dependency_changes}
+
     def create_work(self, project_id: str, kind: str, title: str, description: str,
                     scientific_role: str, created_by: str | None = None, priority: float = 0,
                     expected_value: float | None = None, estimated_cost: float | None = None,
                     related_refs: dict[str, Any] | None = None, dependencies: list[dict] | None = None,
                     equivalence_key: str | None = None, parent_work_item_id: str | None = None,
-                    created_session_id: str | None = None) -> dict:
+                    created_session_id: str | None = None, authority_key: str | None = None,
+                    gate_id: str | None = None, canonical_subject_version: str | None = None,
+                    authority_status: str = "SUPPORTING", subject_id: str | None = None,
+                    recovery_policy: dict[str, Any] | None = None) -> dict:
         now, ident = self._now(), str(uuid.uuid4())
         dependencies = dependencies or []
+        authority_status = self._validate(authority_status, AUTHORITY_STATUSES, "LAB_WORK_AUTHORITY_STATUS")
+        existing_id: str | None = None
         with self.store._connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT id FROM research_projects WHERE id=%s", (project_id,))
             if not cur.fetchone():
@@ -265,29 +551,88 @@ class LabController:
                 raise GPUError("LAB_WORK_CREATOR_SESSION_REQUIRED", "created_by and created_session_id")
             self._worker(cur, created_by)
             self._session(cur, created_session_id, created_by, project_id)
+            if gate_id:
+                cur.execute("SELECT * FROM scientific_gates WHERE id=%s AND project_id=%s FOR UPDATE", (gate_id, project_id))
+                gate = cur.fetchone()
+                if not gate:
+                    raise GPUError("SCIENTIFIC_GATE_NOT_FOUND", gate_id)
+                if gate["status"] in {"SUPERSEDED", "INVALID"}:
+                    raise GPUError("SCIENTIFIC_GATE_NOT_ACTIONABLE", gate["status"])
+                authority_key = authority_key or gate["authority_key"]
+                canonical_subject_version = canonical_subject_version or gate["canonical_subject_version"]
+                subject_id = subject_id or gate["scientific_object_id"]
+            if authority_status == "AUTHORITATIVE":
+                if not authority_key or not gate_id or not canonical_subject_version:
+                    raise GPUError("LAB_WORK_AUTHORITY_IDENTITY_REQUIRED", "authority_key, gate_id, canonical_subject_version")
+                cur.execute(
+                    "SELECT id FROM lab_work_items WHERE project_id=%s AND authority_key=%s "
+                    "AND authority_status='AUTHORITATIVE' AND status=ANY(%s) FOR UPDATE",
+                    (project_id, authority_key, list(ACTIVE_WORK_STATUSES)),
+                )
+                existing = cur.fetchone()
+                if existing:
+                    existing_id = str(existing["id"])
+                    cur.execute(
+                        "UPDATE scientific_gates SET authoritative_work_item_id=COALESCE(authoritative_work_item_id,%s) WHERE id=%s",
+                        (existing_id, gate_id),
+                    )
+                elif equivalence_key is None:
+                    equivalence_key = authority_key
+            if existing_id:
+                self._event(cur, project_id, "WORK_ITEM_AUTHORITY_REUSED", existing_id, {"authority_key": authority_key, "gate_id": gate_id})
+                return self._work_record(cur, existing_id)
             status = "WAITING_DEPENDENCY" if dependencies else "READY"
             try:
-                cur.execute("INSERT INTO lab_work_items(id,project_id,kind,title,description,scientific_role,status,priority,expected_value,estimated_cost,created_by,parent_work_item_id,related_refs,equivalence_key,created_at,updated_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                            (ident, project_id, kind, title, description, scientific_role, status, priority, expected_value, estimated_cost, created_by, parent_work_item_id, json.dumps(related_refs or {}), equivalence_key, now, now))
+                cur.execute(
+                    "INSERT INTO lab_work_items(id,project_id,kind,title,description,scientific_role,status,priority,expected_value,estimated_cost,"
+                    "created_by,parent_work_item_id,related_refs,equivalence_key,authority_key,gate_id,canonical_subject_version,authority_status,subject_id,recovery_policy,created_at,updated_at) "
+                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (ident, project_id, kind, title, description, scientific_role, status, priority, expected_value, estimated_cost,
+                     created_by, parent_work_item_id, json.dumps(related_refs or {}), equivalence_key, authority_key, gate_id,
+                     canonical_subject_version, authority_status, subject_id, json.dumps(recovery_policy or {}), now, now),
+                )
             except Exception as exc:
                 if getattr(exc, "sqlstate", None) == "23505":
+                    if authority_status == "AUTHORITATIVE" and authority_key:
+                        cur.execute(
+                            "SELECT id FROM lab_work_items WHERE project_id=%s AND authority_key=%s "
+                            "AND authority_status='AUTHORITATIVE' AND status=ANY(%s)",
+                            (project_id, authority_key, list(ACTIVE_WORK_STATUSES)),
+                        )
+                        existing = cur.fetchone()
+                        if existing:
+                            existing_id = str(existing["id"])
+                            self._event(cur, project_id, "WORK_ITEM_AUTHORITY_REUSED", existing_id, {"authority_key": authority_key, "gate_id": gate_id})
+                            return self._work_record(cur, existing_id)
                     raise GPUError("LAB_EQUIVALENT_WORK_ACTIVE", equivalence_key or title) from exc
                 raise
             self._replace_dependencies(cur, ident, dependencies, now)
-            self._event(cur, project_id, "WORK_ITEM_CREATED", ident, {"kind": kind, "title": title, "status": status})
+            if gate_id and authority_status == "AUTHORITATIVE":
+                cur.execute("UPDATE scientific_gates SET authoritative_work_item_id=%s WHERE id=%s", (ident, gate_id))
+            self._event(cur, project_id, "WORK_ITEM_CREATED", ident, {
+                "kind": kind, "title": title, "status": status, "gate_id": gate_id,
+                "authority_key": authority_key, "authority_status": authority_status,
+            })
         self.resolve_dependencies(project_id)
         return self.work_get(ident)
 
+    def _work_record(self, cur, work_item_id: str) -> dict:
+        cur.execute("SELECT * FROM lab_work_items WHERE id=%s", (work_item_id,))
+        item = cur.fetchone()
+        if not item:
+            raise GPUError("LAB_WORK_NOT_FOUND", work_item_id)
+        cur.execute(
+            "SELECT target_type,target_id,required_statuses,invalidating_statuses,description "
+            "FROM lab_work_dependencies WHERE work_item_id=%s ORDER BY created_at",
+            (work_item_id,),
+        )
+        result = self._record(item) or {}
+        result["dependencies"] = cur.fetchall()
+        return result
+
     def work_get(self, work_item_id: str) -> dict:
         with self.store._connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT * FROM lab_work_items WHERE id=%s", (work_item_id,))
-            item = cur.fetchone()
-            if not item:
-                raise GPUError("LAB_WORK_NOT_FOUND", work_item_id)
-            cur.execute("SELECT target_type,target_id,required_statuses,invalidating_statuses,description FROM lab_work_dependencies WHERE work_item_id=%s ORDER BY created_at", (work_item_id,))
-            result = self._record(item)
-            result["dependencies"] = cur.fetchall()
-            return result
+            return self._work_record(cur, work_item_id)
 
     def work_list(self, project_id: str, statuses: list[str] | None = None, limit: int = 100) -> list[dict]:
         with self.store._connect() as conn, conn.cursor() as cur:
@@ -301,11 +646,25 @@ class LabController:
             cur.execute(sql, args)
             return [self._record(row) for row in cur.fetchall()]
 
+    def gate_list(self, project_id: str, statuses: list[str] | None = None, limit: int = 100) -> list[dict]:
+        with self.store._connect() as conn, conn.cursor() as cur:
+            sql, args = "SELECT * FROM scientific_gates WHERE project_id=%s", [project_id]
+            if statuses:
+                normalized = [self._validate(status, GATE_STATUSES, "SCIENTIFIC_GATE_STATUS") for status in statuses]
+                sql += " AND status=ANY(%s)"
+                args.append(normalized)
+            sql += " ORDER BY created_at DESC LIMIT %s"
+            args.append(min(max(1, limit), 500))
+            cur.execute(sql, args)
+            return [self._record(row) or {} for row in cur.fetchall()]
+
     def _dependency_status(self, cur, project_id: str, dependency: dict) -> tuple[bool, bool, str]:
         """Return (satisfied, invalidated, explanation) for one typed dependency."""
         target_type, target_id = dependency["target_type"], dependency["target_id"]
         if target_type == "WORK_ITEM":
             cur.execute("SELECT status FROM lab_work_items WHERE id=%s AND project_id=%s", (target_id, project_id))
+        elif target_type == "SCIENTIFIC_GATE":
+            cur.execute("SELECT status FROM scientific_gates WHERE id=%s AND project_id=%s", (target_id, project_id))
         elif target_type in {"RESEARCH_OBJECT", "EXPERIMENT_RUN", "ENGINEERING_RESULT", "RESEARCH_DECISION", "EVIDENCE_UNIT", "ARTIFACT"}:
             kind = {"EXPERIMENT_RUN": "ExperimentRun", "ENGINEERING_RESULT": "EngineeringResult", "RESEARCH_DECISION": "ResearchDecision", "EVIDENCE_UNIT": "EvidenceUnit", "ARTIFACT": "Artifact"}.get(target_type)
             sql = "SELECT status FROM research_objects WHERE id=%s AND project_id=%s"
@@ -321,6 +680,8 @@ class LabController:
             return False, False, f"dependency target {target_id} is unavailable"
         status = row["status"]
         invalidating = dependency["invalidating_statuses"] or []
+        if status in {"SUPERSEDED", "INVALIDATED"}:
+            return False, True, f"dependency {target_id} is operationally obsolete ({status})"
         if status in invalidating:
             return False, True, f"dependency {target_id} entered invalidating status {status}"
         required = dependency["required_statuses"] or []
@@ -346,7 +707,7 @@ class LabController:
             target_id = str(dependency.get("target_id", ""))
             if not target_id:
                 raise GPUError("LAB_DEPENDENCY_TARGET_REQUIRED", "target_id")
-            if target_type not in {"WORK_ITEM", "RESEARCH_OBJECT", "EXPERIMENT_RUN", "ENGINEERING_RESULT", "RESEARCH_DECISION", "EVIDENCE_UNIT", "ARTIFACT"}:
+            if target_type not in {"WORK_ITEM", "SCIENTIFIC_GATE", "RESEARCH_OBJECT", "EXPERIMENT_RUN", "ENGINEERING_RESULT", "RESEARCH_DECISION", "EVIDENCE_UNIT", "ARTIFACT"}:
                 raise GPUError("LAB_DEPENDENCY_TYPE_INVALID", target_type)
             cur.execute("INSERT INTO lab_work_dependencies(id,work_item_id,target_type,target_id,required_statuses,invalidating_statuses,description,created_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",
                         (str(uuid.uuid4()), work_item_id, target_type, target_id, json.dumps(dependency.get("required_statuses", [])), json.dumps(dependency.get("invalidating_statuses", [])), str(dependency.get("description", "")), now))
@@ -682,6 +1043,7 @@ class LabController:
             "research_policy_version": policies[0]["data"].get("version") if policies else None,
             "brain_policy_version": decisions[0]["data"].get("brain_policy_version") if decisions else None,
             "active_workers": self._active_workers(project_id),
+            "scientific_gates": self.gate_list(project_id, ["PENDING", "AWAITING_SEMANTIC_REVIEW", "PREFLIGHT_FAILED"], 30),
             "ready_work_items": self.work_list(project_id, ["READY"], 30),
             "blocked_work_items": self.work_list(project_id, ["BLOCKED", "WAITING_DEPENDENCY"], 30),
             "running_work_items": self.work_list(project_id, ["CLAIMED", "RUNNING", "RUNNING_DETACHED"], 30),
@@ -696,17 +1058,42 @@ class LabController:
         }
 
     def sync(self, session_id: str, project_id: str, since: str | None = None,
-             current_work_item_id: str | None = None) -> dict:
+             current_work_item_id: str | None = None,
+             expected_work_version: int | None = None) -> dict:
+        self.recover_stale_leases(project_id)
+        lease_state = "IDLE"
+        lease_detail: dict[str, Any] = {}
         with self.store._connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT worker_id,current_work_item_id FROM research_worker_sessions WHERE id=%s AND current_project_id=%s FOR UPDATE", (session_id, project_id))
+            cur.execute("SELECT worker_id,current_work_item_id,status FROM research_worker_sessions WHERE id=%s AND current_project_id=%s FOR UPDATE", (session_id, project_id))
             session = cur.fetchone()
             if not session:
                 raise GPUError("LAB_SESSION_NOT_FOUND", session_id)
             now = self._now()
-            cur.execute("UPDATE research_worker_sessions SET last_heartbeat_at=%s WHERE id=%s", (now, session_id))
+            if current_work_item_id:
+                cur.execute("SELECT id,status,assigned_session_id,work_version,subject_id FROM lab_work_items WHERE id=%s AND project_id=%s", (current_work_item_id, project_id))
+                item = cur.fetchone()
+                if not item or str(item["assigned_session_id"] or "") != str(session_id):
+                    lease_state = "LEASE_LOST"
+                    lease_detail = {"work_item_id": current_work_item_id, "reason": "work is no longer owned by this session"}
+                elif item["status"] not in {"CLAIMED", "RUNNING"}:
+                    lease_state = "LEASE_LOST"
+                    lease_detail = {"work_item_id": current_work_item_id, "reason": f"work status is {item['status']}"}
+                elif expected_work_version is not None and item["work_version"] != expected_work_version:
+                    lease_state = "STALE_WORK_CONTEXT"
+                    lease_detail = {
+                        "work_item_id": current_work_item_id, "expected_work_version": expected_work_version,
+                        "current_work_version": item["work_version"], "subject_id": item["subject_id"],
+                    }
+                else:
+                    lease_state = "OWNED"
+            if session["status"] not in {"DISCONNECTED", "EXPIRED"}:
+                cur.execute("UPDATE research_worker_sessions SET last_heartbeat_at=%s WHERE id=%s", (now, session_id))
         state = self.state_get(project_id, session_id, since)
         old_work_reassigned = bool(current_work_item_id and current_work_item_id != str(session["current_work_item_id"] or ""))
-        return {"session_id": session_id, "old_work_reassigned": old_work_reassigned, "lab_state": state}
+        return {
+            "session_id": session_id, "old_work_reassigned": old_work_reassigned,
+            "lease_state": lease_state, "lease_detail": lease_detail, "lab_state": state,
+        }
 
     def _lab_budget_get(self, project_id: str) -> dict[str, Any]:
         with self.store._connect() as conn, conn.cursor() as cur:

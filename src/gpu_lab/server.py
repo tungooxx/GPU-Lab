@@ -1069,10 +1069,11 @@ async def lab_budget_set(project_id: str, worker_id: str, session_id: str, limit
 
 @mcp.tool()
 async def lab_sync(
-    session_id: str, project_id: str, since: str | None = None, current_work_item_id: str | None = None
+    session_id: str, project_id: str, since: str | None = None, current_work_item_id: str | None = None,
+    expected_work_version: int | None = None,
 ):
     """Incrementally synchronize one worker with shared events, work, leases, and messages."""
-    return await call(lab().sync, session_id, project_id, since, current_work_item_id)
+    return await call(lab().sync, session_id, project_id, since, current_work_item_id, expected_work_version)
 
 
 @mcp.tool()
@@ -1094,11 +1095,93 @@ async def lab_work_create(
     estimated_cost: float | None = None, related_refs: dict[str, Any] | None = None,
     dependencies: list[dict] | None = None, equivalence_key: str | None = None,
     parent_work_item_id: str | None = None, created_session_id: str | None = None,
+    authority_key: str | None = None, gate_id: str | None = None,
+    canonical_subject_version: str | None = None, authority_status: str = "SUPPORTING",
+    subject_id: str | None = None, recovery_policy: dict[str, Any] | None = None,
 ):
-    """Create dependency-aware project work; equivalent active work is rejected."""
+    """Create dependency-aware project work; authoritative gate work is idempotently reused."""
     return await call(lab().create_work, project_id, kind, title, description, scientific_role,
                       created_by, priority, expected_value, estimated_cost, related_refs,
-                      dependencies, equivalence_key, parent_work_item_id, created_session_id)
+                      dependencies, equivalence_key, parent_work_item_id, created_session_id,
+                      authority_key, gate_id, canonical_subject_version, authority_status,
+                      subject_id, recovery_policy)
+
+
+@mcp.tool()
+async def scientific_gate_ensure(
+    project_id: str, gate_key: str, scientific_object_id: str, canonical_subject_version: str,
+    worker_id: str, session_id: str,
+):
+    """Idempotently create or retrieve one authority-bound ScientificGate."""
+    return await call(
+        lab().gate_ensure, project_id, gate_key, scientific_object_id,
+        canonical_subject_version, worker_id, session_id,
+    )
+
+
+@mcp.tool()
+async def scientific_gate_get(gate_id: str):
+    """Read one canonical gate and its immutable deterministic preflight result."""
+    return await call(lab().gate_get, gate_id)
+
+
+@mcp.tool()
+async def scientific_gate_list(project_id: str, statuses: list[str] | None = None, limit: int = 100):
+    """List durable gates; default callers should use LabState for actionable gates only."""
+    return await call(lab().gate_list, project_id, statuses, limit)
+
+
+@mcp.tool()
+async def scientific_gate_work_ensure(
+    gate_id: str, kind: str, title: str, description: str, scientific_role: str,
+    worker_id: str, session_id: str, priority: float = 0, expected_value: float | None = None,
+    estimated_cost: float | None = None, dependencies: list[dict] | None = None,
+    recovery_policy: dict[str, Any] | None = None,
+):
+    """Create or reuse the one active authoritative WorkItem for a gate."""
+    return await call(
+        lab().gate_work_ensure, gate_id, kind, title, description, scientific_role,
+        worker_id, session_id, priority, expected_value, estimated_cost, dependencies, recovery_policy,
+    )
+
+
+@mcp.tool()
+async def deterministic_preflight_run(
+    gate_id: str, worker_id: str, session_id: str, checks: dict[str, Any],
+    validator_version: str = "lab-coordination-v3.2.2-gates-v1",
+):
+    """Persist a normalized immutable mechanical readiness result for a gate subject version."""
+    return await call(lab().preflight_run, gate_id, worker_id, session_id, checks, validator_version)
+
+
+@mcp.tool()
+async def scientific_gate_resolve(
+    gate_id: str, worker_id: str, session_id: str,
+    semantic_status: Literal["PASS", "FAIL", "INVALID"],
+    semantic_review_work_item_id: str | None = None, rationale: str = "",
+):
+    """Resolve a gate only after deterministic preflight PASS; this unlocks typed dependencies."""
+    result = await call(
+        lab().gate_resolve, gate_id, worker_id, session_id, semantic_status,
+        semantic_review_work_item_id, rationale,
+    )
+    if "error" not in result and result.get("dependency_changes", {}).get("ready"):
+        wake = await call(cockpit().wake_ready_work, result["gate"]["project_id"])
+        if "error" not in wake:
+            result["worker_wake"] = wake
+    return result
+
+
+@mcp.tool()
+async def scientific_subject_supersede(
+    project_id: str, old_subject_id: str, new_subject_id: str, rationale: str,
+    worker_id: str, session_id: str, successor_gate_id: str | None = None,
+):
+    """Retire old-subject operational work while preserving its immutable history."""
+    return await call(
+        lab().supersede_subject, project_id, old_subject_id, new_subject_id, rationale,
+        worker_id, session_id, successor_gate_id,
+    )
 
 
 @mcp.tool()

@@ -267,6 +267,52 @@ class CockpitController:
             self.store._event(cur, project_id, "LAB_TURN_REPORTED", turn_id, {"worker_id": worker_id, "work_item_id": work_item_id, "outcome": outcome, "wake_request_id": wake_id})
         return {"turn_id": turn_id, "outcome": outcome, "wake_request_id": wake_id}
 
+    def wake_ready_work(self, project_id: str, work_item_ids: list[str] | None = None) -> dict[str, int]:
+        """Queue at most one bounded ready-work wake per eligible attached browser worker."""
+        now, queued = self._now(), 0
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT autopilot_enabled,auto_continue_enabled,paused FROM lab_project_controls WHERE project_id=%s",
+                (project_id,),
+            )
+            controls = cur.fetchone() or {"autopilot_enabled": False, "auto_continue_enabled": False, "paused": False}
+            if not controls["autopilot_enabled"] or not controls["auto_continue_enabled"] or controls["paused"]:
+                return {"queued": 0}
+            sql = (
+                "SELECT w.id FROM lab_work_items w WHERE w.project_id=%s AND w.status='READY' "
+                "ORDER BY w.priority DESC,w.created_at"
+            )
+            args: list[Any] = [project_id]
+            if work_item_ids:
+                sql = sql.replace(" ORDER BY", " AND w.id=ANY(%s) ORDER BY")
+                args.append(work_item_ids)
+            cur.execute(sql + " LIMIT 1", args)
+            work = cur.fetchone()
+            if not work:
+                return {"queued": 0}
+            cur.execute(
+                "SELECT s.id AS session_id,s.worker_id FROM research_worker_sessions s "
+                "JOIN lab_worker_runtimes r ON r.worker_session_id=s.id "
+                "WHERE s.current_project_id=%s AND s.status IN ('ACTIVE','IDLE') "
+                "AND s.current_work_item_id IS NULL AND r.status NOT IN ('ERROR','LOGIN_REQUIRED','DISCONNECTED') "
+                "ORDER BY s.last_heartbeat_at DESC FOR UPDATE SKIP LOCKED LIMIT 1",
+                (project_id,),
+            )
+            worker = cur.fetchone()
+            if not worker:
+                return {"queued": 0}
+            wake_id = str(uuid.uuid4())
+            cur.execute(
+                "INSERT INTO lab_worker_wake_requests(id,project_id,worker_id,worker_session_id,work_item_id,reason,status,created_at) "
+                "VALUES(%s,%s,%s,%s,%s,'READY_WORK','PENDING',%s) "
+                "ON CONFLICT(worker_session_id) WHERE status IN ('PENDING','DISPATCHED') DO NOTHING RETURNING id",
+                (wake_id, project_id, worker["worker_id"], worker["session_id"], work["id"], now),
+            )
+            if cur.fetchone():
+                self.store._event(cur, project_id, "WORKER_WAKE_QUEUED", wake_id, {"work_item_id": str(work["id"]), "reason": "READY_WORK"})
+                queued = 1
+        return {"queued": queued}
+
     def wake_claim_next(self, project_id: str | None = None) -> dict[str, Any] | None:
         """Atomically hand one pending operational wake to a runtime dispatcher."""
         now = self._now()
