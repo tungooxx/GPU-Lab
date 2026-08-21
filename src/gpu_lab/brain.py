@@ -700,6 +700,19 @@ class ResearchBrain:
             **temporal,
         )
         latest_discovery_round = max(completed_rounds, key=lambda item: item["created_at"], default=None)
+        if latest_discovery_round:
+            # A completed archive is still not safe to rank after decisive
+            # state changed.  The DDE snapshot excludes DDE bookkeeping itself.
+            from .discovery_v33 import DistributedDiscoveryService
+
+            staleness = DistributedDiscoveryService(self.store, migrate=False).stale_check(
+                str(latest_discovery_round["id"]), mark_stale=persist,
+            )
+            if staleness["stale"]:
+                raise GPUError(
+                    "DISCOVERY_ROUND_STALE",
+                    "The completed discovery archive predates current scientific state; do not select from it blindly.",
+                )
         portfolio = (
             self._portfolio_refresh(project_id)
             if persist

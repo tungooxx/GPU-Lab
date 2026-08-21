@@ -121,3 +121,20 @@ def test_isolated_round_blocks_peer_finding_messages_and_detects_stale_state():
     assert dde.stale_check(round_["id"])["stale"] is True
     assert dde.stale_check(round_["id"], mark_stale=True)["round"]["status"] == "STALE"
     assert batch["data"]["worker_session_id"] == first["session_id"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_stale_round_cannot_be_synthesized_into_a_new_execution_portfolio():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab, dde = LabController(store), DistributedDiscoveryService(store)
+    project_id = store.project_create(f"dde-stale-{time.time_ns()}", "Stale round")['project_id']
+    worker = lab.join(None, "stale-worker", "CODEX", project_id)
+    round_ = dde.create_round(project_id, None, "MECHANISM_SEARCH")
+    batch = dde.join_round(round_["id"], worker["worker"]["id"], worker["session_id"], "CAUSAL_INVERSION", "FAR")
+    dde.submit_candidate(round_["id"], batch["id"], worker["worker"]["id"], worker["session_id"], _candidate("candidate", {"causal_object": "new"}))
+    dde.batch_freeze(round_["id"], batch["id"], worker["worker"]["id"], worker["session_id"])
+    store.object_create(project_id, "Claim", {"statement": "decisive update", "scope": "test"}, "CLAIM_CREATED")
+    with pytest.raises(GPUError) as exc:
+        dde.synthesize(round_["id"])
+    assert exc.value.error_type == "DISCOVERY_ROUND_STALE"
+    assert dde.round_get(round_["id"])["status"] == "STALE"

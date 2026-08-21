@@ -532,6 +532,12 @@ class DistributedDiscoveryService:
         return {"status": "CLEAR"}
 
     def synthesize(self, round_id: str, literature_available: bool = False) -> dict:
+        staleness = self.stale_check(round_id, mark_stale=True)
+        if staleness["stale"]:
+            raise GPUError(
+                "DISCOVERY_ROUND_STALE",
+                "Scientific state changed after independent generation; preserve this round for history and start a fresh one.",
+            )
         round_ = self._round(round_id)
         if round_["data"].get("phase") not in {"GENERATION_FROZEN", "CHARACTERIZATION", "DEAD_MEMORY_SCREEN", "QD_ARCHIVE", "LITERATURE_PASS", "SYNTHESIS", "COMPLETED"}:
             raise GPUError("DISCOVERY_SYNTHESIS_BEFORE_FREEZE", round_id)
