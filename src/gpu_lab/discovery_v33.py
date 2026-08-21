@@ -293,10 +293,19 @@ class DistributedDiscoveryService:
         members = self._members(round_id)
         used_operators = {member["generation_operator"] for member in members}
         counts = Counter(member["requested_distance"] for member in members)
+        required_coverage = round_["data"]["required_distance_coverage"]
+        # Cover each required scientific radius once before assigning a second
+        # attempt to any radius.  Otherwise DIVERGENT_SEARCH's second FAR
+        # reservation can consume the final worker slot and silently omit the
+        # required ORTHOGONAL attempt.
         missing = [
-            distance for distance, required in round_["data"]["required_distance_coverage"].items()
-            for _ in range(max(0, required - counts[distance]))
+            distance for distance, required in required_coverage.items()
+            if required and not counts[distance]
         ]
+        missing.extend(
+            distance for distance, required in required_coverage.items()
+            for _ in range(max(0, required - max(1, counts[distance])))
+        )
         regime_operators = {
             "EXPLOIT": ["LOCAL_CAUSAL_REPAIR", "CAUSAL_INVERSION", "REPRESENTATION_RESET"],
             "MECHANISM_SEARCH": ["LOCAL_CAUSAL_REPAIR", "CAUSAL_INVERSION", "INFORMATION_PATH_REDESIGN", "STRONG_NULL_CONSTRUCTION"],
@@ -686,6 +695,7 @@ class DistributedDiscoveryService:
         return {**archive, "survivors": [self.store.object_get(candidate_id) for candidate_id in archive["data"].get("survivor_candidate_ids", [])]}
 
     def outcome_get(self, candidate_id: str) -> dict:
+        candidate_id = str(candidate_id)
         candidate = self.store.object_get(candidate_id)
         if candidate["kind"] != "DiscoveryCandidate":
             raise GPUError("DISCOVERY_CANDIDATE_NOT_FOUND", candidate_id)
@@ -693,6 +703,7 @@ class DistributedDiscoveryService:
         return outcomes[0] if outcomes else {"candidate_id": candidate_id, "resolution_status": "UNKNOWN", "reason": "UNEXECUTED_OR_UNASSESSED_CANDIDATE"}
 
     def outcome_record(self, candidate_id: str, outcome: dict[str, Any]) -> dict:
+        candidate_id = str(candidate_id)
         candidate = self.store.object_get(candidate_id)
         if candidate["kind"] != "DiscoveryCandidate":
             raise GPUError("DISCOVERY_CANDIDATE_NOT_FOUND", candidate_id)
