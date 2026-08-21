@@ -32,6 +32,7 @@ from .cockpit_dashboard import COCKPIT_HTML
 from .config import Settings
 from .dashboard import DASHBOARD_HTML
 from .discovery import breakthrough_signal, local_search_collapse_diagnosis
+from .discovery_v33 import DistributedDiscoveryService
 from .embeddings import EmbeddingService, LocalHashEmbeddingProvider
 from .engineering import CodingExecutionPolicy, EngineeringService
 from .epistemics import EpistemicService
@@ -62,7 +63,7 @@ def _source_sha(path: Path) -> str | None:
 
 _RUNTIME_SOURCE_PATHS = {
     name: Path(__file__).with_name(name)
-    for name in ("server.py", "brain.py", "research.py", "lab.py")
+    for name in ("server.py", "brain.py", "research.py", "lab.py", "discovery_v33.py")
 }
 # Captured at module import, before any MCP request creates the singleton Brain.
 # This detects source mounts changing underneath a long-lived Python process;
@@ -70,8 +71,9 @@ _RUNTIME_SOURCE_PATHS = {
 # state across incompatible class definitions.
 _LOADED_SOURCE_SHAS = {name: _source_sha(path) for name, path in _RUNTIME_SOURCE_PATHS.items()}
 
-settings, service, research_store, research_brain, brain_bench_service, epistemic_service, literature_service, executable_paper_service, qd_service, branch_service, meta_research_service, strategy_service, policy_lab_service, lab_controller_service = (
+settings, service, research_store, research_brain, brain_bench_service, epistemic_service, literature_service, executable_paper_service, qd_service, branch_service, meta_research_service, strategy_service, policy_lab_service, lab_controller_service, distributed_discovery_service = (
     Settings(),
+    None,
     None,
     None,
     None,
@@ -130,6 +132,12 @@ _READ_ONLY_TOOLS = {
     "lab_workers_list",
     "lab_work_list",
     "lab_message_list",
+    "discovery_round_get",
+    "discovery_batch_get",
+    "discovery_round_stale_check",
+    "discovery_archive_get",
+    "discovery_outcome_get",
+    "discovery_shadow_preview",
     "runtime_code_version",
     "research_benchmark_list",
     "research_benchmark_episode_get",
@@ -670,6 +678,15 @@ def qd() -> HypothesisQDService:
     return qd_service
 
 
+def distributed_discovery() -> DistributedDiscoveryService:
+    global distributed_discovery_service
+    if distributed_discovery_service is None:
+        with _singleton_lock:
+            if distributed_discovery_service is None:
+                distributed_discovery_service = DistributedDiscoveryService(research())
+    return distributed_discovery_service
+
+
 def research_operators() -> ResearchOperatorService:
     global research_operator_service
     if settings.gpu_lab_research_operator_provider != "literature-http":
@@ -1074,6 +1091,116 @@ async def lab_sync(
 ):
     """Incrementally synchronize one worker with shared events, work, leases, and messages."""
     return await call(lab().sync, session_id, project_id, since, current_work_item_id, expected_work_version)
+
+
+@mcp.tool()
+async def discovery_round_create(
+    project_id: str, search_regime: Literal["EXPLOIT", "MECHANISM_SEARCH", "DIVERGENT_SEARCH", "PARADIGM_RESET"],
+    agenda_item_id: str | None = None, triggering_decision_id: str | None = None,
+    generation_budget: dict[str, int] | None = None, policy_version: str | None = None,
+    brain_policy_version: str | None = None,
+):
+    """Freeze canonical state and start an isolated v3.3 discovery round; never executes an experiment."""
+    return await call(distributed_discovery().create_round, project_id, agenda_item_id, search_regime,
+                      triggering_decision_id=triggering_decision_id, generation_budget=generation_budget,
+                      policy_version=policy_version, brain_policy_version=brain_policy_version)
+
+
+@mcp.tool()
+async def discovery_round_join(
+    discovery_round_id: str, worker_id: str, session_id: str,
+    generation_operator: str, requested_distance: Literal["NEAR", "MID", "FAR", "ORTHOGONAL"],
+):
+    """Join one worker to an independent discovery batch with a search transformation, not a persona."""
+    return await call(distributed_discovery().join_round, discovery_round_id, worker_id, session_id,
+                      generation_operator, requested_distance)
+
+
+@mcp.tool()
+async def discovery_candidate_submit(
+    discovery_round_id: str, candidate_batch_id: str, worker_id: str, session_id: str,
+    candidate: dict[str, Any],
+):
+    """Persist one immutable proposal-time discovery candidate in the caller's own open batch."""
+    return await call(distributed_discovery().submit_candidate, discovery_round_id, candidate_batch_id,
+                      worker_id, session_id, candidate)
+
+
+@mcp.tool()
+async def discovery_batch_freeze(
+    discovery_round_id: str, candidate_batch_id: str, worker_id: str, session_id: str,
+    abstention_reason: str | None = None,
+):
+    """Freeze a candidate batch; an empty batch must explicitly abstain rather than invent an idea."""
+    return await call(distributed_discovery().batch_freeze, discovery_round_id, candidate_batch_id,
+                      worker_id, session_id, abstention_reason)
+
+
+@mcp.tool()
+async def discovery_round_lab_work_create(discovery_round_id: str):
+    """Create bounded independent-generation Lab WorkItems for joined round workers."""
+    return await call(distributed_discovery().lab_work_items, discovery_round_id)
+
+
+@mcp.tool()
+async def discovery_peer_isolation_override(
+    discovery_round_id: str, candidate_batch_id: str, worker_id: str, session_id: str, rationale: str,
+):
+    """Record a user-directed peer-idea sharing override; the affected batch is no longer independent."""
+    return await call(distributed_discovery().peer_isolation_override, discovery_round_id, candidate_batch_id,
+                      worker_id, session_id, rationale)
+
+
+@mcp.tool()
+async def discovery_round_get(discovery_round_id: str, requester_session_id: str | None = None):
+    """Read a discovery round without exposing current-round peer candidate content before freeze."""
+    return await call(distributed_discovery().round_get, discovery_round_id, requester_session_id)
+
+
+@mcp.tool()
+async def discovery_round_stale_check(discovery_round_id: str):
+    """Read whether a discovery round's frozen scientific snapshot is now stale; does not mutate it."""
+    return await call(distributed_discovery().stale_check, discovery_round_id, False)
+
+
+@mcp.tool()
+async def discovery_batch_get(discovery_round_id: str, candidate_batch_id: str, requester_session_id: str):
+    """Read a batch; peer batches are denied during independent generation."""
+    return await call(distributed_discovery().batch_get, discovery_round_id, candidate_batch_id, requester_session_id)
+
+
+@mcp.tool()
+async def discovery_synthesis_start(discovery_round_id: str, literature_available: bool = False):
+    """Build the cross-worker QD archive after all batches freeze; agreement never becomes evidence."""
+    return await call(distributed_discovery().synthesize, discovery_round_id, literature_available)
+
+
+@mcp.tool()
+async def discovery_archive_get(archive_id: str):
+    """Read the decomposed cross-worker QD archive and provisional selected/runner-up candidates."""
+    return await call(distributed_discovery().archive_get, archive_id)
+
+
+@mcp.tool()
+async def discovery_outcome_get(discovery_candidate_id: str):
+    """Read a candidate's later trajectory; unexecuted candidates remain UNKNOWN."""
+    return await call(distributed_discovery().outcome_get, discovery_candidate_id)
+
+
+@mcp.tool()
+async def discovery_outcome_record(discovery_candidate_id: str, outcome: dict[str, Any]):
+    """Persist retrospective discovery outcome metadata without rewriting the original proposal."""
+    return await call(distributed_discovery().outcome_record, discovery_candidate_id, outcome)
+
+
+@mcp.tool()
+async def discovery_shadow_preview(
+    project_id: str,
+    candidates: list[dict[str, Any]],
+    search_regime: Literal["EXPLOIT", "MECHANISM_SEARCH", "DIVERGENT_SEARCH", "PARADIGM_RESET"],
+):
+    """Read-only v3.3 diversity characterization; it creates no round, work item, or experiment."""
+    return await call(distributed_discovery().shadow_preview, project_id, candidates, search_regime)
 
 
 @mcp.tool()

@@ -91,6 +91,15 @@ RESEARCH_OBJECT_KINDS = (
     "LiteraturePolicyTransfer",
     "ProviderAdapterCandidate",
     "PolicyTournament",
+    # v3.3 Distributed Discovery Engine. These are proposal/search records;
+    # none changes hypothesis belief without the existing evidence workflow.
+    "DiscoveryRound",
+    "CandidateBatch",
+    "DiscoveryCandidate",
+    "MechanisticNiche",
+    "CrossWorkerQDArchive",
+    "DiscoveryCandidateOutcome",
+    "DiscoveryCoverageAtDecision",
 )
 RESEARCH_OBJECT_STATUSES = {
     "ACTIVE",
@@ -145,6 +154,13 @@ RESEARCH_OBJECT_STATUSES = {
     "unknown",
     "TECHNICAL_CANCELLED",
     "TECHNICAL_ORPHANED",
+    "CREATED",
+    "FROZEN",
+    "ABSTAINED",
+    "ARCHIVED",
+    "STALE",
+    "INVALID",
+    "UNRESOLVED",
 }
 
 # Orthogonal epistemic classifications. These are metadata about the role and

@@ -671,6 +671,35 @@ class ResearchBrain:
             items,
             key=lambda item: item["data"].get("importance", 1) * item["data"].get("uncertainty", 1),
         )
+        # A v3.3 round is a deliberately isolated *search* phase.  Do not let
+        # the normal single-Brain ranker collapse it into an execution choice
+        # before the independent batches and coverage record are complete.
+        discovery_rounds = self.store.objects_list(
+            project_id,
+            "DiscoveryRound",
+            {"ACTIVE"},
+            limit=None,
+            data_filters={"agenda_item_id": str(agenda_item["id"])},
+            **temporal,
+        )
+        generating_rounds = [
+            item for item in discovery_rounds
+            if item["data"].get("phase") in {"INDEPENDENT_GENERATION", "GENERATION_FROZEN", "CHARACTERIZATION", "DEAD_MEMORY_SCREEN", "QD_ARCHIVE", "LITERATURE_PASS", "SYNTHESIS"}
+        ]
+        if generating_rounds:
+            raise GPUError(
+                "DISCOVERY_ROUND_INCOMPLETE",
+                "Independent distributed discovery is still in progress; synthesize its coverage before Brain ranking.",
+            )
+        completed_rounds = self.store.objects_list(
+            project_id,
+            "DiscoveryRound",
+            {"COMPLETED"},
+            limit=None,
+            data_filters={"agenda_item_id": str(agenda_item["id"])},
+            **temporal,
+        )
+        latest_discovery_round = max(completed_rounds, key=lambda item: item["created_at"], default=None)
         portfolio = (
             self._portfolio_refresh(project_id)
             if persist
@@ -779,6 +808,9 @@ class ResearchBrain:
                 "state_freshness": state["state_freshness"],
                 "comparative_lesson_ids": [str(item["id"]) for item in comparative_lessons],
                 "meta_lesson_ids": [str(item["id"]) for item in meta_lessons],
+                "distributed_discovery_round_id": str(latest_discovery_round["id"]) if latest_discovery_round else None,
+                "distributed_discovery_archive_id": latest_discovery_round["data"].get("archive_id") if latest_discovery_round else None,
+                "distributed_discovery_coverage_id": latest_discovery_round["data"].get("coverage_id") if latest_discovery_round else None,
             },
             "evidence_considered": self._evidence_ids(state),
             "hypotheses_affected": [str(item["id"]) for item in hypotheses],

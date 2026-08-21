@@ -12,6 +12,8 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import psycopg
+
 from .errors import GPUError
 from .research import ResearchStore
 
@@ -995,6 +997,27 @@ class LabController:
         with self.store._connect() as conn, conn.cursor() as cur:
             self._worker(cur, from_worker_id)
             self._session(cur, from_session_id, from_worker_id, project_id)
+            if message_type == "SHARE_FINDING":
+                # During DDE v3.3 independent generation, a candidate rationale
+                # sent as a LabMessage would bypass the data-access isolation.
+                # Operational messages and post-freeze synthesis remain allowed.
+                try:
+                    cur.execute(
+                        "SELECT 1 FROM discovery_round_memberships m JOIN research_objects r "
+                        "ON r.id=m.discovery_round_id WHERE m.worker_session_id=%s "
+                        "AND r.project_id=%s AND r.kind='DiscoveryRound' AND r.status='ACTIVE' "
+                        "AND r.data->>'phase'='INDEPENDENT_GENERATION' LIMIT 1",
+                        (from_session_id, project_id),
+                    )
+                    if cur.fetchone():
+                        raise GPUError(
+                            "DISCOVERY_PEER_MESSAGE_BLOCKED",
+                            "Current-round candidate sharing is blocked until every batch is frozen.",
+                        )
+                except psycopg.errors.UndefinedTable:
+                    # DDE has not been initialized on this legacy database yet.
+                    conn.rollback()
+                    cur.execute("SELECT pg_advisory_xact_lock(hashtext('gpu_lab_lab_worker_migration'))")
             if to_worker_id:
                 self._worker(cur, to_worker_id)
                 cur.execute("SELECT 1 FROM research_worker_sessions WHERE worker_id=%s AND current_project_id=%s AND status NOT IN ('DISCONNECTED','EXPIRED')", (to_worker_id, project_id))

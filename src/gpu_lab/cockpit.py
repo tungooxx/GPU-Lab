@@ -222,12 +222,30 @@ class CockpitController:
                 (project_id,),
             )
             wakes = [self.lab._record(row) for row in cur.fetchall()]
+            cur.execute(
+                "SELECT id,status,data,created_at FROM research_objects WHERE project_id=%s "
+                "AND kind='DiscoveryRound' ORDER BY created_at DESC LIMIT 12",
+                (project_id,),
+            )
+            discovery_rounds = [
+                {
+                    "id": str(row["id"]), "status": row["status"],
+                    "search_regime": row["data"].get("search_regime"),
+                    "phase": row["data"].get("phase"),
+                    "peer_visibility": row["data"].get("peer_visibility"),
+                    "required_distance_coverage": row["data"].get("required_distance_coverage", {}),
+                    "created_at": row["created_at"],
+                }
+                for row in cur.fetchall()
+            ]
         return {
             "lab_state": lab_state,
             "controls": self.controls_get(project_id),
             "browser_runtimes": runtimes,
             "recent_turns": turns,
             "pending_wake_requests": wakes,
+            # Deliberately excludes candidate content while a round is isolated.
+            "discovery_rounds": discovery_rounds,
         }
 
     def turn_report(self, project_id: str, worker_id: str, session_id: str, outcome: str,
