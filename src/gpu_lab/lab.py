@@ -740,8 +740,8 @@ class LabController:
                         (str(uuid.uuid4()), work_item_id, target_type, target_id, json.dumps(dependency.get("required_statuses", [])), json.dumps(dependency.get("invalidating_statuses", [])), str(dependency.get("description", "")), now))
 
     def resolve_dependencies(self, project_id: str) -> dict[str, int]:
-        """Move eligible waiting work to READY and invalidate deterministic stale work."""
-        changed = {"ready": 0, "invalidated": 0}
+        """Reconcile dependency-gated work without leaving unsafe READY items claimable."""
+        changed = {"ready": 0, "waiting": 0, "invalidated": 0}
         now = self._now()
         with self.store._connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT * FROM lab_work_items WHERE project_id=%s AND status IN ('DORMANT','WAITING_DEPENDENCY','BLOCKED','READY','CLAIMED','RUNNING') FOR UPDATE", (project_id,))
@@ -758,6 +758,16 @@ class LabController:
                     self._event(cur, project_id, "WORK_ITEM_INVALIDATED", item["id"], {"reason": invalidations})
                     changed["invalidated"] += 1
                     continue
+                unsatisfied = [detail for satisfied, _, detail in outcomes if not satisfied]
+                if unsatisfied and item["status"] == "READY":
+                    reason = "; ".join(unsatisfied)
+                    cur.execute(
+                        "UPDATE lab_work_items SET status='WAITING_DEPENDENCY',blocked_reason=%s,updated_at=%s WHERE id=%s",
+                        (reason, now, item["id"]),
+                    )
+                    self._event(cur, project_id, "WORK_ITEM_WAITING_DEPENDENCY", item["id"], {"reason": reason})
+                    changed["waiting"] += 1
+                    continue
                 if all(satisfied for satisfied, _, _ in outcomes) and item["status"] in {"DORMANT", "WAITING_DEPENDENCY", "BLOCKED"}:
                     cur.execute("UPDATE lab_work_items SET status='READY',blocked_reason=NULL,updated_at=%s WHERE id=%s", (now, item["id"]))
                     self._event(cur, project_id, "WORK_DEPENDENCY_RESOLVED", item["id"], {})
@@ -771,27 +781,55 @@ class LabController:
         now = self._now()
         expiry = now + timedelta(seconds=max(30, lease_seconds or self.lease_seconds))
         lease_id = str(uuid.uuid4())
+        dependency_error: tuple[str, str] | None = None
+        result: dict | None = None
         with self.store._connect() as conn, conn.cursor() as cur:
             self._worker(cur, worker_id)
-            cur.execute("SELECT project_id,kind,estimated_cost FROM lab_work_items WHERE id=%s", (work_item_id,))
+            cur.execute("SELECT project_id,kind,estimated_cost,status FROM lab_work_items WHERE id=%s FOR UPDATE", (work_item_id,))
             target = cur.fetchone()
             if not target:
                 raise GPUError("LAB_WORK_NOT_FOUND", work_item_id)
             session = self._session(cur, session_id, worker_id, str(target["project_id"]))
             if str(session["current_project_id"]) != str(target["project_id"]):
                 raise GPUError("LAB_PROJECT_MISMATCH", work_item_id)
-            self._enforce_claim_budget(cur, str(target["project_id"]), target, session_id)
-            cur.execute("UPDATE lab_work_items SET status='CLAIMED',assigned_worker_id=%s,assigned_session_id=%s,lease_id=%s,updated_at=%s WHERE id=%s AND status='READY' RETURNING *", (worker_id, session_id, lease_id, now, work_item_id))
-            item = cur.fetchone()
-            if not item:
-                raise GPUError("LAB_WORK_NOT_CLAIMABLE", work_item_id)
-            cur.execute("INSERT INTO lab_work_leases(id,work_item_id,worker_id,worker_session_id,acquired_at,heartbeat_at,expires_at) VALUES(%s,%s,%s,%s,%s,%s,%s)", (lease_id, work_item_id, worker_id, session_id, now, now, expiry))
-            cur.execute("UPDATE research_worker_sessions SET current_work_item_id=%s,active_role=%s,status='BUSY',last_heartbeat_at=%s WHERE id=%s", (work_item_id, role or item["scientific_role"], now, session_id))
-            self._event(cur, item["project_id"], "WORK_CLAIMED", work_item_id, {"worker_id": worker_id, "session_id": session_id, "lease_id": lease_id, "role": role or item["scientific_role"]})
-            result = self._record(item)
-            result["lease_id"] = lease_id
-            result["lease_expires_at"] = expiry
-            return result
+            cur.execute("SELECT * FROM lab_work_dependencies WHERE work_item_id=%s", (work_item_id,))
+            dependencies = cur.fetchall()
+            if dependencies:
+                outcomes = [self._dependency_status(cur, str(target["project_id"]), dependency) for dependency in dependencies]
+                invalidations = [detail for _, invalidated, detail in outcomes if invalidated]
+                unsatisfied = [detail for satisfied, _, detail in outcomes if not satisfied]
+                if invalidations:
+                    reason = "; ".join(invalidations)
+                    cur.execute(
+                        "UPDATE lab_work_items SET status='INVALIDATED',invalidated_reason=%s,updated_at=%s,completed_at=%s WHERE id=%s AND status='READY'",
+                        (reason, now, now, work_item_id),
+                    )
+                    self._event(cur, target["project_id"], "WORK_ITEM_INVALIDATED", work_item_id, {"reason": invalidations})
+                    dependency_error = ("LAB_WORK_DEPENDENCY_INVALIDATED", reason)
+                elif unsatisfied:
+                    reason = "; ".join(unsatisfied)
+                    cur.execute(
+                        "UPDATE lab_work_items SET status='WAITING_DEPENDENCY',blocked_reason=%s,updated_at=%s WHERE id=%s AND status='READY'",
+                        (reason, now, work_item_id),
+                    )
+                    self._event(cur, target["project_id"], "WORK_ITEM_WAITING_DEPENDENCY", work_item_id, {"reason": reason})
+                    dependency_error = ("LAB_WORK_DEPENDENCY_UNSATISFIED", reason)
+            if dependency_error is None:
+                self._enforce_claim_budget(cur, str(target["project_id"]), target, session_id)
+                cur.execute("UPDATE lab_work_items SET status='CLAIMED',assigned_worker_id=%s,assigned_session_id=%s,lease_id=%s,updated_at=%s WHERE id=%s AND status='READY' RETURNING *", (worker_id, session_id, lease_id, now, work_item_id))
+                item = cur.fetchone()
+                if not item:
+                    raise GPUError("LAB_WORK_NOT_CLAIMABLE", work_item_id)
+                cur.execute("INSERT INTO lab_work_leases(id,work_item_id,worker_id,worker_session_id,acquired_at,heartbeat_at,expires_at) VALUES(%s,%s,%s,%s,%s,%s,%s)", (lease_id, work_item_id, worker_id, session_id, now, now, expiry))
+                cur.execute("UPDATE research_worker_sessions SET current_work_item_id=%s,active_role=%s,status='BUSY',last_heartbeat_at=%s WHERE id=%s", (work_item_id, role or item["scientific_role"], now, session_id))
+                self._event(cur, item["project_id"], "WORK_CLAIMED", work_item_id, {"worker_id": worker_id, "session_id": session_id, "lease_id": lease_id, "role": role or item["scientific_role"]})
+                result = self._record(item)
+                result["lease_id"] = lease_id
+                result["lease_expires_at"] = expiry
+        if dependency_error is not None:
+            raise GPUError(*dependency_error)
+        assert result is not None
+        return result
 
     def heartbeat(self, session_id: str, work_item_id: str | None = None, lease_seconds: int | None = None) -> dict:
         now = self._now()

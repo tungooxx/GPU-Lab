@@ -111,6 +111,36 @@ def test_atomic_claim_and_dependency_reactivation_survive_store_restart():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_unsatisfied_dependency_demotes_ready_work_and_blocks_claim():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-dependency-invariant-{time.time_ns()}", "Dependency invariant")["project_id"]
+    worker = lab.join(None, "dependency-worker", "CODEX", project_id)
+    prerequisite = lab.create_work(
+        project_id, "ENGINEERING", "Recover service", "Repair upstream service", "ENGINEER",
+        worker["worker"]["id"], created_session_id=worker["session_id"],
+    )
+    dependent = lab.create_work(
+        project_id, "EXPERIMENT_DESIGN", "Preregister", "Must wait", "SCIENTIST",
+        worker["worker"]["id"], created_session_id=worker["session_id"],
+        dependencies=[{"target_type": "WORK_ITEM", "target_id": prerequisite["id"], "required_statuses": ["COMPLETED"]}],
+    )
+    assert dependent["status"] == "WAITING_DEPENDENCY"
+    # Simulate a legacy/partial write that attached a dependency to READY work.
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE lab_work_items SET status='READY',blocked_reason=NULL WHERE id=%s", (dependent["id"],))
+    assert lab.resolve_dependencies(project_id)["waiting"] == 1
+    assert lab.work_get(dependent["id"])["status"] == "WAITING_DEPENDENCY"
+
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE lab_work_items SET status='READY',blocked_reason=NULL WHERE id=%s", (dependent["id"],))
+    with pytest.raises(GPUError) as exc:
+        lab.claim_work(dependent["id"], worker["worker"]["id"], worker["session_id"])
+    assert exc.value.error_type == "LAB_WORK_DEPENDENCY_UNSATISFIED"
+    assert lab.work_get(dependent["id"])["status"] == "WAITING_DEPENDENCY"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_budget_and_expired_lease_release_work_without_touching_experiment():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store, lease_seconds=30)
