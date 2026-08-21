@@ -32,9 +32,20 @@ def main() -> None:
         timeline.append(text)
         print(f"  {len(timeline):02d}. {text}")
 
+    model = store.object_create(project_id, "WorldModel", {"mechanisms": ["frozen-mechanism"]}, "SMOKE_MODEL")
+    agenda = store.object_create(project_id, "ResearchAgenda", {"question": "What mechanism remains?"}, "SMOKE_AGENDA")
+    item = store.object_create(project_id, "AgendaItem", {"agenda_id": str(agenda["id"]), "question": "Search distant explanations", "importance": 1, "uncertainty": 1}, "SMOKE_ITEM", "OPEN")
+    store.object_create(project_id, "FrontierGap", {"severity": "HIGH", "lineage": "mature-model"}, "SMOKE_FRONTIER")
+    store.object_create(project_id, "StagnationState", {"local_search_saturation": "HIGH"}, "SMOKE_STAGNATION")
+    store.object_create(project_id, "ArchitectureLineage", {"name": "saturated-lineage"}, "SMOKE_LINEAGE")
+    store.object_create(project_id, "NegativeResult", {"scientific_dimensions": {"representation": "retired-token"}}, "SMOKE_NEGATIVE")
+    store.object_create(project_id, "BreakthroughSignal", {"type": "PARTIAL", "discovery_value": "partial"}, "SMOKE_BREAKTHROUGH")
     workers = [lab.join(None, f"dde-smoke-{name}", "CODEX", project_id) for name in "ABCD"]
-    event("created a frozen-state project and four durable workers")
-    round_ = dde.create_round(project_id, None, "PARADIGM_RESET")
+    event("created frozen model/agenda/frontier/negative-memory state and four durable workers")
+    round_ = dde.create_round(project_id, item["id"], "PARADIGM_RESET")
+    assert round_["data"]["frozen_state"]["frontier_gap_ids"]
+    assert round_["data"]["frozen_state"]["negative_result_ids"]
+    assert round_["data"]["frozen_state"]["architecture_lineage_ids"]
     assignments = [
         ("REPRESENTATION_RESET", "FAR", {"representation": "point tokens"}),
         ("CAUSAL_INVERSION", "MID", {"information_path": "inverse causal probe"}),

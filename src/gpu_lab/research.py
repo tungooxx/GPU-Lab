@@ -49,6 +49,12 @@ RESEARCH_OBJECT_KINDS = (
     "CandidatePortfolio",
     "BreakthroughSignal",
     "HypothesisNiche",
+    # Explicit structured inputs to a frozen discovery state.  Older projects
+    # may express these in portfolio metadata; these additive kinds support
+    # prospective v3.3 records without rewriting historical decisions.
+    "ArchitectureLineage",
+    "FrontierGap",
+    "StagnationState",
     "ExperimentBranch",
     "ExperimentNode",
     "BranchRelation",
