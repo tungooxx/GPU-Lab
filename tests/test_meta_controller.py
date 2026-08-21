@@ -141,6 +141,27 @@ def test_recurring_bad_outcomes_create_one_durable_opportunity():
     assert controller.detect_opportunities("project") == []
 
 
+def test_discovery_coverage_creates_an_evaluation_gated_improvement_opportunity():
+    store = Store()
+    controller = MetaResearchController(store, PolicyLab())
+    archive = store.object_create(
+        "project",
+        "CrossWorkerQDArchive",
+        {"coverage": {"portfolio_health_flags": ["LOW_NICHE_COVERAGE", "DISTANCE_COVERAGE_INCOMPLETE"]}},
+        "FIXTURE",
+        "ARCHIVED",
+    )
+
+    found = controller.detect_opportunities("project")
+
+    assert {item["data"]["action_type"] for item in found} == {
+        "NICHE_COLLAPSE", "DISTANCE_RESERVATION_FAILURE",
+    }
+    assert all(item["data"]["supporting_evidence"] == [archive["id"]] for item in found)
+    assert all(item["data"]["requires_policy_evaluation"] is True for item in found)
+    assert controller.detect_opportunities("project") == []
+
+
 def test_campaign_persists_competing_noncausal_component_diagnosis_before_patch_generation():
     store = Store()
     lab = CampaignPolicyLab(store)

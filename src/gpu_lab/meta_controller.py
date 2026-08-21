@@ -591,6 +591,51 @@ class MetaResearchController:
             opportunity = self.store.object_create(project_id, "ImprovementOpportunity", {"source": "DECISION_OUTCOME", "target_component": "experiment_selection", "action_type": action, "observed_failure": f"Repeated {action} decisions have low or invalid information value.", "supporting_evidence": [str(r["id"]) for r in records], "frequency": frequency, "severity": severity, "scientific_cost": frequency, "compute_cost": 0.0, "confidence": min(0.95, 0.3 + frequency * 0.15), "estimated_fixability": 0.5, "expected_value_of_improvement": expected_value, "scope": "PROJECT", "fingerprint": fingerprint}, "IMPROVEMENT_OPPORTUNITY_CREATED", "CANDIDATE")
             self._ensure_meta_records(project_id, opportunity)
             opportunities.append(opportunity)
+        # DDE v3.3 search telemetry is observational meta-research evidence.
+        # It can request a policy investigation, but never patches discovery
+        # policy or changes scientific belief by itself.
+        diagnostic_map = {
+            "LOW_NICHE_COVERAGE": "NICHE_COLLAPSE",
+            "DISTANCE_COVERAGE_INCOMPLETE": "DISTANCE_RESERVATION_FAILURE",
+            "GENERATOR_CORRELATION_HIGH": "GENERATOR_CORRELATION",
+            "LITERATURE_UNVERIFIED": "LITERATURE_COUPLING",
+            "DEAD_MEMORY_SATURATION": "QD_ARCHIVE_COLLAPSE",
+        }
+        for archive in self._objects(project_id, "CrossWorkerQDArchive"):
+            coverage = archive["data"].get("coverage", {})
+            flags = coverage.get("portfolio_health_flags") or [coverage.get("portfolio_health")]
+            for flag in filter(None, flags):
+                code = diagnostic_map.get(str(flag))
+                if not code:
+                    continue
+                fingerprint = f"discovery-diagnostic:{archive['id']}:{code}"
+                if fingerprint in existing or self._find_by_fingerprint(project_id, "ImprovementOpportunity", fingerprint):
+                    continue
+                opportunity = self.store.object_create(
+                    project_id,
+                    "ImprovementOpportunity",
+                    {
+                        "source": "DISCOVERY_COVERAGE",
+                        "target_component": "distributed_discovery",
+                        "action_type": code,
+                        "observed_failure": f"DDE archive reported {flag}; this is a diagnostic, not scientific evidence.",
+                        "supporting_evidence": [str(archive["id"])],
+                        "frequency": 1,
+                        "severity": 1,
+                        "scientific_cost": 0.0,
+                        "compute_cost": 0.0,
+                        "confidence": 0.5,
+                        "estimated_fixability": 0.5,
+                        "expected_value_of_improvement": 0.4,
+                        "scope": "PROJECT",
+                        "fingerprint": fingerprint,
+                        "requires_policy_evaluation": True,
+                    },
+                    "IMPROVEMENT_OPPORTUNITY_CREATED",
+                    "CANDIDATE",
+                )
+                self._ensure_meta_records(project_id, opportunity)
+                opportunities.append(opportunity)
         return opportunities
 
     def run_once(self, project_id: str) -> dict[str, Any]:

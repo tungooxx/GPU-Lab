@@ -89,6 +89,25 @@ def test_v31_benchmark_policy_prefers_distant_option_only_when_context_requires_
     assert decision.selected_action_id == episode.candidate_actions[1].action_id
 
 
+def test_v33_benchmark_does_not_rank_before_generation_and_uses_qd_survivors_afterward():
+    episode = ResearchBrainBench(BENCH_ROOT).load_episode("after_stage4.json")
+    episode.candidate_actions[0].action_type = "DISCOVERY_GENERATION"
+    episode.v33_context = {"generation_complete": False}
+    pending = ResearchBrainBench.baseline_decision(
+        episode, BenchmarkPolicy.BRAIN_V3_3_DISTRIBUTED_DISCOVERY,
+    )
+    assert pending.selected_action_id == episode.candidate_actions[0].action_id
+
+    episode.v33_context = {
+        "generation_complete": True,
+        "qd_survivor_action_ids": [episode.candidate_actions[1].action_id],
+    }
+    synthesized = ResearchBrainBench.baseline_decision(
+        episode, BenchmarkPolicy.BRAIN_V3_3_DISTRIBUTED_DISCOVERY,
+    )
+    assert synthesized.selected_action_id == episode.candidate_actions[1].action_id
+
+
 def test_all_nine_v31_frozen_regressions_select_the_expected_policy_action():
     episodes = ResearchBrainBench(V31_BENCH_ROOT).load_all()
     assert len(episodes) == 9
@@ -124,6 +143,7 @@ def test_v1_v15_and_v2_policies_run_on_blinded_visible_state():
         BenchmarkPolicy.BRAIN_V1_5,
         BenchmarkPolicy.BRAIN_V2_STRATEGY_AUGMENTED,
         BenchmarkPolicy.BRAIN_V3_1_DISCOVERY_SEARCH,
+        BenchmarkPolicy.BRAIN_V3_3_DISTRIBUTED_DISCOVERY,
     ):
         decision = ResearchBrainBench.baseline_decision(episode, policy)
         assert decision.selected_action_id in {
