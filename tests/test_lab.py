@@ -131,7 +131,6 @@ def test_unsatisfied_dependency_demotes_ready_work_and_blocks_claim():
         cur.execute("UPDATE lab_work_items SET status='READY',blocked_reason=NULL WHERE id=%s", (dependent["id"],))
     assert lab.resolve_dependencies(project_id)["waiting"] == 1
     assert lab.work_get(dependent["id"])["status"] == "WAITING_DEPENDENCY"
-
     with store._connect() as conn, conn.cursor() as cur:
         cur.execute("UPDATE lab_work_items SET status='READY',blocked_reason=NULL WHERE id=%s", (dependent["id"],))
     with pytest.raises(GPUError) as exc:
@@ -139,6 +138,37 @@ def test_unsatisfied_dependency_demotes_ready_work_and_blocks_claim():
     assert exc.value.error_type == "LAB_WORK_DEPENDENCY_UNSATISFIED"
     assert lab.work_get(dependent["id"])["status"] == "WAITING_DEPENDENCY"
 
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_dependency_reconciliation_supersedes_duplicate_equivalent_dormant_work():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-equivalence-reconcile-{time.time_ns()}", "Equivalent work") ["project_id"]
+    worker = lab.join(None, "equivalence-worker", "CODEX", project_id)
+    prerequisite = lab.create_work(
+        project_id, "ENGINEERING", "Implement", "Complete first", "ENGINEER",
+        worker["worker"]["id"], created_session_id=worker["session_id"],
+    )
+    dependency = [{"target_type": "WORK_ITEM", "target_id": prerequisite["id"], "required_statuses": ["COMPLETED"]}]
+    first = lab.create_work(
+        project_id, "REVIEW", "Canonical review", "One review", "ADVERSARIAL_REVIEWER",
+        worker["worker"]["id"], created_session_id=worker["session_id"], dependencies=dependency,
+        equivalence_key="same-review", dormant_until_dependencies=True,
+    )
+    duplicate = lab.create_work(
+        project_id, "REVIEW", "Duplicate review", "Same review", "ADVERSARIAL_REVIEWER",
+        worker["worker"]["id"], created_session_id=worker["session_id"], dependencies=dependency,
+        equivalence_key="same-review", dormant_until_dependencies=True,
+    )
+    claimed = lab.claim_work(prerequisite["id"], worker["worker"]["id"], worker["session_id"])
+    lab.complete_work(claimed["id"], worker["worker"]["id"], worker["session_id"], summary="Implemented")
+    # complete_work invokes dependency reconciliation itself; the explicit
+    # second pass must be idempotent rather than recreating either work item.
+    assert lab.resolve_dependencies(project_id) == {"ready": 0, "waiting": 0, "invalidated": 0}
+    assert lab.work_get(first["id"])["status"] == "READY"
+    reconciled = lab.work_get(duplicate["id"])
+    assert reconciled["status"] == "SUPERSEDED"
+    assert reconciled["superseded_by"] == first["id"]
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_budget_and_expired_lease_release_work_without_touching_experiment():

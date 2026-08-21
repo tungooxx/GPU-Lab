@@ -744,7 +744,17 @@ class LabController:
         changed = {"ready": 0, "waiting": 0, "invalidated": 0}
         now = self._now()
         with self.store._connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT * FROM lab_work_items WHERE project_id=%s AND status IN ('DORMANT','WAITING_DEPENDENCY','BLOCKED','READY','CLAIMED','RUNNING') FOR UPDATE", (project_id,))
+            # A deterministic order establishes which historical duplicate is
+            # canonical when dormant equivalent work becomes eligible at once.
+            # The partial uniqueness constraint remains the final guard, but
+            # reconciliation must never rely on a constraint exception for a
+            # normal duplicate-work condition.
+            cur.execute(
+                "SELECT * FROM lab_work_items WHERE project_id=%s AND status IN "
+                "('DORMANT','WAITING_DEPENDENCY','BLOCKED','READY','CLAIMED','RUNNING') "
+                "ORDER BY created_at,id FOR UPDATE",
+                (project_id,),
+            )
             items = cur.fetchall()
             for item in items:
                 cur.execute("SELECT * FROM lab_work_dependencies WHERE work_item_id=%s", (item["id"],))
@@ -769,6 +779,30 @@ class LabController:
                     changed["waiting"] += 1
                     continue
                 if all(satisfied for satisfied, _, _ in outcomes) and item["status"] in {"DORMANT", "WAITING_DEPENDENCY", "BLOCKED"}:
+                    if item["equivalence_key"]:
+                        cur.execute(
+                            "SELECT id FROM lab_work_items WHERE project_id=%s AND equivalence_key=%s "
+                            "AND id<>%s AND status=ANY(%s) ORDER BY created_at,id LIMIT 1 FOR UPDATE",
+                            (project_id, item["equivalence_key"], item["id"], list(ACTIVE_WORK_STATUSES)),
+                        )
+                        equivalent = cur.fetchone()
+                        if equivalent:
+                            reason = (
+                                "Equivalent WorkItem became canonical before this duplicate was released: "
+                                f"{equivalent['id']}"
+                            )
+                            cur.execute(
+                                "UPDATE lab_work_items SET status='SUPERSEDED',authority_status='SUPERSEDED',"
+                                "superseded_by=%s,invalidated_reason=%s,invalidated_at=%s,updated_at=%s "
+                                "WHERE id=%s",
+                                (equivalent["id"], reason, now, now, item["id"]),
+                            )
+                            self._event(cur, project_id, "WORK_ITEM_EQUIVALENCE_SUPERSEDED", item["id"], {
+                                "canonical_work_item_id": str(equivalent["id"]),
+                                "equivalence_key": item["equivalence_key"], "reason": reason,
+                            })
+                            changed["invalidated"] += 1
+                            continue
                     cur.execute("UPDATE lab_work_items SET status='READY',blocked_reason=NULL,updated_at=%s WHERE id=%s", (now, item["id"]))
                     self._event(cur, project_id, "WORK_DEPENDENCY_RESOLVED", item["id"], {})
                     self._event(cur, project_id, "WORK_ITEM_READY", item["id"], {})
