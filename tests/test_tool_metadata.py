@@ -277,6 +277,7 @@ def test_research_runtime_is_initialized_before_mcp_accepts_requests(monkeypatch
     monkeypatch.setattr(server.settings, "gpu_lab_research_database_url", "postgresql://fixture")
     monkeypatch.setattr(server, "research_store", None)
     monkeypatch.setattr(server, "ResearchStore", InitializedStore)
+    monkeypatch.setattr(server, "distributed_discovery", lambda: object())
 
     initialized = server.initialize_research_runtime()
     replay = server.research()

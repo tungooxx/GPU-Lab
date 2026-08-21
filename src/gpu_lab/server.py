@@ -481,7 +481,12 @@ def initialize_research_runtime() -> ResearchStore | None:
     """Run migrations and deferred temporal recovery before MCP begins accepting requests."""
     if not settings.gpu_lab_research_database_url:
         return None
-    return research()
+    store = research()
+    # DDE's additive coordination tables must exist before the first Lab
+    # message/read call; otherwise a nominally read-only request would have to
+    # migrate the database lazily.
+    distributed_discovery()
+    return store
 
 
 def brain() -> ResearchBrain:
