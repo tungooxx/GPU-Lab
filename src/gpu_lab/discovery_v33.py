@@ -100,6 +100,12 @@ class DistributedDiscoveryService:
             "world_model_version": state["state_freshness"].get("world_model_version"),
             "negative_result_snapshot_version": len(state["canonical_state"].get("negative_results", [])),
             "records": records,
+            "active_hypothesis_ids": [item["id"] for item in records if item["kind"] == "Hypothesis" and item["status"] in {"ACTIVE", "SURVIVES_INITIAL_TEST"}],
+            "negative_result_ids": [item["id"] for item in records if item["kind"] == "NegativeResult"],
+            "frontier_gap_ids": [item["id"] for item in records if item["kind"] in {"FrontierGap", "BenchmarkGap"}],
+            "stagnation_ids": [item["id"] for item in records if item["kind"] == "StagnationState"],
+            "architecture_lineage_ids": [item["id"] for item in records if item["kind"] == "ArchitectureLineage"],
+            "breakthrough_signal_ids": [item["id"] for item in records if item["kind"] == "BreakthroughSignal"],
         }
 
     @staticmethod
@@ -137,6 +143,10 @@ class DistributedDiscoveryService:
             "frozen_state_hash": self._hash(snapshot), "scientific_snapshot_hash": self._hash(snapshot["records"]),
             "research_state_version": snapshot["research_state_version"],
             "world_model_version": snapshot["world_model_version"],
+            "agenda_version": str(agenda_item_id) if agenda_item_id else None,
+            "frontier_gap_snapshot": snapshot["frontier_gap_ids"],
+            "stagnation_snapshot": snapshot["stagnation_ids"],
+            "architecture_lineage_snapshot": snapshot["architecture_lineage_ids"],
             "negative_result_snapshot_version": snapshot["negative_result_snapshot_version"],
             "policy_version": policy_version, "brain_policy_version": brain_policy_version,
             "literature_status": "NOT_REQUESTED", "generation_wave": 1,
@@ -170,16 +180,23 @@ class DistributedDiscoveryService:
         reservations = self.reservations(search_regime)
         characterized = []
         for index, raw in enumerate(candidates):
-            signature = self._signature(raw)
+            try:
+                signature = self._signature(raw)
+            except GPUError as exc:
+                if exc.error_type != "DISCOVERY_DIVERSITY_SIGNATURE_REQUIRED":
+                    raise
+                signature = {}
             distance = classify_scientific_distance(
                 {"payload": {"scientific_dimensions": signature}}, {"payload": {"scientific_dimensions": {}}},
-            )
+            ) if signature else {"scientific_distance": "UNCHARACTERIZED", "reason": "Existing candidate lacks a structured DiversitySignature"}
             characterized.append({
                 "index": index, "title": raw.get("title") or raw.get("action_type", f"candidate-{index}"),
                 "mechanistic_niche": self._niche(signature, raw.get("mechanistic_niche")),
                 "scientific_distance": distance["scientific_distance"],
                 "diversity_signature": signature,
                 "generation_operator": sorted(GENERATION_OPERATORS)[index % len(GENERATION_OPERATORS)],
+                "characterization_status": "CHARACTERIZED" if signature else "NICHE_UNRESOLVED",
+                "characterization_reason": distance["reason"],
             })
         coverage = Counter(item["scientific_distance"] for item in characterized)
         niches = Counter(item["mechanistic_niche"] for item in characterized)
@@ -190,6 +207,7 @@ class DistributedDiscoveryService:
             "candidates": characterized, "effective_niche_count": len(niches),
             "niche_distribution": dict(niches), "scientific_distance_distribution": dict(coverage),
             "unfilled_distance_slots": [key for key, amount in reservations.items() if amount and not coverage[key]],
+            "uncharacterized_candidate_count": sum(item["characterization_status"] != "CHARACTERIZED" for item in characterized),
             "literature_status": "NOT_CALLED_READ_ONLY", "executed_experiments": 0,
         }
 
@@ -281,17 +299,29 @@ class DistributedDiscoveryService:
 
     @staticmethod
     def _niche(signature: dict[str, Any], supplied: str | None) -> str:
-        if supplied and supplied.strip():
-            return supplied.strip().upper()
+        # A model-provided label is advisory only.  The identity used for QD is
+        # derived from scientific structure so cosmetic labels cannot fake
+        # niche diversity.
         ordered = ("causal_object", "representation", "generative_process", "objective_formulation", "architecture_family", "information_path")
         for key in ordered:
             if signature.get(key):
                 return f"{key.upper()}::{str(signature[key]).upper()}"
         return "NICHE_UNRESOLVED"
 
+    @staticmethod
+    def _validate_candidate(candidate: dict[str, Any]) -> None:
+        if not isinstance(candidate.get("mechanism"), str) or not candidate["mechanism"].strip():
+            raise GPUError("DISCOVERY_CANDIDATE_MECHANISM_REQUIRED", "A serious candidate needs a mechanism")
+        predictions = candidate.get("predictions")
+        if not isinstance(predictions, list) or not any(isinstance(item, str) and item.strip() for item in predictions):
+            raise GPUError("DISCOVERY_CANDIDATE_PREDICTION_REQUIRED", "A serious candidate needs a discriminating prediction")
+        if not isinstance(candidate.get("falsifier"), str) or not candidate["falsifier"].strip():
+            raise GPUError("DISCOVERY_CANDIDATE_FALSIFIER_REQUIRED", "A serious candidate needs a falsifier")
+
     def submit_candidate(self, round_id: str, batch_id: str, worker_id: str, session_id: str, candidate: dict[str, Any]) -> dict:
         round_ = self._round(round_id)
         self._assert_independent_phase(round_)
+        self._validate_candidate(candidate)
         signature = self._signature(candidate)
         now = self._now()
         with self.store._connect() as conn, conn.cursor() as cur:
@@ -315,6 +345,7 @@ class DistributedDiscoveryService:
                 "mechanism": candidate.get("mechanism"), "predictions": candidate.get("predictions", []),
                 "falsifier": candidate.get("falsifier"), "diversity_signature": signature,
                 "mechanistic_niche": self._niche(signature, candidate.get("mechanistic_niche")),
+                "requested_mechanistic_niche": candidate.get("mechanistic_niche"),
                 "scientific_distance": distance["scientific_distance"], "distance_reason": distance["reason"],
                 "changed_scientific_dimensions": distance["changed_scientific_dimensions"],
                 "architecture_lineage": candidate.get("architecture_lineage") or signature.get("architecture_family"),
@@ -344,6 +375,7 @@ class DistributedDiscoveryService:
         round_ = self._round(round_id)
         self._assert_independent_phase(round_)
         now = self._now()
+        synthesis_ready = False
         with self.store._connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT * FROM discovery_round_memberships WHERE discovery_round_id=%s AND candidate_batch_id=%s AND worker_id=%s AND worker_session_id=%s FOR UPDATE", (round_id, batch_id, worker_id, session_id))
             member = cur.fetchone()
@@ -363,11 +395,19 @@ class DistributedDiscoveryService:
             cur.execute("UPDATE research_objects SET status=%s,data=%s WHERE id=%s", (status, self._json(batch_data), batch_id))
             cur.execute("UPDATE discovery_round_memberships SET status=%s,frozen_at=%s,failure_reason=%s WHERE discovery_round_id=%s AND candidate_batch_id=%s", (status, now, abstention_reason, round_id, batch_id))
             self.store._event(cur, round_["project_id"], "CANDIDATE_BATCH_FROZEN", batch_id, json.loads(self._json({"round_id": round_id, "status": status, "candidate_count": len(candidate_ids), "abstention_reason": abstention_reason})))
+            if not candidate_ids:
+                self.store._event(cur, round_["project_id"], "DISCOVERY_DISTANCE_SLOT_UNFILLED", round_id, {
+                    "requested_distance": member["requested_distance"], "generation_operator": member["generation_operator"],
+                    "reason": abstention_reason,
+                })
             cur.execute("SELECT count(*) FILTER (WHERE status='JOINED') AS pending FROM discovery_round_memberships WHERE discovery_round_id=%s", (round_id,))
             if int(cur.fetchone()["pending"]) == 0:
                 new_data = {**round_["data"], "phase": "GENERATION_FROZEN", "peer_visibility": "VISIBLE_FOR_SYNTHESIS", "generation_frozen_at": now.isoformat()}
                 cur.execute("UPDATE research_objects SET data=%s WHERE id=%s", (self._json(new_data), round_id))
                 self.store._event(cur, round_["project_id"], "DISCOVERY_GENERATION_FROZEN", round_id, {"peer_visibility": "VISIBLE_FOR_SYNTHESIS"})
+                synthesis_ready = True
+        if synthesis_ready:
+            self.synthesis_work_item(round_id, worker_id, session_id)
         return self.store.object_get(batch_id)
 
     def _members(self, round_id: str) -> list[dict]:
@@ -450,6 +490,30 @@ class DistributedDiscoveryService:
             items.append(item)
         return items
 
+    def synthesis_work_item(self, round_id: str, worker_id: str, session_id: str) -> dict:
+        """Materialize one READY operational synthesis task only after isolation ends."""
+        from .lab import LabController
+
+        round_ = self._round(round_id)
+        if round_["data"].get("phase") != "GENERATION_FROZEN":
+            raise GPUError("DISCOVERY_SYNTHESIS_NOT_READY", round_id)
+        controller = LabController(self.store)
+        key = f"dde-v33-synthesis:{round_id}"
+        existing = [
+            item for item in controller.work_list(str(round_["project_id"]), limit=500)
+            if item.get("equivalence_key") == key
+        ]
+        if existing:
+            return existing[0]
+        return controller.create_work(
+            str(round_["project_id"]), "DISCOVERY_SYNTHESIS", "Synthesize independent discovery batches",
+            "Compare frozen batches through structured niche, distance, dead-memory, and QD checks.",
+            "DISCOVERY_SYNTHESIS", worker_id,
+            related_refs={"discovery_round_id": str(round_id), "peer_visibility": "VISIBLE_FOR_SYNTHESIS"},
+            equivalence_key=key, created_session_id=session_id, subject_id=str(round_id),
+            recovery_policy={"reassign_same_work_item": True, "fallback_live_work_item": False},
+        )
+
     @staticmethod
     def _signature_key(candidate: dict) -> str:
         return json.dumps(candidate["data"].get("diversity_signature", {}), sort_keys=True, separators=(",", ":"))
@@ -520,13 +584,20 @@ class DistributedDiscoveryService:
             required = round_["data"]["required_distance_coverage"]
             attempted = {distance: int(distances.get(distance, 0)) for distance in required}
             unfilled = [distance for distance, required_count in required.items() if required_count and not attempted[distance]]
-            health = "HEALTHY"
+            health_flags: list[str] = []
             if not niches:
-                health = "LOW_NICHE_COVERAGE"
-            elif unfilled:
-                health = "DISTANCE_COVERAGE_INCOMPLETE"
-            elif len({item["data"].get("architecture_lineage") for item in live}) <= 1 and len(live) > 1:
-                health = "SAME_LINEAGE_COLLAPSE"
+                health_flags.append("LOW_NICHE_COVERAGE")
+            if unfilled:
+                health_flags.append("DISTANCE_COVERAGE_INCOMPLETE")
+            if len({item["data"].get("architecture_lineage") for item in live}) <= 1 and len(live) > 1:
+                health_flags.append("SAME_LINEAGE_COLLAPSE")
+            if len(survivors) < len(live) and len({self._signature_key(item) for item in live}) < len(live):
+                health_flags.append("GENERATOR_CORRELATION_HIGH")
+            if not literature_available:
+                health_flags.append("LITERATURE_UNVERIFIED")
+            if not live and candidates:
+                health_flags.append("DEAD_MEMORY_SATURATION")
+            health = "HEALTHY" if not health_flags else health_flags[0]
             coverage = {
                 "generated_candidate_count": len(candidates), "candidate_batch_count": len(batches),
                 "independent_generator_count": len({item["data"]["worker_session_id"] for item in candidates if item["data"].get("independent_generation")}),
@@ -540,6 +611,8 @@ class DistributedDiscoveryService:
                 "literature_status": "AVAILABLE" if literature_available else "UNAVAILABLE_NOVELTY_UNVERIFIED",
                 "novelty_verified_count": 0, "dead_equivalent_count": len(candidates) - len(live),
                 "archive_survivor_count": len(survivors), "portfolio_health": health,
+                "portfolio_health_flags": health_flags,
+                "causal_object_distribution": dict(Counter(str(item["data"]["diversity_signature"].get("causal_object") or "UNSPECIFIED") for item in candidates)),
             }
             archive_id = str(uuid.uuid4())
             archive = {"implementation_version": DDE_VERSION, "discovery_round_id": str(round_id), "mechanistic_niche_ids": niche_ids, "survivor_candidate_ids": [str(item["id"]) for item in survivors], "duplicate_candidate_ids": duplicate_ids, "dead_memory_screen": [{"candidate_id": str(candidate["id"]), **screen} for candidate, screen in screened], "coverage": coverage, "selected_candidate_id": str(survivors[0]["id"]) if survivors else None, "runner_up_candidate_id": str(survivors[1]["id"]) if len(survivors) > 1 else None, "created_at": now.isoformat(), "not_evidence": True}

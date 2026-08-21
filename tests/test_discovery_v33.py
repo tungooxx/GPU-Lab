@@ -29,6 +29,16 @@ def test_shadow_signature_accepts_existing_brain_candidate_shape_without_writes(
     }) == {"representation": "token-grid"}
 
 
+def test_structural_niche_ignores_untrusted_label_and_requires_serious_candidate_fields():
+    signature = {"representation": "token-grid"}
+    assert DistributedDiscoveryService._niche(signature, "TOTALLY_NEW_NICHE") == "REPRESENTATION::TOKEN-GRID"
+    with pytest.raises(GPUError) as exc:
+        DistributedDiscoveryService._validate_candidate({
+            "predictions": ["P"], "falsifier": "F", "diversity_signature": signature,
+        })
+    assert exc.value.error_type == "DISCOVERY_CANDIDATE_MECHANISM_REQUIRED"
+
+
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_round_isolates_batches_then_archives_distinct_candidates():
     store = ResearchStore(TEST_DATABASE_URL)
@@ -49,6 +59,11 @@ def test_round_isolates_batches_then_archives_distinct_candidates():
     candidate_b = dde.submit_candidate(round_["id"], batch_b["id"], second["worker"]["id"], second["session_id"], _candidate("strong null", {"causal_object": "null ontology"}))
     dde.batch_freeze(round_["id"], batch_b["id"], second["worker"]["id"], second["session_id"])
     assert dde.round_get(round_["id"])["data"]["peer_visibility"] == "VISIBLE_FOR_SYNTHESIS"
+    synthesis_work = [
+        item for item in lab.work_list(project_id, limit=100)
+        if item["kind"] == "DISCOVERY_SYNTHESIS"
+    ]
+    assert len(synthesis_work) == 1 and synthesis_work[0]["status"] == "READY"
     archive = dde.synthesize(round_["id"], literature_available=False)
     assert archive["data"]["coverage"]["effective_niche_count"] == 2
     assert archive["data"]["coverage"]["literature_status"] == "UNAVAILABLE_NOVELTY_UNVERIFIED"
