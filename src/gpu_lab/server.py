@@ -30,6 +30,7 @@ from .cockpit import CockpitController
 from .cockpit_auth import issue_session, password_matches, verify_session
 from .cockpit_dashboard import COCKPIT_HTML
 from .config import Settings
+from .correction_v34 import DistributedCorrectionService
 from .dashboard import DASHBOARD_HTML
 from .discovery import breakthrough_signal, local_search_collapse_diagnosis
 from .discovery_v33 import DistributedDiscoveryService
@@ -63,7 +64,7 @@ def _source_sha(path: Path) -> str | None:
 
 _RUNTIME_SOURCE_PATHS = {
     name: Path(__file__).with_name(name)
-    for name in ("server.py", "brain.py", "research.py", "lab.py", "discovery_v33.py")
+    for name in ("server.py", "brain.py", "research.py", "lab.py", "discovery_v33.py", "correction_v34.py")
 }
 # Captured at module import, before any MCP request creates the singleton Brain.
 # This detects source mounts changing underneath a long-lived Python process;
@@ -71,8 +72,9 @@ _RUNTIME_SOURCE_PATHS = {
 # state across incompatible class definitions.
 _LOADED_SOURCE_SHAS = {name: _source_sha(path) for name, path in _RUNTIME_SOURCE_PATHS.items()}
 
-settings, service, research_store, research_brain, brain_bench_service, epistemic_service, literature_service, executable_paper_service, qd_service, branch_service, meta_research_service, strategy_service, policy_lab_service, lab_controller_service, distributed_discovery_service = (
+settings, service, research_store, research_brain, brain_bench_service, epistemic_service, literature_service, executable_paper_service, qd_service, branch_service, meta_research_service, strategy_service, policy_lab_service, lab_controller_service, distributed_discovery_service, correction_service = (
     Settings(),
+    None,
     None,
     None,
     None,
@@ -139,6 +141,9 @@ _READ_ONLY_TOOLS = {
     "discovery_archive_get",
     "discovery_outcome_get",
     "discovery_shadow_preview",
+    "correction_case_get",
+    "correction_challenge_get",
+    "correction_shadow_preview",
     "runtime_code_version",
     "research_benchmark_list",
     "research_benchmark_episode_get",
@@ -693,6 +698,16 @@ def distributed_discovery() -> DistributedDiscoveryService:
     return distributed_discovery_service
 
 
+def correction() -> DistributedCorrectionService:
+    """Return the durable v3.4 correction coordinator."""
+    global correction_service
+    if correction_service is None:
+        with _singleton_lock:
+            if correction_service is None:
+                correction_service = DistributedCorrectionService(research())
+    return correction_service
+
+
 def research_operators() -> ResearchOperatorService:
     global research_operator_service
     if settings.gpu_lab_research_operator_provider != "literature-http":
@@ -1213,6 +1228,87 @@ async def discovery_shadow_preview(
 ):
     """Read-only v3.3 diversity characterization; it creates no round, work item, or experiment."""
     return await call(distributed_discovery().shadow_preview, project_id, candidates, search_regime)
+
+
+@mcp.tool()
+async def correction_case_create(
+    project_id: str, target_id: str, opened_by: str | None = None,
+    purpose: str = "SCIENTIFIC_CORRECTION", severity: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"] = "MEDIUM",
+):
+    """Freeze one scientific target into a v3.4 correction case; this never changes the target."""
+    return await call(correction().create_case, project_id, target_id, opened_by, purpose, severity)
+
+
+@mcp.tool()
+async def correction_case_join(
+    correction_case_id: str, worker_id: str, session_id: str,
+    correction_operator: Literal[
+        "CAUSAL_LOGIC", "STRONGEST_NULL", "EXPERIMENT_VALIDITY", "IMPLEMENTATION_VALIDITY",
+        "EVIDENCE_SCOPE", "CONTRADICTION_SEARCH", "METRIC_VALIDITY", "REPLICATION_VALIDITY",
+        "GENERALIZATION_VALIDITY", "LITERATURE_CONTRADICTION", "NOVELTY_VALIDITY",
+        "WORLD_MODEL_CONSISTENCY", "COUNTERFACTUAL_VALIDITY", "ASSUMPTION_AUDIT",
+        "DATA_PROVENANCE", "STATISTICAL_VALIDITY",
+    ],
+):
+    """Join as one independent correction operator while peer challenges remain hidden."""
+    return await call(correction().join_case, correction_case_id, worker_id, session_id, correction_operator)
+
+
+@mcp.tool()
+async def correction_challenge_submit(
+    correction_case_id: str, worker_id: str, session_id: str, challenge: dict[str, Any],
+):
+    """Submit exactly one structured critique for the caller's own isolated correction slot."""
+    return await call(correction().submit_challenge, correction_case_id, worker_id, session_id, challenge)
+
+
+@mcp.tool()
+async def correction_challenge_freeze(correction_case_id: str, worker_id: str, session_id: str):
+    """Freeze the caller's challenge. Peer challenges become visible only when all joined critics freeze."""
+    return await call(correction().freeze_challenge, correction_case_id, worker_id, session_id)
+
+
+@mcp.tool()
+async def correction_case_get(correction_case_id: str, requester_session_id: str | None = None):
+    """Read correction-case phase, frozen target metadata, and isolation-safe membership state."""
+    return await call(correction().case_get, correction_case_id, requester_session_id)
+
+
+@mcp.tool()
+async def correction_challenge_get(correction_case_id: str, correction_challenge_id: str, requester_session_id: str):
+    """Read a challenge only when peer-isolation permits it."""
+    return await call(correction().challenge_get, correction_case_id, correction_challenge_id, requester_session_id)
+
+
+@mcp.tool()
+async def correction_verification_record(
+    correction_challenge_id: str, verifier_worker_id: str, verification: dict[str, Any],
+):
+    """Record an independent, evidence- or deterministic-check-grounded verification of a frozen critique."""
+    return await call(correction().verify, correction_challenge_id, verifier_worker_id, verification)
+
+
+@mcp.tool()
+async def correction_adjudicate(
+    correction_case_id: str,
+    resolution: Literal["KEEP", "REVISE", "REJECT", "NARROW_SCOPE", "EXPERIMENT_REQUIRED"],
+    rationale: str, discriminating_test: str | None = None,
+):
+    """Create the case's single adjudication record; a critique alone cannot revise scientific truth."""
+    return await call(correction().adjudicate, correction_case_id, resolution, rationale,
+                      discriminating_test=discriminating_test)
+
+
+@mcp.tool()
+async def correction_hindsight_record(correction_record_id: str, hindsight: dict[str, Any]):
+    """Record later correction usefulness without rewriting the original correction record."""
+    return await call(correction().hindsight_record, correction_record_id, hindsight)
+
+
+@mcp.tool()
+async def correction_shadow_preview(project_id: str, target_id: str):
+    """Read-only v3.4 correction planning. It creates no case, challenge, evidence, or experiment."""
+    return await call(correction().shadow_preview, project_id, target_id)
 
 
 @mcp.tool()

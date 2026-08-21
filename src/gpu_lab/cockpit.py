@@ -271,6 +271,23 @@ class CockpitController:
                         "id": str(row["id"]), "round_id": archive_data.get("discovery_round_id"),
                         "coverage": archive_data.get("coverage", {}), "candidates": candidates,
                     })
+            cur.execute(
+                "SELECT id,status,data,created_at FROM research_objects WHERE project_id=%s "
+                "AND kind='CorrectionCase' ORDER BY created_at DESC LIMIT 12",
+                (project_id,),
+            )
+            correction_cases = [
+                {
+                    "id": str(row["id"]), "status": row["status"],
+                    "target_id": row["data"].get("target_id"),
+                    "target_type": row["data"].get("target_type"),
+                    "phase": row["data"].get("correction_stage"),
+                    "peer_visibility": row["data"].get("peer_visibility"),
+                    "resolution": row["data"].get("resolution"),
+                    "created_at": row["created_at"],
+                }
+                for row in cur.fetchall()
+            ]
         return {
             "lab_state": lab_state,
             "controls": self.controls_get(project_id),
@@ -280,6 +297,7 @@ class CockpitController:
             # Deliberately excludes candidate content while a round is isolated.
             "discovery_rounds": discovery_rounds,
             "discovery_archives": discovery_archives,
+            "correction_cases": correction_cases,
         }
 
     def turn_report(self, project_id: str, worker_id: str, session_id: str, outcome: str,

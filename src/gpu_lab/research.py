@@ -106,6 +106,15 @@ RESEARCH_OBJECT_KINDS = (
     "CrossWorkerQDArchive",
     "DiscoveryCandidateOutcome",
     "DiscoveryCoverageAtDecision",
+    # v3.4 Distributed Verification & Correction Engine. Correction records
+    # preserve a separate, immutable path from critique to verification and
+    # adjudication; they never make a critic a scientific truth writer.
+    "CorrectionCase",
+    "CorrectionChallenge",
+    "CorrectionVerification",
+    "ScientificDisagreement",
+    "CorrectionRecord",
+    "CorrectionHindsight",
 )
 RESEARCH_OBJECT_STATUSES = {
     "ACTIVE",
@@ -167,6 +176,13 @@ RESEARCH_OBJECT_STATUSES = {
     "STALE",
     "INVALID",
     "UNRESOLVED",
+    "CRITIQUE_GENERATION",
+    "VERIFICATION",
+    "NEEDS_EXPERIMENT",
+    "RESOLVED_KEEP",
+    "RESOLVED_REVISE",
+    "RESOLVED_REJECT",
+    "RESOLVED_NARROW_SCOPE",
 }
 
 # Orthogonal epistemic classifications. These are metadata about the role and
