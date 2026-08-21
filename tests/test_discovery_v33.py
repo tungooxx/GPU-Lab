@@ -62,6 +62,15 @@ def test_round_isolates_batches_then_archives_distinct_candidates():
     candidate_a = dde.submit_candidate(round_["id"], batch_a["id"], first["worker"]["id"], first["session_id"], _candidate("representation reset", {"representation": "point tokens"}))
     with pytest.raises(GPUError, match="PEER_ISOLATION_ACTIVE"):
         dde.batch_get(round_["id"], batch_a["id"], second["session_id"])
+    overridden = dde.peer_isolation_override(
+        round_["id"], batch_b["id"], second["worker"]["id"], second["session_id"], "User requested comparison with A",
+    )
+    assert overridden["data"]["independent_generation"] is False
+    assert dde.batch_get(round_["id"], batch_a["id"], second["session_id"])["id"] == batch_a["id"]
+    assert lab.message_send(
+        project_id, second["worker"]["id"], second["session_id"], "SHARE_FINDING",
+        "override", "User explicitly authorized this non-independent comparison.", to_worker_id=first["worker"]["id"],
+    )["message_type"] == "SHARE_FINDING"
     dde.batch_freeze(round_["id"], batch_a["id"], first["worker"]["id"], first["session_id"])
     with pytest.raises(GPUError, match="PEER_ISOLATION_ACTIVE"):
         dde.batch_get(round_["id"], batch_a["id"], second["session_id"])

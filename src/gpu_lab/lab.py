@@ -1006,6 +1006,7 @@ class LabController:
                         "SELECT 1 FROM discovery_round_memberships m JOIN research_objects r "
                         "ON r.id=m.discovery_round_id WHERE m.worker_session_id=%s "
                         "AND r.project_id=%s AND r.kind='DiscoveryRound' AND r.status='ACTIVE' "
+                        "AND m.independent_generation=TRUE "
                         "AND r.data->>'phase'='INDEPENDENT_GENERATION' LIMIT 1",
                         (from_session_id, project_id),
                     )

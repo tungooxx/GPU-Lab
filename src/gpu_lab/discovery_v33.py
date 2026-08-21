@@ -463,7 +463,12 @@ class DistributedDiscoveryService:
         if str(batch["data"].get("discovery_round_id")) != str(round_id):
             raise GPUError("DISCOVERY_BATCH_ROUND_MISMATCH", batch_id)
         if round_["data"].get("peer_visibility") == "HIDDEN" and str(batch["data"].get("worker_session_id")) != str(requester_session_id):
-            raise GPUError("DISCOVERY_PEER_ISOLATION_ACTIVE", "Peer candidate batches are hidden until generation freezes")
+            requester = next(
+                (member for member in self._members(round_id) if member["worker_session_id"] == str(requester_session_id)),
+                None,
+            )
+            if not requester or requester["independent_generation"]:
+                raise GPUError("DISCOVERY_PEER_ISOLATION_ACTIVE", "Peer candidate batches are hidden until generation freezes")
         candidate_ids = batch["data"].get("candidate_ids", [])
         return {**batch, "candidates": [self.store.object_get(candidate_id) for candidate_id in candidate_ids]}
 

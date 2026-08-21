@@ -92,6 +92,16 @@ async def main() -> None:
         })
         denied_payload = payload(denied)
         assert denied_payload["error"]["type"] == "DISCOVERY_PEER_ISOLATION_ACTIVE"
+        await call(session, "discovery_peer_isolation_override", {
+            "discovery_round_id": round_["id"], "candidate_batch_id": batch_b["id"],
+            "worker_id": second["worker"]["id"], "session_id": second["session_id"],
+            "rationale": "Explicit operator test of the audited override path",
+        })
+        exposed = await call(session, "discovery_batch_get", {
+            "discovery_round_id": round_["id"], "candidate_batch_id": batch_a["id"],
+            "requester_session_id": second["session_id"],
+        })
+        assert len(exposed["candidates"]) == 1
         await call(session, "discovery_candidate_submit", {
             "discovery_round_id": round_["id"], "candidate_batch_id": batch_b["id"],
             "worker_id": second["worker"]["id"], "session_id": second["session_id"],
