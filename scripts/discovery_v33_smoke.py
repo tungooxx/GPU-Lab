@@ -32,7 +32,7 @@ def main() -> None:
         timeline.append(text)
         print(f"  {len(timeline):02d}. {text}")
 
-    model = store.object_create(project_id, "WorldModel", {"mechanisms": ["frozen-mechanism"]}, "SMOKE_MODEL")
+    store.object_create(project_id, "WorldModel", {"mechanisms": ["frozen-mechanism"]}, "SMOKE_MODEL")
     agenda = store.object_create(project_id, "ResearchAgenda", {"question": "What mechanism remains?"}, "SMOKE_AGENDA")
     item = store.object_create(project_id, "AgendaItem", {"agenda_id": str(agenda["id"]), "question": "Search distant explanations", "importance": 1, "uncertainty": 1}, "SMOKE_ITEM", "OPEN")
     store.object_create(project_id, "FrontierGap", {"severity": "HIGH", "lineage": "mature-model"}, "SMOKE_FRONTIER")
