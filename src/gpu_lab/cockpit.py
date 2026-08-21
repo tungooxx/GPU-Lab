@@ -238,6 +238,39 @@ class CockpitController:
                 }
                 for row in cur.fetchall()
             ]
+            completed_round_ids = [item["id"] for item in discovery_rounds if item["status"] == "COMPLETED"]
+            discovery_archives: list[dict[str, Any]] = []
+            if completed_round_ids:
+                cur.execute(
+                    "SELECT id,data,created_at FROM research_objects WHERE project_id=%s "
+                    "AND kind='CrossWorkerQDArchive' AND data->>'discovery_round_id'=ANY(%s) "
+                    "ORDER BY created_at DESC LIMIT 12",
+                    (project_id, completed_round_ids),
+                )
+                for row in cur.fetchall():
+                    archive_data = row["data"]
+                    candidates = []
+                    for candidate_id in archive_data.get("survivor_candidate_ids", []):
+                        cur.execute("SELECT id,data FROM research_objects WHERE id=%s AND kind='DiscoveryCandidate'", (candidate_id,))
+                        candidate = cur.fetchone()
+                        if candidate:
+                            data = candidate["data"]
+                            candidates.append({
+                                "id": str(candidate["id"]), "title": data.get("title"),
+                                "generation_operator": data.get("generation_operator"),
+                                "scientific_distance": data.get("scientific_distance"),
+                                "mechanistic_niche": data.get("mechanistic_niche"),
+                                "architecture_lineage": data.get("architecture_lineage"),
+                                "dead_memory_status": data.get("dead_memory_status"),
+                                "novelty_status": data.get("novelty_status"),
+                                "falsifier": data.get("falsifier"),
+                                "selected": str(candidate["id"]) == archive_data.get("selected_candidate_id"),
+                                "runner_up": str(candidate["id"]) == archive_data.get("runner_up_candidate_id"),
+                            })
+                    discovery_archives.append({
+                        "id": str(row["id"]), "round_id": archive_data.get("discovery_round_id"),
+                        "coverage": archive_data.get("coverage", {}), "candidates": candidates,
+                    })
         return {
             "lab_state": lab_state,
             "controls": self.controls_get(project_id),
@@ -246,6 +279,7 @@ class CockpitController:
             "pending_wake_requests": wakes,
             # Deliberately excludes candidate content while a round is isolated.
             "discovery_rounds": discovery_rounds,
+            "discovery_archives": discovery_archives,
         }
 
     def turn_report(self, project_id: str, worker_id: str, session_id: str, outcome: str,

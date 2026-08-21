@@ -133,6 +133,7 @@ _READ_ONLY_TOOLS = {
     "lab_work_list",
     "lab_message_list",
     "discovery_round_get",
+    "discovery_round_recommend_assignments",
     "discovery_batch_get",
     "discovery_round_stale_check",
     "discovery_archive_get",
@@ -1114,6 +1115,12 @@ async def discovery_round_join(
     """Join one worker to an independent discovery batch with a search transformation, not a persona."""
     return await call(distributed_discovery().join_round, discovery_round_id, worker_id, session_id,
                       generation_operator, requested_distance)
+
+
+@mcp.tool()
+async def discovery_round_recommend_assignments(discovery_round_id: str, worker_slots: int | None = None):
+    """Recommend distinct operator/distance assignments from frozen regime coverage; does not join or create work."""
+    return await call(distributed_discovery().recommended_assignments, discovery_round_id, worker_slots)
 
 
 @mcp.tool()

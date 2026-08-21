@@ -39,6 +39,12 @@ def test_structural_niche_ignores_untrusted_label_and_requires_serious_candidate
     assert exc.value.error_type == "DISCOVERY_CANDIDATE_MECHANISM_REQUIRED"
 
 
+def test_hyperparameter_only_variants_share_a_scientific_equivalence_key():
+    first = {"data": {"diversity_signature": {"representation": "token-grid", "learning_rate": 0.001}}}
+    second = {"data": {"diversity_signature": {"representation": "token-grid", "learning_rate": 0.01}}}
+    assert DistributedDiscoveryService._scientific_equivalence_key(first) == DistributedDiscoveryService._scientific_equivalence_key(second)
+
+
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_round_isolates_batches_then_archives_distinct_candidates():
     store = ResearchStore(TEST_DATABASE_URL)
@@ -48,6 +54,9 @@ def test_round_isolates_batches_then_archives_distinct_candidates():
     first = lab.join(None, "dde-a", "CODEX", project_id)
     second = lab.join(None, "dde-b", "LOCAL_AGENT", project_id)
     round_ = dde.create_round(project_id, None, "DIVERGENT_SEARCH")
+    assignments = dde.recommended_assignments(round_["id"])
+    assert {item["requested_distance"] for item in assignments} >= {"NEAR", "MID", "FAR", "ORTHOGONAL"}
+    assert len({item["generation_operator"] for item in assignments}) == len(assignments)
     batch_a = dde.join_round(round_["id"], first["worker"]["id"], first["session_id"], "REPRESENTATION_RESET", "FAR")
     batch_b = dde.join_round(round_["id"], second["worker"]["id"], second["session_id"], "STRONG_NULL_CONSTRUCTION", "ORTHOGONAL")
     candidate_a = dde.submit_candidate(round_["id"], batch_a["id"], first["worker"]["id"], first["session_id"], _candidate("representation reset", {"representation": "point tokens"}))

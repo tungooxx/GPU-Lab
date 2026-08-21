@@ -281,6 +281,37 @@ class DistributedDiscoveryService:
             cur.execute("INSERT INTO discovery_round_memberships(discovery_round_id,worker_id,worker_session_id,candidate_batch_id,generation_operator,requested_distance,status,joined_at) VALUES(%s,%s,%s,%s,%s,%s,'JOINED',%s)", (round_id, worker_id, session_id, batch_id, operator, distance, now))
         return self.store.object_get(batch_id)
 
+    def recommended_assignments(self, round_id: str, worker_slots: int | None = None) -> list[dict[str, str]]:
+        """Suggest distinct search transformations without assigning worker personas.
+
+        The caller still binds each recommendation to a real worker/session via
+        ``join_round``.  Recommendations are derived only from the frozen round
+        regime and currently unfilled reservation slots.
+        """
+        round_ = self._round(round_id)
+        self._assert_independent_phase(round_)
+        members = self._members(round_id)
+        used_operators = {member["generation_operator"] for member in members}
+        counts = Counter(member["requested_distance"] for member in members)
+        missing = [
+            distance for distance, required in round_["data"]["required_distance_coverage"].items()
+            for _ in range(max(0, required - counts[distance]))
+        ]
+        regime_operators = {
+            "EXPLOIT": ["LOCAL_CAUSAL_REPAIR", "CAUSAL_INVERSION", "REPRESENTATION_RESET"],
+            "MECHANISM_SEARCH": ["LOCAL_CAUSAL_REPAIR", "CAUSAL_INVERSION", "INFORMATION_PATH_REDESIGN", "STRONG_NULL_CONSTRUCTION"],
+            "DIVERGENT_SEARCH": ["REPRESENTATION_RESET", "GENERATIVE_PROCESS_CHANGE", "STRONG_NULL_CONSTRUCTION", "ONTOLOGY_CHALLENGE", "CROSS_DOMAIN_STRUCTURAL_TRANSFER"],
+            "PARADIGM_RESET": ["REPRESENTATION_RESET", "ONTOLOGY_CHALLENGE", "OBJECTIVE_REFORMULATION", "STRONG_NULL_CONSTRUCTION", "GENERATIVE_PROCESS_CHANGE"],
+        }[round_["data"]["search_regime"]]
+        available = [operator for operator in regime_operators if operator not in used_operators]
+        available.extend(operator for operator in sorted(GENERATION_OPERATORS) if operator not in used_operators and operator not in available)
+        remaining = round_["data"]["generation_budget"]["max_workers"] - len(members)
+        count = min(remaining, worker_slots if worker_slots is not None else remaining, len(missing), len(available))
+        return [
+            {"generation_operator": available[index], "requested_distance": missing[index], "reason": "Missing reserved search coverage"}
+            for index in range(count)
+        ]
+
     @staticmethod
     def _signature(candidate: dict[str, Any]) -> dict[str, Any]:
         payload = candidate.get("payload") if isinstance(candidate.get("payload"), dict) else {}
@@ -519,6 +550,16 @@ class DistributedDiscoveryService:
         return json.dumps(candidate["data"].get("diversity_signature", {}), sort_keys=True, separators=(",", ":"))
 
     @staticmethod
+    def _scientific_equivalence_key(candidate: dict) -> str:
+        """Ignore hyperparameter-only dimensions when de-duplicating a niche."""
+        cosmetic = {"learning_rate", "width", "residual_cap", "loss_weight", "seed", "batch_size", "epochs"}
+        signature = {
+            key: value for key, value in candidate["data"].get("diversity_signature", {}).items()
+            if key not in cosmetic
+        }
+        return json.dumps(signature, sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
     def _quality_key(candidate: dict) -> tuple:
         components = candidate["data"].get("quality_components", {})
         return tuple(float(components.get(key, 0) or 0) for key in ("discriminating_value", "mechanistic_information_potential", "option_value", "frontier_closure_potential"))
@@ -579,7 +620,7 @@ class DistributedDiscoveryService:
             for group in grouped.values():
                 by_signature: dict[str, list[dict]] = defaultdict(list)
                 for candidate in group:
-                    by_signature[self._signature_key(candidate)].append(candidate)
+                    by_signature[self._scientific_equivalence_key(candidate)].append(candidate)
                 for equivalent in by_signature.values():
                     equivalent.sort(key=self._quality_key, reverse=True)
                     survivors.append(equivalent[0])
@@ -597,7 +638,7 @@ class DistributedDiscoveryService:
                 health_flags.append("DISTANCE_COVERAGE_INCOMPLETE")
             if len({item["data"].get("architecture_lineage") for item in live}) <= 1 and len(live) > 1:
                 health_flags.append("SAME_LINEAGE_COLLAPSE")
-            if len(survivors) < len(live) and len({self._signature_key(item) for item in live}) < len(live):
+            if len(survivors) < len(live) and len({self._scientific_equivalence_key(item) for item in live}) < len(live):
                 health_flags.append("GENERATOR_CORRELATION_HIGH")
             if not literature_available:
                 health_flags.append("LITERATURE_UNVERIFIED")
@@ -653,6 +694,6 @@ class DistributedDiscoveryService:
         allowed = {"UNKNOWN", "TESTED", "SUPPORTED", "WEAKENED", "REFUTED", "IMPLEMENTATION_FAILURE", "EXPERIMENT_DESIGN_FAILURE", "TRANSFER_FAILURE"}
         if resolution not in allowed:
             raise GPUError("DISCOVERY_OUTCOME_STATUS_INVALID", resolution)
-        data = {"candidate_id": candidate_id, "discovery_round_id": candidate["data"]["discovery_round_id"], "resolution_status": resolution, "current_hypothesis_status": outcome.get("current_hypothesis_status"), "evidence_family_count": int(outcome.get("evidence_family_count", 0) or 0), "independent_origin_count": int(outcome.get("independent_origin_count", 0) or 0), "caused_world_model_change": bool(outcome.get("caused_world_model_change", False)), "caused_agenda_change": bool(outcome.get("caused_agenda_change", False)), "spawned_descendant_count": int(outcome.get("spawned_descendant_count", 0) or 0), "retrospective_discovery_value_components": dict(outcome.get("retrospective_discovery_value_components") or {}), "assessed_at": self._now().isoformat()}
+        data = {"candidate_id": candidate_id, "discovery_round_id": candidate["data"]["discovery_round_id"], "resolution_status": resolution, "first_tested_at": outcome.get("first_tested_at"), "first_decisive_evidence_at": outcome.get("first_decisive_evidence_at"), "current_hypothesis_status": outcome.get("current_hypothesis_status"), "evidence_family_count": int(outcome.get("evidence_family_count", 0) or 0), "independent_origin_count": int(outcome.get("independent_origin_count", 0) or 0), "caused_world_model_change": bool(outcome.get("caused_world_model_change", False)), "caused_agenda_change": bool(outcome.get("caused_agenda_change", False)), "spawned_descendant_count": int(outcome.get("spawned_descendant_count", 0) or 0), "spawned_new_niche": bool(outcome.get("spawned_new_niche", False)), "produced_breakthrough_signal": bool(outcome.get("produced_breakthrough_signal", False)), "frontier_gap_change": outcome.get("frontier_gap_change"), "architecture_lineage_impact": outcome.get("architecture_lineage_impact"), "generalized": bool(outcome.get("generalized", False)), "later_refuted": bool(outcome.get("later_refuted", False)), "revisit_count": int(outcome.get("revisit_count", 0) or 0), "retrospective_discovery_value_components": dict(outcome.get("retrospective_discovery_value_components") or {}), "assessed_at": self._now().isoformat()}
         result = self.store.object_create(str(candidate["project_id"]), "DiscoveryCandidateOutcome", data, "DISCOVERY_CANDIDATE_OUTCOME_UPDATED", "COMPLETED")
         return result
