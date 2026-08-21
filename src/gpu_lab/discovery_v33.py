@@ -584,6 +584,7 @@ class DistributedDiscoveryService:
             raise GPUError("DISCOVERY_SYNTHESIS_BEFORE_FREEZE", round_id)
         now = self._now()
         with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"dde-synthesis:{round_id}",))
             cur.execute("SELECT * FROM discovery_round_syntheses WHERE discovery_round_id=%s FOR UPDATE", (round_id,))
             existing = cur.fetchone()
             if existing:
