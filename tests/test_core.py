@@ -81,6 +81,40 @@ async def test_list_instances_uses_non_deprecated_path(monkeypatch):
     assert captured["path"] == "/instances"
 
 
+@pytest.mark.asyncio
+async def test_missing_vast_instance_returns_a_domain_error(monkeypatch):
+    provider = VastProvider("not-a-real-key")
+
+    async def fake_request(*_args, **_kwargs):
+        return {"instances": None}
+
+    monkeypatch.setattr(provider, "_request", fake_request)
+    with pytest.raises(GPUError, match="Vast instance 123 was not found"):
+        await provider.get_instance("vast_123")
+    await provider.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_vast_creation_requests_direct_ssh(monkeypatch):
+    provider = VastProvider("not-a-real-key")
+    captured = {}
+
+    async def fake_request(method, path, **kwargs):
+        captured.update(method=method, path=path, payload=kwargs["json"])
+        return {"new_contract": 123}
+
+    async def fake_get_instance(_instance_id):
+        return Instance(id="vast_123", provider_instance_id="123")
+
+    monkeypatch.setattr(provider, "_request", fake_request)
+    monkeypatch.setattr(provider, "get_instance", fake_get_instance)
+    await provider.create_instance("offer-1")
+    await provider.client.aclose()
+    assert captured["method"] == "PUT"
+    assert captured["path"] == "/asks/offer-1"
+    assert captured["payload"]["runtype"] == "ssh_direct"
+
+
 def test_database_persists_models(tmp_path):
     db = Repository(tmp_path / "state.db")
     db.save_instance(Instance(id="vast_1", provider_instance_id="1"))
