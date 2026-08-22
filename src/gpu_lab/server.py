@@ -4186,7 +4186,23 @@ async def monitor(_: Request):
                 "completed_at": job.completed_at.isoformat() if job.completed_at else None,
             }
         )
-    return JSONResponse({"enabled": True, "jobs": jobs, "gpus": gpus, "gpu_error": gpu_error})
+    live_workers = []
+    live_workers_error = None
+    if settings.gpu_lab_research_database_url:
+        try:
+            live_workers = cockpit().live_workers_by_project()
+        except GPUError as exc:
+            live_workers_error = exc.message
+    return JSONResponse(
+        {
+            "enabled": True,
+            "jobs": jobs,
+            "gpus": gpus,
+            "gpu_error": gpu_error,
+            "live_workers_by_project": ResearchBrain._json_safe(live_workers),
+            "live_workers_error": live_workers_error,
+        }
+    )
 
 
 def _research_map_payload(project_id: str) -> dict[str, Any]:
