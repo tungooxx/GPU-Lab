@@ -4199,6 +4199,10 @@ def _monitor_operational_state() -> tuple[list[dict[str, Any]], list[dict[str, A
 @mcp.custom_route("/monitor", methods=["GET"], include_in_schema=False)
 async def monitor(_: Request):
     """Return real local-job state and GPU telemetry for the dashboard."""
+    if not settings.gpu_lab_dashboard_monitor_enabled:
+        return JSONResponse(
+            {"enabled": False, "jobs": [], "gpus": [], "monitoring_disabled": True}
+        )
     if not settings.gpu_lab_enable_local_runner:
         return JSONResponse({"enabled": False, "jobs": [], "gpus": []})
     try:
