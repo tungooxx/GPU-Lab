@@ -1138,13 +1138,8 @@ class LabController:
     def state_get(self, project_id: str, session_id: str | None = None, since: str | None = None) -> dict:
         self.recover_stale_leases(project_id)
         self.resolve_dependencies(project_id)
-        project = self.store.project_get(project_id)
-        state = self.store.state_get(project_id)
-        objects = state.get("objects", [])
-        worlds = [item for item in objects if item["kind"] == "WorldModel"]
-        policies = [item for item in objects if item["kind"] == "ResearchPolicy" and item["status"] == "PRODUCTION"]
-        decisions = [item for item in objects if item["kind"] == "ResearchDecision"]
-        events = self.store.events(project_id, 30)
+        state = self.store.lab_state_summary(project_id)
+        events = self.store.events_summary(project_id, 30)
         if since:
             events = [event for event in events if event["created_at"].isoformat() > since]
         worker_id = None
@@ -1156,13 +1151,11 @@ class LabController:
                 if session:
                     worker_id, role = str(session["worker_id"]), session["active_role"]
         return {
-            "project": {"id": str(project["id"]), "name": project["name"]},
-            # This is the canonical object revision count, not the historical
-            # number of optional ResearchState cache objects (often zero).
-            "research_state_version": state["state_freshness"]["research_state_version"],
-            "world_model_version": str(worlds[0]["id"]) if worlds else None,
-            "research_policy_version": policies[0]["data"].get("version") if policies else None,
-            "brain_policy_version": decisions[0]["data"].get("brain_policy_version") if decisions else None,
+            "project": state["project"],
+            "research_state_version": state["research_state_version"],
+            "world_model_version": state["world_model_version"],
+            "research_policy_version": state["research_policy_version"],
+            "brain_policy_version": state["brain_policy_version"],
             "active_workers": self._active_workers(project_id),
             "scientific_gates": self.gate_list(project_id, ["PENDING", "AWAITING_SEMANTIC_REVIEW", "PREFLIGHT_FAILED"], 30),
             "ready_work_items": self.work_list(project_id, ["READY"], 30),
@@ -1171,10 +1164,7 @@ class LabController:
             "result_ready_work_items": self.work_list(project_id, ["RESULT_READY"], 30),
             "recent_events": [{**event, "subject_id": str(event["subject_id"]) if event["subject_id"] else None} for event in events],
             "unread_messages": self.message_list(project_id, worker_id, role, True, 30) if worker_id else [],
-            "gpu_activity": [
-                item for item in objects
-                if item["kind"] == "ExperimentRun" and self.store.experiment_run_is_operationally_active(item)
-            ][:30],
+            "gpu_activity": state["active_experiments"],
             "lab_budget": self._lab_budget_get(project_id),
         }
 

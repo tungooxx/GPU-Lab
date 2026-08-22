@@ -54,6 +54,10 @@ def test_round_isolates_batches_then_archives_distinct_candidates():
     first = lab.join(None, "dde-a", "CODEX", project_id)
     second = lab.join(None, "dde-b", "LOCAL_AGENT", project_id)
     round_ = dde.create_round(project_id, None, "DIVERGENT_SEARCH")
+    assert all(
+        "data_hash" in record and "data" not in record
+        for record in round_["data"]["frozen_state"]["records"]
+    )
     assignments = dde.recommended_assignments(round_["id"])
     assert {item["requested_distance"] for item in assignments} >= {"NEAR", "MID", "FAR", "ORTHOGONAL"}
     assert len({item["generation_operator"] for item in assignments}) == len(assignments)
@@ -93,6 +97,22 @@ def test_round_isolates_batches_then_archives_distinct_candidates():
     assert exc.value.error_type == "DISCOVERY_ROUND_NOT_GENERATING"
     assert dde.outcome_get(candidate_a["id"])["resolution_status"] == "UNKNOWN"
     assert candidate_b["data"]["scientific_distance"] == "ORTHOGONAL"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_legacy_full_discovery_snapshot_keeps_compatible_staleness_hashing():
+    store = ResearchStore(TEST_DATABASE_URL)
+    dde = DistributedDiscoveryService(store)
+    project_id = store.project_create(f"dde-legacy-snapshot-{time.time_ns()}", "Legacy snapshot")['project_id']
+    claim = store.object_create(project_id, "Claim", {"statement": "frozen", "scope": "fixture"}, "CLAIM_CREATED")
+    legacy_snapshot = dde._scientific_snapshot(project_id, legacy_full_data=True)
+    legacy_round = store.object_create(project_id, "DiscoveryRound", {
+        "frozen_state": legacy_snapshot,
+        "scientific_snapshot_hash": dde._hash(legacy_snapshot["records"]),
+    }, "LEGACY_DISCOVERY_ROUND", "ACTIVE")
+    assert dde.stale_check(legacy_round["id"])["stale"] is False
+    store.object_update(claim["id"], {"scope": "changed"}, "ACTIVE", "CLAIM_CHANGED")
+    assert dde.stale_check(legacy_round["id"])["stale"] is True
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")

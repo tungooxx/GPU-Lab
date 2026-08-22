@@ -3799,6 +3799,81 @@ class ResearchStore:
             and not cls.run_has_terminal_technical_inspection(run)
         )
 
+    def lab_state_summary(self, project_id: str) -> dict[str, Any]:
+        """Return the bounded operational projection used by Lab sync.
+
+        Lab polling is intentionally not a scientific-state export.  In
+        particular, it must not materialize every historical decision or a
+        large frozen discovery snapshot merely to report current work.
+        """
+        project_id = self._canonical_uuid(project_id)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id,name FROM research_projects WHERE id=%s", (project_id,))
+            project = cur.fetchone()
+            if not project:
+                raise GPUError("RESEARCH_PROJECT_NOT_FOUND", project_id)
+            cur.execute(
+                "SELECT count(*) AS object_count,max(created_at) AS latest_object_at "
+                "FROM research_objects WHERE project_id=%s",
+                (project_id,),
+            )
+            object_freshness = cur.fetchone()
+            cur.execute(
+                "SELECT count(*) AS event_count,max(created_at) AS latest_scientific_event_at "
+                "FROM research_events WHERE project_id=%s",
+                (project_id,),
+            )
+            event_freshness = cur.fetchone()
+            cur.execute(
+                "SELECT id FROM research_objects "
+                "WHERE project_id=%s AND kind='WorldModel' ORDER BY created_at DESC LIMIT 1",
+                (project_id,),
+            )
+            world_model = cur.fetchone()
+            cur.execute(
+                "SELECT data->>'version' AS version FROM research_objects "
+                "WHERE project_id=%s AND kind='ResearchPolicy' AND status='PRODUCTION' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (project_id,),
+            )
+            policy = cur.fetchone()
+            cur.execute(
+                "SELECT data->>'brain_policy_version' AS version FROM research_objects "
+                "WHERE project_id=%s AND kind='ResearchDecision' ORDER BY created_at DESC LIMIT 1",
+                (project_id,),
+            )
+            decision = cur.fetchone()
+            # Inspection is retained only because it is part of the canonical
+            # operational-active predicate; arbitrary ExperimentRun metadata
+            # never belongs in a routine Lab poll.
+            cur.execute(
+                "SELECT id,kind,status,jsonb_build_object("
+                "'label',data->>'label','job_id',data->>'job_id',"
+                "'inspection',jsonb_build_object("
+                "'technical_non_scientific',data#>'{inspection,technical_non_scientific}',"
+                "'prediction_outcome',data#>'{inspection,prediction_outcome}',"
+                "'scientific_result',data#>'{inspection,scientific_result}',"
+                "'actual_information_gain',data#>'{inspection,actual_information_gain}')) AS data,created_at "
+                "FROM research_objects WHERE project_id=%s AND kind='ExperimentRun' "
+                "AND status=ANY(%s) ORDER BY created_at DESC LIMIT 100",
+                (project_id, ["ACTIVE", "RESERVED", "running", "unknown", "RUNNING", "TECHNICAL_CANCELLED", "TECHNICAL_ORPHANED"]),
+            )
+            runs = cur.fetchall()
+        return {
+            "project": {"id": str(project["id"]), "name": project["name"]},
+            "research_state_version": int(object_freshness["object_count"] or 0),
+            "world_model_version": str(world_model["id"]) if world_model else None,
+            "research_policy_version": policy["version"] if policy else None,
+            "brain_policy_version": decision["version"] if decision else None,
+            "state_updated_at": object_freshness["latest_object_at"].isoformat() if object_freshness["latest_object_at"] else None,
+            "latest_scientific_event_at": event_freshness["latest_scientific_event_at"].isoformat() if event_freshness["latest_scientific_event_at"] else None,
+            "scientific_event_count": int(event_freshness["event_count"] or 0),
+            "active_experiments": [
+                {**run, "id": str(run["id"])}
+                for run in runs if self.experiment_run_is_operationally_active(run)
+            ][:30],
+        }
+
     def references_get(
         self, identifiers: list[str], as_of: datetime | str | None = None
     ) -> dict[str, dict]:
@@ -4527,6 +4602,17 @@ class ResearchStore:
             sql += " ORDER BY created_at DESC LIMIT %s"
             args.append(limit)
             cur.execute(sql, args)
+            return cur.fetchall()
+
+    def events_summary(self, project_id: str, limit: int = 100) -> list[dict]:
+        """Return event headers for polling without transferring event payloads."""
+        project_id = self._canonical_uuid(project_id)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT event_type,subject_id,created_at FROM research_events WHERE project_id=%s "
+                "ORDER BY created_at DESC LIMIT %s",
+                (project_id, min(max(limit, 1), 500)),
+            )
             return cur.fetchall()
 
     def search(

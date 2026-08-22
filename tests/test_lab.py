@@ -170,6 +170,18 @@ def test_dependency_reconciliation_supersedes_duplicate_equivalent_dormant_work(
     assert reconciled["status"] == "SUPERSEDED"
     assert reconciled["superseded_by"] == first["id"]
 
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_lab_state_summary_does_not_return_historical_large_object_data():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-compact-state-{time.time_ns()}", "Compact state") ["project_id"]
+    store.object_create(project_id, "Artifact", {"content": "x" * 200_000}, "ARTIFACT_CREATED", "COMPLETED")
+    summary = lab.state_get(project_id)
+    assert summary["research_state_version"] == 1
+    assert "content" not in str(summary)
+    assert len(str(summary)) < 20_000
+
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_budget_and_expired_lease_release_work_without_touching_experiment():
     store = ResearchStore(TEST_DATABASE_URL)

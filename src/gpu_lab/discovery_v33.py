@@ -89,10 +89,17 @@ class DistributedDiscoveryService:
             return None
         return {key: str(value) if isinstance(value, uuid.UUID) else value for key, value in row.items()}
 
-    def _scientific_snapshot(self, project_id: str) -> dict[str, Any]:
+    def _scientific_snapshot(self, project_id: str, *, legacy_full_data: bool = False) -> dict[str, Any]:
         state = self.store.state_get(project_id)
         records = [
-            {"id": str(item["id"]), "kind": item["kind"], "status": item["status"], "data": item["data"]}
+            # A frozen discovery snapshot needs an immutable identity and
+            # content hash, not a second copy of every historical document.
+            # This keeps future rounds bounded even for long-lived projects.
+            (
+                {"id": str(item["id"]), "kind": item["kind"], "status": item["status"], "data": item["data"]}
+                if legacy_full_data else
+                {"id": str(item["id"]), "kind": item["kind"], "status": item["status"], "data_hash": self._hash(item["data"])}
+            )
             for item in state["objects"] if item["kind"] not in DISCOVERY_KINDS
         ]
         return {
@@ -159,7 +166,11 @@ class DistributedDiscoveryService:
     def stale_check(self, round_id: str, mark_stale: bool = False) -> dict:
         """Detect external scientific-state changes without mixing generations across state versions."""
         round_ = self._round(round_id)
-        current = self._scientific_snapshot(str(round_["project_id"]))
+        frozen_records = round_["data"].get("frozen_state", {}).get("records", [])
+        current = self._scientific_snapshot(
+            str(round_["project_id"]),
+            legacy_full_data=bool(frozen_records and "data" in frozen_records[0]),
+        )
         stale = self._hash(current["records"]) != round_["data"].get("scientific_snapshot_hash")
         result = {
             "discovery_round_id": str(round_id), "stale": stale,
