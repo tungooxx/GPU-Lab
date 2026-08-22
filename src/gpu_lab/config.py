@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     gpu_lab_worker_max_turns_per_work_item: int = Field(default=20, ge=1, le=100)
     gpu_lab_worker_max_consecutive_continues: int = Field(default=3, ge=1, le=20)
     gpu_lab_browser_wake_poll_seconds: int = Field(default=5, ge=1, le=60)
+    gpu_lab_lease_reconciliation_poll_seconds: int = Field(default=30, ge=5, le=300)
     gpu_lab_cockpit_password: str | None = None
     gpu_lab_cockpit_session_secret: str | None = None
     fastmcp_host: str = "127.0.0.1"

@@ -96,6 +96,8 @@ cockpit_controller_service: CockpitController | None = None
 browser_wake_dispatcher: BrowserWakeDispatcher | None = None
 browser_wake_loop_thread: threading.Thread | None = None
 browser_wake_loop_stop = threading.Event()
+lab_reconciliation_loop_thread: threading.Thread | None = None
+lab_reconciliation_loop_stop = threading.Event()
 _singleton_lock = threading.RLock()
 embedding_service: EmbeddingService | None = None
 engineering_service: EngineeringService | None = None
@@ -472,6 +474,29 @@ def start_browser_wake_loop() -> None:
     browser_wake_loop_stop.clear()
     browser_wake_loop_thread = threading.Thread(target=run, name="browser-wake-loop", daemon=True)
     browser_wake_loop_thread.start()
+
+
+def start_lab_reconciliation_loop() -> None:
+    """Continuously reap orphaned Lab ownership, independent of UI/MCP reads."""
+    global lab_reconciliation_loop_thread
+    if lab_reconciliation_loop_thread and lab_reconciliation_loop_thread.is_alive():
+        return
+
+    def run() -> None:
+        while not lab_reconciliation_loop_stop.is_set():
+            try:
+                result = lab().recover_stale_leases()
+                if result["recovered"]:
+                    logger.info("Reconciled orphaned Lab WorkItems: %s", result)
+            except Exception:
+                logger.exception("Lab reconciliation sweep failed; it will retry")
+            lab_reconciliation_loop_stop.wait(settings.gpu_lab_lease_reconciliation_poll_seconds)
+
+    lab_reconciliation_loop_stop.clear()
+    lab_reconciliation_loop_thread = threading.Thread(
+        target=run, name="lab-reconciliation-loop", daemon=True
+    )
+    lab_reconciliation_loop_thread.start()
 
 
 def engineering() -> EngineeringService:
@@ -4338,6 +4363,8 @@ def main():
     reconciliation = local.reconcile_jobs()
     if reconciliation["reconciled"]:
         logger.info("Reconciled persisted local jobs at startup: %s", reconciliation)
+    if settings.gpu_lab_research_database_url:
+        start_lab_reconciliation_loop()
     if settings.chatgpt_web_bridge_enabled and settings.autopilot_enabled and settings.auto_continue_enabled:
         start_browser_wake_loop()
     if args.transport == "streamable-http":

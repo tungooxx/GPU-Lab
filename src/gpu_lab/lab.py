@@ -1029,8 +1029,14 @@ class LabController:
         return self.work_get(work_item_id)
 
     def recover_stale_leases(self, project_id: str | None = None) -> dict[str, int]:
-        """Release abandoned intellectual work without cancelling external execution."""
+        """Reconcile orphaned work without cancelling external execution.
+
+        Historical failures can leave a RUNNING/CLAIMED WorkItem with no lease
+        at all.  A live session is required for such an item to remain owned;
+        otherwise it is recovered just like an expired lease.
+        """
         now, recovered = self._now(), 0
+        changed_projects: set[str] = set()
         with self.store._connect() as conn, conn.cursor() as cur:
             sql = "SELECT l.*,w.project_id,w.kind,w.related_refs FROM lab_work_leases l JOIN lab_work_items w ON w.id=l.work_item_id WHERE l.released_at IS NULL AND l.expires_at<%s"
             args: list[Any] = [now]
@@ -1058,6 +1064,71 @@ class LabController:
                 self._event(cur, lease["project_id"], "WORK_RELEASED", lease["work_item_id"], {"reason": "LEASE_EXPIRED", "worker_id": str(lease["worker_id"]), "next_status": next_status})
                 self._event(cur, lease["project_id"], "WORKER_DISCONNECTED", None, {"worker_id": str(lease["worker_id"]), "session_id": str(lease["worker_session_id"])})
                 recovered += 1
+                changed_projects.add(str(lease["project_id"]))
+
+            # Do not trust a lease to be present.  A WorkItem in an owned
+            # state is valid only while its assigned session is heartbeat-live.
+            # This catches old/manual rows and partial failures where the lease
+            # write was lost after the WorkItem status committed.
+            threshold = now - timedelta(seconds=self.lease_seconds)
+            sql = (
+                "SELECT w.*,s.status AS session_status,s.last_heartbeat_at "
+                "FROM lab_work_items w LEFT JOIN research_worker_sessions s "
+                "ON s.id=w.assigned_session_id WHERE w.status IN ('CLAIMED','RUNNING')"
+            )
+            args: list[Any] = []
+            if project_id:
+                sql += " AND w.project_id=%s"
+                args.append(project_id)
+            sql += " FOR UPDATE SKIP LOCKED"
+            cur.execute(sql, args)
+            for item in cur.fetchall():
+                session_live = (
+                    item["assigned_session_id"] is not None
+                    and item["session_status"] not in {None, "DISCONNECTED", "EXPIRED"}
+                    and item["last_heartbeat_at"] >= threshold
+                )
+                if session_live:
+                    continue
+                links = self._linked_experiment_run_ids(item["related_refs"] or {})
+                detached = False
+                for run_id in links:
+                    cur.execute(
+                        "SELECT status,data FROM research_objects WHERE id=%s AND project_id=%s "
+                        "AND kind='ExperimentRun'",
+                        (run_id, item["project_id"]),
+                    )
+                    run = cur.fetchone()
+                    if run and self.store.experiment_run_is_operationally_active(run):
+                        detached = True
+                        break
+                next_status = "RUNNING_DETACHED" if detached else "READY"
+                reason = (
+                    "Worker ownership is orphaned; linked execution continues detached."
+                    if detached
+                    else "Worker ownership is orphaned; no heartbeat-live session remains."
+                )
+                cur.execute(
+                    "UPDATE lab_work_leases SET released_at=%s,release_reason='ORPHANED_SESSION' "
+                    "WHERE work_item_id=%s AND released_at IS NULL",
+                    (now, item["id"]),
+                )
+                cur.execute(
+                    "UPDATE lab_work_items SET status=%s,assigned_worker_id=NULL,assigned_session_id=NULL,"
+                    "lease_id=NULL,updated_at=%s,blocked_reason=%s WHERE id=%s",
+                    (next_status, now, reason, item["id"]),
+                )
+                self._event(
+                    cur,
+                    item["project_id"],
+                    "WORK_ORPHAN_RECONCILED",
+                    item["id"],
+                    {"reason": reason, "next_status": next_status},
+                )
+                recovered += 1
+                changed_projects.add(str(item["project_id"]))
+        for changed_project in changed_projects:
+            self.resolve_dependencies(changed_project)
         return {"recovered": recovered}
 
     def message_send(self, project_id: str, from_worker_id: str, from_session_id: str, message_type: str,

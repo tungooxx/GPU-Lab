@@ -225,6 +225,30 @@ def test_budget_and_expired_lease_release_work_without_touching_experiment():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_orphaned_running_work_without_a_lease_is_recovered():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store, lease_seconds=30)
+    project_id = store.project_create(f"lab-orphan-{time.time_ns()}", "Orphan recovery")["project_id"]
+    joined = lab.join(None, "orphaned-worker", "CODEX", project_id)
+    work = lab.create_work(
+        project_id, "REVIEW", "Recover me", "No owner may run forever", "REVIEWER",
+        joined["worker"]["id"], created_session_id=joined["session_id"],
+    )
+    lab.claim_work(work["id"], joined["worker"]["id"], joined["session_id"])
+    lab.start_work(work["id"], joined["worker"]["id"], joined["session_id"])
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM lab_work_leases WHERE work_item_id=%s", (work["id"],))
+        cur.execute(
+            "UPDATE research_worker_sessions SET status='EXPIRED',last_heartbeat_at="
+            "NOW() - INTERVAL '1 hour' WHERE id=%s",
+            (joined["session_id"],),
+        )
+
+    assert lab.recover_stale_leases(project_id) == {"recovered": 1}
+    assert lab.work_get(work["id"])["status"] == "READY"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_attached_execution_cannot_return_to_ready_after_worker_disconnect():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store, lease_seconds=30)
