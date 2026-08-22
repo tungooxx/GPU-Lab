@@ -305,8 +305,11 @@ class LabController:
                             (session_id, worker["id"], runtime_type, json.dumps(runtime_metadata or {}), project_id, now, now))
             self._event(cur, project_id, "WORKER_SESSION_RECOVERED" if recovered else "WORKER_JOINED", None,
                         {"worker_id": str(worker["id"]), "session_id": session_id, "runtime_type": runtime_type})
+        # Joining only creates or resumes a session.  Reconciliation is a
+        # sync-time responsibility; doing it here makes every new worker wait
+        # behind lease/dependency scans before it can even receive its state.
         return {"worker": self._record(worker), "session_id": session_id, "recovered": recovered,
-                "lab_state": self.state_get(project_id, session_id)}
+                "lab_state": self.state_get(project_id, session_id, reconcile=False)}
 
     def gate_ensure(
         self, project_id: str, gate_key: str, scientific_object_id: str,
