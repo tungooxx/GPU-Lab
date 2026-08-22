@@ -657,6 +657,22 @@ class LabController:
         result["dependencies"] = cur.fetchall()
         return result
 
+    @staticmethod
+    def _work_not_found_error(cur, work_item_id: str) -> GPUError:
+        """Explain an ID-domain mismatch instead of returning a bare UUID."""
+        cur.execute("SELECT kind FROM research_objects WHERE id=%s", (work_item_id,))
+        object_row = cur.fetchone()
+        if object_row:
+            return GPUError(
+                "LAB_WORK_NOT_FOUND",
+                f"Expected a Lab WorkItem ID; {work_item_id} resolves to ResearchObject "
+                f"kind {object_row['kind']}",
+            )
+        return GPUError(
+            "LAB_WORK_NOT_FOUND",
+            f"Expected a Lab WorkItem ID; no WorkItem exists for {work_item_id}",
+        )
+
     def work_get(self, work_item_id: str) -> dict:
         with self.store._connect() as conn, conn.cursor() as cur:
             return self._work_record(cur, work_item_id)
@@ -888,7 +904,7 @@ class LabController:
             cur.execute("SELECT * FROM lab_work_items WHERE id=%s FOR UPDATE", (work_item_id,))
             item = cur.fetchone()
             if not item:
-                raise GPUError("LAB_WORK_NOT_FOUND", work_item_id)
+                raise self._work_not_found_error(cur, work_item_id)
             self._session(cur, session_id, worker_id, str(item["project_id"]))
             if str(item["assigned_worker_id"]) != str(worker_id) or str(item["assigned_session_id"]) != str(session_id):
                 raise GPUError("LAB_WORK_NOT_OWNED", work_item_id)
@@ -1043,7 +1059,7 @@ class LabController:
             if project_id:
                 sql += " AND w.project_id=%s"
                 args.append(project_id)
-            sql += " FOR UPDATE SKIP LOCKED"
+            sql += " FOR UPDATE OF w SKIP LOCKED"
             cur.execute(sql, args)
             for lease in cur.fetchall():
                 cur.execute("UPDATE lab_work_leases SET released_at=%s,release_reason='LEASE_EXPIRED' WHERE id=%s", (now, lease["id"]))
@@ -1080,7 +1096,9 @@ class LabController:
             if project_id:
                 sql += " AND w.project_id=%s"
                 args.append(project_id)
-            sql += " FOR UPDATE SKIP LOCKED"
+            # Lock only the WorkItem side. PostgreSQL rejects a generic FOR
+            # UPDATE on the nullable side of this LEFT JOIN.
+            sql += " FOR UPDATE OF w SKIP LOCKED"
             cur.execute(sql, args)
             for item in cur.fetchall():
                 session_live = (
@@ -1206,9 +1224,17 @@ class LabController:
             cur.execute("SELECT s.id AS session_id,s.worker_id,w.display_name,s.status,s.active_role,s.current_work_item_id,s.last_heartbeat_at FROM research_worker_sessions s JOIN research_workers w ON w.id=s.worker_id WHERE s.current_project_id=%s AND s.status NOT IN ('DISCONNECTED','EXPIRED') AND s.last_heartbeat_at>=%s ORDER BY s.last_heartbeat_at DESC", (project_id, threshold))
             return [self._record(row) for row in cur.fetchall()]
 
-    def state_get(self, project_id: str, session_id: str | None = None, since: str | None = None) -> dict:
-        self.recover_stale_leases(project_id)
-        self.resolve_dependencies(project_id)
+    def state_get(
+        self,
+        project_id: str,
+        session_id: str | None = None,
+        since: str | None = None,
+        *,
+        reconcile: bool = True,
+    ) -> dict:
+        if reconcile:
+            self.recover_stale_leases(project_id)
+            self.resolve_dependencies(project_id)
         state = self.store.lab_state_summary(project_id)
         events = self.store.events_summary(project_id, 30)
         if since:
@@ -1270,7 +1296,10 @@ class LabController:
                     lease_state = "OWNED"
             if session["status"] not in {"DISCONNECTED", "EXPIRED"}:
                 cur.execute("UPDATE research_worker_sessions SET last_heartbeat_at=%s WHERE id=%s", (now, session_id))
-        state = self.state_get(project_id, session_id, since)
+        # Sync has already performed ownership reconciliation. Do not repeat
+        # recovery/dependency scans inside state_get for every poll.
+        self.resolve_dependencies(project_id)
+        state = self.state_get(project_id, session_id, since, reconcile=False)
         old_work_reassigned = bool(current_work_item_id and current_work_item_id != str(session["current_work_item_id"] or ""))
         return {
             "session_id": session_id, "old_work_reassigned": old_work_reassigned,

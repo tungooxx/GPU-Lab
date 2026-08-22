@@ -787,8 +787,17 @@ async def call(fn, *args, **kwargs):
     started = time.perf_counter()
     arguments = {"args": scrub(args), "kwargs": scrub(kwargs)}
     try:
-        result = fn(*args, **kwargs)
-        result = await result if inspect.isawaitable(result) else result
+        # Most persistence and Lab operations are synchronous. Running them on
+        # the ASGI event loop turns one slow project-state read into a global
+        # outage: health checks and unrelated MCP calls cannot be scheduled.
+        # Keep native async providers on the loop, but move sync work to the
+        # default worker pool so requests can progress independently.
+        if inspect.iscoroutinefunction(fn):
+            result = await fn(*args, **kwargs)
+        else:
+            result = await asyncio.to_thread(fn, *args, **kwargs)
+            if inspect.isawaitable(result):
+                result = await result
         svc().repo.audit(
             tool_name, arguments, "success", int((time.perf_counter() - started) * 1000)
         )

@@ -1,6 +1,7 @@
 import os
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -246,6 +247,21 @@ def test_orphaned_running_work_without_a_lease_is_recovered():
 
     assert lab.recover_stale_leases(project_id) == {"recovered": 1}
     assert lab.work_get(work["id"])["status"] == "READY"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_start_work_explains_an_unknown_work_item_id():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-missing-id-{time.time_ns()}", "ID diagnostics")["project_id"]
+    joined = lab.join(None, "id-diagnostic-worker", "CODEX", project_id)
+
+    missing_id = str(uuid.uuid4())
+    with pytest.raises(GPUError) as exc_info:
+        lab.start_work(missing_id, joined["worker"]["id"], joined["session_id"])
+
+    assert exc_info.value.error_type == "LAB_WORK_NOT_FOUND"
+    assert exc_info.value.message == f"Expected a Lab WorkItem ID; no WorkItem exists for {missing_id}"
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")

@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from pathlib import Path
 
 import pytest
@@ -149,6 +150,21 @@ async def test_call_audits_only_scrubbed_arguments(monkeypatch):
     assert "hidden" not in payload
     assert "top-secret" not in payload
     assert "[REDACTED]" in payload
+
+
+@pytest.mark.asyncio
+async def test_call_runs_synchronous_tools_off_the_event_loop(monkeypatch):
+    class FakeRepository:
+        def audit(self, *_args):
+            return None
+
+    class FakeService:
+        repo = FakeRepository()
+
+    monkeypatch.setattr("gpu_lab.server.svc", lambda: FakeService())
+    event_loop_thread = threading.get_ident()
+
+    assert await call(threading.get_ident) != event_loop_thread
 
 
 def test_mcp_network_policy_blocks_only_the_isolated_worker_subnet():
