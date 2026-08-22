@@ -38,6 +38,7 @@ from .embeddings import EmbeddingService, LocalHashEmbeddingProvider
 from .engineering import CodingExecutionPolicy, EngineeringService
 from .epistemics import EpistemicService
 from .errors import GPUError
+from .execution_validity import aggregate_episode_attestations
 from .executable_papers import ExecutablePaperService, HttpExecutablePaperProvider
 from .lab import LabController
 from .literature import HttpLiteratureProvider, LiteratureService
@@ -3632,6 +3633,7 @@ async def research_experiment_execute(
     lab_work_item_id: str | None = None,
     lab_worker_id: str | None = None,
     lab_session_id: str | None = None,
+    runtime_fingerprint: str | None = None,
 ):
     """Run a preregistered experiment with a ResearchDecision created by research_decision_create.
 
@@ -3648,6 +3650,25 @@ async def research_experiment_execute(
         )
         if "error" in readiness:
             return readiness
+    experiment = await call(research().object_get, experiment_id)
+    if "error" in experiment:
+        return experiment
+    requires_canary = bool(experiment.get("data", {}).get("plan", {}).get("require_exact_runtime_canary"))
+    if requires_canary and not runtime_fingerprint:
+        return {"error": {"type": "RUNTIME_CANARY_REQUIRED", "message": "Provide the exact runtime fingerprint"}}
+    if runtime_fingerprint:
+        canaries = await call(
+            research().objects_list,
+            str(experiment["project_id"]),
+            "RuntimeCanary",
+            {"VERIFIED_REAL"},
+            1,
+            {"runtime_fingerprint": runtime_fingerprint},
+        )
+        if "error" in canaries:
+            return canaries
+        if not canaries:
+            return {"error": {"type": "RUNTIME_CANARY_REQUIRED", "message": "No passing canary matches this exact runtime"}}
     request = {
         "experiment_id": experiment_id,
         "decision_id": decision_id,
@@ -3764,6 +3785,45 @@ async def research_experiment_execute(
         else:
             response["lab_work_item"] = attachment
     return response
+
+
+@mcp.tool()
+async def research_execution_attest(run_id: str, attestation: dict[str, Any]):
+    """Record typed execution stages. Technical failures cannot become scientific evidence."""
+    return await call(research().run_record_execution_attestation, run_id, attestation)
+
+
+@mcp.tool()
+async def research_technical_result_inspect(
+    run_id: str,
+    decision_id: str,
+    inspection: dict[str, Any],
+    information_gain_basis: list[str],
+    actual_information_gain: str = "INVALID",
+):
+    """Close a technically invalid run without updating scientific belief or evidence."""
+    return await call(
+        research().technical_result_inspection_apply,
+        run_id=run_id,
+        decision_id=decision_id,
+        actual_information_gain=actual_information_gain,
+        information_gain_basis=information_gain_basis,
+        inspection=inspection,
+    )
+
+
+@mcp.tool()
+async def research_execution_episode_summary(episode_attestations: list[dict[str, Any]]):
+    """Validate and aggregate episode packets without collapsing errors into failed candidates."""
+    return await call(aggregate_episode_attestations, episode_attestations)
+
+
+@mcp.tool()
+async def runtime_canary_record(
+    project_id: str, runtime_fingerprint: str, attestation: dict[str, Any]
+):
+    """Record a non-scientific exact-runtime canary reusable by compatible experiments."""
+    return await call(research().runtime_canary_record, project_id, runtime_fingerprint, attestation)
 
 
 @mcp.tool()

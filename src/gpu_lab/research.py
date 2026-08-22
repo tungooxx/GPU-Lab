@@ -10,6 +10,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from .errors import GPUError
+from .execution_validity import normalize_execution_attestation
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +116,7 @@ RESEARCH_OBJECT_KINDS = (
     "ScientificDisagreement",
     "CorrectionRecord",
     "CorrectionHindsight",
+    "RuntimeCanary",
 )
 RESEARCH_OBJECT_STATUSES = {
     "ACTIVE",
@@ -4319,6 +4321,61 @@ class ResearchStore:
             )
             self._event(cur, run["project_id"], event, run_id, result)
         return {"id": run_id, "status": status, "data": data}
+
+    def run_record_execution_attestation(self, run_id: str, attestation: dict[str, Any]) -> dict:
+        """Persist runner-stage facts before any scientific result assessment.
+
+        This is deliberately separate from ``run_update`` so an arbitrary job
+        status or a log parser cannot silently manufacture scientific stages.
+        """
+        normalized = normalize_execution_attestation(attestation)
+        now = datetime.now(UTC)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,project_id,kind,status,data FROM research_objects WHERE id=%s FOR UPDATE",
+                (run_id,),
+            )
+            run = cur.fetchone()
+            if not run or run["kind"] != "ExperimentRun":
+                raise GPUError("EXPERIMENT_RUN_NOT_FOUND", run_id)
+            if run["status"] == "RESULT_INSPECTED":
+                raise GPUError("EXPERIMENT_RESULT_ALREADY_INSPECTED", run_id)
+            existing = run["data"].get("execution_attestation")
+            if existing is not None:
+                if existing == normalized:
+                    return {"id": run_id, "status": run["status"], "data": run["data"], "idempotent_replay": True}
+                raise GPUError("EXECUTION_ATTESTATION_ALREADY_RECORDED", run_id)
+            data = {**run["data"], "execution_attestation": normalized, "execution_attested_at": now.isoformat()}
+            cur.execute("UPDATE research_objects SET data=%s WHERE id=%s", (json.dumps(data), run_id))
+            self._event(
+                cur,
+                run["project_id"],
+                "EXPERIMENT_EXECUTION_ATTESTED",
+                run_id,
+                {
+                    "technical_status": normalized["technical_status"],
+                    "measurement_reached": normalized["measurement_reached"],
+                    "technical_error_count": len(normalized["technical_errors"]),
+                },
+            )
+        return {"id": run_id, "status": run["status"], "data": data, "idempotent_replay": False}
+
+    def runtime_canary_record(
+        self, project_id: str, runtime_fingerprint: str, attestation: dict[str, Any]
+    ) -> dict:
+        """Store a content-addressed, non-scientific exact-runtime canary."""
+        if not isinstance(runtime_fingerprint, str) or len(runtime_fingerprint) != 64 or not re.fullmatch(r"[0-9a-f]{64}", runtime_fingerprint):
+            raise GPUError("INVALID_RUNTIME_FINGERPRINT", "Use a SHA-256 hex digest")
+        normalized = normalize_execution_attestation(attestation)
+        if not normalized["technical_valid"]:
+            raise GPUError("RUNTIME_CANARY_FAILED", "A canary must pass all required stages")
+        return self.object_create(
+            project_id,
+            "RuntimeCanary",
+            {"runtime_fingerprint": runtime_fingerprint, "attestation": normalized, "scientific_data": False},
+            "RUNTIME_CANARY_PASSED",
+            "VERIFIED_REAL",
+        )
 
     def run_reconcile_orphan(
         self,

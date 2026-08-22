@@ -17,6 +17,7 @@ from .discovery import (
 )
 from .epistemics import normalize_scientific_scope, scope_is_empirically_bounded
 from .errors import GPUError
+from .execution_validity import normalize_execution_attestation
 from .research import ResearchStore
 from .strategy import SCORING_POLICY_VERSION, STRATEGY_POLICY_VERSION, ResearchStrategyService
 
@@ -1270,6 +1271,21 @@ class ResearchBrain:
         }:
             raise GPUError("INVALID_INFORMATION_GAIN", actual_information_gain)
         guard_passed = condition_evaluations[pass_condition]
+        # New runs may carry an explicit runner attestation.  Its technical
+        # facts have absolute precedence over a client supplied scientific
+        # classification: a crash before measurement is not an inconclusive
+        # observation, even when the process itself exited zero.
+        attestation = run["data"].get("execution_attestation")
+        if attestation is not None:
+            validated_attestation = normalize_execution_attestation(attestation)
+            if not validated_attestation["technical_valid"] or not validated_attestation[
+                "measurement_reached"
+            ]:
+                raise GPUError(
+                    "SCIENTIFIC_OUTCOME_INVALID",
+                    "Run did not reach the preregistered scientific measurement stage; "
+                    "record a technical inspection instead.",
+                )
         successful_run = run["status"] in {"completed", "RESULT_NOT_INSPECTED"}
         basis = list(information_gain_basis or [])
         technical_non_scientific = (

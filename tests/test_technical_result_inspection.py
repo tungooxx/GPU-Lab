@@ -1,4 +1,7 @@
+import pytest
+
 from gpu_lab.brain import ResearchBrain
+from gpu_lab.errors import GPUError
 
 
 class TechnicalAssessmentStore:
@@ -83,3 +86,35 @@ def test_failed_technical_result_uses_non_scientific_inspection_with_basis():
     assert store.applied["information_gain_basis"] == [
         "Prevented a technical bug from becoming scientific evidence."
     ]
+
+
+def test_completed_process_with_failed_reset_attestation_cannot_be_scientifically_assessed():
+    store = TechnicalAssessmentStore()
+    store.objects["run"]["status"] = "completed"
+    store.objects["run"]["data"]["execution_attestation"] = {
+        "technical_status": "FAIL",
+        "stages": {
+            "runtime_initialized": True,
+            "environment_reset": False,
+            "initial_observation_received": False,
+            "planner_called": False,
+            "plan_parsed": False,
+            "executor_started": False,
+            "environment_actions_executed": 0,
+            "scientific_eligibility_evaluated": False,
+            "scientific_metric_evaluated": False,
+        },
+        "technical_errors": [
+            {"stage": "environment_reset", "type": "NameError", "message": "name 'r' is not defined"}
+        ],
+    }
+
+    with pytest.raises(GPUError) as error:
+        ResearchBrain(store).result_assess(
+            run_id="run", decision_id="decision", hypothesis_id="hypothesis", agenda_item_id="agenda",
+            prediction_outcome="INCONCLUSIVE_INSUFFICIENT_NATURAL_TRAJECTORIES",
+            guard_condition_outcome="zero qualified", condition_evaluations={"metric > 0": False},
+            evidence_supporting=[], evidence_against=[], unexpected_observations=[], alternative_explanations=[],
+            scope="fixture", hypothesis_transition="INCONCLUSIVE", rationale="fixture",
+        )
+    assert error.value.error_type == "SCIENTIFIC_OUTCOME_INVALID"
