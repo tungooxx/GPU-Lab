@@ -61,6 +61,24 @@ def test_browser_runtime_marks_first_successful_connection_attached():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_cockpit_groups_live_workers_by_project_with_identifiers():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    cockpit = CockpitController(store, lab)
+    first = store.project_create(f"cockpit-live-a-{time.time_ns()}", "First project")
+    second = store.project_create(f"cockpit-live-b-{time.time_ns()}", "Second project")
+    first_worker = lab.join(None, "live-a", "CHATGPT_WEB", first["project_id"])
+    second_worker = lab.join(None, "live-b", "CODEX", second["project_id"])
+
+    by_project = {item["project_id"]: item for item in cockpit.live_workers_by_project()}
+
+    assert by_project[first["project_id"]]["live_worker_count"] == 1
+    assert by_project[first["project_id"]]["workers"][0]["display_name"] == "live-a"
+    assert by_project[first["project_id"]]["workers"][0]["worker_id"] == first_worker["worker"]["id"]
+    assert by_project[second["project_id"]]["workers"][0]["worker_id"] == second_worker["worker"]["id"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_ready_work_wake_is_deduplicated():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)

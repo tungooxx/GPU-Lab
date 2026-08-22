@@ -8,7 +8,7 @@ runtime failure never changes a hypothesis or cancels an ExperimentRun.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlparse
 
@@ -290,6 +290,7 @@ class CockpitController:
             ]
         return {
             "lab_state": lab_state,
+            "live_workers_by_project": self.live_workers_by_project(),
             "controls": self.controls_get(project_id),
             "browser_runtimes": runtimes,
             "recent_turns": turns,
@@ -299,6 +300,50 @@ class CockpitController:
             "discovery_archives": discovery_archives,
             "correction_cases": correction_cases,
         }
+
+    def live_workers_by_project(self) -> list[dict[str, Any]]:
+        """List heartbeat-live workers grouped by current project for safe operations."""
+        threshold = self._now() - timedelta(seconds=self.lab.lease_seconds)
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT p.id AS project_id,p.name AS project_name,s.id AS session_id,"
+                "s.worker_id,w.display_name,s.status,s.active_role,s.current_work_item_id,"
+                "s.last_heartbeat_at FROM research_worker_sessions s "
+                "JOIN research_workers w ON w.id=s.worker_id "
+                "JOIN research_projects p ON p.id=s.current_project_id "
+                "WHERE s.status NOT IN ('DISCONNECTED','EXPIRED') "
+                "AND s.last_heartbeat_at>=%s ORDER BY p.name,s.last_heartbeat_at DESC",
+                (threshold,),
+            )
+            grouped: dict[str, dict[str, Any]] = {}
+            for row in cur.fetchall():
+                project_id = str(row["project_id"])
+                project = grouped.setdefault(
+                    project_id,
+                    {
+                        "project_id": project_id,
+                        "project_name": row["project_name"],
+                        "live_worker_count": 0,
+                        "workers": [],
+                    },
+                )
+                project["workers"].append(
+                    {
+                        "worker_id": str(row["worker_id"]),
+                        "display_name": row["display_name"],
+                        "session_id": str(row["session_id"]),
+                        "status": row["status"],
+                        "active_role": row["active_role"],
+                        "current_work_item_id": (
+                            str(row["current_work_item_id"])
+                            if row["current_work_item_id"]
+                            else None
+                        ),
+                        "last_heartbeat_at": row["last_heartbeat_at"],
+                    }
+                )
+                project["live_worker_count"] += 1
+        return list(grouped.values())
 
     def turn_report(self, project_id: str, worker_id: str, session_id: str, outcome: str,
                     summary: str, work_item_id: str | None = None) -> dict[str, Any]:
