@@ -1,0 +1,1068 @@
+"""Bounded controller for durable meta-research campaigns."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from .errors import GPUError
+
+
+class MetaResearchController:
+    """Observe research behavior and launch at most one evidence-gated campaign."""
+
+    def __init__(self, store, policy_lab, *, mode: str = "AUTO_PROJECT", candidate_budget: int = 3, benchmark_budget: int = 6, literature_budget: int = 1):
+        self.store, self.policy_lab = store, policy_lab
+        self.defaults = {
+            "mode": mode,
+            "candidate_budget": candidate_budget,
+            "benchmark_budget": benchmark_budget,
+            "literature_budget": literature_budget,
+            "max_revision_rounds": 3,
+            "token_budget": 12_000,
+            "llm_call_budget": 12,
+            "engineering_budget": 0,
+            "wall_clock_iteration_budget": 3,
+            "gpu_budget": 0.0,
+        }
+
+    def _objects(self, project_id: str, kind: str) -> list[dict[str, Any]]:
+        return self.store.objects_list(project_id, kind, limit=None)
+
+    def _find_by_fingerprint(self, project_id: str, kind: str, fingerprint: str) -> dict[str, Any] | None:
+        return next(
+            (item for item in self._objects(project_id, kind) if item["data"].get("fingerprint") == fingerprint),
+            None,
+        )
+
+    def _candidate_sources(self, project_id: str, opportunity: dict[str, Any]) -> dict[str, list[str]]:
+        """Return durable, reviewable inputs for policy invention.
+
+        Sources are evidence and constraints, not executable instructions.  In
+        particular rejected policy results are retained to avoid repeating a
+        failed mechanism casually.
+        """
+        return {
+            "ImprovementOpportunity": [str(opportunity["id"])],
+            "MetaWorldModel": [str(item["id"]) for item in self._objects(project_id, "MetaWorldModel")[-5:]],
+            "MetaLesson": [str(item["id"]) for item in self._objects(project_id, "MetaLesson")[-5:]],
+            "ResearchStrategyPattern": [str(item["id"]) for item in self._objects(project_id, "ResearchStrategyPattern")[-5:]],
+            "PolicyNegativeResult": [str(item["id"]) for item in self._objects(project_id, "PolicyNegativeResult")[-10:]],
+            "LiteraturePolicyTransfer": [
+                str(item["id"])
+                for item in self._objects(project_id, "LiteraturePolicyTransfer")
+                if str(item["data"].get("opportunity_id")) == str(opportunity["id"])
+                and item["status"] == "CANDIDATE"
+            ][-10:],
+        }
+
+    def literature_scout_complete(self, project_id: str, request_id: str, evidence_ids: list[str]) -> list[dict[str, Any]]:
+        """Extract bounded, reviewable policy-transfer candidates from scout evidence.
+
+        This performs no scientific validation and does not execute paper text.
+        Each record is a later policy-idea input whose provenance remains the
+        original candidate EvidenceUnit.
+        """
+        request = self.store.object_get(request_id)
+        if request["kind"] != "LiteratureScoutRequest" or str(request["project_id"]) != str(project_id):
+            raise GPUError("LITERATURE_SCOUT_REQUEST_INVALID", request_id)
+        transfers = []
+        for evidence_id in evidence_ids[:20]:
+            evidence = self.store.object_get(str(evidence_id))
+            if evidence["kind"] != "EvidenceUnit" or str(evidence["project_id"]) != str(project_id):
+                raise GPUError("LITERATURE_SCOUT_EVIDENCE_INVALID", str(evidence_id))
+            fingerprint = f"literature-policy-transfer:{request_id}:{evidence_id}"
+            existing = self._find_by_fingerprint(project_id, "LiteraturePolicyTransfer", fingerprint)
+            if existing:
+                transfers.append(existing)
+                continue
+            excerpt = str(evidence["data"].get("excerpt", evidence["data"].get("source_excerpt", "")))
+            lowered = excerpt.lower()
+            overlap = any(term in lowered for term in ("hypothesis-outcome", "runner-up", "null-focused"))
+            transfers.append(self.store.object_create(
+                project_id,
+                "LiteraturePolicyTransfer",
+                {
+                    "fingerprint": fingerprint,
+                    "opportunity_id": str(request["data"].get("opportunity_id")),
+                    "literature_scout_request_id": request_id,
+                    "evidence_id": str(evidence_id),
+                    "problem_addressed": request["data"].get("question"),
+                    "proposed_mechanism_excerpt": excerpt[:4000],
+                    "procedure": "UNEXTRACTED_FROM_CANDIDATE_EVIDENCE",
+                    "assumptions": "UNVERIFIED_EXTERNAL_SOURCE",
+                    "benchmark_or_ablation": "UNEXTRACTED_FROM_CANDIDATE_EVIDENCE",
+                    "failure_or_cost": "UNEXTRACTED_FROM_CANDIDATE_EVIDENCE",
+                    "transferable_principle": "Requires policy-hypothesis review and blinded benchmark evaluation.",
+                    "non_transferable_architecture": "External architecture is not imported by this record.",
+                    "comparison": "PARTIAL_OVERLAP" if overlap else "NOVEL_CANDIDATE",
+                    "authority": "EVIDENCE_CANDIDATE_ONLY",
+                },
+                "LITERATURE_POLICY_TRANSFER_EXTRACTED",
+                "CANDIDATE",
+            ))
+        return transfers
+
+    def _diagnose_opportunity(self, project_id: str, opportunity: dict[str, Any]) -> dict[str, Any]:
+        """Persist competing, explicitly non-causal explanations before patching."""
+        fingerprint = f"meta-diagnosis:{opportunity['id']}"
+        existing = self._find_by_fingerprint(project_id, "MetaWorldModel", fingerprint)
+        if existing:
+            return existing
+        evidence_ids = {str(item) for item in opportunity["data"].get("supporting_evidence", [])}
+        outcomes = [
+            item for item in self._objects(project_id, "ResearchDecisionOutcome")
+            if str(item["id"]) in evidence_ids
+        ]
+        labels = [str(item["data"].get("label", "UNKNOWN")) for item in outcomes]
+        severe = sum(label in {"INVALID", "PREMATURE"} for label in labels)
+        repeated_action = len({str(item["data"].get("action_type", "UNKNOWN")) for item in outcomes}) <= 1
+        candidates = [
+            {
+                "component": "candidate_generation",
+                "mechanism": "Candidate generation may lack decisive interventions.",
+                "diagnostic_score": 0.6 if repeated_action else 0.35,
+                "evidence_basis": "Repeated action-family selection across observed failures." if repeated_action else "Action-family diversity is not yet diagnostic.",
+            },
+            {
+                "component": "ranking",
+                "mechanism": "Ranking may overweight low-cost diagnostics over discrimination value.",
+                "diagnostic_score": round(min(0.8, 0.35 + 0.1 * len(outcomes)), 2),
+                "evidence_basis": "Repeated low-information selected actions require a ranking comparison.",
+            },
+            {
+                "component": "critic",
+                "mechanism": "The critic may fail to reject a cheap available falsifier or scope risk.",
+                "diagnostic_score": round(min(0.85, 0.3 + 0.2 * severe), 2),
+                "evidence_basis": "Invalid or premature outcomes are critic-relevant only as an investigatory signal.",
+            },
+        ]
+        candidates.sort(key=lambda item: (-item["diagnostic_score"], item["component"]))
+        return self.store.object_create(
+            project_id,
+            "MetaWorldModel",
+            {
+                "fingerprint": fingerprint,
+                "scope": opportunity["data"].get("scope", "PROJECT"),
+                "relationships": [
+                    {
+                        "from": candidate["component"],
+                        "to": "observed_research_failure",
+                        "observation": candidate["mechanism"],
+                        "causal_status": "HYPOTHESIS_NOT_ESTABLISHED",
+                    }
+                    for candidate in candidates
+                ],
+                "evidence": sorted(evidence_ids),
+                "confidence": max(candidate["diagnostic_score"] for candidate in candidates),
+                "counterexamples": [],
+                "unresolved_relationships": ["Competing component explanations require blinded policy evaluation; correlation is not causation."],
+                "diagnostic_hypotheses": candidates,
+                "provider_sensitivity": "UNVERIFIED",
+                "domain_sensitivity": "UNVERIFIED",
+            },
+            "META_POLICY_CAUSES_DIAGNOSED",
+            "CANDIDATE",
+        )
+
+    def _prepare_literature_scout(self, project_id: str, opportunity: dict[str, Any], literature_budget: int) -> dict[str, Any] | None:
+        """Create a finite, problem-driven literature brief before any retrieval happens."""
+        if literature_budget < 1:
+            return None
+        data = opportunity["data"]
+        fingerprint = f"literature-scout:{opportunity['id']}"
+        existing = self._find_by_fingerprint(project_id, "LiteratureScoutRequest", fingerprint)
+        if existing:
+            return existing
+        question = (
+            f"What tested methods improve {data['target_component']} when the observed weakness is: "
+            f"{data['observed_failure']}? Compare mechanisms, ablations, limitations, negative results, and cost."
+        )
+        return self.store.object_create(
+            project_id,
+            "LiteratureScoutRequest",
+            {
+                "fingerprint": fingerprint,
+                "opportunity_id": str(opportunity["id"]),
+                "question": question,
+                "max_queries": literature_budget,
+                "required_perspectives": ["target method", "closest prior method", "competing methods", "ablations", "limitations", "negative results"],
+                "status_reason": "Problem-driven request; external content remains untrusted evidence.",
+            },
+            "LITERATURE_SCOUT_PREPARED",
+            "PREPARED",
+        )
+
+    def _promotion_preflight(self, project_id: str, patch_id: str, config: dict[str, Any]) -> dict[str, Any]:
+        """Apply v3's scoped auto-promotion gates before creating a new policy."""
+        patch = self.store.object_get(patch_id)
+        experiments = [
+            item for item in self._objects(project_id, "PolicyExperiment")
+            if str(item["data"].get("candidate_patch_id")) == patch_id
+        ]
+        experiment = experiments[-1] if experiments else None
+        reasons = []
+        if patch["status"] not in {"SUPPORTED_ON_BENCHMARK", "CROSS_PROJECT_SUPPORTED", "CROSS_MODEL_SUPPORTED", "RECOMMENDED_FOR_PROMOTION"}:
+            reasons.append("patch_not_supported")
+        if not experiment or not experiment["data"].get("splits", {}).get("held_out"):
+            reasons.append("held_out_coverage_missing")
+        if experiment and experiment["data"].get("regressions"):
+            reasons.append("benchmark_regressions_present")
+        if not patch["data"].get("implementation_change", {}).get("enabled"):
+            reasons.append("implementation_not_verified")
+        if not any(item["status"] == "PRODUCTION" for item in self._objects(project_id, "ResearchPolicy")):
+            reasons.append("rollback_target_missing")
+        scope = str(patch["data"].get("applicability", {}).get("scope", "PROJECT")).upper()
+        required_mode = f"AUTO_{scope}"
+        if config.get("mode") != required_mode:
+            reasons.append(f"autonomy_mode_must_be_{required_mode}")
+        transfer = experiment["data"].get("transfer_classification") if experiment else None
+        if scope == "DOMAIN" and transfer not in {"CROSS_PROJECT_SUPPORTED", "CROSS_MODEL_SUPPORTED"}:
+            reasons.append("cross_project_support_missing")
+        if scope == "GLOBAL" and transfer != "CROSS_MODEL_SUPPORTED":
+            reasons.append("cross_model_support_missing")
+        if scope not in {"PROJECT", "DOMAIN", "GLOBAL"}:
+            reasons.append("invalid_policy_scope")
+        if config.get("pinned_policy_id"):
+            reasons.append("operator_policy_pin_active")
+        return {
+            "eligible": not reasons,
+            "reasons": reasons,
+            "scope": scope,
+            "patch_id": patch_id,
+            "policy_experiment_id": str(experiment["id"]) if experiment else None,
+        }
+
+    def _benchmark_health(self, project_id: str) -> dict[str, Any]:
+        health = {
+            "policy_experiments": len(self._objects(project_id, "PolicyExperiment")),
+            "benchmark_gaps": len(self._objects(project_id, "BenchmarkGap")),
+            "evaluation_audits": len(self._objects(project_id, "PolicyEvaluationAudit")),
+        }
+        bench = getattr(self.policy_lab, "bench", None)
+        if bench is None:
+            return health
+        episodes = bench.load_all()
+        domains: dict[str, int] = {}
+        action_types: dict[str, int] = {}
+        splits: dict[str, int] = {}
+        episode_ids: list[str] = []
+        for episode in episodes:
+            domains[episode.domain] = domains.get(episode.domain, 0) + 1
+            split = str(episode.benchmark_split.value)
+            splits[split] = splits.get(split, 0) + 1
+            episode_ids.append(episode.episode_id)
+            for action in episode.candidate_actions:
+                action_types[action.action_type] = action_types.get(action.action_type, 0) + 1
+        health.update(
+            {
+                "episodes": len(episodes),
+                "domain_distribution": domains,
+                "action_distribution": action_types,
+                "split_distribution": splits,
+                "duplicated_episode_ids": sorted({item for item in episode_ids if episode_ids.count(item) > 1}),
+                "leakage_audit_status": "RECORDED" if health["evaluation_audits"] else "NO_REJECTIONS_RECORDED",
+            }
+        )
+        return health
+
+    def benchmark_gap_prepare(self, project_id: str, gap_id: str) -> dict[str, Any]:
+        """Create a future-only benchmark authoring proposal from a discovered gap."""
+        gap = self.store.object_get(gap_id)
+        if gap["kind"] != "BenchmarkGap" or str(gap["project_id"]) != str(project_id):
+            raise GPUError("BENCHMARK_GAP_REQUIRED", gap_id)
+        if gap["data"].get("candidate_evaluation_eligibility") != "FUTURE_BENCHMARK_ONLY":
+            raise GPUError("BENCHMARK_GAP_ELIGIBILITY_INVALID", gap_id)
+        fingerprint = f"benchmark-episode-proposal:{gap_id}"
+        existing = self._find_by_fingerprint(project_id, "BenchmarkEpisodeProposal", fingerprint)
+        if existing:
+            return existing
+        return self.store.object_create(
+            project_id,
+            "BenchmarkEpisodeProposal",
+            {
+                "fingerprint": fingerprint,
+                "benchmark_gap_id": gap_id,
+                "observed_failure": gap["data"].get("observed_failure"),
+                "supporting_evidence": gap["data"].get("supporting_evidence", []),
+                "authoring_requirements": [
+                    "Use an independently collected future decision episode.",
+                    "Freeze labels, split, and rubric before candidate policy evaluation.",
+                    "Do not use the triggering evidence as the evaluation episode.",
+                    "Require provenance and a leakage review before benchmark admission.",
+                ],
+                "admission_status": "NOT_A_BENCHMARK_EPISODE",
+                "candidate_evaluation_eligibility": "FUTURE_BENCHMARK_ONLY",
+            },
+            "BENCHMARK_EPISODE_PROPOSAL_CREATED",
+            "PREPARED",
+        )
+
+    def _science_vs_meta_schedule(self, project_id: str, opportunity: dict[str, Any]) -> dict[str, Any]:
+        """Reserve capacity for a materially more valuable unresolved science task."""
+        candidates = []
+        for item in self._objects(project_id, "AgendaItem"):
+            if item["status"] not in {"OPEN", "ACTIVE"}:
+                continue
+            data = item["data"]
+            try:
+                priority = float(data.get("importance", 0.0)) * float(data.get("uncertainty", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if data.get("reproduction_required"):
+                priority = max(priority, 0.8)
+            candidates.append({"agenda_item_id": str(item["id"]), "priority": min(1.0, priority), "question": data.get("question", "")})
+        highest = max(candidates, key=lambda item: item["priority"], default=None)
+        meta_value = float(opportunity["data"].get("expected_value_of_improvement", 0.0))
+        severe = int(opportunity["data"].get("severity", 0)) >= 2
+        defer = bool(highest and highest["priority"] >= 0.75 and highest["priority"] >= meta_value + 0.2 and not severe)
+        return {
+            "decision": "DEFER_TO_DOMAIN_SCIENCE" if defer else "META_RESEARCH_WARRANTED",
+            "meta_value": meta_value,
+            "highest_domain_science": highest,
+            "severe_meta_failure": severe,
+        }
+
+    def _ensure_meta_records(self, project_id: str, opportunity: dict[str, Any]) -> None:
+        """Turn an observed weakness into explicit, non-causal meta-science records.
+
+        The records deliberately retain counterexamples and unresolved causal links:
+        repeated outcomes are a reason to investigate, never proof that a policy
+        component caused them.
+        """
+        data = opportunity["data"]
+        fingerprint = str(data["fingerprint"])
+        if not self._find_by_fingerprint(project_id, "MetaWorldModel", fingerprint):
+            self.store.object_create(
+                project_id,
+                "MetaWorldModel",
+                {
+                    "fingerprint": fingerprint,
+                    "scope": data.get("scope", "PROJECT"),
+                    "relationships": [{
+                        "from": "research_decision_behavior",
+                        "to": data["target_component"],
+                        "observation": data["observed_failure"],
+                        "causal_status": "UNRESOLVED",
+                    }],
+                    "evidence": data.get("supporting_evidence", []),
+                    "confidence": data.get("confidence", 0.0),
+                    "counterexamples": [],
+                    "unresolved_relationships": [
+                        "Observed association is not sufficient to assign component-level causality."
+                    ],
+                    "provider_sensitivity": "UNVERIFIED",
+                    "domain_sensitivity": "UNVERIFIED",
+                },
+                "META_WORLD_MODEL_UPDATED",
+                "ACTIVE",
+            )
+        if not self._find_by_fingerprint(project_id, "MetaResearchAgenda", fingerprint):
+            self.store.object_create(
+                project_id,
+                "MetaResearchAgenda",
+                {
+                    "fingerprint": fingerprint,
+                    "question": f"Why does {data['target_component']} exhibit: {data['observed_failure']}?",
+                    "opportunity_id": str(opportunity["id"]),
+                    "priority": data["expected_value_of_improvement"],
+                    "scope": data.get("scope", "PROJECT"),
+                    "status_reason": "Evidence-backed question awaiting bounded diagnosis.",
+                    "required_evaluation": data.get("required_evaluation", "STANDARD_POLICY_BENCHMARK"),
+                },
+                "META_RESEARCH_AGENDA_CREATED",
+                "OPEN",
+            )
+        if not self._find_by_fingerprint(project_id, "BenchmarkGap", fingerprint):
+            # A failure that generated this opportunity is contaminated for the
+            # current candidate.  It can seed a later benchmark episode only.
+            gap = self.store.object_create(
+                project_id,
+                "BenchmarkGap",
+                {
+                    "fingerprint": fingerprint,
+                    "observed_failure": data["observed_failure"],
+                    "supporting_evidence": data.get("supporting_evidence", []),
+                    "scope": data.get("scope", "PROJECT"),
+                    "candidate_evaluation_eligibility": "FUTURE_BENCHMARK_ONLY",
+                    "excluded_from_improvement_opportunity_id": str(opportunity["id"]),
+                    "reason": "Gap discovered from the same evidence that generated the policy candidate.",
+                },
+                "BENCHMARK_GAP_DISCOVERED",
+                "CANDIDATE",
+            )
+            self.benchmark_gap_prepare(project_id, str(gap["id"]))
+
+    def config_get(self, project_id: str) -> dict[str, Any]:
+        configs = self._objects(project_id, "PolicyAutonomyConfig")
+        if configs:
+            return configs[0]
+        return self.store.object_create(project_id, "PolicyAutonomyConfig", {**self.defaults, "paused": False, "pinned_policy_id": None, "provenance": "v3-default"}, "POLICY_AUTONOMY_CONFIG_CREATED", "ACTIVE")
+
+    def config_update(self, project_id: str, update: dict[str, Any]) -> dict[str, Any]:
+        config = self.config_get(project_id)
+        allowed = {
+            "mode", "paused", "pinned_policy_id", "candidate_budget", "benchmark_budget",
+            "literature_budget", "max_revision_rounds", "token_budget", "llm_call_budget",
+            "engineering_budget", "wall_clock_iteration_budget", "gpu_budget",
+        }
+        if not isinstance(update, dict) or set(update) - allowed:
+            raise GPUError("POLICY_AUTONOMY_CONFIG_INVALID", "unsupported autonomy setting")
+        mode = str(update.get("mode", config["data"]["mode"])).upper()
+        if mode not in {"ADVISORY", "AUTO_PROJECT", "AUTO_DOMAIN", "AUTO_GLOBAL"}:
+            raise GPUError("POLICY_AUTONOMY_MODE_INVALID", mode)
+        non_negative = {
+            "candidate_budget", "benchmark_budget", "literature_budget", "max_revision_rounds",
+            "token_budget", "llm_call_budget", "engineering_budget", "wall_clock_iteration_budget", "gpu_budget",
+        }
+        if any(not isinstance(update[key], (int, float)) or isinstance(update[key], bool) or update[key] < 0 for key in non_negative & set(update)):
+            raise GPUError("POLICY_AUTONOMY_CONFIG_INVALID", "budgets must be non-negative numbers")
+        pinned = update.get("pinned_policy_id")
+        if pinned is not None:
+            getter = getattr(self.store, "object_get", None)
+            policy = getter(str(pinned)) if callable(getter) else None
+            if policy is not None and (policy["kind"] != "ResearchPolicy" or str(policy["project_id"]) != str(project_id)):
+                raise GPUError("POLICY_PIN_INVALID", "pinned policy must belong to the project")
+        return self.store.object_update(str(config["id"]), update, "ACTIVE", "POLICY_AUTONOMY_CONFIG_UPDATED")
+
+    def policy_pin(self, project_id: str, policy_id: str | None) -> dict[str, Any]:
+        """Persist an operator override without deleting autonomous conclusions."""
+        return self.config_update(project_id, {"pinned_policy_id": policy_id})
+
+    def feedback_record(self, project_id: str, feedback: str, target_component: str = "experiment_selection") -> dict[str, Any]:
+        """Persist user feedback as a hypothesis, not as policy authority."""
+        if not isinstance(feedback, str) or not feedback.strip():
+            raise GPUError("POLICY_USER_FEEDBACK_INVALID", "feedback must be non-empty")
+        feedback_record = self.store.object_create(
+            project_id,
+            "PolicyUserFeedback",
+            {"feedback": feedback.strip(), "target_component": target_component, "validation_status": "PENDING_OUTCOME_INSPECTION"},
+            "POLICY_USER_FEEDBACK_RECORDED",
+            "PENDING_EVIDENCE_REVIEW",
+        )
+        opportunity = self.store.object_create(
+            project_id,
+            "ImprovementOpportunity",
+            {
+                "source": "USER_FEEDBACK",
+                "target_component": target_component,
+                "observed_failure": feedback.strip(),
+                "supporting_evidence": [str(feedback_record["id"])],
+                "frequency": 0,
+                "severity": 0,
+                "scientific_cost": 0.0,
+                "compute_cost": 0.0,
+                "confidence": 0.0,
+                "estimated_fixability": 0.5,
+                "expected_value_of_improvement": 0.0,
+                "scope": "PROJECT",
+                "fingerprint": f"user-feedback:{feedback_record['id']}",
+                "requires_outcome_validation": True,
+            },
+            "IMPROVEMENT_OPPORTUNITY_CREATED",
+            "PENDING_EVIDENCE_REVIEW",
+        )
+        return {"feedback": feedback_record, "opportunity": opportunity}
+
+    def feedback_validate(self, project_id: str, feedback_id: str) -> dict[str, Any]:
+        """Gate feedback-derived opportunities on actual inspected outcomes."""
+        feedback = self.store.object_get(feedback_id)
+        if feedback["kind"] != "PolicyUserFeedback" or str(feedback["project_id"]) != str(project_id):
+            raise GPUError("POLICY_USER_FEEDBACK_INVALID", feedback_id)
+        outcomes = self._objects(project_id, "ResearchDecisionOutcome")
+        negative = [item for item in outcomes if item["data"].get("label") in {"LOW_VALUE", "ZERO_INFORMATION", "PREMATURE", "INVALID"}]
+        if len(negative) < 2:
+            return self.store.object_update(str(feedback["id"]), {"validation_status": "INSUFFICIENT_OUTCOME_EVIDENCE"}, "PENDING_EVIDENCE_REVIEW", "POLICY_USER_FEEDBACK_VALIDATED")
+        opportunity = next(item for item in self._objects(project_id, "ImprovementOpportunity") if str(feedback["id"]) in item["data"].get("supporting_evidence", []))
+        updated = self.store.object_update(str(opportunity["id"]), {"supporting_evidence": [str(feedback["id"]), *[str(item["id"]) for item in negative]], "frequency": len(negative), "confidence": min(0.9, 0.3 + len(negative) * 0.15), "expected_value_of_improvement": 0.4}, "CANDIDATE", "USER_FEEDBACK_EVIDENCE_CONFIRMED")
+        self.store.object_update(str(feedback["id"]), {"validation_status": "OUTCOME_EVIDENCE_CONFIRMED"}, "COMPLETED", "POLICY_USER_FEEDBACK_VALIDATED")
+        self._ensure_meta_records(project_id, updated)
+        return updated
+
+    def ranker_readiness(self, project_id: str) -> dict[str, Any]:
+        """Assess whether observational records justify even an offline ranker experiment."""
+        outcomes = self._objects(project_id, "ResearchDecisionOutcome")
+        actions = {str(item["data"].get("action_type", "UNKNOWN")) for item in outcomes}
+        labels = {str(item["data"].get("label", "UNKNOWN")) for item in outcomes}
+        projects = {str(item["project_id"]) for item in outcomes}
+        counterexamples = sum(bool(item["data"].get("unexpected_observations")) for item in outcomes)
+        checks = {
+            "sufficient_eligible_decisions": len(outcomes) >= 30,
+            "sufficient_outcome_coverage": len(outcomes) >= 30 and all(item["data"].get("label") for item in outcomes),
+            "action_diversity": len(actions - {"UNKNOWN"}) >= 3,
+            "stable_labels": len(labels - {"UNKNOWN"}) >= 2,
+            "held_out_projects": len(projects) >= 2,
+            "counterexample_coverage": counterexamples >= 3,
+        }
+        blockers = [name for name, passed in checks.items() if not passed]
+        payload = {
+            "decision": "OFFLINE_ADVISORY_EXPERIMENT_ONLY" if not blockers else "DO_NOT_TRAIN_POLICY_MODEL",
+            "checks": checks,
+            "blockers": blockers,
+            "observed_outcomes": len(outcomes),
+            "action_types": sorted(actions),
+            "label_types": sorted(labels),
+            "project_count": len(projects),
+            "counterexample_count": counterexamples,
+            "warning": "Unchosen actions remain counterfactually unknown and cannot become negative labels.",
+        }
+        fingerprint = f"ranker-readiness:{len(outcomes)}:{len(actions)}:{len(labels)}:{counterexamples}"
+        existing = self._find_by_fingerprint(project_id, "PolicyRankerReadiness", fingerprint)
+        if existing:
+            return existing
+        return self.store.object_create(project_id, "PolicyRankerReadiness", {"fingerprint": fingerprint, **payload}, "POLICY_RANKER_READINESS_ASSESSED", "COMPLETED")
+
+    def postmortem_opportunities(self, project_id: str, lesson_id: str) -> list[dict[str, Any]]:
+        """Turn a bounded meta-review pattern into evidence-backed opportunities.
+
+        The derived MetaLesson is only a trigger. The opportunity preserves the
+        original outcome ids, so it cannot be mistaken for independent evidence.
+        """
+        lesson = self.store.object_get(lesson_id)
+        if lesson["kind"] != "MetaLesson" or str(lesson["project_id"]) != str(project_id):
+            raise GPUError("META_LESSON_REQUIRED", lesson_id)
+        outcomes = self._objects(project_id, "ResearchDecisionOutcome")
+        created = []
+        for action in lesson["data"].get("repeated_low_value_action_types", [])[:3]:
+            evidence = [
+                str(item["id"])
+                for item in outcomes
+                if str(item["data"].get("action_type", "UNKNOWN")) == str(action)
+                and item["data"].get("label") in {"LOW_VALUE", "ZERO_INFORMATION", "REDUNDANT", "PREMATURE", "INVALID"}
+            ]
+            if len(evidence) < 2 or any(
+                item["status"] in {"CANDIDATE", "ACTIVE"}
+                and str(item["data"].get("action_type", "")) == str(action)
+                for item in self._objects(project_id, "ImprovementOpportunity")
+            ):
+                continue
+            fingerprint = f"meta-review:{lesson_id}:{action}"
+            if self._find_by_fingerprint(project_id, "ImprovementOpportunity", fingerprint):
+                continue
+            severity = sum(
+                self.store.object_get(item_id)["data"].get("label") in {"PREMATURE", "INVALID"}
+                for item_id in evidence
+            )
+            opportunity = self.store.object_create(
+                project_id,
+                "ImprovementOpportunity",
+                {
+                    "source": "META_REVIEW",
+                    "meta_lesson_id": lesson_id,
+                    "target_component": "experiment_selection",
+                    "action_type": str(action),
+                    "observed_failure": f"Meta-review confirmed repeated low-value {action} decisions.",
+                    "supporting_evidence": evidence,
+                    "frequency": len(evidence),
+                    "severity": severity,
+                    "scientific_cost": len(evidence),
+                    "compute_cost": 0.0,
+                    "confidence": min(0.95, 0.35 + len(evidence) * 0.15),
+                    "estimated_fixability": 0.5,
+                    "expected_value_of_improvement": round((len(evidence) + severity * 2) * 0.2, 3),
+                    "scope": "PROJECT",
+                    "fingerprint": fingerprint,
+                    "derived_trigger": "MetaLesson; original outcomes retained as supporting evidence.",
+                },
+                "IMPROVEMENT_OPPORTUNITY_CREATED",
+                "CANDIDATE",
+            )
+            self._ensure_meta_records(project_id, opportunity)
+            created.append(opportunity)
+        return created
+
+    def detect_opportunities(self, project_id: str) -> list[dict[str, Any]]:
+        outcomes = self._objects(project_id, "ResearchDecisionOutcome")
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for outcome in outcomes:
+            label = outcome["data"].get("label")
+            if label in {"LOW_VALUE", "ZERO_INFORMATION", "PREMATURE", "INVALID"}:
+                grouped.setdefault(str(outcome["data"].get("action_type", "UNKNOWN")), []).append(outcome)
+        existing = {item["data"].get("fingerprint") for item in self._objects(project_id, "ImprovementOpportunity")}
+        opportunities = []
+        for action, records in grouped.items():
+            catastrophic = any(record["data"].get("label") == "INVALID" for record in records)
+            if len(records) < 2 and not catastrophic:
+                continue
+            fingerprint = f"decision-outcome:{action}:{','.join(sorted(str(r['id']) for r in records))}"
+            if fingerprint in existing:
+                continue
+            frequency, severity = len(records), sum(record["data"].get("label") in {"PREMATURE", "INVALID"} for record in records)
+            expected_value = round((frequency + severity * 2) * 0.2, 3)
+            opportunity = self.store.object_create(project_id, "ImprovementOpportunity", {"source": "DECISION_OUTCOME", "target_component": "experiment_selection", "action_type": action, "observed_failure": f"Repeated {action} decisions have low or invalid information value.", "supporting_evidence": [str(r["id"]) for r in records], "frequency": frequency, "severity": severity, "scientific_cost": frequency, "compute_cost": 0.0, "confidence": min(0.95, 0.3 + frequency * 0.15), "estimated_fixability": 0.5, "expected_value_of_improvement": expected_value, "scope": "PROJECT", "fingerprint": fingerprint}, "IMPROVEMENT_OPPORTUNITY_CREATED", "CANDIDATE")
+            self._ensure_meta_records(project_id, opportunity)
+            opportunities.append(opportunity)
+        # DDE v3.3 search telemetry is observational meta-research evidence.
+        # It can request a policy investigation, but never patches discovery
+        # policy or changes scientific belief by itself.
+        diagnostic_map = {
+            "LOW_NICHE_COVERAGE": "NICHE_COLLAPSE",
+            "DISTANCE_COVERAGE_INCOMPLETE": "DISTANCE_RESERVATION_FAILURE",
+            "GENERATOR_CORRELATION_HIGH": "GENERATOR_CORRELATION",
+            "LITERATURE_UNVERIFIED": "LITERATURE_COUPLING",
+            "DEAD_MEMORY_SATURATION": "QD_ARCHIVE_COLLAPSE",
+        }
+        for archive in self._objects(project_id, "CrossWorkerQDArchive"):
+            coverage = archive["data"].get("coverage", {})
+            flags = coverage.get("portfolio_health_flags") or [coverage.get("portfolio_health")]
+            for flag in filter(None, flags):
+                code = diagnostic_map.get(str(flag))
+                if not code:
+                    continue
+                fingerprint = f"discovery-diagnostic:{archive['id']}:{code}"
+                if fingerprint in existing or self._find_by_fingerprint(project_id, "ImprovementOpportunity", fingerprint):
+                    continue
+                opportunity = self.store.object_create(
+                    project_id,
+                    "ImprovementOpportunity",
+                    {
+                        "source": "DISCOVERY_COVERAGE",
+                        "target_component": "distributed_discovery",
+                        "action_type": code,
+                        "observed_failure": f"DDE archive reported {flag}; this is a diagnostic, not scientific evidence.",
+                        "supporting_evidence": [str(archive["id"])],
+                        "frequency": 1,
+                        "severity": 1,
+                        "scientific_cost": 0.0,
+                        "compute_cost": 0.0,
+                        "confidence": 0.5,
+                        "estimated_fixability": 0.5,
+                        "expected_value_of_improvement": 0.4,
+                        "scope": "PROJECT",
+                        "fingerprint": fingerprint,
+                        "requires_policy_evaluation": True,
+                    },
+                    "IMPROVEMENT_OPPORTUNITY_CREATED",
+                    "CANDIDATE",
+                )
+                self._ensure_meta_records(project_id, opportunity)
+                opportunities.append(opportunity)
+        return opportunities
+
+    def run_once(self, project_id: str) -> dict[str, Any]:
+        config = self.config_get(project_id)
+        self.detect_opportunities(project_id)
+        # Event-driven sources (for example a provider/model change) are
+        # already durable opportunities.  Scheduler passes must consider them
+        # alongside newly detected outcome patterns.
+        opportunities = [
+            item for item in self._objects(project_id, "ImprovementOpportunity")
+            if item["status"] in {"CANDIDATE", "ACTIVE"}
+        ]
+        if config["data"].get("paused"):
+            return {"decision": "PAUSED", "opportunities": opportunities}
+        if not config["data"].get("candidate_budget") or not config["data"].get("benchmark_budget"):
+            return {"decision": "BUDGET_EXHAUSTED", "opportunities": opportunities}
+        viable = [item for item in opportunities if item["data"]["expected_value_of_improvement"] >= 0.4]
+        if not viable:
+            return {"decision": "NO_CAMPAIGN", "opportunities": opportunities}
+        agenda_priority = {
+            str(item["data"].get("opportunity_id")): float(item["data"].get("priority", 0.0))
+            for item in self._objects(project_id, "MetaResearchAgenda")
+            if item["status"] in {"OPEN", "ACTIVE"}
+        }
+        opportunity = max(
+            viable,
+            key=lambda item: (
+                agenda_priority.get(str(item["id"]), 0.0),
+                float(item["data"]["expected_value_of_improvement"]),
+            ),
+        )
+        scheduling = self._science_vs_meta_schedule(project_id, opportunity)
+        if scheduling["decision"] == "DEFER_TO_DOMAIN_SCIENCE":
+            agenda = next(
+                (
+                    item for item in self._objects(project_id, "MetaResearchAgenda")
+                    if str(item["data"].get("opportunity_id")) == str(opportunity["id"])
+                ),
+                None,
+            )
+            if agenda:
+                self.store.object_update(
+                    str(agenda["id"]),
+                    {"scheduling_decision": scheduling},
+                    "OPEN",
+                    "META_RESEARCH_DEFERRED_FOR_DOMAIN_SCIENCE",
+                )
+            return {"decision": "DEFER_TO_DOMAIN_SCIENCE", "opportunities": opportunities, "scheduling": scheduling}
+        if opportunity["data"].get("required_evaluation") == "COMPACT_COMPATIBILITY_BENCHMARK":
+            compatibility = self.policy_lab.evaluate_provider_compatibility(
+                project_id,
+                str(opportunity["data"].get("provider", "GENERIC")),
+                str(opportunity["data"].get("model", "unknown")),
+            )
+            adapter_candidate = self.policy_lab.provider_adapter_candidate(
+                project_id,
+                str(opportunity["data"].get("provider", "GENERIC")),
+                str(opportunity["data"].get("model", "unknown")),
+                str(compatibility["id"]),
+            )
+            self.store.object_update(
+                str(opportunity["id"]),
+                {"compatibility_experiment_id": str(compatibility["id"]), "provider_adapter_candidate_id": str(adapter_candidate["id"])},
+                "COMPLETED",
+                "POLICY_COMPATIBILITY_EVALUATED",
+            )
+            return {"decision": "COMPATIBILITY_EVALUATED", "opportunities": opportunities, "compatibility": compatibility, "provider_adapter_candidate": adapter_candidate}
+        budget = {key: config["data"][key] for key in self.defaults if key != "mode"}
+        source_context = self._candidate_sources(project_id, opportunity)
+        diagnosis = self._diagnose_opportunity(project_id, opportunity)
+        source_context["MetaWorldModel"] = [*source_context["MetaWorldModel"], str(diagnosis["id"])]
+        literature_request = self._prepare_literature_scout(project_id, opportunity, int(config["data"]["literature_budget"]))
+        if literature_request:
+            source_context["LiteratureScoutRequest"] = [str(literature_request["id"])]
+        campaign_fingerprint = f"meta-campaign:{opportunity['id']}"
+        active_campaign = next(
+            (
+                item for item in self._objects(project_id, "MetaResearchCampaign")
+                if item["data"].get("fingerprint") == campaign_fingerprint and item["status"] in {"RUNNING", "ACTIVE"}
+            ),
+            None,
+        )
+        campaign = active_campaign or self.store.object_create(
+            project_id,
+            "MetaResearchCampaign",
+            {
+                "fingerprint": campaign_fingerprint,
+                "opportunity_id": str(opportunity["id"]),
+                "trigger": opportunity["data"].get("source"),
+                "scope": opportunity["data"]["scope"],
+                "budget": budget,
+                "source_context": source_context,
+                "resume_state": "POLICY_LAB_NOT_STARTED",
+            },
+            "META_RESEARCH_STARTED",
+            "RUNNING",
+        )
+        source_context = {
+            **source_context,
+            "MetaResearchCampaign": [str(campaign["id"])],
+        }
+        if not active_campaign:
+            campaign = self.store.object_update(
+                str(campaign["id"]), {"source_context": source_context}, "RUNNING", "META_RESEARCH_CONTEXT_LINKED"
+            )
+        recovered_run = next(
+            (
+                item for item in self._objects(project_id, "ImprovementRun")
+                if str(campaign["id"]) in item["data"].get("source_context", {}).get("MetaResearchCampaign", [])
+            ),
+            None,
+        )
+        resumed = active_campaign is not None
+        if recovered_run:
+            result = {
+                "improvement_run": recovered_run,
+                "recommendation": recovered_run["data"].get("recommendation", "REJECT_OR_REVISE"),
+                "recovered": True,
+            }
+        else:
+            if resumed:
+                campaign = self.store.object_update(
+                    str(campaign["id"]), {"resume_state": "POLICY_LAB_RESUMED", "source_context": source_context}, "RUNNING", "META_RESEARCH_RESUMED"
+                )
+            result = self.policy_lab.improve(
+                project_id,
+                failure=opportunity["data"]["observed_failure"],
+                component=opportunity["data"]["target_component"],
+                candidate_budget=int(config["data"]["candidate_budget"]),
+                max_revisions=int(config["data"]["max_revision_rounds"]),
+                source_context=source_context,
+                diagnostic_hypotheses=diagnosis["data"]["diagnostic_hypotheses"],
+            )
+        run_id = str(result["improvement_run"]["id"])
+        run_data = result["improvement_run"].get("data", {})
+        patch_ids = [str(item) for item in run_data.get("patch_ids", [])]
+        evaluation_ids = [str(item) for item in run_data.get("evaluation_ids", [])]
+        revised = sum(
+            int(self.store.object_get(patch_id)["data"].get("revision_count", 0)) > 0
+            for patch_id in patch_ids
+        )
+        consumption = {
+            "candidates_generated": len(patch_ids),
+            "benchmark_evaluations": len(evaluation_ids),
+            "revisions_generated": revised,
+            "literature_requests_prepared": 1 if literature_request else 0,
+            "engineering_tasks_prepared": sum(
+                bool(self.store.object_get(patch_id)["data"].get("engineering_task_id")) for patch_id in patch_ids
+            ),
+        }
+        stop_reason = (
+            "candidate_supported" if result["recommendation"] == "PROMOTE"
+            else "candidate_budget_exhausted" if consumption["candidates_generated"] >= int(config["data"]["candidate_budget"])
+            else "no_supported_candidate"
+        )
+        self.store.object_update(
+            str(campaign["id"]),
+            {"improvement_run_id": run_id, "resume_state": "POLICY_LAB_COMPLETED", "consumption": consumption, "stop_reason": stop_reason},
+            "RUNNING",
+            "META_RESEARCH_POLICY_LAB_COMPLETED",
+        )
+        self.store.object_update(run_id, {"meta_campaign": {"trigger": str(opportunity["id"]), "target_component": opportunity["data"]["target_component"], "scope": opportunity["data"]["scope"], "budget": budget, "consumption": consumption, "stop_reason": stop_reason, "candidate_sources": source_context, "stop_conditions": ["candidate budget exhausted", "benchmark budget exhausted", "hard epistemic regression", "revision limit reached"]}}, "COMPLETED", "META_RESEARCH_BUDGET_RECORDED")
+        self.store.object_update(str(opportunity["id"]), {"improvement_run_id": run_id}, "COMPLETED", "META_RESEARCH_STARTED")
+        best_patch = result["improvement_run"]["data"].get("best_supported_patch_id")
+        promoted = next(
+            (
+                policy for policy in self._objects(project_id, "ResearchPolicy")
+                if best_patch in policy["data"].get("applied_patch_ids", [])
+            ),
+            None,
+        )
+        promotion_preflight = None
+        if result["recommendation"] == "PROMOTE" and best_patch:
+            promotion_preflight = self._promotion_preflight(project_id, best_patch, config["data"])
+            self.store.object_update(run_id, {"auto_promotion_preflight": promotion_preflight}, "COMPLETED", "POLICY_AUTO_PROMOTION_PREFLIGHT")
+            if promotion_preflight["eligible"]:
+                if not promoted:
+                    promoted = self.policy_lab.promote(project_id, best_patch)
+                patch = self.store.object_get(best_patch)
+                if not any(
+                    item["data"].get("policy_id") == str(promoted["id"])
+                    and item["data"].get("patch_id") == best_patch
+                    for item in self._objects(project_id, "MetaStrategyPattern")
+                ):
+                    self.store.object_create(
+                        project_id,
+                        "MetaStrategyPattern",
+                        {
+                            "policy_id": str(promoted["id"]),
+                            "patch_id": best_patch,
+                            "target_component": opportunity["data"]["target_component"],
+                            "scope": promotion_preflight["scope"],
+                            "observed_effect": "BENCHMARK_SUPPORTED_AWAITING_REAL_WORLD_HINDSIGHT",
+                            "mechanism": patch["data"].get("semantic_change"),
+                            "supporting_evidence": [str(promotion_preflight["policy_experiment_id"])],
+                            "counterexamples": [],
+                            "provider_sensitivity": "UNVERIFIED",
+                            "domain_sensitivity": "UNVERIFIED",
+                            "revisit_condition": "Accumulate prospective policy hindsight before reuse beyond the promoted scope.",
+                        },
+                        "META_STRATEGY_PATTERN_CREATED",
+                        "CANDIDATE",
+                    )
+        campaign = self.store.object_update(
+            str(campaign["id"]),
+            {"improvement_run_id": run_id, "resume_state": "COMPLETED", "consumption": consumption, "stop_reason": stop_reason, "promoted_policy_id": str(promoted["id"]) if promoted else None},
+            "COMPLETED",
+            "META_RESEARCH_COMPLETED",
+        )
+        decision = "CAMPAIGN_RECOVERED" if recovered_run else "CAMPAIGN_RESUMED" if resumed else "CAMPAIGN_STARTED"
+        return {"decision": decision, "opportunities": opportunities, "campaign": campaign, "literature_request": literature_request, "improvement": result, "promotion_preflight": promotion_preflight, "promoted_policy": promoted, "scheduling": scheduling}
+
+    def monitor_promotions(self, project_id: str) -> list[dict[str, Any]]:
+        """Detect severe, repeated post-promotion failures and rollback scoped policy."""
+        config = self.config_get(project_id)
+        regressions = []
+        for policy in self._objects(project_id, "ResearchPolicy"):
+            if policy["status"] != "PRODUCTION":
+                continue
+            scope = str(policy["data"].get("applicability", {}).get("scope", "PROJECT")).upper()
+            hindsight = policy["data"].get("post_promotion_hindsight", [])
+            failures = [item for item in hindsight if item.get("unexpected_failure") or (isinstance(item.get("observed_improvement"), (int, float)) and item["observed_improvement"] < 0)]
+            if len(failures) < 2:
+                continue
+            fingerprint = f"policy-regression:{policy['id']}:{len(failures)}"
+            if self._find_by_fingerprint(project_id, "PolicyRegression", fingerprint):
+                continue
+            regression = self.store.object_create(project_id, "PolicyRegression", {"fingerprint": fingerprint, "policy_id": str(policy["id"]), "expected_behavior": "non-regressing scoped research behavior", "observed_behavior": "repeated negative post-promotion hindsight", "supporting_decisions": [], "severity": "HIGH", "confidence": min(0.95, 0.5 + len(failures) * 0.1), "affected_scope": scope, "rollback_decision": "PENDING", "revisit_condition": "new causal diagnosis required"}, "POLICY_REGRESSION_DETECTED", "CANDIDATE")
+            self.store.object_create(
+                project_id,
+                "MetaWorldModel",
+                {
+                    "fingerprint": fingerprint,
+                    "scope": scope,
+                    "relationships": [{"from": f"policy:{policy['id']}", "to": "real_world_policy_hindsight", "observation": "Repeated negative hindsight after promotion", "causal_status": "UNRESOLVED"}],
+                    "evidence": [str(regression["id"])],
+                    "confidence": regression["data"]["confidence"],
+                    "counterexamples": [],
+                    "unresolved_relationships": ["Regression mechanism requires causal diagnosis before future reuse."],
+                    "provider_sensitivity": "UNVERIFIED",
+                    "domain_sensitivity": "UNVERIFIED",
+                },
+                "META_WORLD_MODEL_UPDATED",
+                "ACTIVE",
+            )
+            agenda_fingerprint = f"post-rollback-agenda:{regression['id']}"
+            self.store.object_create(
+                project_id,
+                "MetaResearchAgenda",
+                {
+                    "fingerprint": agenda_fingerprint,
+                    "question": "Why did the historical policy benchmark fail to predict this production regression?",
+                    "policy_regression_id": str(regression["id"]),
+                    "priority": regression["data"]["confidence"],
+                    "scope": scope,
+                    "status_reason": "Rollback requires a causal benchmark-calibration diagnosis before reuse.",
+                    "required_evaluation": "BENCHMARK_CALIBRATION_DIAGNOSIS",
+                },
+                "META_RESEARCH_AGENDA_CREATED",
+                "OPEN",
+            )
+            parent = policy["data"].get("parent_policy_id")
+            if config["data"].get("mode") == f"AUTO_{scope}" and parent and not config["data"].get("pinned_policy_id"):
+                restored = self.policy_lab.rollback(project_id, str(parent))
+                self.store.object_update(str(regression["id"]), {"rollback_decision": "ROLLED_BACK", "restored_policy_id": str(restored["id"])}, "COMPLETED", "POLICY_ROLLED_BACK")
+                self.store.object_create(
+                    project_id,
+                    "PolicyNegativeResult",
+                    {
+                        "proposal": str(policy["id"]),
+                        "source": "post-promotion regression",
+                        "expected_improvement": "non-regressing scoped research behavior",
+                        "observed_result": "repeated negative post-promotion hindsight",
+                        "failure_mode": "policy regression",
+                        "regressions": ["real_world_policy_regression"],
+                        "benchmark_scope": "production hindsight",
+                        "models_tested": [],
+                        "revisit_condition": "new causal diagnosis required",
+                        "related_policy_patches": policy["data"].get("applied_patch_ids", []),
+                        "semantic_fingerprint": fingerprint,
+                    },
+                    "POLICY_NEGATIVE_RESULT_CREATED",
+                    "REJECTED",
+                )
+            regressions.append(regression)
+        return regressions
+
+    def monitor_calibration(self, project_id: str) -> list[dict[str, Any]]:
+        """Detect repeated benchmark overprediction without mistaking it for causal proof."""
+        opportunities = []
+        for policy in self._objects(project_id, "ResearchPolicy"):
+            predicted = policy["data"].get("policy_benchmark_prediction")
+            hindsight = policy["data"].get("post_promotion_hindsight", [])
+            observed = [item.get("observed_improvement") for item in hindsight if isinstance(item.get("observed_improvement"), (int, float))]
+            if not isinstance(predicted, (int, float)) or len(observed) < 2:
+                continue
+            mean_observed = sum(observed) / len(observed)
+            calibration_error = mean_observed - predicted
+            if calibration_error >= -0.2:
+                continue
+            fingerprint = f"policy-calibration:{policy['id']}:{len(observed)}"
+            if self._find_by_fingerprint(project_id, "ImprovementOpportunity", fingerprint):
+                continue
+            opportunity = self.store.object_create(
+                project_id,
+                "ImprovementOpportunity",
+                {
+                    "source": "POLICY_HINDSIGHT",
+                    "target_component": "policy_evaluator",
+                    "observed_failure": "Benchmark prediction repeatedly overestimates realized policy improvement.",
+                    "supporting_evidence": [],
+                    "frequency": len(observed),
+                    "severity": 2,
+                    "scientific_cost": 0.0,
+                    "compute_cost": 0.0,
+                    "confidence": min(0.9, 0.4 + len(observed) * 0.1),
+                    "estimated_fixability": 0.4,
+                    "expected_value_of_improvement": 0.4,
+                    "scope": "PROJECT",
+                    "fingerprint": fingerprint,
+                    "predicted_improvement": predicted,
+                    "realized_improvement": mean_observed,
+                    "causal_status": "UNRESOLVED",
+                },
+                "IMPROVEMENT_OPPORTUNITY_CREATED",
+                "CANDIDATE",
+            )
+            self._ensure_meta_records(project_id, opportunity)
+            opportunities.append(opportunity)
+        return opportunities
+
+    def state_get(self, project_id: str) -> dict[str, Any]:
+        """Compact durable view; never substitutes meta records for scientific truth."""
+        policies = self._objects(project_id, "ResearchPolicy")
+        production = next((item for item in policies if item["status"] == "PRODUCTION"), None)
+        compatibility = [
+            item for item in self._objects(project_id, "PolicyExperiment")
+            if item["data"].get("benchmark_version") == "provider-compatibility-v3"
+        ]
+        return {
+            "production_policy_id": str(production["id"]) if production else None,
+            "autonomy": self.config_get(project_id),
+            "active_opportunities": [item for item in self._objects(project_id, "ImprovementOpportunity") if item["status"] in {"CANDIDATE", "ACTIVE"}],
+            "active_agenda": [item for item in self._objects(project_id, "MetaResearchAgenda") if item["status"] in {"OPEN", "ACTIVE"}],
+            "meta_world_models": self._objects(project_id, "MetaWorldModel")[-10:],
+            "active_runs": [item for item in self._objects(project_id, "ImprovementRun") if item["status"] not in {"COMPLETED", "REJECTED"}],
+            "policy_candidates": [item for item in self._objects(project_id, "ResearchPolicyPatch") if item["status"] in {"CANDIDATE", "SUPPORTED_ON_BENCHMARK", "CROSS_PROJECT_SUPPORTED", "CROSS_MODEL_SUPPORTED", "RECOMMENDED_FOR_PROMOTION"}],
+            "recent_regressions": self._objects(project_id, "PolicyRegression")[-10:],
+            "benchmark_health": self._benchmark_health(project_id),
+            "model_provider_compatibility": compatibility[-10:],
+        }
+
+    def policy_health_report(self, project_id: str) -> dict[str, Any]:
+        """Return the bounded operational policy report required by v3."""
+        state = self.state_get(project_id)
+        policies = self._objects(project_id, "ResearchPolicy")
+        production = next((item for item in policies if item["status"] == "PRODUCTION"), None)
+        lineage = []
+        cursor = production
+        while cursor and len(lineage) < 20:
+            lineage.append({"policy_id": str(cursor["id"]), "version": cursor["data"].get("version"), "status": cursor["status"]})
+            parent_id = cursor["data"].get("parent_policy_id")
+            cursor = next((item for item in policies if str(item["id"]) == str(parent_id)), None) if parent_id else None
+        hindsight = production["data"].get("post_promotion_hindsight", []) if production else []
+        observed = [item["observed_improvement"] for item in hindsight if isinstance(item.get("observed_improvement"), (int, float))]
+        prediction = production["data"].get("policy_benchmark_prediction") if production else None
+        calibration = {
+            "benchmark_prediction": prediction,
+            "mean_realized_improvement": sum(observed) / len(observed) if observed else None,
+            "observations": len(observed),
+            "latest_error": production["data"].get("policy_calibration_error") if production else None,
+        }
+        overrides = [
+            item for item in policies
+            if item["status"] == "PRODUCTION" and item["data"].get("applicability", {}).get("scope") in {"PROJECT", "DOMAIN"}
+        ]
+        return {
+            "current_production_policy": production,
+            "policy_lineage": lineage,
+            "active_project_domain_overrides": overrides,
+            "model_adapters": self._objects(project_id, "ProviderAdapterCandidate")[-10:],
+            "benchmark_health": state["benchmark_health"],
+            "real_world_policy_calibration": calibration,
+            "recent_improvement_opportunities": state["active_opportunities"][-10:],
+            "active_meta_research": [item for item in self._objects(project_id, "MetaResearchCampaign") if item["status"] in {"RUNNING", "ACTIVE"}],
+            "recent_promotions": [item for item in policies if item["data"].get("provenance", {}).get("source_type") == "POLICY_PATCH"][-10:],
+            "recent_rejections": self._objects(project_id, "PolicyNegativeResult")[-10:],
+            "recent_rollbacks": [item for item in policies if item["status"] == "ROLLED_BACK"][-10:],
+            "known_policy_failure_modes": production["data"].get("known_failure_modes", []) if production else [],
+        }
+
+    def meta_research_roi(self, project_id: str) -> dict[str, Any]:
+        """Report observed meta-science yield without inventing causal savings."""
+        campaigns = self._objects(project_id, "MetaResearchCampaign")
+        outcomes = self._objects(project_id, "ResearchDecisionOutcome")
+        experiments = self._objects(project_id, "PolicyExperiment")
+        patches = self._objects(project_id, "ResearchPolicyPatch")
+        promoted = [item for item in self._objects(project_id, "ResearchPolicy") if item["data"].get("provenance", {}).get("source_type") == "POLICY_PATCH"]
+        hindsight = [entry for item in promoted for entry in item["data"].get("post_promotion_hindsight", [])]
+        realized = [entry["observed_improvement"] for entry in hindsight if isinstance(entry.get("observed_improvement"), (int, float))]
+        completed = [item for item in campaigns if item["status"] == "COMPLETED"]
+        budget_keys = ("token_budget", "llm_call_budget", "literature_budget", "benchmark_budget", "engineering_budget", "wall_clock_iteration_budget", "candidate_budget", "gpu_budget")
+        budget_ceiling = {
+            key: sum(float(item["data"].get("budget", {}).get(key, 0)) for item in completed)
+            for key in budget_keys
+        }
+        rejected = [item for item in patches if item["status"] in {"REJECTED", "INVALID_EVALUATION"}]
+        return {
+            "campaigns_completed": len(completed),
+            "campaigns_active": sum(item["status"] in {"RUNNING", "ACTIVE"} for item in campaigns),
+            "meta_research_budget_ceiling": budget_ceiling,
+            "policy_candidates_evaluated": len(experiments),
+            "policy_candidate_rejection_rate": len(rejected) / len(patches) if patches else None,
+            "policy_promotions": len(promoted),
+            "post_promotion_regression_rate": len(self._objects(project_id, "PolicyRegression")) / len(promoted) if promoted else None,
+            "zero_information_action_rate": sum(item["data"].get("label") == "ZERO_INFORMATION" for item in outcomes) / len(outcomes) if outcomes else None,
+            "invalid_experiment_rate": sum(item["data"].get("label") == "INVALID" for item in outcomes) / len(outcomes) if outcomes else None,
+            "observed_policy_improvement_mean": sum(realized) / len(realized) if realized else None,
+            "estimated_future_research_cost_avoided": None,
+            "roi_interpretation": "Operational observations only; causal savings require matched prospective evidence.",
+        }
+
+    def model_change_detect(self, project_id: str, provider: str, model: str) -> dict[str, Any] | None:
+        """Record provider/model drift as a bounded compatibility-evaluation opportunity."""
+        fingerprint = f"model-change:{provider}:{model}"
+        if self._find_by_fingerprint(project_id, "ImprovementOpportunity", fingerprint):
+            return None
+        opportunity = self.store.object_create(project_id, "ImprovementOpportunity", {"source": "MODEL_CHANGE", "target_component": "provider_adapter", "provider": provider, "model": model, "observed_failure": f"Provider/model changed to {provider}:{model}; policy compatibility is unverified.", "supporting_evidence": [], "frequency": 1, "severity": 1, "scientific_cost": 0.0, "compute_cost": 0.0, "confidence": 1.0, "estimated_fixability": 0.5, "expected_value_of_improvement": 0.4, "scope": "PROJECT", "fingerprint": fingerprint, "required_evaluation": "COMPACT_COMPATIBILITY_BENCHMARK"}, "IMPROVEMENT_OPPORTUNITY_CREATED", "CANDIDATE")
+        self._ensure_meta_records(project_id, opportunity)
+        return opportunity

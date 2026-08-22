@@ -36,7 +36,7 @@ class MetaResearchService:
             for item in decisions
         }
         scientific_decisions = [
-            item for item in decisions if classify_decision_data(item["data"])["decision_role"] == "SCIENTIFIC_ACTION"
+            item for item in decisions if eligibility[str(item["id"])]["decision_role"] == "SCIENTIFIC_ACTION"
         ]
         eligible_decisions = [item for item in decisions if eligibility[str(item["id"])] ["eligible"]]
         information_points = sum(
@@ -88,11 +88,11 @@ class MetaResearchService:
             "scientific_cycles_open": max(len(scientific_decisions) - len(eligible_decisions), 0),
             "strategy_eligible_cycles": len(eligible_decisions),
             "administrative_decisions": sum(
-                classify_decision_data(item["data"])["decision_role"] == "ADMINISTRATIVE_RECOVERY"
+                eligibility[str(item["id"])]["decision_role"] == "ADMINISTRATIVE_RECOVERY"
                 for item in decisions
             ),
             "system_verification_decisions": sum(
-                classify_decision_data(item["data"])["decision_role"] in {"SYSTEM_VERIFICATION", "PROVIDER_CONTRACT_TEST"}
+                eligibility[str(item["id"])]["decision_role"] in {"SYSTEM_VERIFICATION", "PROVIDER_CONTRACT_TEST"}
                 for item in decisions
             ),
             "decisions_with_hindsight": sum(
@@ -118,6 +118,7 @@ class MetaResearchService:
             str(item["id"])
             for item in runs
             if item["status"] in RECOVERABLE_RUN_STATUSES
+            and ResearchStore.experiment_run_is_operationally_active(item)
         ]
         uninspected = [
             str(item["id"])
@@ -189,7 +190,7 @@ class MetaResearchService:
         if inspected < 5:
             campaign_reasons.append("fewer than five inspected experiments")
         if decisions == 0:
-            campaign_reasons.append("no research decisions recorded")
+            campaign_reasons.append("no scientific decisions recorded")
         elif hindsight / decisions < 0.8:
             campaign_reasons.append("scientific decision hindsight coverage below 80%")
         if metrics["scientific_cycles_closed"] == 0 and decisions:

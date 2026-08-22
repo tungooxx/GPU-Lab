@@ -141,6 +141,50 @@ class LocalRunner:
             },
         }
 
+    @staticmethod
+    def _parse_gpu_metrics(output: str) -> list[dict]:
+        """Parse the small, unit-free ``nvidia-smi`` telemetry response."""
+        metrics = []
+        for line in output.splitlines():
+            fields = [field.strip() for field in line.split(",")]
+            if len(fields) != 6:
+                continue
+            try:
+                index, memory_total, memory_used, utilization, temperature = map(
+                    int, (fields[0], fields[2], fields[3], fields[4], fields[5])
+                )
+            except ValueError:
+                continue
+            metrics.append(
+                {
+                    "index": index,
+                    "name": fields[1],
+                    "memory_total_mb": memory_total,
+                    "memory_used_mb": memory_used,
+                    "utilization_percent": utilization,
+                    "temperature_c": temperature,
+                }
+            )
+        return metrics
+
+    async def gpu_metrics(self) -> list[dict]:
+        """Return current local GPU load for the read-only web monitor."""
+        self._require_enabled()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "nvidia-smi",
+                "--query-gpu=index,name,memory.total,memory.used,utilization.gpu,temperature.gpu",
+                "--format=csv,noheader,nounits",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:
+            raise GPUError("NVIDIA_SMI_UNAVAILABLE", "nvidia-smi is unavailable in the local runtime") from exc
+        output, error = await proc.communicate()
+        if proc.returncode:
+            raise GPUError("NVIDIA_SMI_FAILED", error.decode(errors="replace").strip())
+        return self._parse_gpu_metrics(output.decode(errors="replace"))
+
     async def submit(
         self,
         command: str,
@@ -303,7 +347,7 @@ class LocalRunner:
         content = file.read_bytes()[:limit]
         return {"job_id": job_id, "path": path, "truncated": file.stat().st_size > limit, "content": content.decode(errors="replace")}
 
-    def job_status(self, job_id: str) -> dict:
+    def job_status(self, job_id: str, include_logs: bool = True) -> dict:
         job = self.repo.get_job(job_id)
         if not job or job.instance_id != "local":
             raise GPUError("JOB_NOT_FOUND", f"No local job named {job_id}")
@@ -363,11 +407,14 @@ class LocalRunner:
                 except OSError:
                     job.status = "unknown"
         self.repo.save_job(job)
-        logs = ""
-        for file in (jobdir / "stdout.log", jobdir / "stderr.log"):
-            if file.exists():
-                logs += file.read_text(errors="replace")[-65536:]
-        return {"job_id": job_id, "status": job.status, "exit_code": job.exit_code, "logs_tail": logs}
+        result = {"job_id": job_id, "status": job.status, "exit_code": job.exit_code}
+        if include_logs:
+            logs = ""
+            for file in (jobdir / "stdout.log", jobdir / "stderr.log"):
+                if file.exists():
+                    logs += file.read_text(errors="replace")[-65536:]
+            result["logs_tail"] = logs
+        return result
 
     def reconcile_jobs(self) -> dict[str, int]:
         """Refresh persisted non-final jobs after a gateway start or restart."""

@@ -6,8 +6,10 @@ from pathlib import Path
 import pytest
 
 from gpu_lab.brain_bench import BenchmarkDecision, ResearchBrainBench
+from gpu_lab.engineering import EngineeringService
 from gpu_lab.errors import GPUError
 from gpu_lab.policy_lab import PolicyLabService
+from gpu_lab.prompt_compiler import CORE_EPISTEMIC_INVARIANTS, PromptCompiler
 
 
 class Store:
@@ -52,6 +54,47 @@ def test_user_idea_auto_evaluates_and_leaves_production_unchanged():
     assert all(item["data"]["namespace"] == "BENCHMARK" for item in store.items if item["kind"] == "PolicyExperiment")
 
 
+def test_improvement_budget_bounds_candidates_and_revisions():
+    result = service().improve("project", idea="Improve discrimination", candidate_budget=1, max_revisions=0)
+
+    assert len(result["hypotheses"]) == 1
+    assert result["improvement_run"]["data"]["budget"] == {"candidate_budget": 1, "max_revisions": 0}
+
+
+def test_improvement_keeps_meta_source_provenance_on_hypotheses_and_run():
+    result = service().improve("project", idea="Improve discrimination", source_context={"MetaLesson": ["lesson-1"], "PolicyNegativeResult": ["negative-1"]})
+
+    assert result["hypotheses"][0]["data"]["source_ids"] == ["lesson-1", "negative-1"]
+    assert result["improvement_run"]["data"]["source_context"]["MetaLesson"] == ["lesson-1"]
+
+
+def test_improvement_preserves_competing_diagnostic_mechanisms_on_policy_hypotheses():
+    result = service().improve(
+        "project",
+        idea="Improve discrimination",
+        diagnostic_hypotheses=[
+            {"component": "critic", "mechanism": "critic omission", "diagnostic_score": 0.8},
+            {"component": "ranking", "mechanism": "ranking trade-off", "diagnostic_score": 0.6},
+        ],
+    )
+
+    assert result["hypotheses"][0]["data"]["diagnostic_hypothesis"]["component"] == "critic"
+    assert result["hypotheses"][1]["data"]["diagnostic_hypothesis"]["component"] == "ranking"
+    assert result["improvement_run"]["data"]["diagnostic_hypotheses"][0]["mechanism"] == "critic omission"
+
+
+def test_policy_tournament_ranks_multiple_supported_candidates_without_combining_them():
+    store = Store()
+    lab = service(store)
+    first = store.object_create("project", "ResearchPolicyPatch", {"benchmark_results": {"metrics": {"strong_next_action_recall": {"mean": 0.4}}}}, "FIXTURE", "SUPPORTED_ON_BENCHMARK")
+    second = store.object_create("project", "ResearchPolicyPatch", {"benchmark_results": {"metrics": {"strong_next_action_recall": {"mean": 0.8}}}}, "FIXTURE", "SUPPORTED_ON_BENCHMARK")
+
+    tournament = lab._tournament("project", [{"patch": first}, {"patch": second}])
+
+    assert tournament["data"]["winner_patch_id"] == second["id"]
+    assert "No combinations" in tournament["data"]["combination_policy"]
+
+
 def test_duplicate_failed_policy_is_rejected_before_evaluation():
     store = Store()
     lab = service(store)
@@ -78,7 +121,8 @@ def test_promotion_is_explicit_and_rollback_preserves_history():
 
     assert promoted["id"] != original["id"]
     assert rolled_back["status"] == "PRODUCTION"
-    assert any(item["status"] == "SUPERSEDED" for item in store.items if item["kind"] == "ResearchPolicy")
+    assert any(item["status"] == "ROLLED_BACK" for item in store.items if item["kind"] == "ResearchPolicy")
+    assert promoted["data"]["provenance"]["evaluation"]["evaluator_version"] == "policy-evaluator-v3"
 
 
 def test_promotion_requires_evidence():
@@ -90,6 +134,96 @@ def test_promotion_requires_evidence():
 
     with pytest.raises(GPUError, match="lacks required evidence"):
         lab.promote("project", patch["id"])
+
+
+def test_policy_lifecycle_restriction_preserves_nonproduction_history():
+    store = Store()
+    lab = service(store)
+    policy = store.object_create("project", "ResearchPolicy", {"version": 1}, "FIXTURE", "SUPERSEDED")
+
+    restricted = lab.restrict_policy("project", policy["id"], "MODEL_INCOMPATIBLE", "adapter compatibility failure")
+
+    assert restricted["status"] == "MODEL_INCOMPATIBLE"
+    assert restricted["data"]["lifecycle_restriction_reason"] == "adapter compatibility failure"
+
+
+def test_code_bearing_policy_patch_creates_bounded_engineering_task():
+    store = Store()
+    lab = service(store)
+    policy = lab.ensure_production_policy("project")
+    patch = lab._patch("project", policy, lab._hypotheses_for("project", "USER_IDEA", "problem", "critic")[0])
+
+    result = lab.code_patch_prepare("project", patch["id"], {"purpose": "Bound candidate scoring", "files": ["src/gpu_lab/policy_lab.py"], "tests": ["tests/test_policy_lab.py"]})
+
+    assert result["patch"]["status"] == "IMPLEMENTED_UNVERIFIED"
+    assert result["engineering_task"]["data"]["scientific_result"] == "NOT_ASSESSED"
+
+
+def test_code_patch_uses_v2_2_engineering_task_contract_when_service_is_available():
+    store = Store()
+    lab = PolicyLabService(store, ResearchBrainBench(Path(__file__).parents[1] / "research_bench"), engineering_service=EngineeringService(store))
+    policy = lab.ensure_production_policy("project")
+    patch = lab._patch("project", policy, lab._hypotheses_for("project", "USER_IDEA", "problem", "critic")[0])
+
+    task = lab.code_patch_prepare("project", patch["id"], {"purpose": "Bound candidate scoring", "files": ["src/gpu_lab/policy_lab.py"], "tests": ["tests/test_policy_lab.py"]})["engineering_task"]
+
+    assert task["data"]["policy_patch_id"] == patch["id"]
+    assert task["data"]["acceptance_tests"] == []
+    assert task["data"]["engineering_invariants"]["scientific_truth_unchanged"] is True
+
+
+def test_code_patch_waits_for_verified_engineering_result_then_auto_evaluates():
+    store = Store()
+    lab = service(store)
+    policy = lab.ensure_production_policy("project")
+    patch = lab._patch("project", policy, lab._hypotheses_for("project", "USER_IDEA", "problem", "critic")[0])
+    task = lab.code_patch_prepare("project", patch["id"], {"purpose": "Bound candidate scoring", "files": ["src/gpu_lab/policy_lab.py"], "tests": ["tests/test_policy_lab.py"]})["engineering_task"]
+
+    assert lab.evaluate("project", patch["id"])["decision"] == "IMPLEMENTATION_REQUIRED"
+    result = store.object_create("project", "EngineeringResult", {"implementation_verification": "VERIFIED_TARGETED"}, "FIXTURE", "COMPLETED")
+    task["data"]["latest_result_id"] = result["id"]
+
+    handoff = lab.code_patch_result_sync("project", task["id"])
+
+    assert handoff["patch"]["data"]["implementation_verified"] is True
+    assert handoff["evaluation"]["decision"] in {"SUPPORTED_ON_BENCHMARK", "REJECTED"}
+
+
+def test_unverified_code_patch_result_is_retained_as_non_scientific_negative_result():
+    store = Store()
+    lab = service(store)
+    policy = lab.ensure_production_policy("project")
+    patch = lab._patch("project", policy, lab._hypotheses_for("project", "USER_IDEA", "problem", "critic")[0])
+    task = lab.code_patch_prepare("project", patch["id"], {"purpose": "Bound candidate scoring", "files": ["src/gpu_lab/policy_lab.py"], "tests": ["tests/test_policy_lab.py"]})["engineering_task"]
+    result = store.object_create("project", "EngineeringResult", {"implementation_verification": "INVALID_IMPLEMENTATION"}, "FIXTURE", "INCONCLUSIVE")
+    task["data"]["latest_result_id"] = result["id"]
+
+    handoff = lab.code_patch_result_sync("project", task["id"])
+
+    assert handoff["decision"] == "IMPLEMENTATION_REJECTED"
+    assert handoff["patch"]["status"] == "REJECTED"
+    assert handoff["negative_result"]["data"]["failure_mode"] == "implementation not verified"
+
+
+def test_policy_patch_cannot_be_evaluated_or_promoted_in_another_project():
+    store = Store()
+    lab = service(store)
+    patch = lab.improve("project-a", idea="Improve discrimination")["patches"][0]
+    with pytest.raises(GPUError) as evaluation_mismatch:
+        lab.evaluate("project-b", patch["id"])
+    assert evaluation_mismatch.value.error_type == "RESEARCH_PROJECT_MISMATCH"
+    with pytest.raises(GPUError) as promotion_mismatch:
+        lab.promote("project-b", patch["id"])
+    assert promotion_mismatch.value.error_type == "RESEARCH_PROJECT_MISMATCH"
+
+
+def test_promotion_materializes_validated_policy_delta():
+    store = Store()
+    lab = service(store)
+    patch = next(item for item in lab.improve("project", idea="Improve discrimination")["patches"] if item["status"] == "SUPPORTED_ON_BENCHMARK")
+    promoted = lab.promote("project", patch["id"])
+    assert promoted["data"]["applied_policy_delta"]
+    assert promoted["data"]["decision_policy"].get("preferred_action_types")
 
 
 def test_candidate_that_regresses_on_held_out_is_rejected(monkeypatch):
@@ -106,6 +240,10 @@ def test_candidate_that_regresses_on_held_out_is_rejected(monkeypatch):
     outcome = lab.evaluate("project", patch["id"])
 
     assert outcome["decision"] == "REJECTED"
+    adversarial = outcome["experiment"]["data"]["results"]["adversarial_falsification"]
+    assert patch["id"] == outcome["patch"]["id"]
+    assert adversarial["episode_ids"]
+    assert "adversarial:bad_action_selection_rate" in outcome["experiment"]["data"]["regressions"]
     assert "bad_action_selection_rate" in outcome["experiment"]["data"]["regressions"]
     assert any(item["kind"] == "PolicyNegativeResult" for item in store.items)
 
@@ -200,10 +338,76 @@ def test_post_promotion_hindsight_is_appended_without_creating_science_records()
     lab = service(store)
     policy = lab.ensure_production_policy("project")
 
-    updated = lab.record_hindsight(policy["id"], observed_improvement=0.2, observed_cost=1.1)
+    updated = lab.record_hindsight(policy["id"], observed_improvement=0.2, observed_cost=1.1, decision_ids=["decision-1"])
 
     assert updated["data"]["post_promotion_hindsight"][0]["observed_improvement"] == 0.2
+    assert updated["data"]["post_promotion_hindsight"][0]["decision_ids"] == ["decision-1"]
     assert not [item for item in store.items if item["kind"] in {"WorldModel", "Hypothesis", "EvidenceUnit"}]
+    assert store.objects_list("project", "PolicyHindsight")[0]["data"]["calibration_error"] is None
+
+
+def test_shadow_comparison_preserves_counterfactual_unknown_and_canary_does_not_promote():
+    store = Store()
+    lab = service(store)
+    production = lab.ensure_production_policy("project")
+    candidate = store.object_create(
+        "project",
+        "ResearchPolicy",
+        {**production["data"], "version": 2, "applicability": {"scope": "PROJECT"}},
+        "FIXTURE",
+        "CANDIDATE",
+    )
+
+    canary = lab.start_canary("project", candidate["id"], percentage=10)
+    shadow = lab.record_shadow(
+        "project", production["id"], candidate["id"], "decision-1",
+        {"action_type": "CAUSAL_INTERVENTION"}, {"action_type": "NULL_MODEL_TEST"}, {"label": "HIGH_VALUE"},
+    )
+
+    assert canary["status"] == "ACTIVE"
+    assert lab.ensure_production_policy("project")["id"] == production["id"]
+    assert shadow["data"]["counterfactual_status"] == "COUNTERFACTUAL_UNKNOWN"
+    stopped = lab.record_canary_observation(canary["id"], "decision-1", {"scope_violation": True}, hard_epistemic_regression=True)
+    assert stopped["status"] == "COMPLETED"
+    assert stopped["data"]["stop_reason"] == "hard epistemic regression"
+
+
+def test_provider_compatibility_is_not_claimed_as_cross_model_success():
+    result = service().evaluate_provider_compatibility("project", "openai", "new-model")
+
+    assert result["status"] == "CROSS_MODEL_UNVERIFIED"
+    assert result["data"]["results"]["adapter_compilation"] == "PASS"
+    assert result["data"]["results"]["live_model_evaluation"] == "UNAVAILABLE"
+
+
+def test_model_compatibility_creates_a_candidate_only_provider_adapter():
+    store = Store()
+    lab = service(store)
+    compatibility = lab.evaluate_provider_compatibility("project", "openai", "new-model")
+
+    candidate = lab.provider_adapter_candidate("project", "openai", "new-model", compatibility["id"])
+
+    assert candidate["status"] == "CANDIDATE"
+    assert candidate["data"]["evaluation_status"] == "LIVE_MODEL_EVALUATION_REQUIRED"
+    assert candidate["data"]["promotion_status"] == "NOT_ELIGIBLE_WITHOUT_CROSS_MODEL_SUPPORT"
+
+
+def test_live_supported_provider_adapter_can_be_promoted_but_unverified_one_cannot():
+    store = Store()
+    lab = service(store)
+    compatibility = lab.evaluate_provider_compatibility("project", "openai", "new-model")
+    candidate = lab.provider_adapter_candidate("project", "openai", "new-model", compatibility["id"])
+    evidence = store.object_create("project", "EvidenceUnit", {"excerpt": "Live evaluation trace"}, "FIXTURE", "CANDIDATE")
+
+    with pytest.raises(GPUError) as error:
+        lab.provider_adapter_promote("project", candidate["id"])
+    assert error.value.error_type == "PROVIDER_ADAPTER_PROMOTION_NOT_SUPPORTED"
+    evaluated = lab.provider_adapter_evaluate("project", candidate["id"], [evidence["id"]], "PASS")
+    promoted = lab.provider_adapter_promote("project", candidate["id"])
+
+    assert evaluated["status"] == "CROSS_MODEL_SUPPORTED"
+    assert promoted["status"] == "PRODUCTION"
+    assert promoted["data"]["provider_adapters"]["openai"]["model"] == "new-model"
 
 
 def test_policy_evaluation_cannot_mutate_production_science(monkeypatch):
@@ -220,3 +424,77 @@ def test_policy_evaluation_cannot_mutate_production_science(monkeypatch):
     lab.evaluate("project", result["patches"][0]["id"])
 
     assert store.object_get(science["id"])["data"] == {"name": "production"}
+
+
+def test_production_policy_compiles_immutable_provider_artifacts():
+    store = Store()
+    lab = service(store)
+    policy = lab.ensure_production_policy("project")
+
+    artifact = lab.compile_policy(policy["id"], "CHATGPT")
+
+    assert artifact["kind"] == "ResearchPolicyArtifact"
+    assert "GENERATED FILE" in artifact["data"]["content"]
+    assert artifact["data"]["policy_version"] == 1
+    assert artifact["data"]["compiled_prompt_tokens"] > 0
+    assert {item["data"]["target_provider"] for item in store.items if item["kind"] == "ResearchPolicyArtifact"} >= {"CHATGPT", "CLAUDE", "CODEX", "GENERIC"}
+
+
+def test_prompt_mode_compiles_candidate_before_benchmarking():
+    store = Store()
+    lab = service(store)
+
+    result = lab.improve("project", idea="Improve experiment comparison", prompt=True)
+
+    assert result["improvement_run"]["data"]["input"]["prompt"] is True
+    assert all(patch["data"]["patch_type"] == "PROMPT_PRESENTATION" for patch in result["patches"][:3])
+    assert all("compiled_prompts" in evaluation["experiment"]["data"] for evaluation in result["evaluations"])
+    assert result["improvement_run"]["data"]["production_unchanged"] is True
+
+
+def test_core_invariant_attack_is_rejected_before_benchmark():
+    store = Store()
+    lab = service(store)
+    policy = lab.ensure_production_policy("project")
+    hypothesis = lab._hypotheses_for("project", "USER_IDEA", "problem", "critic")[0]
+    patch = lab._patch("project", policy, hypothesis)
+    patch["data"]["core_epistemic_invariants"] = [CORE_EPISTEMIC_INVARIANTS[0]]
+
+    result = lab.evaluate("project", patch["id"])
+
+    assert result["decision"] == "INVALID_EVALUATION"
+    assert not [item for item in store.items if item["kind"] == "PolicyExperiment"]
+
+
+def test_evaluator_tampering_is_rejected_before_benchmark():
+    store = Store()
+    lab = service(store)
+    policy = lab.ensure_production_policy("project")
+    patch = lab._patch("project", policy, lab._hypotheses_for("project", "USER_IDEA", "problem", "critic")[0])
+    patch["data"]["benchmark_labels"] = {"rewrite": "forbidden"}
+
+    result = lab.evaluate("project", patch["id"])
+
+    assert result["decision"] == "INVALID_EVALUATION"
+    assert not [item for item in store.items if item["kind"] == "PolicyExperiment"]
+    audit = store.objects_list("project", "PolicyEvaluationAudit")[0]
+    assert audit["data"]["reason_type"] == "INVALID_POLICY_EXPERIMENT"
+    assert audit["data"]["leakage_audit"] == "PASS"
+    assert audit["data"]["evaluator_integrity"] == "PRESERVED"
+
+
+def test_provider_compilation_preserves_canonical_invariants():
+    policy = {"id": "policy", "data": {"version": 1, "core_epistemic_invariants": list(CORE_EPISTEMIC_INVARIANTS), "decision_policy": {"falsification_first": True}}}
+    compiler = PromptCompiler()
+    outputs = [compiler.compile(policy, provider) for provider in ("GENERIC", "CHATGPT", "CLAUDE", "CODEX")]
+
+    assert len({output["content_hash"] for output in outputs}) == 4
+    assert all("execution is not evidence" in output["content"] for output in outputs)
+
+
+def test_provider_compilation_includes_only_the_selected_adapter_data():
+    compiler = PromptCompiler()
+    compiled = compiler.compile({"data": {"version": 1, "provider_adapters": {"codex": {"format": "structured"}}}}, "CODEX")
+
+    assert compiled["provider_adapter"] == {"format": "structured"}
+    assert 'Provider adapter data: {"format": "structured"}' in compiled["content"]

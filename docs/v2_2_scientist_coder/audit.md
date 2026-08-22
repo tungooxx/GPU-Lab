@@ -75,11 +75,10 @@ equality, checksums, and declared guard coverage. A failed guard produces
 `INVALID_IMPLEMENTATION` and blocks scientific interpretation; it cannot refute
 a hypothesis or teach strategy memory.
 
-The execution handoff is guarded when a task ID is supplied: the task must link
-to the requested experiment, all declared implementation/scientific guards must
-be present and pass, and only then is the existing experiment reservation path
-allowed to continue. Tasks without a code-change requirement remain compatible
-with the prior execution API.
+The execution handoff is guarded whenever a task ID is supplied: the task must
+link to the requested experiment, all declared implementation/scientific guards
+must be present and pass, and only then is the existing experiment reservation
+path allowed to continue.
 
 ## Verification status
 

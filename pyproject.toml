@@ -17,6 +17,8 @@ dependencies = [
 # PaperQA follows CalVer without cross-release compatibility guarantees. Keep this adapter on the
 # audited 2026 API family and install it only in an isolated literature worker/environment.
 literature = ["paper-qa>=2026.3.18,<2027"]
+# The browser bridge is opt-in; the browser profile always stays server-side.
+browser = ["playwright>=1.0,<2"]
 
 [project.scripts]
 gpu-lab-mcp = "gpu_lab.server:main"

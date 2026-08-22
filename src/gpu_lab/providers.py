@@ -36,7 +36,7 @@ class VastProvider:
             raise GPUError(
                 "PROVIDER_API_ERROR", str(exc), isinstance(exc, httpx.TimeoutException)
             ) from exc
-        if data.get("success") is False:
+        if isinstance(data, dict) and data.get("success") is False:
             raise GPUError(
                 "PROVIDER_API_ERROR", data.get("msg", data.get("error", "Vast request failed"))
             )
@@ -108,7 +108,9 @@ class VastProvider:
         payload = {
             "image": options.get("image") or "vastai/base-image:@vastai-automatic-tag",
             "disk": options.get("disk_gb", 100),
-            "runtype": "ssh",
+            # Vast documents ``ssh_direct`` for a directly reachable SSH
+            # instance. The remote executor requires that connectivity.
+            "runtype": "ssh_direct",
             "label": options.get("label"),
         }
         data = await self._request(
@@ -119,7 +121,10 @@ class VastProvider:
     async def get_instance(self, instance_id: str) -> Instance:
         ident = instance_id.removeprefix("vast_")
         data = await self._request("GET", f"/instances/{ident}")
-        return self.normalize(data.get("instances", data))
+        raw = data.get("instances", data) if isinstance(data, dict) else data
+        if not isinstance(raw, dict):
+            raise GPUError("INSTANCE_NOT_FOUND", f"Vast instance {ident} was not found")
+        return self.normalize(raw)
 
     async def list_instances(self) -> list[Instance]:
         data = await self._request_v1("GET", "/instances")

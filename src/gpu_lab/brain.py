@@ -5,8 +5,19 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
+from .discovery import (
+    BRAIN_POLICY_VERSION,
+    SearchRegime,
+    choose_regime,
+    classify_scientific_distance,
+    fallback_candidates,
+    frontier_gap,
+    portfolio_critique,
+    stagnation_state,
+)
 from .epistemics import normalize_scientific_scope, scope_is_empirically_bounded
 from .errors import GPUError
+from .execution_validity import normalize_execution_attestation
 from .research import ResearchStore
 from .strategy import SCORING_POLICY_VERSION, STRATEGY_POLICY_VERSION, ResearchStrategyService
 
@@ -55,6 +66,7 @@ ACTION_TYPES = {
     "MATCHED_CONTROL",
     "RANDOM_CONTROL",
     "MAGNITUDE_MATCHED_CONTROL",
+    "PORTFOLIO_REFINEMENT",
 }
 EXECUTABLE_ACTIONS = {
     "REPRODUCTION",
@@ -143,11 +155,15 @@ class ResearchBrain:
         for key, value in state["canonical_state"].items():
             if isinstance(value, list):
                 snapshot[key] = [
-                    {
-                        field: str(item[field]) if field == "id" else item[field]
-                        for field in ("id", "kind", "status")
-                        if field in item
-                    }
+                    (
+                        {
+                            field: str(item[field]) if field == "id" else item[field]
+                            for field in ("id", "kind", "status")
+                            if field in item
+                        }
+                        if isinstance(item, dict)
+                        else item
+                    )
                     for item in value
                 ]
             else:
@@ -390,7 +406,22 @@ class ResearchBrain:
             *(related_contradiction_ids or []),
         ]
         self._validate_references(agenda["project_id"], references)
-        experiments = candidate_experiments or []
+        experiments = []
+        for raw_candidate in candidate_experiments or []:
+            # Normalize the accepted AgendaItem shorthand at the write boundary.
+            # Older callers supplied a singular ``prediction`` and a top-level
+            # experiment ID; downstream action construction requires the plural
+            # outcome list and a payload-bound experiment ID.
+            candidate = dict(raw_candidate)
+            if not candidate.get("predicted_outcomes"):
+                prediction = candidate.get("prediction")
+                if isinstance(prediction, str) and prediction.strip():
+                    candidate["predicted_outcomes"] = [prediction.strip()]
+            payload = dict(candidate.get("payload") or {})
+            if candidate.get("experiment_id") and not payload.get("experiment_id"):
+                payload["experiment_id"] = candidate["experiment_id"]
+            candidate["payload"] = payload
+            experiments.append(candidate)
         for candidate in experiments:
             if "action_type" not in candidate:
                 raise GPUError("INVALID_RESEARCH_ACTION_TYPE", "Candidate action_type is required")
@@ -479,6 +510,130 @@ class ResearchBrain:
             "HYPOTHESIS_PORTFOLIO_CREATED",
         )
 
+    def _discovery_portfolio(
+        self,
+        project_id: str,
+        agenda_item: dict[str, Any],
+        candidates: list[dict[str, Any]],
+        hypotheses: list[dict[str, Any]],
+        prerequisite: bool,
+        related_dead: list[dict[str, Any]],
+        as_of: str | None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Create a validated, multi-distance portfolio without authorizing a run."""
+        temporal = {"as_of": as_of} if as_of is not None else {}
+        decisions = self.store.objects_list(project_id, "ResearchDecision", limit=None, **temporal)
+        negatives = self.store.objects_list(project_id, "NegativeResult", limit=None, **temporal)
+        breakthroughs = self.store.objects_list(project_id, "BreakthroughSignal", limit=None, **temporal)
+        metrics = agenda_item["data"].get("frontier_metrics", [])
+        if not isinstance(metrics, list):
+            metrics = []
+        frontier = frontier_gap(metrics)
+        stagnation = stagnation_state(decisions, negatives)
+        mechanism_unknown = not bool(agenda_item["data"].get("mechanism_resolved"))
+        regime = choose_regime(
+            prerequisite=prerequisite,
+            mechanism_unknown=mechanism_unknown,
+            frontier=frontier,
+            stagnation=stagnation,
+        )
+        baseline = candidates[0] if candidates else None
+        for candidate in candidates:
+            candidate.update(classify_scientific_distance(candidate, baseline))
+            candidate["generation_source"] = candidate.get("payload", {}).get(
+                "generation_source", "AGENDA_CONFIGURED"
+            )
+        critique = portfolio_critique(candidates, prerequisite)
+        if not critique["adequate"] and not prerequisite:
+            generated = fallback_candidates(
+                agenda_item["data"]["question"],
+                [str(item["id"]) for item in hypotheses],
+                baseline,
+                regime["search_regime"],
+            )
+            for item in generated:
+                candidate = ActionCandidate(**item).checked().persisted_data()
+                candidate.update(classify_scientific_distance(candidate, baseline))
+                candidate["generation_source"] = "DETERMINISTIC_DISCOVERY_FALLBACK"
+                candidates.append(candidate)
+            critique = portfolio_critique(candidates, False)
+        high_breakthroughs = [
+            item for item in breakthroughs if item.get("data", {}).get("discovery_value") == "HIGH"
+        ]
+        if high_breakthroughs and not prerequisite:
+            branches = high_breakthroughs[0]["data"].get("branch_recommendations", [])
+            for branch in branches:
+                dimensions = {"architecture_family": "mechanism-derived redesign"}
+                if branch == "search_different_architecture_or_representation":
+                    dimensions = {"representation": "alternative representation family"}
+                elif branch == "reformulate_joint_objective":
+                    dimensions = {"causal_object": "reformulated joint objective"}
+                item = ActionCandidate(
+                    action_type="LITERATURE_SEARCH",
+                    question_addressed=agenda_item["data"]["question"],
+                    hypotheses_discriminated=[str(hypothesis["id"]) for hypothesis in hypotheses],
+                    predicted_outcomes=["Specify a distinct branch implied by the partial breakthrough."],
+                    required_resources=["breakthrough evidence", "human review"],
+                    payload={"scientific_dimensions": dimensions, "breakthrough_branch": branch, "generation_source": "BREAKTHROUGH_BRANCHING", "requires_preregistration": True, "non_executing_discovery_candidate": True},
+                    score=ActionScore(scientific_importance=4, expected_discrimination=3, expected_information_gain=3, feasibility=4, compute_cost=0.2, engineering_cost=0.5, execution_risk=0.2, decision_relevance=4),
+                ).checked().persisted_data()
+                item.update(classify_scientific_distance(item, baseline))
+                item["generation_source"] = "BREAKTHROUGH_BRANCHING"
+                candidates.append(item)
+            critique = portfolio_critique(candidates, False)
+        # Diminishing returns must change selection behavior, not merely a label.
+        for candidate in candidates:
+            distance = candidate["scientific_distance"]
+            multiplier = 1.0
+            if regime["search_regime"] == SearchRegime.DIVERGENT_SEARCH.value:
+                multiplier = 0.55 if distance == "NEAR" else 1.2 if distance in {"FAR", "ORTHOGONAL"} else 1.0
+            elif regime["search_regime"] == SearchRegime.PARADIGM_RESET.value:
+                multiplier = 0.35 if distance == "NEAR" else 1.3 if distance in {"FAR", "ORTHOGONAL"} else 0.8
+            candidate["strategic_priority_multiplier"] = multiplier
+            candidate["priority"] = round(float(candidate["priority"]) * multiplier, 6)
+        # Fallback ideas are deliberate portfolio members, not executable or
+        # self-justifying research actions.  Selecting them was the v3.1-v1
+        # local-search loop: a zero-information cycle could lead to another
+        # non-executing fallback with no concrete preregistered design.
+        if not prerequisite and not any(
+            not item.get("payload", {}).get("non_executing_discovery_candidate", False)
+            and item.get("available", True)
+            for item in candidates
+        ):
+            refinement = ActionCandidate(
+                action_type="PORTFOLIO_REFINEMENT",
+                question_addressed=agenda_item["data"]["question"],
+                hypotheses_discriminated=[str(item["id"]) for item in hypotheses],
+                predicted_outcomes=["Convert a scientifically distant idea into a concrete, preregisterable candidate before a new decision."],
+                required_resources=["human scientific review", "existing evidence"],
+                payload={"mode": "REQUIRES_CONCRETE_PREREGISTERED_CANDIDATE", "non_scientific_process_action": True, "does_not_authorize_execution": True},
+                score=ActionScore(scientific_importance=1, expected_discrimination=1, expected_information_gain=1, feasibility=5, compute_cost=0.1, engineering_cost=0.2, execution_risk=0.1, decision_relevance=1),
+            ).checked().persisted_data()
+            refinement.update(classify_scientific_distance(refinement, baseline))
+            refinement["generation_source"] = "PORTFOLIO_GOVERNANCE"
+            refinement["strategic_priority_multiplier"] = 1.0
+            candidates.append(refinement)
+        portfolio = {
+            "project_id": project_id,
+            "agenda_item_id": str(agenda_item["id"]),
+            "search_regime": regime["search_regime"],
+            "portfolio_type": "SINGLE_PATH_PREREQUISITE" if prerequisite else "OPEN_ENDED_DISCOVERY",
+            "valid_candidate_indexes": [index for index, item in enumerate(candidates) if item.get("available", True)],
+            "rejected_candidate_indexes": [],
+            "distance_coverage": critique["distance_coverage"],
+            "representation_coverage": sorted({str(item.get("payload", {}).get("scientific_dimensions", {}).get("representation", "UNSPECIFIED")) for item in candidates}),
+            "lineage_coverage": sorted({str(item.get("payload", {}).get("scientific_dimensions", {}).get("architecture_family", "UNSPECIFIED")) for item in candidates}),
+            "generation_sources": sorted({str(item.get("generation_source", "UNKNOWN")) for item in candidates}),
+            "negative_memory_constraints_applied": {"related_dead_count": len(related_dead), "local_search_saturation": stagnation["local_search_saturation"], "required_search_radius": stagnation["required_search_radius"]},
+            "breakthrough_context": [
+                {"id": str(item["id"]), "discovery_value": item["data"].get("discovery_value"), "type": item["data"].get("type")}
+                for item in breakthroughs[-10:]
+            ],
+            "portfolio_critic_result": critique,
+            "brain_policy_version": BRAIN_POLICY_VERSION,
+        }
+        return candidates, portfolio, frontier, {**stagnation, "search_regime": regime, "portfolio_critic": critique}
+
     def brain_step(
         self, project_id: str, as_of: str | None = None, persist: bool = True
     ) -> dict:
@@ -517,6 +672,48 @@ class ResearchBrain:
             items,
             key=lambda item: item["data"].get("importance", 1) * item["data"].get("uncertainty", 1),
         )
+        # A v3.3 round is a deliberately isolated *search* phase.  Do not let
+        # the normal single-Brain ranker collapse it into an execution choice
+        # before the independent batches and coverage record are complete.
+        discovery_rounds = self.store.objects_list(
+            project_id,
+            "DiscoveryRound",
+            {"ACTIVE"},
+            limit=None,
+            data_filters={"agenda_item_id": str(agenda_item["id"])},
+            **temporal,
+        )
+        generating_rounds = [
+            item for item in discovery_rounds
+            if item["data"].get("phase") in {"INDEPENDENT_GENERATION", "GENERATION_FROZEN", "CHARACTERIZATION", "DEAD_MEMORY_SCREEN", "QD_ARCHIVE", "LITERATURE_PASS", "SYNTHESIS"}
+        ]
+        if generating_rounds:
+            raise GPUError(
+                "DISCOVERY_ROUND_INCOMPLETE",
+                "Independent distributed discovery is still in progress; synthesize its coverage before Brain ranking.",
+            )
+        completed_rounds = self.store.objects_list(
+            project_id,
+            "DiscoveryRound",
+            {"COMPLETED"},
+            limit=None,
+            data_filters={"agenda_item_id": str(agenda_item["id"])},
+            **temporal,
+        )
+        latest_discovery_round = max(completed_rounds, key=lambda item: item["created_at"], default=None)
+        if latest_discovery_round:
+            # A completed archive is still not safe to rank after decisive
+            # state changed.  The DDE snapshot excludes DDE bookkeeping itself.
+            from .discovery_v33 import DistributedDiscoveryService
+
+            staleness = DistributedDiscoveryService(self.store, migrate=False).stale_check(
+                str(latest_discovery_round["id"]), mark_stale=persist,
+            )
+            if staleness["stale"]:
+                raise GPUError(
+                    "DISCOVERY_ROUND_STALE",
+                    "The completed discovery archive predates current scientific state; do not select from it blindly.",
+                )
         portfolio = (
             self._portfolio_refresh(project_id)
             if persist
@@ -550,6 +747,19 @@ class ResearchBrain:
             }
             for candidate in candidates
         ]
+        hard_gate = len(candidates) == 1 and candidates[0].action_type in {
+            "ARTIFACT_ANALYSIS",
+            "REPRODUCTION",
+        }
+        base_candidate_data, candidate_portfolio, frontier, discovery_state = self._discovery_portfolio(
+            project_id,
+            agenda_item,
+            base_candidate_data,
+            hypotheses,
+            hard_gate,
+            related_dead,
+            as_of,
+        )
         situation_data = self.strategy.construct_situation_data(
             project_id,
             agenda_item,
@@ -558,21 +768,31 @@ class ResearchBrain:
             len(related_dead),
             as_of,
         )
+        situation_data.update(
+            {
+                "search_regime": candidate_portfolio["search_regime"],
+                "frontier_gap": frontier,
+                "stagnation_state": discovery_state,
+                "state_freshness": state["state_freshness"],
+            }
+        )
         strategy_retrieval = self.strategy.retrieve(project_id, situation_data, as_of)
         agenda_telemetry = self.strategy.agenda_telemetry(
             project_id, agenda_item, as_of
         )
-        hard_gate = len(candidates) == 1 and candidates[0].action_type in {
-            "ARTIFACT_ANALYSIS",
-            "REPRODUCTION",
-        }
         candidate_data = self.strategy.adjust_candidates(
             base_candidate_data,
             strategy_retrieval,
             agenda_telemetry,
             hard_gate,
         )
-        selected_index = max(range(len(candidate_data)), key=lambda index: candidate_data[index]["priority"])
+        selectable = [
+            index
+            for index, item in enumerate(candidate_data)
+            if not item.get("payload", {}).get("non_executing_discovery_candidate", False)
+            and item.get("available", True)
+        ]
+        selected_index = max(selectable, key=lambda index: candidate_data[index]["priority"])
         selected = candidate_data[selected_index]
         runner_ups = sorted(
             (
@@ -599,8 +819,12 @@ class ResearchBrain:
                 "agenda_id": str(agenda["id"]),
                 "portfolio_id": str(portfolio["id"]) if portfolio["id"] else None,
                 "research_state": self._state_snapshot(state),
+                "state_freshness": state["state_freshness"],
                 "comparative_lesson_ids": [str(item["id"]) for item in comparative_lessons],
                 "meta_lesson_ids": [str(item["id"]) for item in meta_lessons],
+                "distributed_discovery_round_id": str(latest_discovery_round["id"]) if latest_discovery_round else None,
+                "distributed_discovery_archive_id": latest_discovery_round["data"].get("archive_id") if latest_discovery_round else None,
+                "distributed_discovery_coverage_id": latest_discovery_round["data"].get("coverage_id") if latest_discovery_round else None,
             },
             "evidence_considered": self._evidence_ids(state),
             "hypotheses_affected": [str(item["id"]) for item in hypotheses],
@@ -611,10 +835,19 @@ class ResearchBrain:
             "strategy_patterns_retrieved": strategy_retrieval["applied"],
             "strategy_patterns_rejected": strategy_retrieval["rejected"],
             "agenda_diminishing_returns": agenda_telemetry,
-            "brain_policy_version": "brain-v2-strategy-augmented-v1",
+            "brain_policy_version": BRAIN_POLICY_VERSION,
             "strategy_policy_version": STRATEGY_POLICY_VERSION,
             "scoring_policy_version": SCORING_POLICY_VERSION,
             "rationale": self._decision_rationale(selected, related_dead, runner_up),
+            "search_regime": candidate_portfolio["search_regime"],
+            "search_regime_reason": discovery_state["search_regime"]["reason"],
+            "candidate_portfolio": candidate_portfolio,
+            "candidate_portfolio_size": len(candidate_data),
+            "scientific_distance_selected": selected.get("scientific_distance"),
+            "scientific_distance_distribution": candidate_portfolio["distance_coverage"],
+            "frontier_gap": frontier,
+            "stagnation_state": discovery_state,
+            "breakthrough_context": candidate_portfolio["breakthrough_context"],
             "central_uncertainty": agenda_item["data"].get(
                 "central_uncertainty", agenda_item["data"]["question"]
             ),
@@ -623,6 +856,13 @@ class ResearchBrain:
             "why_selected_over_runner_up": (
                 self._runner_up_reason(selected, runner_up) if runner_up else None
             ),
+            "why_cheaper_alternative_insufficient": (
+                "The selected action targets the recorded uncertainty with greater discriminating value under the active search regime."
+            ),
+            "result_that_changes_belief": selected.get("predicted_outcomes", []),
+            "pass_means": "The frozen, preregistered prediction is supported only after artifact inspection.",
+            "fail_means": "The stated hypothesis may be weakened or refuted; strategic discovery value remains independent.",
+            "remains_unresolved": agenda_item["data"].get("central_uncertainty", agenda_item["data"]["question"]),
             "candidate_comparison": candidate_comparison,
             "prospective_hindsight": prospective_hindsight,
             "hard_blocks_checked": [
@@ -659,6 +899,12 @@ class ResearchBrain:
                 "research_situation": situation_data,
                 "strategy_patterns_retrieved": strategy_retrieval,
                 "agenda_diminishing_returns": agenda_telemetry,
+                "candidate_portfolio": candidate_portfolio,
+                "brain_policy_version": BRAIN_POLICY_VERSION,
+                "search_regime": candidate_portfolio["search_regime"],
+                "frontier_gap": frontier,
+                "stagnation_state": discovery_state,
+                "state_freshness": state["state_freshness"],
                 "candidate_actions": candidate_data,
                 "selected_action": selected,
                 "reason": decision_data["rationale"],
@@ -674,6 +920,7 @@ class ResearchBrain:
             selected_index,
             decision_data,
             situation_data,
+            candidate_portfolio,
         )
         decision = persisted_step["decision"]
         persisted = persisted_step["candidates"]
@@ -690,6 +937,12 @@ class ResearchBrain:
             "research_situation": persisted_step["situation"],
             "strategy_patterns_retrieved": strategy_retrieval,
             "agenda_diminishing_returns": agenda_telemetry,
+            "candidate_portfolio": persisted_step["portfolio"],
+            "brain_policy_version": BRAIN_POLICY_VERSION,
+            "search_regime": candidate_portfolio["search_regime"],
+            "frontier_gap": frontier,
+            "stagnation_state": discovery_state,
+            "state_freshness": state["state_freshness"],
             "candidate_actions": persisted,
             "selected_action": selected,
             "reason": decision_data["rationale"],
@@ -937,6 +1190,7 @@ class ResearchBrain:
         causal_edge_id: str | None = None,
         causal_edge_status: str | None = None,
         actual_information_gain: str = "MEDIUM",
+        information_gain_basis: list[str] | None = None,
         guard_passed: bool | None = None,
         matched_control_passed: bool | None = None,
     ) -> dict:
@@ -1007,10 +1261,61 @@ class ResearchBrain:
         }
         if hypothesis_transition not in allowed_transitions:
             raise GPUError("INVALID_SCIENTIFIC_STATUS", hypothesis_transition)
-        if actual_information_gain not in {"HIGH", "MEDIUM", "LOW"}:
+        if actual_information_gain not in {
+            "HIGH",
+            "MEDIUM",
+            "LOW",
+            "ZERO",
+            "INVALID",
+            "UNKNOWN",
+        }:
             raise GPUError("INVALID_INFORMATION_GAIN", actual_information_gain)
         guard_passed = condition_evaluations[pass_condition]
+        # New runs may carry an explicit runner attestation.  Its technical
+        # facts have absolute precedence over a client supplied scientific
+        # classification: a crash before measurement is not an inconclusive
+        # observation, even when the process itself exited zero.
+        attestation = run["data"].get("execution_attestation")
+        if attestation is not None:
+            validated_attestation = normalize_execution_attestation(attestation)
+            if not validated_attestation["technical_valid"] or not validated_attestation[
+                "measurement_reached"
+            ]:
+                raise GPUError(
+                    "SCIENTIFIC_OUTCOME_INVALID",
+                    "Run did not reach the preregistered scientific measurement stage; "
+                    "record a technical inspection instead.",
+                )
         successful_run = run["status"] in {"completed", "RESULT_NOT_INSPECTED"}
+        basis = list(information_gain_basis or [])
+        technical_non_scientific = (
+            not successful_run and actual_information_gain in {"ZERO", "INVALID", "UNKNOWN"}
+        )
+        if technical_non_scientific:
+            if causal_edge_id or causal_edge_status:
+                raise GPUError(
+                    "TECHNICAL_INSPECTION_CANNOT_UPDATE_CAUSAL_EDGE",
+                    "A failed technical run cannot update a causal edge",
+                )
+            result = self.store.technical_result_inspection_apply(
+                run_id=run_id,
+                decision_id=decision_id,
+                actual_information_gain=actual_information_gain,
+                information_gain_basis=basis,
+                inspection={
+                    "prediction_outcome": prediction_outcome,
+                    "guard_condition_outcome": guard_condition_outcome,
+                    "frozen_pass_condition": pass_condition,
+                    "condition_evaluations": condition_evaluations,
+                    "guard_passed": guard_passed,
+                    "scope": normalize_scientific_scope(scope),
+                    "rationale": rationale,
+                },
+            )
+            return {
+                **result,
+                "verification_status": "TECHNICAL_FAILURE_INSPECTED",
+            }
         if hypothesis_transition in {"SUPPORTED", "SURVIVES_INITIAL_TEST"} and not guard_passed:
             raise GPUError(
                 "EXPERIMENT_GUARD_NOT_PASSED",
@@ -1124,6 +1429,7 @@ class ResearchBrain:
                 else "RESOLVED"
             ),
             actual_information_gain=actual_information_gain,
+            information_gain_basis=basis,
             causal_edge_id=causal_edge_id,
             causal_edge_status=causal_edge_status,
         )
@@ -1144,7 +1450,7 @@ class ResearchBrain:
             **temporal,
         )
         unfinished = self.store.experiment_run_first(
-            project_id, {"RESERVED", "running", "unknown"}, **temporal
+            project_id, {"RESERVED", "running", "unknown"}, inspected=False, **temporal
         )
         failed_uninspected = self.store.experiment_run_first(
             project_id, {"failed", "cancelled"}, inspected=False, **temporal
@@ -1335,6 +1641,8 @@ class ResearchBrain:
                     required_resources=["literature provider"],
                     payload={
                         "mode": "ALTERNATIVE_ACTION",
+                        "non_executing_discovery_candidate": True,
+                        "does_not_authorize_execution": True,
                         "blocked_actions": [
                             {
                                 "action_type": item.get("action_type"),
@@ -1402,9 +1710,15 @@ class ResearchBrain:
                 action_type=item["action_type"],
                 question_addressed=item.get("question_addressed", question),
                 hypotheses_discriminated=item.get("hypotheses_discriminated", hypothesis_ids),
-                predicted_outcomes=item.get("predicted_outcomes", []),
+                predicted_outcomes=(
+                    item.get("predicted_outcomes")
+                    or ([item["prediction"].strip()] if isinstance(item.get("prediction"), str) and item["prediction"].strip() else [])
+                ),
                 required_resources=item.get("required_resources", []),
-                payload=item.get("payload", {}),
+                payload={
+                    **item.get("payload", {}),
+                    **({"experiment_id": item["experiment_id"]} if item.get("experiment_id") and not item.get("payload", {}).get("experiment_id") else {}),
+                },
                 available=item.get("available", True),
                 blocked_reason=item.get("blocked_reason"),
                 score=ActionScore(
@@ -1507,9 +1821,12 @@ class ResearchBrain:
         selected: dict, related_dead: list[dict], runner_up: dict | None = None
     ) -> str:
         reason = (
-            f"Selected {selected['action_type']} because its transparent final priority "
-            f"({selected['priority']}) is highest for the active agenda item "
-            f"(base={selected.get('base_priority', selected['priority'])}, "
+            f"Selected {selected['action_type']} to discriminate the recorded agenda uncertainty "
+            f"with expected discrimination {selected.get('score', {}).get('expected_discrimination')} "
+            f"and information gain {selected.get('score', {}).get('expected_information_gain')}; "
+            f"it is a {selected.get('scientific_distance', 'NEAR')} scientific alternative. "
+            f"Transparent priority remains supporting evidence "
+            f"(final={selected['priority']}, base={selected.get('base_priority', selected['priority'])}, "
             f"strategy+={selected.get('positive_strategy_adjustment', 0)}, "
             f"strategy-={selected.get('negative_strategy_adjustment', 0)}, "
             f"diminishing={selected.get('diminishing_return_adjustment', 0)})."

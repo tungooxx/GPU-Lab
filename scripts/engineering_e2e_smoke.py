@@ -40,12 +40,14 @@ def main() -> None:
     restarted = EngineeringService(ResearchStore(args.database_url))
     readiness = restarted.task_verify(task["id"])
     print(json.dumps({
-        "verification": "VERIFIED_INTEGRATION",
+        "verification": result["data"]["implementation_verification"],
         "scientific_result": result["data"]["scientific_result"],
         "project_id": project["project_id"], "task_id": task["id"],
         "result_id": result["id"], "ready_for_scientific_execution": readiness["ready_for_scientific_execution"],
         "scientific_execution": "NOT_RUN",
     }))
+    if not readiness["ready_for_scientific_execution"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

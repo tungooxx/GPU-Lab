@@ -19,6 +19,7 @@ OPERATOR_NAMES = {
     "ExperimentalDesignCritic",
     "ProximityCritic",
     "NoveltyCritic",
+    "SearchPortfolioCritic",
 }
 OPERATOR_PROMPT_VERSION = "brain-v2-operators-1"
 OPERATOR_SCHEMA_VERSION = "1.0"
@@ -233,7 +234,12 @@ class ResearchOperatorService:
             timestamp=datetime.now(UTC),
         )
 
-    def hypothesis_context(self, project_id: str, agenda_item_id: str) -> dict[str, Any]:
+    def hypothesis_context(
+        self,
+        project_id: str,
+        agenda_item_id: str,
+        discovery_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         agenda = self.store.object_get(agenda_item_id)
         if agenda["kind"] != "AgendaItem":
             raise GPUError("NOT_AN_AGENDAITEM", agenda_item_id)
@@ -275,6 +281,11 @@ class ResearchOperatorService:
                 "advisory_only": True,
                 "no_state_promotion": True,
                 "untrusted_external_text": True,
+            },
+            "discovery_context": discovery_context or {
+                "search_regime": "UNSPECIFIED",
+                "required_scientific_distance": "UNSPECIFIED",
+                "advisory_only": True,
             },
         }
 

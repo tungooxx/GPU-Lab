@@ -10,6 +10,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from .errors import GPUError
+from .execution_validity import normalize_execution_attestation
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,15 @@ RESEARCH_OBJECT_KINDS = (
     "ResearchAgenda",
     "AgendaItem",
     "HypothesisPortfolio",
+    "CandidatePortfolio",
+    "BreakthroughSignal",
     "HypothesisNiche",
+    # Explicit structured inputs to a frozen discovery state.  Older projects
+    # may express these in portfolio metadata; these additive kinds support
+    # prospective v3.3 records without rewriting historical decisions.
+    "ArchitectureLineage",
+    "FrontierGap",
+    "StagnationState",
     "ExperimentBranch",
     "ExperimentNode",
     "BranchRelation",
@@ -69,6 +78,45 @@ RESEARCH_OBJECT_KINDS = (
     "PolicyNegativeResult",
     "ResearchPolicyWeakness",
     "ImprovementRun",
+    "ResearchPolicyArtifact",
+    "MetaWorldModel",
+    "MetaResearchAgenda",
+    "ImprovementOpportunity",
+    "PolicyAutonomyConfig",
+    "PolicyRegression",
+    "BenchmarkGap",
+    "BenchmarkEpisodeProposal",
+    "MetaStrategyPattern",
+    "PolicyCanary",
+    "PolicyShadowEvaluation",
+    "PolicyHindsight",
+    "PolicyUserFeedback",
+    "PolicyEvaluationAudit",
+    "PolicyRankerReadiness",
+    "MetaResearchCampaign",
+    "LiteratureScoutRequest",
+    "LiteraturePolicyTransfer",
+    "ProviderAdapterCandidate",
+    "PolicyTournament",
+    # v3.3 Distributed Discovery Engine. These are proposal/search records;
+    # none changes hypothesis belief without the existing evidence workflow.
+    "DiscoveryRound",
+    "CandidateBatch",
+    "DiscoveryCandidate",
+    "MechanisticNiche",
+    "CrossWorkerQDArchive",
+    "DiscoveryCandidateOutcome",
+    "DiscoveryCoverageAtDecision",
+    # v3.4 Distributed Verification & Correction Engine. Correction records
+    # preserve a separate, immutable path from critique to verification and
+    # adjudication; they never make a critic a scientific truth writer.
+    "CorrectionCase",
+    "CorrectionChallenge",
+    "CorrectionVerification",
+    "ScientificDisagreement",
+    "CorrectionRecord",
+    "CorrectionHindsight",
+    "RuntimeCanary",
 )
 RESEARCH_OBJECT_STATUSES = {
     "ACTIVE",
@@ -106,6 +154,10 @@ RESEARCH_OBJECT_STATUSES = {
     "CROSS_MODEL_SUPPORTED",
     "REJECTED",
     "SUPERSEDED",
+    "ROLLED_BACK",
+    "DEPRECATED",
+    "MODEL_INCOMPATIBLE",
+    "DOMAIN_RESTRICTED",
     "PRODUCTION",
     "OVERFIT",
     "INVALID_EVALUATION",
@@ -117,6 +169,22 @@ RESEARCH_OBJECT_STATUSES = {
     "failed",
     "running",
     "unknown",
+    "TECHNICAL_CANCELLED",
+    "TECHNICAL_ORPHANED",
+    "CREATED",
+    "FROZEN",
+    "ABSTAINED",
+    "ARCHIVED",
+    "STALE",
+    "INVALID",
+    "UNRESOLVED",
+    "CRITIQUE_GENERATION",
+    "VERIFICATION",
+    "NEEDS_EXPERIMENT",
+    "RESOLVED_KEEP",
+    "RESOLVED_REVISE",
+    "RESOLVED_REJECT",
+    "RESOLVED_NARROW_SCOPE",
 }
 
 # Orthogonal epistemic classifications. These are metadata about the role and
@@ -169,12 +237,19 @@ def classify_decision_data(data: dict[str, Any]) -> dict[str, str]:
     """Deterministically classify a decision while preserving legacy fields."""
     selected = data.get("selected_action", {}) if isinstance(data.get("selected_action"), dict) else {}
     action = str(selected.get("action_type", data.get("action_type", "UNKNOWN"))).upper()
+    process_only = isinstance(selected.get("payload"), dict) and (
+        selected["payload"].get("non_executing_discovery_candidate") is True
+        or selected["payload"].get("non_scientific_process_action") is True
+        or selected["payload"].get("does_not_authorize_execution") is True
+    )
     legacy = data.get("legacy_provenance")
     role = str(data.get("decision_role") or "").upper()
-    if role not in DECISION_ROLES:
+    if process_only or action == "PORTFOLIO_REFINEMENT":
+        role = "ADMINISTRATIVE_RECOVERY"
+    elif role not in DECISION_ROLES:
         if isinstance(legacy, dict) and legacy.get("reconstructed"):
             role = "LEGACY_BACKFILL"
-        elif selected.get("payload", {}).get("mode") in {"INSPECT_RESULT", "INSPECT_FAILURE", "RECOVER_UNFINISHED"}:
+        elif isinstance(selected.get("payload"), dict) and selected["payload"].get("mode") in {"INSPECT_RESULT", "INSPECT_FAILURE", "RECOVER_UNFINISHED"}:
             role = "RESULT_INSPECTION"
         elif action in {"REPRODUCTION"}:
             role = "REPRODUCTION_ACTION"
@@ -186,7 +261,9 @@ def classify_decision_data(data: dict[str, Any]) -> dict[str, str]:
             # learning until deterministic backfill can identify its role.
             role = "LEGACY_BACKFILL" if not data.get("brain_policy_version") else "SCIENTIFIC_ACTION"
     scientific_role = str(data.get("scientific_role") or "").upper()
-    if scientific_role not in SCIENTIFIC_ROLES:
+    if process_only or action == "PORTFOLIO_REFINEMENT":
+        scientific_role = "NOT_SCIENTIFIC"
+    elif scientific_role not in SCIENTIFIC_ROLES:
         if role in {"LEGACY_BACKFILL", "ADMINISTRATIVE_RECOVERY", "SYSTEM_VERIFICATION", "PROVIDER_CONTRACT_TEST", "BENCHMARK_EVALUATION"}:
             scientific_role = "NOT_SCIENTIFIC"
         elif action == "REPRODUCTION":
@@ -249,8 +326,7 @@ def strategy_learning_eligibility(decision: dict[str, Any], outcome: dict[str, A
         reasons.append("DECISION_OUTCOME_MISSING")
     else:
         outcome_data = outcome.get("data", {})
-        cycle_status = str(data.get("cycle_status") or "").upper()
-        if cycle_status and cycle_status != "CLOSED":
+        if classification["cycle_status"] != "CLOSED":
             reasons.append("DECISION_CYCLE_NOT_CLOSED")
         if str(outcome.get("status")) not in {"RESULT_INSPECTED", "ASSESSED", "CLOSED"}:
             reasons.append("OUTCOME_NOT_INSPECTED")
@@ -560,6 +636,10 @@ class ResearchStore:
                 "WHERE kind='ResearchStrategyPattern'"
             )
             cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS research_objects_single_production_policy_unique "
+                "ON research_objects(project_id) WHERE kind='ResearchPolicy' AND status='PRODUCTION'"
+            )
+            cur.execute(
                 "SELECT project_id,data->>'decision_outcome_id' AS outcome_id,"
                 "data->>'scope_level' AS scope_level,array_agg(id ORDER BY created_at,id) AS ids "
                 "FROM research_objects WHERE kind='StrategyOutcome' "
@@ -755,6 +835,67 @@ class ResearchStore:
             "status": status,
             "data": data,
         }
+
+    def production_policy_ensure(self, project_id: str, data: dict[str, Any]) -> dict:
+        """Return the sole production policy, creating it under a project lock."""
+        ident, now = uuid.uuid4(), datetime.now(UTC)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"production-policy:{project_id}",))
+            cur.execute(
+                "SELECT id,project_id,kind,status,data FROM research_objects "
+                "WHERE project_id=%s AND kind='ResearchPolicy' AND status='PRODUCTION' FOR UPDATE",
+                (project_id,),
+            )
+            existing = cur.fetchone()
+            if existing:
+                return {**existing, "id": str(existing["id"])}
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'ResearchPolicy','PRODUCTION',%s,%s)",
+                (ident, project_id, json.dumps(data), now),
+            )
+            self._event(cur, project_id, "RESEARCH_POLICY_CREATED", ident, data)
+        return {"id": str(ident), "project_id": project_id, "kind": "ResearchPolicy", "status": "PRODUCTION", "data": data}
+
+    def production_policy_promote(self, project_id: str, current_policy_id: str, data: dict[str, Any]) -> dict:
+        """Atomically supersede the current production policy and insert its successor."""
+        ident, now = uuid.uuid4(), datetime.now(UTC)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"production-policy:{project_id}",))
+            cur.execute(
+                "SELECT id FROM research_objects WHERE id=%s AND project_id=%s "
+                "AND kind='ResearchPolicy' AND status='PRODUCTION' FOR UPDATE",
+                (current_policy_id, project_id),
+            )
+            if not cur.fetchone():
+                raise GPUError("POLICY_PRODUCTION_CONFLICT", current_policy_id)
+            cur.execute("UPDATE research_objects SET status='SUPERSEDED' WHERE id=%s", (current_policy_id,))
+            self._event(cur, project_id, "RESEARCH_POLICY_SUPERSEDED", current_policy_id, {})
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'ResearchPolicy','PRODUCTION',%s,%s)",
+                (ident, project_id, json.dumps(data), now),
+            )
+            self._event(cur, project_id, "RESEARCH_POLICY_PROMOTED", ident, data)
+        return {"id": str(ident), "project_id": project_id, "kind": "ResearchPolicy", "status": "PRODUCTION", "data": data}
+
+    def production_policy_rollback(self, project_id: str, current_policy_id: str, target_policy_id: str) -> dict:
+        """Atomically restore a prior policy as the sole production policy."""
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"production-policy:{project_id}",))
+            cur.execute("SELECT id FROM research_objects WHERE id=%s AND project_id=%s AND kind='ResearchPolicy' AND status='PRODUCTION' FOR UPDATE", (current_policy_id, project_id))
+            if not cur.fetchone():
+                raise GPUError("POLICY_PRODUCTION_CONFLICT", current_policy_id)
+            cur.execute("SELECT id,data FROM research_objects WHERE id=%s AND project_id=%s AND kind='ResearchPolicy' FOR UPDATE", (target_policy_id, project_id))
+            target = cur.fetchone()
+            if not target:
+                raise GPUError("INVALID_POLICY_ROLLBACK_TARGET", target_policy_id)
+            cur.execute("UPDATE research_objects SET status='ROLLED_BACK' WHERE id=%s", (current_policy_id,))
+            data = {**target["data"], "rollback_from_policy_id": str(current_policy_id)}
+            cur.execute("UPDATE research_objects SET status='PRODUCTION',data=%s WHERE id=%s", (json.dumps(data), target_policy_id))
+            self._event(cur, project_id, "RESEARCH_POLICY_ROLLED_BACK", current_policy_id, {"restored_policy_id": str(target_policy_id)})
+            self._event(cur, project_id, "RESEARCH_POLICY_ROLLED_BACK", target_policy_id, {"rollback_from_policy_id": str(current_policy_id)})
+        return {"id": str(target_policy_id), "project_id": project_id, "kind": "ResearchPolicy", "status": "PRODUCTION", "data": data}
 
     def evidence_family_create_atomic(
         self,
@@ -1822,6 +1963,7 @@ class ResearchStore:
         selected_index: int,
         decision_data: dict[str, Any],
         situation_data: dict[str, Any] | None = None,
+        portfolio_data: dict[str, Any] | None = None,
     ) -> dict:
         """Persist one Brain step's situation, candidates, and decision atomically."""
         if not candidates or not 0 <= selected_index < len(candidates):
@@ -1830,6 +1972,7 @@ class ResearchStore:
         candidate_ids = [uuid.uuid4() for _ in candidates]
         decision_id = uuid.uuid4()
         situation_id = uuid.uuid4() if situation_data is not None else None
+        portfolio_id = uuid.uuid4() if portfolio_data is not None else None
         persisted = _json_document(
             [
                 {**candidate, "id": str(candidate_id)}
@@ -1840,8 +1983,9 @@ class ResearchStore:
             {
                 **decision_data,
                 **classify_decision_data(decision_data),
-                "cycle_status": decision_data.get("cycle_status", "SELECTED"),
+                "cycle_status": classify_decision_data(decision_data)["cycle_status"],
                 "research_situation_id": str(situation_id) if situation_id else None,
+                "candidate_portfolio_id": str(portfolio_id) if portfolio_id else None,
                 "candidate_action_ids": [str(item) for item in candidate_ids],
                 "candidate_actions": persisted,
                 "selected_action": persisted[selected_index],
@@ -1863,6 +2007,26 @@ class ResearchStore:
                     "RESEARCH_SITUATION_CREATED",
                     situation_id,
                     persisted_situation,
+                )
+            if portfolio_id is not None and portfolio_data is not None:
+                persisted_portfolio = _json_document(
+                    {
+                        **portfolio_data,
+                        "created_from_decision_id": str(decision_id),
+                        "generated_candidate_ids": [str(item) for item in candidate_ids],
+                    }
+                )
+                cur.execute(
+                    "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                    "VALUES(%s,%s,'CandidatePortfolio','ACTIVE',%s,%s)",
+                    (portfolio_id, project_id, json.dumps(persisted_portfolio), now),
+                )
+                self._event(
+                    cur,
+                    project_id,
+                    "CANDIDATE_PORTFOLIO_CREATED",
+                    portfolio_id,
+                    persisted_portfolio,
                 )
             for candidate, candidate_id in zip(candidates, candidate_ids, strict=True):
                 cur.execute(
@@ -1889,6 +2053,31 @@ class ResearchStore:
                 decision_id,
                 materialized,
             )
+            regime = materialized.get("search_regime")
+            if regime:
+                self._event(
+                    cur,
+                    project_id,
+                    "SEARCH_REGIME_CHANGED",
+                    decision_id,
+                    {
+                        "search_regime": regime,
+                        "reason": materialized.get("search_regime_reason", []),
+                        "candidate_portfolio_id": str(portfolio_id) if portfolio_id else None,
+                    },
+                )
+            if regime == "PARADIGM_RESET":
+                self._event(
+                    cur,
+                    project_id,
+                    "PARADIGM_RESET_TRIGGERED",
+                    decision_id,
+                    {
+                        "candidate_portfolio_id": str(portfolio_id) if portfolio_id else None,
+                        "frontier_gap": materialized.get("frontier_gap", {}),
+                        "stagnation_state": materialized.get("stagnation_state", {}),
+                    },
+                )
         return {
             "decision": {
                 "id": str(decision_id),
@@ -1912,7 +2101,40 @@ class ResearchStore:
                 if situation_id is not None and situation_data is not None
                 else None
             ),
+            "portfolio": (
+                {
+                    "id": str(portfolio_id),
+                    "project_id": project_id,
+                    "kind": "CandidatePortfolio",
+                    "status": "ACTIVE",
+                    "data": _json_document(
+                        {
+                            **portfolio_data,
+                            "created_from_decision_id": str(decision_id),
+                            "generated_candidate_ids": [str(item) for item in candidate_ids],
+                        }
+                    ),
+                }
+                if portfolio_id is not None and portfolio_data is not None
+                else None
+            ),
         }
+
+    def breakthrough_signal_record(
+        self, project_id: str, signal: dict[str, Any], decision_id: str | None = None
+    ) -> dict[str, Any]:
+        """Persist strategic discovery value without mutating hypothesis status."""
+        data = _json_document(
+            {
+                **signal,
+                "decision_id": decision_id,
+                "scientific_truth_independent": True,
+                "recording_policy": "brain-v3.1-discovery-search-v1",
+            }
+        )
+        if signal.get("hypothesis_status") == "SUPPORTED" and signal.get("type") == "PARTIAL_METRIC_BREAKTHROUGH":
+            raise GPUError("BREAKTHROUGH_CANNOT_RECLASSIFY_HYPOTHESIS", "Record a partial breakthrough without changing scientific truth")
+        return self.object_create(project_id, "BreakthroughSignal", data, "BREAKTHROUGH_SIGNAL_RECORDED")
 
     def epistemic_reclassification(self, project_id: str | None = None) -> dict[str, Any]:
         """Classify legacy decision records without changing scientific observations.
@@ -1929,11 +2151,11 @@ class ResearchStore:
             if project_id:
                 sql += " AND project_id=%s"
                 args.append(project_id)
-            sql += " ORDER BY created_at"
+            sql += " ORDER BY created_at FOR UPDATE"
             cur.execute(sql, args)
             decisions = cur.fetchall()
             cur.execute(
-                "SELECT project_id,data FROM research_objects "
+                "SELECT project_id,status,data FROM research_objects "
                 "WHERE kind='ResearchDecisionOutcome'"
                 + (" AND project_id=%s" if project_id else ""),
                 args,
@@ -1949,7 +2171,7 @@ class ResearchStore:
             for decision in decisions:
                 classification = classify_decision_data(decision["data"])
                 outcome = outcome_by_decision.get(str(decision["id"]))
-                if outcome:
+                if outcome and str(outcome["status"]) in {"RESULT_INSPECTED", "ASSESSED", "CLOSED"}:
                     classification["cycle_status"] = "CLOSED"
                     if classification["scientific_role"] not in {"NOT_SCIENTIFIC", "SYSTEM_SMOKE", "CONTRACT_TEST"}:
                         classification["scientific_verification"] = "RESULT_INSPECTED"
@@ -2128,6 +2350,63 @@ class ResearchStore:
                     "VALUES(%s,%s,'ResearchDecisionOutcome','RESULT_INSPECTED',%s,%s)",
                     (outcome_id, project_id, json.dumps(materialized_outcome), now),
                 )
+
+            # A failure-analysis decision is a terminal inspection of its linked
+            # failed run, even though it deliberately produces no scientific
+            # evidence. Preserve the execution status and add the normal
+            # inspection marker so INSPECT_FAILURE is not selected indefinitely.
+            technically_inspected_runs: list[dict[str, Any]] = []
+            try:
+                run_ids = sorted(
+                    {
+                        str(uuid.UUID(str(run_id)))
+                        for run_id in outcome_data.get("experiment_run_ids", [])
+                    }
+                )
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise GPUError("INVALID_RESEARCH_OBJECT_ID", str(exc)) from exc
+            if run_ids:
+                cur.execute(
+                    "SELECT id,project_id,kind,status,data FROM research_objects "
+                    "WHERE id=ANY(%s::uuid[]) FOR UPDATE",
+                    (run_ids,),
+                )
+                runs = {str(item["id"]): item for item in cur.fetchall()}
+                for run_id in run_ids:
+                    run = runs.get(run_id)
+                    if not run:
+                        raise GPUError("RESEARCH_OBJECT_NOT_FOUND", run_id)
+                    if run["kind"] != "ExperimentRun":
+                        raise GPUError("NOT_AN_EXPERIMENTRUN", run_id)
+                    if str(run["project_id"]) != project_id:
+                        raise GPUError("RESEARCH_PROJECT_MISMATCH", run_id)
+                    if run["status"] not in {"failed", "cancelled", "unknown"}:
+                        continue
+                    if run["data"].get("inspection") is not None:
+                        continue
+                    inspection_data = {
+                        "inspection_kind": "TECHNICAL_FAILURE",
+                        "decision_id": decision_id,
+                        "decision_outcome_id": str(outcome_id),
+                        "assessed_at": now.isoformat(),
+                        "execution_status": run["status"],
+                        "scientific_result": "NOT_ASSESSED",
+                    }
+                    run_data = _json_document({**run["data"], "inspection": inspection_data})
+                    cur.execute(
+                        "UPDATE research_objects SET data=%s WHERE id=%s",
+                        (json.dumps(run_data), run_id),
+                    )
+                    self._event(
+                        cur,
+                        project_id,
+                        "EXPERIMENT_FAILURE_INSPECTED",
+                        run_id,
+                        inspection_data,
+                    )
+                    technically_inspected_runs.append(
+                        {"id": run_id, "status": run["status"], "data": run_data}
+                    )
             self._event(
                 cur,
                 project_id,
@@ -2512,6 +2791,7 @@ class ResearchStore:
                 "data": after_situation_data,
             },
             "strategy_patterns": patterns,
+            "technically_inspected_experiment_runs": technically_inspected_runs,
         }
 
     @staticmethod
@@ -2523,6 +2803,98 @@ class ResearchStore:
             and not isinstance(item["data"].get(field), bool)
         ]
         return round(sum(values) / len(values), 6) if values else None
+
+    def technical_result_inspection_apply(
+        self,
+        *,
+        run_id: str,
+        decision_id: str,
+        actual_information_gain: str,
+        information_gain_basis: list[str],
+        inspection: dict[str, Any],
+    ) -> dict:
+        """Close a failed execution without manufacturing scientific evidence."""
+        if actual_information_gain not in {"ZERO", "INVALID", "UNKNOWN"}:
+            raise GPUError("INVALID_INFORMATION_GAIN", actual_information_gain)
+        if not information_gain_basis:
+            raise GPUError(
+                "INFORMATION_GAIN_BASIS_REQUIRED",
+                "Provide what technical uncertainty or evidence changed",
+            )
+        try:
+            run_id = str(uuid.UUID(run_id))
+            decision_id = str(uuid.UUID(decision_id))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise GPUError("INVALID_RESEARCH_OBJECT_ID", str(exc)) from exc
+        now = datetime.now(UTC)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,project_id,kind,status,data FROM research_objects "
+                "WHERE id=ANY(%s::uuid[]) FOR UPDATE",
+                ([run_id, decision_id],),
+            )
+            rows = {str(row["id"]): row for row in cur.fetchall()}
+            if len(rows) != 2:
+                missing = next(item for item in (run_id, decision_id) if item not in rows)
+                raise GPUError("RESEARCH_OBJECT_NOT_FOUND", missing)
+            run, decision = rows[run_id], rows[decision_id]
+            if run["kind"] != "ExperimentRun":
+                raise GPUError("NOT_AN_EXPERIMENTRUN", run_id)
+            if decision["kind"] != "ResearchDecision":
+                raise GPUError("NOT_A_RESEARCHDECISION", decision_id)
+            if str(run["project_id"]) != str(decision["project_id"]):
+                raise GPUError("RESEARCH_PROJECT_MISMATCH", "Run and decision differ")
+            if run["status"] not in {"failed", "cancelled", "unknown"}:
+                raise GPUError("TECHNICAL_INSPECTION_REQUIRES_FAILED_RUN", run["status"])
+            prior = run["data"].get("inspection")
+            if prior is not None:
+                if (
+                    prior.get("inspection_kind") == "TECHNICAL_FAILURE"
+                    and prior.get("decision_id") == decision_id
+                ):
+                    return {
+                        "run": {"id": run_id, "status": run["status"], "data": run["data"]},
+                        "decision": {
+                            "id": decision_id,
+                            "status": decision["status"],
+                            "data": decision["data"],
+                        },
+                        "idempotent_replay": True,
+                    }
+                raise GPUError("EXPERIMENT_RESULT_ALREADY_INSPECTED", run_id)
+            inspection_data = _json_document(
+                {
+                    **inspection,
+                    "inspection_kind": "TECHNICAL_FAILURE",
+                    "decision_id": decision_id,
+                    "assessed_at": now.isoformat(),
+                    "execution_status": run["status"],
+                    "scientific_result": "NOT_ASSESSED",
+                    "actual_information_gain": actual_information_gain,
+                    "information_gain_basis": information_gain_basis,
+                }
+            )
+            run_data = _json_document({**run["data"], "inspection": inspection_data})
+            cur.execute(
+                "UPDATE research_objects SET data=%s WHERE id=%s",
+                (json.dumps(run_data), run_id),
+            )
+            self._event(
+                cur,
+                str(run["project_id"]),
+                "EXPERIMENT_FAILURE_INSPECTED",
+                run_id,
+                inspection_data,
+            )
+        return {
+            "run": {"id": run_id, "status": run["status"], "data": run_data},
+            "decision": {
+                "id": decision_id,
+                "status": decision["status"],
+                "data": decision["data"],
+            },
+            "technical_non_scientific": True,
+        }
 
     def result_assessment_apply(
         self,
@@ -2542,10 +2914,17 @@ class ResearchStore:
         causal_edge_status: str | None = None,
     ) -> dict:
         """Apply a complete scientific result assessment atomically."""
-        self._validate_status(hypothesis_transition)
-        self._validate_status(agenda_status)
+        if hypothesis_transition not in {"SUPPORTED", "SURVIVES_INITIAL_TEST", "WEAKENED", "REFUTED", "INCONCLUSIVE"}:
+            raise GPUError("INVALID_RESEARCH_OBJECT_STATUS", hypothesis_transition)
+        if agenda_status not in {"OPEN", "ACTIVE", "RESOLVED", "BLOCKED", "DEFERRED"}:
+            raise GPUError("INVALID_RESEARCH_OBJECT_STATUS", agenda_status)
         if actual_information_gain not in {"HIGH", "MEDIUM", "LOW", "ZERO", "INVALID", "UNKNOWN"}:
             raise GPUError("INVALID_INFORMATION_GAIN", actual_information_gain)
+        if information_gain_basis is not None and (
+            not isinstance(information_gain_basis, list)
+            or any(not isinstance(item, str) for item in information_gain_basis)
+        ):
+            raise GPUError("INVALID_INFORMATION_GAIN_BASIS", "information_gain_basis must be a list of strings")
         basis = list(information_gain_basis or [])
         if actual_information_gain not in {"ZERO", "INVALID", "UNKNOWN"} and not basis:
             basis = ["HYPOTHESIS_TRANSITION"] if hypothesis_transition != "INCONCLUSIVE" else []
@@ -3389,6 +3768,114 @@ class ResearchStore:
             cur.execute(sql, args)
             return cur.fetchone()
 
+    @staticmethod
+    def run_has_terminal_technical_inspection(run: dict[str, Any]) -> bool:
+        """Whether a run has already been closed as non-scientific operations work.
+
+        A failed launch must not be reintroduced as scientific work merely because
+        an older runner record still says ``unknown`` or ``running``.  Keep this
+        deliberately narrow: ordinary completed scientific results remain subject
+        to normal result inspection.
+        """
+        if run.get("status") in {"TECHNICAL_CANCELLED", "TECHNICAL_ORPHANED"}:
+            return True
+        data = run.get("data") or {}
+        inspection = data.get("inspection")
+        if not isinstance(inspection, dict):
+            return False
+        outcome = str(inspection.get("prediction_outcome", ""))
+        return bool(
+            inspection.get("technical_non_scientific") is True
+            or outcome.startswith("TECHNICAL_")
+            or (
+                inspection.get("scientific_result") == "NOT_ASSESSED"
+                and inspection.get("actual_information_gain") in {"ZERO", "INVALID"}
+            )
+        )
+
+    @classmethod
+    def experiment_run_is_operationally_active(cls, run: dict[str, Any]) -> bool:
+        """Single canonical predicate for an execution that can still be recovered."""
+        return (
+            run.get("status") in {"ACTIVE", "RESERVED", "running", "unknown", "RUNNING"}
+            and not cls.run_has_terminal_technical_inspection(run)
+        )
+
+    def lab_state_summary(self, project_id: str) -> dict[str, Any]:
+        """Return the bounded operational projection used by Lab sync.
+
+        Lab polling is intentionally not a scientific-state export.  In
+        particular, it must not materialize every historical decision or a
+        large frozen discovery snapshot merely to report current work.
+        """
+        project_id = self._canonical_uuid(project_id)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id,name FROM research_projects WHERE id=%s", (project_id,))
+            project = cur.fetchone()
+            if not project:
+                raise GPUError("RESEARCH_PROJECT_NOT_FOUND", project_id)
+            cur.execute(
+                "SELECT count(*) AS object_count,max(created_at) AS latest_object_at "
+                "FROM research_objects WHERE project_id=%s",
+                (project_id,),
+            )
+            object_freshness = cur.fetchone()
+            cur.execute(
+                "SELECT count(*) AS event_count,max(created_at) AS latest_scientific_event_at "
+                "FROM research_events WHERE project_id=%s",
+                (project_id,),
+            )
+            event_freshness = cur.fetchone()
+            cur.execute(
+                "SELECT id FROM research_objects "
+                "WHERE project_id=%s AND kind='WorldModel' ORDER BY created_at DESC LIMIT 1",
+                (project_id,),
+            )
+            world_model = cur.fetchone()
+            cur.execute(
+                "SELECT data->>'version' AS version FROM research_objects "
+                "WHERE project_id=%s AND kind='ResearchPolicy' AND status='PRODUCTION' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (project_id,),
+            )
+            policy = cur.fetchone()
+            cur.execute(
+                "SELECT data->>'brain_policy_version' AS version FROM research_objects "
+                "WHERE project_id=%s AND kind='ResearchDecision' ORDER BY created_at DESC LIMIT 1",
+                (project_id,),
+            )
+            decision = cur.fetchone()
+            # Inspection is retained only because it is part of the canonical
+            # operational-active predicate; arbitrary ExperimentRun metadata
+            # never belongs in a routine Lab poll.
+            cur.execute(
+                "SELECT id,kind,status,jsonb_build_object("
+                "'label',data->>'label','job_id',data->>'job_id',"
+                "'inspection',jsonb_build_object("
+                "'technical_non_scientific',data#>'{inspection,technical_non_scientific}',"
+                "'prediction_outcome',data#>'{inspection,prediction_outcome}',"
+                "'scientific_result',data#>'{inspection,scientific_result}',"
+                "'actual_information_gain',data#>'{inspection,actual_information_gain}')) AS data,created_at "
+                "FROM research_objects WHERE project_id=%s AND kind='ExperimentRun' "
+                "AND status=ANY(%s) ORDER BY created_at DESC LIMIT 100",
+                (project_id, ["ACTIVE", "RESERVED", "running", "unknown", "RUNNING", "TECHNICAL_CANCELLED", "TECHNICAL_ORPHANED"]),
+            )
+            runs = cur.fetchall()
+        return {
+            "project": {"id": str(project["id"]), "name": project["name"]},
+            "research_state_version": int(object_freshness["object_count"] or 0),
+            "world_model_version": str(world_model["id"]) if world_model else None,
+            "research_policy_version": policy["version"] if policy else None,
+            "brain_policy_version": decision["version"] if decision else None,
+            "state_updated_at": object_freshness["latest_object_at"].isoformat() if object_freshness["latest_object_at"] else None,
+            "latest_scientific_event_at": event_freshness["latest_scientific_event_at"].isoformat() if event_freshness["latest_scientific_event_at"] else None,
+            "scientific_event_count": int(event_freshness["event_count"] or 0),
+            "active_experiments": [
+                {**run, "id": str(run["id"])}
+                for run in runs if self.experiment_run_is_operationally_active(run)
+            ][:30],
+        }
+
     def references_get(
         self, identifiers: list[str], as_of: datetime | str | None = None
     ) -> dict[str, dict]:
@@ -3459,6 +3946,18 @@ class ResearchStore:
                     (project_id, cutoff),
                 )
             objects = cur.fetchall()
+            cur.execute(
+                "SELECT MAX(created_at) AS latest_scientific_event_at, COUNT(*) AS event_count "
+                "FROM research_events WHERE project_id=%s",
+                (project_id,),
+            )
+            event_freshness = cur.fetchone()
+            cur.execute(
+                "SELECT MAX(created_at) AS latest_object_at, COUNT(*) AS object_count "
+                "FROM research_objects WHERE project_id=%s",
+                (project_id,),
+            )
+            object_freshness = cur.fetchone()
             by_kind = lambda kind, statuses=None: [item for item in objects if item["kind"] == kind and (not statuses or item["status"] in statuses)]
             canonical = {
                 "research_question": row["question"],
@@ -3472,11 +3971,13 @@ class ResearchStore:
                 "active_hypotheses": by_kind("Hypothesis", {"ACTIVE", "SURVIVES_INITIAL_TEST"}),
                 "refuted_lineages": by_kind("Hypothesis", {"REFUTED"}),
                 "completed_experiments": by_kind("ExperimentRun", {"completed"}),
-                "active_experiments": by_kind(
-                    "ExperimentRun", {"ACTIVE", "RESERVED", "running", "unknown"}
-                ),
+                "active_experiments": [
+                    item
+                    for item in by_kind("ExperimentRun")
+                    if self.experiment_run_is_operationally_active(item)
+                ],
                 "terminal_non_success_experiments": by_kind(
-                    "ExperimentRun", {"failed", "cancelled"}
+                    "ExperimentRun", {"failed", "cancelled", "TECHNICAL_CANCELLED", "TECHNICAL_ORPHANED"}
                 ),
                 "open_experiments": by_kind("Experiment", {"ACTIVE"}),
                 "reproduction_status": by_kind("Reproduction"),
@@ -3489,9 +3990,30 @@ class ResearchStore:
                 "highest_value_unknown": row["state"].get("highest_value_unknown"),
                 "next_discriminating_experiments": row["state"].get("next_discriminating_experiments", []),
             }
+            world_models = by_kind("WorldModel")
+            world_version = (
+                world_models[0]["data"].get("version") if world_models else None
+            )
+            freshness = {
+                "canonical_source": "research_objects_and_immutable_events",
+                "project_state_role": "CACHE_ONLY",
+                "research_state_version": int(object_freshness["object_count"] or 0),
+                "world_model_version": world_version,
+                "state_updated_at": (
+                    object_freshness["latest_object_at"].isoformat()
+                    if object_freshness["latest_object_at"] else None
+                ),
+                "latest_scientific_event_at": (
+                    event_freshness["latest_scientific_event_at"].isoformat()
+                    if event_freshness["latest_scientific_event_at"] else None
+                ),
+                "scientific_event_count": int(event_freshness["event_count"] or 0),
+            }
             return {
                 **row,
                 "canonical_state": canonical,
+                "state_freshness": freshness,
+                "project_state_cache": row["state"],
                 "objects": objects,
                 "as_of": cutoff.isoformat() if cutoff is not None else None,
             }
@@ -3771,7 +4293,10 @@ class ResearchStore:
             run = cur.fetchone()
             if not run or run["kind"] != "ExperimentRun":
                 raise GPUError("EXPERIMENT_RUN_NOT_FOUND", run_id)
-            if run["status"] in {"completed", "failed", "cancelled", "RESULT_INSPECTED"}:
+            if run["status"] in {
+                "completed", "failed", "cancelled", "RESULT_INSPECTED",
+                "TECHNICAL_CANCELLED", "TECHNICAL_ORPHANED",
+            }:
                 return {
                     "id": run_id,
                     "status": run["status"],
@@ -3796,6 +4321,120 @@ class ResearchStore:
             )
             self._event(cur, run["project_id"], event, run_id, result)
         return {"id": run_id, "status": status, "data": data}
+
+    def run_record_execution_attestation(self, run_id: str, attestation: dict[str, Any]) -> dict:
+        """Persist runner-stage facts before any scientific result assessment.
+
+        This is deliberately separate from ``run_update`` so an arbitrary job
+        status or a log parser cannot silently manufacture scientific stages.
+        """
+        normalized = normalize_execution_attestation(attestation)
+        now = datetime.now(UTC)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,project_id,kind,status,data FROM research_objects WHERE id=%s FOR UPDATE",
+                (run_id,),
+            )
+            run = cur.fetchone()
+            if not run or run["kind"] != "ExperimentRun":
+                raise GPUError("EXPERIMENT_RUN_NOT_FOUND", run_id)
+            if run["status"] == "RESULT_INSPECTED":
+                raise GPUError("EXPERIMENT_RESULT_ALREADY_INSPECTED", run_id)
+            existing = run["data"].get("execution_attestation")
+            if existing is not None:
+                if existing == normalized:
+                    return {"id": run_id, "status": run["status"], "data": run["data"], "idempotent_replay": True}
+                raise GPUError("EXECUTION_ATTESTATION_ALREADY_RECORDED", run_id)
+            data = {**run["data"], "execution_attestation": normalized, "execution_attested_at": now.isoformat()}
+            cur.execute("UPDATE research_objects SET data=%s WHERE id=%s", (json.dumps(data), run_id))
+            self._event(
+                cur,
+                run["project_id"],
+                "EXPERIMENT_EXECUTION_ATTESTED",
+                run_id,
+                {
+                    "technical_status": normalized["technical_status"],
+                    "measurement_reached": normalized["measurement_reached"],
+                    "technical_error_count": len(normalized["technical_errors"]),
+                },
+            )
+        return {"id": run_id, "status": run["status"], "data": data, "idempotent_replay": False}
+
+    def runtime_canary_record(
+        self, project_id: str, runtime_fingerprint: str, attestation: dict[str, Any]
+    ) -> dict:
+        """Store a content-addressed, non-scientific exact-runtime canary."""
+        if not isinstance(runtime_fingerprint, str) or len(runtime_fingerprint) != 64 or not re.fullmatch(r"[0-9a-f]{64}", runtime_fingerprint):
+            raise GPUError("INVALID_RUNTIME_FINGERPRINT", "Use a SHA-256 hex digest")
+        normalized = normalize_execution_attestation(attestation)
+        if not normalized["technical_valid"]:
+            raise GPUError("RUNTIME_CANARY_FAILED", "A canary must pass all required stages")
+        return self.object_create(
+            project_id,
+            "RuntimeCanary",
+            {"runtime_fingerprint": runtime_fingerprint, "attestation": normalized, "scientific_data": False},
+            "RUNTIME_CANARY_PASSED",
+            "VERIFIED_REAL",
+        )
+
+    def run_reconcile_orphan(
+        self,
+        run_id: str,
+        job_id: str,
+        terminal_status: str,
+        runner_status: str,
+        rationale: str,
+    ) -> dict:
+        """Terminally close a submitted run proved to be a non-scientific orphan.
+
+        This is intentionally stricter than normal sync: it cannot discard a
+        canonical artifact, a live job, or an unsubmitted reservation.
+        """
+        if terminal_status not in {"TECHNICAL_CANCELLED", "TECHNICAL_ORPHANED"}:
+            raise GPUError("INVALID_TECHNICAL_TERMINAL_STATUS", terminal_status)
+        if runner_status not in {"cancelled", "missing", "unknown"}:
+            raise GPUError("RUNNER_STATUS_NOT_ORPHANED", runner_status)
+        if not rationale.strip():
+            raise GPUError("TECHNICAL_RECONCILIATION_RATIONALE_REQUIRED", run_id)
+        now = datetime.now(UTC)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,project_id,kind,status,data FROM research_objects WHERE id=%s FOR UPDATE",
+                (run_id,),
+            )
+            run = cur.fetchone()
+            if not run or run["kind"] != "ExperimentRun":
+                raise GPUError("EXPERIMENT_RUN_NOT_FOUND", run_id)
+            if run["data"].get("job_id") != job_id:
+                raise GPUError("EXPERIMENT_RUN_JOB_MISMATCH", job_id)
+            if not run["data"].get("submission_status"):
+                raise GPUError("EXPERIMENT_RUN_NOT_SUBMITTED", run_id)
+            if run["status"] in {"completed", "RESULT_INSPECTED"}:
+                raise GPUError("EXPERIMENT_RUN_ALREADY_SCIENTIFICALLY_FINAL", run_id)
+            if run["status"] in {"TECHNICAL_CANCELLED", "TECHNICAL_ORPHANED"}:
+                return {"id": run_id, "status": run["status"], "data": run["data"], "idempotent_replay": True}
+            cur.execute(
+                "SELECT 1 FROM research_objects WHERE project_id=%s AND kind='Artifact' "
+                "AND data->>'run_id'=%s LIMIT 1",
+                (run["project_id"], run_id),
+            )
+            if cur.fetchone():
+                raise GPUError("EXPERIMENT_RUN_ARTIFACT_PRESENT", run_id)
+            inspection = {
+                "mode": "TECHNICAL_ORPHAN_RECONCILIATION",
+                "technical_non_scientific": True,
+                "scientific_result": "NOT_ASSESSED",
+                "prediction_outcome": "TECHNICAL_STALE_DUPLICATE_NO_RESULT",
+                "actual_information_gain": "ZERO",
+                "recorded_at": now.isoformat(),
+                "rationale": rationale.strip(),
+                "runner_status": runner_status,
+            }
+            data = {**run["data"], "inspection": inspection, "technical_reconciliation": inspection}
+            cur.execute("UPDATE research_objects SET status=%s,data=%s WHERE id=%s", (terminal_status, json.dumps(data), run_id))
+            cur.execute("UPDATE research_execution_attempts SET status=%s,updated_at=%s WHERE run_id=%s", (terminal_status, now, run_id))
+            self._event(cur, run["project_id"], "EXPERIMENT_RUN_TECHNICALLY_RECONCILED", run_id, {"status": terminal_status, "runner_status": runner_status, "rationale": rationale.strip()})
+        return {"id": run_id, "status": terminal_status, "data": data, "idempotent_replay": False}
 
     def legacy_reserved_run_abandon(
         self, run_id: str, job_id: str, rationale: str, provenance: dict[str, Any]
@@ -4020,6 +4659,17 @@ class ResearchStore:
             sql += " ORDER BY created_at DESC LIMIT %s"
             args.append(limit)
             cur.execute(sql, args)
+            return cur.fetchall()
+
+    def events_summary(self, project_id: str, limit: int = 100) -> list[dict]:
+        """Return event headers for polling without transferring event payloads."""
+        project_id = self._canonical_uuid(project_id)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT event_type,subject_id,created_at FROM research_events WHERE project_id=%s "
+                "ORDER BY created_at DESC LIMIT %s",
+                (project_id, min(max(limit, 1), 500)),
+            )
             return cur.fetchall()
 
     def search(

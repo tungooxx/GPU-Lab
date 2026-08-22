@@ -32,6 +32,9 @@ class BenchmarkPolicy(StrEnum):
     RANDOM_VALID_ACTION = "RANDOM_VALID_ACTION"
     BRAIN_V1_5 = "BRAIN_v1_5"
     BRAIN_V2_STRATEGY_AUGMENTED = "BRAIN_v2_STRATEGY_AUGMENTED"
+    BRAIN_V3_1_DISCOVERY_SEARCH = "BRAIN_v3.1_DISCOVERY_SEARCH"
+    BRAIN_V3_3_DISTRIBUTED_DISCOVERY = "BRAIN_v3.3_DISTRIBUTED_DISCOVERY"
+    BRAIN_V3_4_DISTRIBUTED_CORRECTION = "BRAIN_v3.4_DISTRIBUTED_CORRECTION"
 
 
 class SourceProvenance(BaseModel):
@@ -64,6 +67,7 @@ class BenchmarkAction(BaseModel):
     execution_risk: float = Field(default=0.0, ge=0.0)
     tags: list[str] = Field(default_factory=list)
     prediction: str | None = None
+    scientific_distance: str | None = None
 
     @property
     def total_cost(self) -> float:
@@ -105,6 +109,11 @@ class BenchmarkEpisode(BaseModel):
     forbidden_future_records: list[str] = Field(default_factory=list)
     source_provenance: list[SourceProvenance] = Field(min_length=1)
     evaluation_rubric: EvaluationRubric = Field(default_factory=EvaluationRubric)
+    v31_context: dict[str, Any] = Field(default_factory=dict)
+    v33_context: dict[str, Any] = Field(default_factory=dict)
+    # Correction fixtures encode only pre-cutoff critique/verification facts.
+    # A policy never receives adjudication or outcome facts from the future.
+    v34_context: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("cutoff_timestamp")
     @classmethod
@@ -151,6 +160,9 @@ class BenchmarkEpisode(BaseModel):
                 )
                 for action in self.candidate_actions
             ],
+            "v31_context": self.v31_context,
+            "v33_context": self.v33_context,
+            "v34_context": self.v34_context,
         }
 
 
@@ -336,6 +348,67 @@ class ResearchBrainBench:
                 else [],
                 strategy_reused=True,
             )
+        if policy == BenchmarkPolicy.BRAIN_V3_1_DISCOVERY_SEARCH:
+            context = payload.get("v31_context", {})
+            regime = str(context.get("expected_search_regime", "EXPLOIT"))
+            if context.get("single_path_prerequisite"):
+                selected = next(
+                    (item for item in actions if item["action_type"] in {"ARTIFACT_ANALYSIS", "REPRODUCTION"}),
+                    actions[0],
+                )
+            else:
+                preferred = (
+                    ["ORTHOGONAL", "FAR", "MID", "NEAR"]
+                    if regime == "PARADIGM_RESET"
+                    else ["FAR", "ORTHOGONAL", "MID", "NEAR"]
+                    if regime == "DIVERGENT_SEARCH"
+                    else ["MID", "NEAR", "FAR", "ORTHOGONAL"]
+                )
+                selected = next(
+                    (item for distance in preferred for item in actions if item.get("scientific_distance") == distance),
+                    actions[0],
+                )
+            return BenchmarkDecision(
+                selected_action_id=selected["action_id"],
+                retrieved_record_ids=sorted(dead),
+                strategy_reused=True,
+            )
+        if policy == BenchmarkPolicy.BRAIN_V3_3_DISTRIBUTED_DISCOVERY:
+            context = payload.get("v33_context", {})
+            if not context.get("generation_complete", True):
+                selected = next(
+                    (item for item in actions if item["action_type"] == "DISCOVERY_GENERATION"),
+                    actions[0],
+                )
+                return BenchmarkDecision(selected_action_id=selected["action_id"], strategy_reused=True)
+            survivors = set(context.get("qd_survivor_action_ids", []))
+            selected = next((item for item in actions if item["action_id"] in survivors), None)
+            if selected is None:
+                return cls.builtin_policy_decision(episode, BenchmarkPolicy.BRAIN_V3_1_DISCOVERY_SEARCH)
+            return BenchmarkDecision(
+                selected_action_id=selected["action_id"],
+                retrieved_record_ids=sorted(dead),
+                strategy_reused=True,
+            )
+        if policy == BenchmarkPolicy.BRAIN_V3_4_DISTRIBUTED_CORRECTION:
+            context = payload.get("v34_context", {})
+            phase = str(context.get("correction_phase", "")).upper()
+            required_type = {
+                "INDEPENDENT_CRITIQUE": "CORRECTION_CHALLENGE",
+                "VERIFICATION": "CORRECTION_VERIFICATION",
+                "EXPERIMENT_REQUIRED": "DISCRIMINATING_TEST_DESIGN",
+            }.get(phase)
+            selected = next(
+                (item for item in actions if required_type and item["action_type"] == required_type),
+                None,
+            )
+            if selected is None:
+                return cls.builtin_policy_decision(episode, BenchmarkPolicy.BRAIN_V3_3_DISTRIBUTED_DISCOVERY)
+            return BenchmarkDecision(
+                selected_action_id=selected["action_id"],
+                retrieved_record_ids=sorted(dead),
+                strategy_reused=True,
+            )
         if policy == BenchmarkPolicy.LLM_DIRECT_WITHOUT_STRUCTURED_MEMORY:
             selected = min(actions, key=lambda item: item["action_id"])
             return BenchmarkDecision(selected_action_id=selected["action_id"])
@@ -378,6 +451,9 @@ class ResearchBrainBench:
             BenchmarkPolicy.CURRENT_BRAIN_V1,
             BenchmarkPolicy.BRAIN_V1_5,
             BenchmarkPolicy.BRAIN_V2_STRATEGY_AUGMENTED,
+            BenchmarkPolicy.BRAIN_V3_1_DISCOVERY_SEARCH,
+            BenchmarkPolicy.BRAIN_V3_3_DISTRIBUTED_DISCOVERY,
+            BenchmarkPolicy.BRAIN_V3_4_DISTRIBUTED_CORRECTION,
             BenchmarkPolicy.LLM_DIRECT_WITHOUT_STRUCTURED_MEMORY,
         } and runner is None:
             return cls.builtin_policy_decision(episode, policy)
@@ -399,6 +475,9 @@ class ResearchBrainBench:
             BenchmarkPolicy.RANDOM_VALID_ACTION,
             BenchmarkPolicy.BRAIN_V1_5,
             BenchmarkPolicy.BRAIN_V2_STRATEGY_AUGMENTED,
+            BenchmarkPolicy.BRAIN_V3_1_DISCOVERY_SEARCH,
+            BenchmarkPolicy.BRAIN_V3_3_DISTRIBUTED_DISCOVERY,
+            BenchmarkPolicy.BRAIN_V3_4_DISTRIBUTED_CORRECTION,
         ]
         episodes = self.load_all()
         results = {}
@@ -409,7 +488,7 @@ class ResearchBrainBench:
             ]
             results[policy.value] = self.aggregate(cards).model_dump(mode="json")
         return {
-            "benchmark_version": "brain-bench-v2-1",
+            "benchmark_version": "brain-bench-v3-4",
             "episode_count": len(episodes),
             "results": results,
             "warning": "These are sourced historical scorecards; no model policy is claimed validated by this comparison alone.",

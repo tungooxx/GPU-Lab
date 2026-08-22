@@ -16,7 +16,12 @@ services:
     networks: [backend]
   gpu-lab:
     build: .
-    env_file: .env
+    # Load the gateway configuration and the mounted research-workspace
+    # environment at container startup. MCP tools never receive filesystem
+    # authority to source either credential file directly.
+    env_file:
+      - .env
+      - ${GPU_LAB_LOCAL_WORKSPACE_HOST:-F:/Newgeneration/VLM}/.env
     environment:
       GPU_LAB_DATA_DIR: /data
       GPU_LAB_DATABASE_URL: sqlite:////data/gpu_lab.db
@@ -37,8 +42,9 @@ services:
       CROSSREF_API_KEY: ""
       SEMANTIC_SCHOLAR_API_KEY: ""
       GPU_LAB_DENIED_MCP_CLIENT_CIDRS: 172.29.0.0/24,172.30.0.0/24
+      CHATGPT_WEB_PROFILE_ROOT: /var/lib/gpu-lab/chatgpt-web
     ports: ["127.0.0.1:8000:8000"]
-    volumes: ["./data:/data", "gpu-lab-envs:/opt/gpu-lab/envs", "${GPU_LAB_SSH_PRIVATE_KEY_PATH:-/dev/null}:/run/ssh-key:ro", "${GPU_LAB_LOCAL_WORKSPACE_HOST:-F:/Newgeneration/VLM}:/workspace/local-vlm"]
+    volumes: ["./data:/data", "gpu-lab-envs:/opt/gpu-lab/envs", "chatgpt-web-profile:/var/lib/gpu-lab/chatgpt-web", "${GPU_LAB_SSH_PRIVATE_KEY_PATH:-/dev/null}:/run/ssh-key:ro", "${GPU_LAB_LOCAL_WORKSPACE_HOST:-F:/Newgeneration/VLM}:/workspace/local-vlm"]
     gpus: all
     depends_on:
       postgres:
@@ -60,6 +66,9 @@ services:
     build:
       context: .
       dockerfile: literature.Dockerfile
+    env_file:
+      # Credentials are loaded directly by the isolated worker, never through an MCP tool call.
+      - ${GPU_LAB_LITERATURE_ENV_FILE:-F:/Newgeneration/VLM/.env}
     environment:
       GPU_LAB_LITERATURE_WORKER_TOKEN: ${GPU_LAB_LITERATURE_WORKER_TOKEN:-}
       GPU_LAB_PAPERQA_DIRECTORY: /papers
@@ -149,6 +158,7 @@ services:
 
 volumes:
   gpu-lab-envs:
+  chatgpt-web-profile:
   literature-papers:
   paper2agent-projects:
   paper2agent-claude:

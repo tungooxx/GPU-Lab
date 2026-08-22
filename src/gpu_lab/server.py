@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import hashlib
 import hmac
 import inspect
@@ -10,28 +11,39 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+from urllib.parse import parse_qs
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.types import ASGIApp
 
 from .brain import ResearchBrain
 from .brain_bench import BenchmarkPolicy, ResearchBrainBench
 from .branches import ExperimentBranchService
+from .browser_scheduler import BrowserWakeDispatcher
+from .cockpit import CockpitController
+from .cockpit_auth import issue_session, password_matches, verify_session
+from .cockpit_dashboard import COCKPIT_HTML
 from .config import Settings
+from .correction_v34 import DistributedCorrectionService
 from .dashboard import DASHBOARD_HTML
+from .discovery import breakthrough_signal, local_search_collapse_diagnosis
+from .discovery_v33 import DistributedDiscoveryService
 from .embeddings import EmbeddingService, LocalHashEmbeddingProvider
 from .engineering import CodingExecutionPolicy, EngineeringService
 from .epistemics import EpistemicService
 from .errors import GPUError
+from .execution_validity import aggregate_episode_attestations
 from .executable_papers import ExecutablePaperService, HttpExecutablePaperProvider
+from .lab import LabController
 from .literature import HttpLiteratureProvider, LiteratureService
 from .local_runner import LocalRunner
+from .meta_controller import MetaResearchController
 from .meta_research import MetaResearchService
 from .policy_lab import PolicyLabService
 from .qd import HypothesisQDService
@@ -43,7 +55,25 @@ from .terminal import TERMINAL_HTML
 
 logger = logging.getLogger(__name__)
 
-settings, service, research_store, research_brain, brain_bench_service, epistemic_service, literature_service, executable_paper_service, qd_service, branch_service, meta_research_service, strategy_service, policy_lab_service = (
+
+def _source_sha(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+_RUNTIME_SOURCE_PATHS = {
+    name: Path(__file__).with_name(name)
+    for name in ("server.py", "brain.py", "research.py", "lab.py", "discovery_v33.py", "correction_v34.py")
+}
+# Captured at module import, before any MCP request creates the singleton Brain.
+# This detects source mounts changing underneath a long-lived Python process;
+# dynamic reload is intentionally avoided because it can split live singleton
+# state across incompatible class definitions.
+_LOADED_SOURCE_SHAS = {name: _source_sha(path) for name, path in _RUNTIME_SOURCE_PATHS.items()}
+
+settings, service, research_store, research_brain, brain_bench_service, epistemic_service, literature_service, executable_paper_service, qd_service, branch_service, meta_research_service, strategy_service, policy_lab_service, lab_controller_service, distributed_discovery_service, correction_service = (
     Settings(),
     None,
     None,
@@ -57,7 +87,17 @@ settings, service, research_store, research_brain, brain_bench_service, epistemi
     None,
     None,
     None,
+    None,
+    None,
+    None,
 )
+meta_controller_service: MetaResearchController | None = None
+cockpit_controller_service: CockpitController | None = None
+browser_wake_dispatcher: BrowserWakeDispatcher | None = None
+browser_wake_loop_thread: threading.Thread | None = None
+browser_wake_loop_stop = threading.Event()
+lab_reconciliation_loop_thread: threading.Thread | None = None
+lab_reconciliation_loop_stop = threading.Event()
 _singleton_lock = threading.RLock()
 embedding_service: EmbeddingService | None = None
 engineering_service: EngineeringService | None = None
@@ -92,6 +132,22 @@ _READ_ONLY_TOOLS = {
     "activity_recent",
     "research_state_get",
     "research_object_get",
+    "lab_state_get",
+    "lab_sync",
+    "lab_workers_list",
+    "lab_work_list",
+    "lab_message_list",
+    "discovery_round_get",
+    "discovery_round_recommend_assignments",
+    "discovery_batch_get",
+    "discovery_round_stale_check",
+    "discovery_archive_get",
+    "discovery_outcome_get",
+    "discovery_shadow_preview",
+    "correction_case_get",
+    "correction_challenge_get",
+    "correction_shadow_preview",
+    "runtime_code_version",
     "research_benchmark_list",
     "research_benchmark_episode_get",
     "research_benchmark_policy_run",
@@ -260,6 +316,38 @@ class McpClientNetworkPolicyMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+_COCKPIT_COOKIE = "gpu_lab_cockpit"
+_COCKPIT_PROTECTED_PATHS = {"/", "/activity", "/monitor", "/research-map", "/terminal", "/terminal/activity", "/terminal/jobs"}
+
+
+def _cockpit_is_protected(path: str) -> bool:
+    return path in _COCKPIT_PROTECTED_PATHS or path.startswith("/cockpit/")
+
+
+def _cockpit_session(request: Request):
+    secret = settings.gpu_lab_cockpit_session_secret
+    return verify_session(secret, request.cookies.get(_COCKPIT_COOKIE)) if secret else None
+
+
+class CockpitAuthMiddleware(BaseHTTPMiddleware):
+    """Require a signed private-operator session for the human cockpit only."""
+
+    async def dispatch(self, request: Request, call_next):
+        if not settings.lab_ui_enabled or not _cockpit_is_protected(request.url.path):
+            return await call_next(request)
+        if request.url.path == "/cockpit/login":
+            return await call_next(request)
+        if not settings.gpu_lab_cockpit_password or not settings.gpu_lab_cockpit_session_secret:
+            return JSONResponse({"error": "Cockpit authentication is not configured"}, status_code=503)
+        session = _cockpit_session(request)
+        if session:
+            request.state.cockpit_session = session
+            return await call_next(request)
+        if request.method in {"GET", "HEAD"} and "text/html" in request.headers.get("accept", ""):
+            return RedirectResponse("/cockpit/login", status_code=303)
+        return JSONResponse({"error": "Cockpit authentication required"}, status_code=401)
+
+
 class McpRequestObservabilityMiddleware(BaseHTTPMiddleware):
     """Correlate every MCP request that reaches this process with its final HTTP result."""
 
@@ -336,6 +424,81 @@ def research() -> ResearchStore:
     return research_store
 
 
+def lab() -> LabController:
+    global lab_controller_service
+    if lab_controller_service is None:
+        with _singleton_lock:
+            if lab_controller_service is None:
+                lab_controller_service = LabController(research())
+    return lab_controller_service
+
+
+def cockpit() -> CockpitController:
+    global cockpit_controller_service
+    if cockpit_controller_service is None:
+        with _singleton_lock:
+            if cockpit_controller_service is None:
+                cockpit_controller_service = CockpitController(
+                    research(), lab(),
+                    max_turns_per_work_item=settings.gpu_lab_worker_max_turns_per_work_item,
+                    max_consecutive_continues=settings.gpu_lab_worker_max_consecutive_continues,
+                )
+    return cockpit_controller_service
+
+
+def browser_dispatcher() -> BrowserWakeDispatcher:
+    global browser_wake_dispatcher
+    if browser_wake_dispatcher is None:
+        with _singleton_lock:
+            if browser_wake_dispatcher is None:
+                browser_wake_dispatcher = BrowserWakeDispatcher(cockpit(), settings.chatgpt_web_profile_root)
+    return browser_wake_dispatcher
+
+
+def start_browser_wake_loop() -> None:
+    """Start the opt-in, bounded autonomous continuation loop exactly once."""
+    global browser_wake_loop_thread
+    if browser_wake_loop_thread and browser_wake_loop_thread.is_alive():
+        return
+
+    def run() -> None:
+        while not browser_wake_loop_stop.is_set():
+            try:
+                result = asyncio.run(browser_dispatcher().dispatch_one())
+                if result.get("dispatched"):
+                    logger.info("Dispatched browser worker wake wake_id=%s", result.get("wake_id"))
+            except Exception:
+                logger.exception("Browser wake loop failed; it will retry after the configured interval")
+            browser_wake_loop_stop.wait(settings.gpu_lab_browser_wake_poll_seconds)
+
+    browser_wake_loop_stop.clear()
+    browser_wake_loop_thread = threading.Thread(target=run, name="browser-wake-loop", daemon=True)
+    browser_wake_loop_thread.start()
+
+
+def start_lab_reconciliation_loop() -> None:
+    """Continuously reap orphaned Lab ownership, independent of UI/MCP reads."""
+    global lab_reconciliation_loop_thread
+    if lab_reconciliation_loop_thread and lab_reconciliation_loop_thread.is_alive():
+        return
+
+    def run() -> None:
+        while not lab_reconciliation_loop_stop.is_set():
+            try:
+                result = lab().recover_stale_leases()
+                if result["recovered"]:
+                    logger.info("Reconciled orphaned Lab WorkItems: %s", result)
+            except Exception:
+                logger.exception("Lab reconciliation sweep failed; it will retry")
+            lab_reconciliation_loop_stop.wait(settings.gpu_lab_lease_reconciliation_poll_seconds)
+
+    lab_reconciliation_loop_stop.clear()
+    lab_reconciliation_loop_thread = threading.Thread(
+        target=run, name="lab-reconciliation-loop", daemon=True
+    )
+    lab_reconciliation_loop_thread.start()
+
+
 def engineering() -> EngineeringService:
     global engineering_service
     if engineering_service is None:
@@ -349,7 +512,12 @@ def initialize_research_runtime() -> ResearchStore | None:
     """Run migrations and deferred temporal recovery before MCP begins accepting requests."""
     if not settings.gpu_lab_research_database_url:
         return None
-    return research()
+    store = research()
+    # DDE's additive coordination tables must exist before the first Lab
+    # message/read call; otherwise a nominally read-only request would have to
+    # migrate the database lazily.
+    distributed_discovery()
+    return store
 
 
 def brain() -> ResearchBrain:
@@ -359,6 +527,21 @@ def brain() -> ResearchBrain:
             if research_brain is None:
                 research_brain = ResearchBrain(research())
     return research_brain
+
+
+def _runtime_code_version() -> dict[str, Any]:
+    """Report the process-loaded and current-on-disk Research OS source hashes."""
+    files = {
+        name: {"loaded_sha256": loaded, "disk_sha256": _source_sha(_RUNTIME_SOURCE_PATHS[name])}
+        for name, loaded in _LOADED_SOURCE_SHAS.items()
+    }
+    drifted = [name for name, values in files.items() if values["loaded_sha256"] != values["disk_sha256"]]
+    return {"files": files, "code_drift": bool(drifted), "drifted_files": drifted,
+            "reload_policy": "restart_required_for_consistent_singleton_runtime"}
+
+
+def _research_runtime_has_code_drift() -> bool:
+    return any(_LOADED_SOURCE_SHAS[name] != _source_sha(path) for name, path in _RUNTIME_SOURCE_PATHS.items())
 
 
 def brain_bench() -> ResearchBrainBench:
@@ -385,8 +568,23 @@ def policy_lab() -> PolicyLabService:
                     auto_revise=settings.gpu_lab_policy_auto_revise,
                     max_revisions=settings.gpu_lab_policy_max_revisions,
                     auto_promote_production=settings.gpu_lab_policy_auto_promote_production,
+                    engineering_service=engineering(),
                 )
     return policy_lab_service
+
+
+def meta_controller() -> MetaResearchController:
+    global meta_controller_service
+    if meta_controller_service is None:
+        with _singleton_lock:
+            if meta_controller_service is None:
+                meta_controller_service = MetaResearchController(
+                    research(), policy_lab(), mode=settings.gpu_lab_policy_autonomy_mode,
+                    candidate_budget=settings.gpu_lab_policy_meta_candidate_budget,
+                    benchmark_budget=settings.gpu_lab_policy_meta_benchmark_budget,
+                    literature_budget=settings.gpu_lab_policy_meta_literature_budget,
+                )
+    return meta_controller_service
 
 
 def epistemics() -> EpistemicService:
@@ -435,6 +633,59 @@ def literature() -> LiteratureService:
     return literature_service
 
 
+async def run_meta_research(project_id: str) -> dict[str, Any]:
+    """Run one bounded campaign and, when configured, its single prepared literature scout."""
+    progress = await call(meta_research().progress, project_id)
+    decisions = int(progress.get("metrics", {}).get("scientific_decisions_total", 0)) if isinstance(progress, dict) else 0
+    postmortem = None
+    postmortem_opportunities = []
+    if decisions and decisions % 5 == 0:
+        postmortem = await call(meta_research().meta_review, project_id)
+        if "error" not in postmortem:
+            postmortem_opportunities = await call(
+                meta_controller().postmortem_opportunities,
+                project_id,
+                str(postmortem["id"]),
+            )
+    result = await call(meta_controller().run_once, project_id)
+    request = result.get("literature_request") if isinstance(result, dict) else None
+    if not request:
+        return {**result, "postmortem": postmortem, "postmortem_opportunities": postmortem_opportunities}
+    if settings.gpu_lab_literature_provider != "paperqa-http":
+        deferred = await call(
+            research().object_update,
+            str(request["id"]),
+            {"dispatch_status": "DEFERRED", "dispatch_reason": "literature provider unavailable"},
+            "DEFERRED",
+            "LITERATURE_SCOUT_DEFERRED",
+        )
+        return {**result, "postmortem": postmortem, "postmortem_opportunities": postmortem_opportunities, "literature_scout": {"status": "DEFERRED", "request": deferred}}
+    gathered = await call(literature().gather, project_id, request["data"]["question"])
+    if "error" in gathered:
+        deferred = await call(
+            research().object_update,
+            str(request["id"]),
+            {"dispatch_status": "UNAVAILABLE", "provider_error": gathered["error"]},
+            "DEFERRED",
+            "LITERATURE_SCOUT_DEFERRED",
+        )
+        return {**result, "postmortem": postmortem, "postmortem_opportunities": postmortem_opportunities, "literature_scout": {"status": "UNAVAILABLE", "request": deferred}}
+    completed = await call(
+        research().object_update,
+        str(request["id"]),
+        {"dispatch_status": "COMPLETED", "evidence_ids": [str(item["id"]) for item in gathered.get("evidence", [])]},
+        "COMPLETED",
+        "LITERATURE_SCOUT_COMPLETED",
+    )
+    transfers = await call(
+        meta_controller().literature_scout_complete,
+        project_id,
+        str(request["id"]),
+        [str(item["id"]) for item in gathered.get("evidence", [])],
+    )
+    return {**result, "postmortem": postmortem, "postmortem_opportunities": postmortem_opportunities, "literature_scout": {"status": "COMPLETED", "request": completed, "gathered": gathered, "policy_transfers": transfers}}
+
+
 def executable_papers() -> ExecutablePaperService:
     global executable_paper_service
     if settings.gpu_lab_executable_paper_provider != "paper2agent-http":
@@ -462,6 +713,25 @@ def qd() -> HypothesisQDService:
             if qd_service is None:
                 qd_service = HypothesisQDService(research())
     return qd_service
+
+
+def distributed_discovery() -> DistributedDiscoveryService:
+    global distributed_discovery_service
+    if distributed_discovery_service is None:
+        with _singleton_lock:
+            if distributed_discovery_service is None:
+                distributed_discovery_service = DistributedDiscoveryService(research())
+    return distributed_discovery_service
+
+
+def correction() -> DistributedCorrectionService:
+    """Return the durable v3.4 correction coordinator."""
+    global correction_service
+    if correction_service is None:
+        with _singleton_lock:
+            if correction_service is None:
+                correction_service = DistributedCorrectionService(research())
+    return correction_service
 
 
 def research_operators() -> ResearchOperatorService:
@@ -517,8 +787,17 @@ async def call(fn, *args, **kwargs):
     started = time.perf_counter()
     arguments = {"args": scrub(args), "kwargs": scrub(kwargs)}
     try:
-        result = fn(*args, **kwargs)
-        result = await result if inspect.isawaitable(result) else result
+        # Most persistence and Lab operations are synchronous. Running them on
+        # the ASGI event loop turns one slow project-state read into a global
+        # outage: health checks and unrelated MCP calls cannot be scheduled.
+        # Keep native async providers on the loop, but move sync work to the
+        # default worker pool so requests can progress independently.
+        if inspect.iscoroutinefunction(fn):
+            result = await fn(*args, **kwargs)
+        else:
+            result = await asyncio.to_thread(fn, *args, **kwargs)
+            if inspect.isawaitable(result):
+                result = await result
         svc().repo.audit(
             tool_name, arguments, "success", int((time.perf_counter() - started) * 1000)
         )
@@ -646,7 +925,10 @@ def _compact_canonical_state(canonical_state: dict[str, Any], limit: int) -> dic
     compact: dict[str, Any] = {}
     for key, value in canonical_state.items():
         if isinstance(value, list):
-            compact[key] = [_state_object_summary(item) for item in value[:limit]]
+            compact[key] = [
+                _state_object_summary(item) if isinstance(item, dict) else item
+                for item in value[:limit]
+            ]
             if len(value) > limit:
                 compact[f"{key}_truncated"] = len(value) - limit
         else:
@@ -670,6 +952,12 @@ def _compact_brain_step(result: dict[str, Any], limit: int = 10) -> dict[str, An
         "research_situation": result.get("research_situation"),
         "strategy_patterns_retrieved": result.get("strategy_patterns_retrieved"),
         "agenda_diminishing_returns": result.get("agenda_diminishing_returns"),
+        "candidate_portfolio": result.get("candidate_portfolio"),
+        "brain_policy_version": result.get("brain_policy_version"),
+        "search_regime": result.get("search_regime"),
+        "frontier_gap": result.get("frontier_gap"),
+        "stagnation_state": result.get("stagnation_state"),
+        "state_freshness": result.get("state_freshness"),
         "candidate_actions": result["candidate_actions"][:limit],
         "selected_action": result["selected_action"],
         "reason": result.get("reason"),
@@ -812,6 +1100,495 @@ async def research_state_get(project_id: str, limit: int = 10, as_of: str | None
 
 
 @mcp.tool()
+async def runtime_code_version():
+    """Show whether this long-lived MCP process differs from its mounted source code."""
+    return _runtime_code_version()
+
+
+@mcp.tool()
+async def lab_join(
+    project_id: str,
+    runtime_type: Literal["CHATGPT_WEB", "OPENAI_API", "CLAUDE_API", "CODEX", "LOCAL_AGENT", "OTHER"],
+    worker_id: str | None = None,
+    worker_name: str | None = None,
+    capabilities: dict[str, Any] | None = None,
+    runtime_metadata: dict[str, Any] | None = None,
+    session_id: str | None = None,
+):
+    """Register or recover a durable worker session and return compact shared LabState."""
+    return await call(
+        lab().join,
+        worker_id,
+        worker_name,
+        runtime_type,
+        project_id,
+        capabilities,
+        runtime_metadata,
+        session_id,
+    )
+
+
+@mcp.tool()
+async def lab_state_get(project_id: str, session_id: str | None = None):
+    """Read compact project-scoped operational state; it is not a second scientific truth store."""
+    return await call(lab().state_get, project_id, session_id)
+
+
+@mcp.tool()
+async def lab_budget_set(project_id: str, worker_id: str, session_id: str, limits: dict[str, Any]):
+    """Set project-level worker and compute concurrency limits for Lab Control."""
+    return await call(lab().budget_set, project_id, worker_id, session_id, limits)
+
+
+@mcp.tool()
+async def lab_sync(
+    session_id: str, project_id: str, since: str | None = None, current_work_item_id: str | None = None,
+    expected_work_version: int | None = None,
+):
+    """Incrementally synchronize one worker with shared events, work, leases, and messages."""
+    return await call(lab().sync, session_id, project_id, since, current_work_item_id, expected_work_version)
+
+
+@mcp.tool()
+async def discovery_round_create(
+    project_id: str, search_regime: Literal["EXPLOIT", "MECHANISM_SEARCH", "DIVERGENT_SEARCH", "PARADIGM_RESET"],
+    agenda_item_id: str | None = None, triggering_decision_id: str | None = None,
+    generation_budget: dict[str, int] | None = None, policy_version: str | None = None,
+    brain_policy_version: str | None = None,
+):
+    """Freeze canonical state and start an isolated v3.3 discovery round; never executes an experiment."""
+    return await call(distributed_discovery().create_round, project_id, agenda_item_id, search_regime,
+                      triggering_decision_id=triggering_decision_id, generation_budget=generation_budget,
+                      policy_version=policy_version, brain_policy_version=brain_policy_version)
+
+
+@mcp.tool()
+async def discovery_round_join(
+    discovery_round_id: str, worker_id: str, session_id: str,
+    generation_operator: str, requested_distance: Literal["NEAR", "MID", "FAR", "ORTHOGONAL"],
+):
+    """Join one worker to an independent discovery batch with a search transformation, not a persona."""
+    return await call(distributed_discovery().join_round, discovery_round_id, worker_id, session_id,
+                      generation_operator, requested_distance)
+
+
+@mcp.tool()
+async def discovery_round_recommend_assignments(discovery_round_id: str, worker_slots: int | None = None):
+    """Recommend distinct operator/distance assignments from frozen regime coverage; does not join or create work."""
+    return await call(distributed_discovery().recommended_assignments, discovery_round_id, worker_slots)
+
+
+@mcp.tool()
+async def discovery_candidate_submit(
+    discovery_round_id: str, candidate_batch_id: str, worker_id: str, session_id: str,
+    candidate: dict[str, Any],
+):
+    """Persist one immutable proposal-time discovery candidate in the caller's own open batch."""
+    return await call(distributed_discovery().submit_candidate, discovery_round_id, candidate_batch_id,
+                      worker_id, session_id, candidate)
+
+
+@mcp.tool()
+async def discovery_batch_freeze(
+    discovery_round_id: str, candidate_batch_id: str, worker_id: str, session_id: str,
+    abstention_reason: str | None = None,
+):
+    """Freeze a candidate batch; an empty batch must explicitly abstain rather than invent an idea."""
+    return await call(distributed_discovery().batch_freeze, discovery_round_id, candidate_batch_id,
+                      worker_id, session_id, abstention_reason)
+
+
+@mcp.tool()
+async def discovery_round_lab_work_create(discovery_round_id: str):
+    """Create bounded independent-generation Lab WorkItems for joined round workers."""
+    return await call(distributed_discovery().lab_work_items, discovery_round_id)
+
+
+@mcp.tool()
+async def discovery_peer_isolation_override(
+    discovery_round_id: str, candidate_batch_id: str, worker_id: str, session_id: str, rationale: str,
+):
+    """Record a user-directed peer-idea sharing override; the affected batch is no longer independent."""
+    return await call(distributed_discovery().peer_isolation_override, discovery_round_id, candidate_batch_id,
+                      worker_id, session_id, rationale)
+
+
+@mcp.tool()
+async def discovery_round_get(discovery_round_id: str, requester_session_id: str | None = None):
+    """Read a discovery round without exposing current-round peer candidate content before freeze."""
+    return await call(distributed_discovery().round_get, discovery_round_id, requester_session_id)
+
+
+@mcp.tool()
+async def discovery_round_stale_check(discovery_round_id: str):
+    """Read whether a discovery round's frozen scientific snapshot is now stale; does not mutate it."""
+    return await call(distributed_discovery().stale_check, discovery_round_id, False)
+
+
+@mcp.tool()
+async def discovery_batch_get(discovery_round_id: str, candidate_batch_id: str, requester_session_id: str):
+    """Read a batch; peer batches are denied during independent generation."""
+    return await call(distributed_discovery().batch_get, discovery_round_id, candidate_batch_id, requester_session_id)
+
+
+@mcp.tool()
+async def discovery_synthesis_start(discovery_round_id: str, literature_available: bool = False):
+    """Build the cross-worker QD archive after all batches freeze; agreement never becomes evidence."""
+    return await call(distributed_discovery().synthesize, discovery_round_id, literature_available)
+
+
+@mcp.tool()
+async def discovery_archive_get(archive_id: str):
+    """Read the decomposed cross-worker QD archive and provisional selected/runner-up candidates."""
+    return await call(distributed_discovery().archive_get, archive_id)
+
+
+@mcp.tool()
+async def discovery_outcome_get(discovery_candidate_id: str):
+    """Read a candidate's later trajectory; unexecuted candidates remain UNKNOWN."""
+    return await call(distributed_discovery().outcome_get, discovery_candidate_id)
+
+
+@mcp.tool()
+async def discovery_outcome_record(discovery_candidate_id: str, outcome: dict[str, Any]):
+    """Persist retrospective discovery outcome metadata without rewriting the original proposal."""
+    return await call(distributed_discovery().outcome_record, discovery_candidate_id, outcome)
+
+
+@mcp.tool()
+async def discovery_shadow_preview(
+    project_id: str,
+    candidates: list[dict[str, Any]],
+    search_regime: Literal["EXPLOIT", "MECHANISM_SEARCH", "DIVERGENT_SEARCH", "PARADIGM_RESET"],
+):
+    """Read-only v3.3 diversity characterization; it creates no round, work item, or experiment."""
+    return await call(distributed_discovery().shadow_preview, project_id, candidates, search_regime)
+
+
+@mcp.tool()
+async def correction_case_create(
+    project_id: str, target_id: str, opened_by: str | None = None,
+    purpose: str = "SCIENTIFIC_CORRECTION", severity: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"] = "MEDIUM",
+):
+    """Freeze one scientific target into a v3.4 correction case; this never changes the target."""
+    return await call(correction().create_case, project_id, target_id, opened_by, purpose, severity)
+
+
+@mcp.tool()
+async def correction_case_join(
+    correction_case_id: str, worker_id: str, session_id: str,
+    correction_operator: Literal[
+        "CAUSAL_LOGIC", "STRONGEST_NULL", "EXPERIMENT_VALIDITY", "IMPLEMENTATION_VALIDITY",
+        "EVIDENCE_SCOPE", "CONTRADICTION_SEARCH", "METRIC_VALIDITY", "REPLICATION_VALIDITY",
+        "GENERALIZATION_VALIDITY", "LITERATURE_CONTRADICTION", "NOVELTY_VALIDITY",
+        "WORLD_MODEL_CONSISTENCY", "COUNTERFACTUAL_VALIDITY", "ASSUMPTION_AUDIT",
+        "DATA_PROVENANCE", "STATISTICAL_VALIDITY",
+    ],
+):
+    """Join as one independent correction operator while peer challenges remain hidden."""
+    return await call(correction().join_case, correction_case_id, worker_id, session_id, correction_operator)
+
+
+@mcp.tool()
+async def correction_challenge_submit(
+    correction_case_id: str, worker_id: str, session_id: str, challenge: dict[str, Any],
+):
+    """Submit exactly one structured critique for the caller's own isolated correction slot."""
+    return await call(correction().submit_challenge, correction_case_id, worker_id, session_id, challenge)
+
+
+@mcp.tool()
+async def correction_challenge_freeze(correction_case_id: str, worker_id: str, session_id: str):
+    """Freeze the caller's challenge. Peer challenges become visible only when all joined critics freeze."""
+    return await call(correction().freeze_challenge, correction_case_id, worker_id, session_id)
+
+
+@mcp.tool()
+async def correction_case_get(correction_case_id: str, requester_session_id: str | None = None):
+    """Read correction-case phase, frozen target metadata, and isolation-safe membership state."""
+    return await call(correction().case_get, correction_case_id, requester_session_id)
+
+
+@mcp.tool()
+async def correction_challenge_get(correction_case_id: str, correction_challenge_id: str, requester_session_id: str):
+    """Read a challenge only when peer-isolation permits it."""
+    return await call(correction().challenge_get, correction_case_id, correction_challenge_id, requester_session_id)
+
+
+@mcp.tool()
+async def correction_verification_record(
+    correction_challenge_id: str, verifier_worker_id: str, verification: dict[str, Any],
+):
+    """Record an independent, evidence- or deterministic-check-grounded verification of a frozen critique."""
+    return await call(correction().verify, correction_challenge_id, verifier_worker_id, verification)
+
+
+@mcp.tool()
+async def correction_adjudicate(
+    correction_case_id: str,
+    resolution: Literal["KEEP", "REVISE", "REJECT", "NARROW_SCOPE", "EXPERIMENT_REQUIRED"],
+    rationale: str, discriminating_test: str | None = None,
+):
+    """Create the case's single adjudication record; a critique alone cannot revise scientific truth."""
+    return await call(correction().adjudicate, correction_case_id, resolution, rationale,
+                      discriminating_test=discriminating_test)
+
+
+@mcp.tool()
+async def correction_hindsight_record(correction_record_id: str, hindsight: dict[str, Any]):
+    """Record later correction usefulness without rewriting the original correction record."""
+    return await call(correction().hindsight_record, correction_record_id, hindsight)
+
+
+@mcp.tool()
+async def correction_shadow_preview(project_id: str, target_id: str):
+    """Read-only v3.4 correction planning. It creates no case, challenge, evidence, or experiment."""
+    return await call(correction().shadow_preview, project_id, target_id)
+
+
+@mcp.tool()
+async def lab_workers_list(project_id: str):
+    """List active workers for this project only."""
+    return await call(lab()._active_workers, project_id)
+
+
+@mcp.tool()
+async def lab_work_list(project_id: str, statuses: list[str] | None = None, limit: int = 100):
+    """List project-scoped WorkItems, optionally by operational status."""
+    return await call(lab().work_list, project_id, statuses, limit)
+
+
+@mcp.tool()
+async def lab_work_create(
+    project_id: str, kind: str, title: str, description: str, scientific_role: str,
+    created_by: str | None = None, priority: float = 0, expected_value: float | None = None,
+    estimated_cost: float | None = None, related_refs: dict[str, Any] | None = None,
+    dependencies: list[dict] | None = None, equivalence_key: str | None = None,
+    parent_work_item_id: str | None = None, created_session_id: str | None = None,
+    authority_key: str | None = None, gate_id: str | None = None,
+    canonical_subject_version: str | None = None, authority_status: str = "SUPPORTING",
+    subject_id: str | None = None, recovery_policy: dict[str, Any] | None = None,
+    dormant_until_dependencies: bool = False,
+):
+    """Create dependency-aware project work; authoritative gate work is idempotently reused."""
+    return await call(lab().create_work, project_id, kind, title, description, scientific_role,
+                      created_by, priority, expected_value, estimated_cost, related_refs,
+                      dependencies, equivalence_key, parent_work_item_id, created_session_id,
+                      authority_key, gate_id, canonical_subject_version, authority_status,
+                      subject_id, recovery_policy, dormant_until_dependencies)
+
+
+@mcp.tool()
+async def scientific_gate_ensure(
+    project_id: str, gate_key: str, scientific_object_id: str, canonical_subject_version: str,
+    worker_id: str, session_id: str, semantic_review_required: bool = True,
+):
+    """Idempotently create or retrieve one authority-bound ScientificGate."""
+    return await call(
+        lab().gate_ensure, project_id, gate_key, scientific_object_id,
+        canonical_subject_version, worker_id, session_id, semantic_review_required,
+    )
+
+
+@mcp.tool()
+async def scientific_gate_get(gate_id: str):
+    """Read one canonical gate and its immutable deterministic preflight result."""
+    return await call(lab().gate_get, gate_id)
+
+
+@mcp.tool()
+async def scientific_gate_list(project_id: str, statuses: list[str] | None = None, limit: int = 100):
+    """List durable gates; default callers should use LabState for actionable gates only."""
+    return await call(lab().gate_list, project_id, statuses, limit)
+
+
+@mcp.tool()
+async def scientific_gate_work_ensure(
+    gate_id: str, kind: str, title: str, description: str, scientific_role: str,
+    worker_id: str, session_id: str, priority: float = 0, expected_value: float | None = None,
+    estimated_cost: float | None = None, dependencies: list[dict] | None = None,
+    recovery_policy: dict[str, Any] | None = None,
+):
+    """Create or reuse the one active authoritative WorkItem for a gate."""
+    return await call(
+        lab().gate_work_ensure, gate_id, kind, title, description, scientific_role,
+        worker_id, session_id, priority, expected_value, estimated_cost, dependencies, recovery_policy,
+    )
+
+
+@mcp.tool()
+async def deterministic_preflight_run(
+    gate_id: str, worker_id: str, session_id: str, checks: dict[str, Any],
+    validator_version: str = "lab-coordination-v3.2.2-gates-v1",
+):
+    """Persist a normalized immutable mechanical readiness result for a gate subject version."""
+    return await call(lab().preflight_run, gate_id, worker_id, session_id, checks, validator_version)
+
+
+@mcp.tool()
+async def scientific_gate_resolve(
+    gate_id: str, worker_id: str, session_id: str,
+    semantic_status: Literal["PASS", "FAIL", "INVALID"],
+    semantic_review_work_item_id: str | None = None, rationale: str = "",
+):
+    """Resolve a gate only after deterministic preflight PASS; this unlocks typed dependencies."""
+    result = await call(
+        lab().gate_resolve, gate_id, worker_id, session_id, semantic_status,
+        semantic_review_work_item_id, rationale,
+    )
+    if "error" not in result and result.get("dependency_changes", {}).get("ready"):
+        wake = await call(cockpit().wake_ready_work, result["gate"]["project_id"])
+        if "error" not in wake:
+            result["worker_wake"] = wake
+    return result
+
+
+@mcp.tool()
+async def scientific_subject_supersede(
+    project_id: str, old_subject_id: str, new_subject_id: str, rationale: str,
+    worker_id: str, session_id: str, successor_gate_id: str | None = None,
+):
+    """Retire old-subject operational work while preserving its immutable history."""
+    return await call(
+        lab().supersede_subject, project_id, old_subject_id, new_subject_id, rationale,
+        worker_id, session_id, successor_gate_id,
+    )
+
+
+@mcp.tool()
+async def lab_work_claim(work_item_id: str, worker_id: str, session_id: str,
+                         role: str | None = None, lease_seconds: int | None = None):
+    """Atomically claim one READY WorkItem and create its renewable lease."""
+    return await call(lab().claim_work, work_item_id, worker_id, session_id, role, lease_seconds)
+
+
+@mcp.tool()
+async def lab_work_start(work_item_id: str, worker_id: str, session_id: str):
+    """Mark work already claimed by this session as actively running."""
+    return await call(lab().start_work, work_item_id, worker_id, session_id)
+
+
+@mcp.tool()
+async def lab_work_release(work_item_id: str, worker_id: str, session_id: str,
+                           reason: str = "RELEASED", dependencies: list[dict] | None = None):
+    """Release only work owned by this session; GPU execution is never cancelled."""
+    return await call(lab().release_work, work_item_id, worker_id, session_id, reason, dependencies)
+
+
+@mcp.tool()
+async def lab_work_block(work_item_id: str, worker_id: str, session_id: str,
+                         dependencies: list[dict], reason: str = "WAITING_DEPENDENCY"):
+    """Release owned work into a dependency-gated state that cannot be claimed early."""
+    return await call(lab().block_work, work_item_id, worker_id, session_id, dependencies, reason)
+
+
+@mcp.tool()
+async def lab_work_attach_experiment_run(
+    work_item_id: str, worker_id: str, session_id: str, run_id: str
+):
+    """Detach an owned execution WorkItem onto a live canonical ExperimentRun."""
+    return await call(lab().attach_experiment_run, work_item_id, worker_id, session_id, run_id)
+
+
+@mcp.tool()
+async def lab_work_repair_dependencies(
+    work_item_id: str, worker_id: str, session_id: str, dependencies: list[dict], rationale: str
+):
+    """Repair a legacy READY item into a dependency-gated state with an audit event."""
+    return await call(lab().repair_dependencies, work_item_id, worker_id, session_id, dependencies, rationale)
+
+
+@mcp.tool()
+async def lab_work_complete(work_item_id: str, worker_id: str, session_id: str,
+                            summary: str = "", output_object_ids: list[str] | None = None):
+    """Complete owned work after its canonical scientific or engineering outputs were persisted."""
+    return await call(lab().complete_work, work_item_id, worker_id, session_id, summary, output_object_ids)
+
+
+@mcp.tool()
+async def lab_heartbeat(session_id: str, work_item_id: str | None = None, lease_seconds: int | None = None):
+    """Refresh a lightweight worker/session heartbeat and, optionally, its owned lease."""
+    return await call(lab().heartbeat, session_id, work_item_id, lease_seconds)
+
+
+@mcp.tool()
+async def lab_message_send(project_id: str, from_worker_id: str, from_session_id: str, message_type: str, subject: str,
+                           body: str, to_worker_id: str | None = None, to_role: str | None = None,
+                           reference_ids: list[str] | None = None, priority: int = 0,
+                           broadcast_scope: str | None = None):
+    """Send advisory worker communication; it cannot alter scientific evidence or beliefs."""
+    return await call(lab().message_send, project_id, from_worker_id, from_session_id, message_type, subject, body,
+                      to_worker_id, to_role, reference_ids, priority, broadcast_scope)
+
+
+@mcp.tool()
+async def lab_message_list(project_id: str, worker_id: str, role: str | None = None,
+                           unread_only: bool = False, limit: int = 100):
+    """Retrieve project-scoped worker messages without loading chat histories."""
+    return await call(lab().message_list, project_id, worker_id, role, unread_only, limit)
+
+
+@mcp.tool()
+async def lab_message_mark_read(project_id: str, worker_id: str, session_id: str, message_ids: list[str]):
+    """Acknowledge messages visible to this project-scoped active worker session."""
+    return await call(lab().message_mark_read, project_id, worker_id, session_id, message_ids)
+
+
+@mcp.tool()
+async def lab_controls_get(project_id: str):
+    """Read project autopilot, auto-continue, and scheduling-pause controls."""
+    return await call(cockpit().controls_get, project_id)
+
+
+@mcp.tool()
+async def cockpit_state_get(project_id: str, session_id: str | None = None):
+    """Read the compact canonical/operational cockpit projection for one project."""
+    return await call(cockpit().state_get, project_id, session_id)
+
+
+@mcp.tool()
+async def lab_controls_set(
+    project_id: str, worker_id: str, session_id: str,
+    autopilot_enabled: bool | None = None, auto_continue_enabled: bool | None = None,
+    paused: bool | None = None,
+):
+    """Change only scheduling controls; this never cancels an active GPU experiment."""
+    return await call(cockpit().controls_set, project_id, worker_id, session_id,
+                      autopilot_enabled=autopilot_enabled,
+                      auto_continue_enabled=auto_continue_enabled, paused=paused)
+
+
+@mcp.tool()
+async def browser_runtime_attach(
+    project_id: str, worker_id: str, session_id: str, conversation_url: str | None = None,
+    browser_profile_key: str | None = None,
+):
+    """Persist a server-side ChatGPT Web runtime attachment; no browser cookie is returned."""
+    return await call(cockpit().runtime_attach, project_id, worker_id, session_id,
+                      conversation_url, browser_profile_key)
+
+
+@mcp.tool()
+async def lab_turn_report(
+    project_id: str, worker_id: str, session_id: str, outcome: str, summary: str = "",
+    work_item_id: str | None = None,
+):
+    """Persist one bounded worker-turn outcome; CONTINUE can queue one idempotent wake only."""
+    return await call(cockpit().turn_report, project_id, worker_id, session_id, outcome,
+                      summary, work_item_id)
+
+
+@mcp.tool()
+async def browser_wake_dispatch(project_id: str | None = None):
+    """Dispatch one durable continuation only when browser bridge and auto-continue are enabled."""
+    if not settings.chatgpt_web_bridge_enabled:
+        raise GPUError("CHATGPT_WEB_BRIDGE_DISABLED", "Set CHATGPT_WEB_BRIDGE_ENABLED=true")
+    if not settings.auto_continue_enabled:
+        raise GPUError("AUTO_CONTINUE_DISABLED", "Set AUTO_CONTINUE_ENABLED=true")
+    return await call(browser_dispatcher().dispatch_one, project_id)
+
+
+@mcp.tool()
 async def research_object_get(object_id: str, as_of: str | None = None):
     """Retrieve one complete persisted research record by its ID."""
     return await call(research().object_get, object_id, as_of)
@@ -902,8 +1679,17 @@ async def engineering_diff_review(task_id: str, review: dict[str, Any]):
 
 @mcp.tool()
 async def engineering_result_record(task_id: str, result: dict[str, Any]):
-    """Record implementation evidence; scientific_result is always NOT_ASSESSED."""
-    return await call(engineering().result_record, task_id, result)
+    """Record implementation evidence and unlock a linked policy benchmark if verified."""
+    recorded = await call(engineering().result_record, task_id, result)
+    if isinstance(recorded, dict) and "error" in recorded:
+        return recorded
+    task = await call(engineering().task_get, task_id)
+    if isinstance(task, dict) and "error" in task:
+        return task
+    if not task.get("data", {}).get("policy_patch_id"):
+        return recorded
+    handoff = await call(policy_lab().code_patch_result_sync, str(task["project_id"]), task_id)
+    return {"engineering_result": recorded, "policy_handoff": handoff}
 
 
 @mcp.tool()
@@ -972,8 +1758,9 @@ async def improve_start(
     failure: str | None = None,
     component: str | None = None,
     search: bool = False,
+    prompt: bool = False,
 ):
-    """Create bounded policy candidates and evaluate them without changing production policy."""
+    """Create bounded policy candidates; prompt mode compiles candidates before evaluation."""
     if search:
         if settings.gpu_lab_literature_provider != "paperqa-http":
             raise GPUError(
@@ -981,10 +1768,15 @@ async def improve_start(
                 "improve --search requires the isolated PaperQA literature provider.",
             )
         weakness_query = failure or idea or component or "research experiment discrimination weakness"
-        literature_result = await literature().search(
+        literature_service = await call(literature)
+        if isinstance(literature_service, dict) and "error" in literature_service:
+            return literature_service
+        literature_result = await call(literature_service.provider.search,
             "Research methods for this measured policy weakness; return competing methods, "
             "limitations, and negative evidence where available: " + weakness_query
         )
+        if isinstance(literature_result, dict) and "error" in literature_result:
+            return literature_result
         paper = literature_result.answer or "\n".join(
             candidate.source_excerpt for candidate in literature_result.evidence_candidates[:3]
         )
@@ -996,6 +1788,7 @@ async def improve_start(
         failure=failure,
         component=component,
         search=search,
+        prompt=prompt,
     )
 
 
@@ -1003,6 +1796,18 @@ async def improve_start(
 async def improve_status(improvement_run_id: str):
     """Retrieve a durable improvement run and its recommendation."""
     return await call(research().object_get, improvement_run_id)
+
+
+@mcp.tool()
+async def improve_local_search_collapse_diagnose(project_id: str):
+    """Return an advisory LOCAL_SEARCH_COLLAPSE diagnosis without modifying policy or science."""
+    portfolios = await call(research().objects_list, project_id, "CandidatePortfolio", limit=None)
+    decisions = await call(research().objects_list, project_id, "ResearchDecision", limit=None)
+    if isinstance(portfolios, dict) and "error" in portfolios:
+        return portfolios
+    if isinstance(decisions, dict) and "error" in decisions:
+        return decisions
+    return local_search_collapse_diagnosis(portfolios, decisions)
 
 
 @mcp.tool()
@@ -1021,6 +1826,15 @@ async def policy_compare(base_policy_id: str, candidate_policy_id: str):
 async def policy_export(policy_id: str, provider: str | None = None):
     """Export a portable policy representation without applying or compiling executable text."""
     return await call(policy_lab().export_policy, policy_id, provider)
+
+
+@mcp.tool()
+async def research_policy_context_get(project_id: str, provider: str = "CHATGPT"):
+    """Return the active compiled policy context; dynamic research state remains in Research OS tools."""
+    policy = await call(policy_lab().ensure_production_policy, project_id)
+    if isinstance(policy, dict) and "error" in policy:
+        return policy
+    return await call(policy_lab().compile_policy, str(policy["id"]), provider)
 
 
 @mcp.tool()
@@ -1052,20 +1866,114 @@ async def policy_rollback(project_id: str, policy_id: str):
 
 
 @mcp.tool()
+async def policy_restrict(project_id: str, policy_id: str, status: str, reason: str):
+    """Deprecate or scope-restrict a non-production policy without deleting its lineage."""
+    return await call(policy_lab().restrict_policy, project_id, policy_id, status, reason)
+
+
+@mcp.tool()
+async def policy_code_patch_prepare(project_id: str, patch_id: str, code_change: dict[str, Any]):
+    """Create a bounded EngineeringTask for a code-bearing policy patch; it is not policy success."""
+    return await call(policy_lab().code_patch_prepare, project_id, patch_id, code_change)
+
+
+@mcp.tool()
+async def policy_pin(project_id: str, policy_id: str | None = None):
+    """Pin a project policy (or clear the pin) to constrain autonomous policy changes."""
+    return await call(meta_controller().policy_pin, project_id, policy_id)
+
+
+@mcp.tool()
+async def policy_feedback_record(project_id: str, feedback: str, target_component: str = "experiment_selection"):
+    """Record user feedback as a hypothesis pending inspection of actual outcomes."""
+    return await call(meta_controller().feedback_record, project_id, feedback, target_component)
+
+
+@mcp.tool()
+async def policy_feedback_validate(project_id: str, feedback_id: str):
+    """Validate feedback against persisted decision outcomes before creating a candidate."""
+    return await call(meta_controller().feedback_validate, project_id, feedback_id)
+
+
+@mcp.tool()
+async def policy_ranker_readiness(project_id: str):
+    """Assess whether an offline advisory ranker is justified; it never trains or deploys one."""
+    return await call(meta_controller().ranker_readiness, project_id)
+
+
+@mcp.tool()
+async def policy_canary_start(project_id: str, candidate_policy_id: str, percentage: int = 10):
+    """Start a bounded prospective canary; it does not replace production policy."""
+    return await call(policy_lab().start_canary, project_id, candidate_policy_id, percentage)
+
+
+@mcp.tool()
+async def policy_canary_observation_record(
+    canary_id: str,
+    decision_id: str,
+    observed_behavior: dict[str, Any],
+    hard_epistemic_regression: bool = False,
+):
+    """Record a prospective canary observation; hard epistemic regression stops the canary."""
+    return await call(
+        policy_lab().record_canary_observation,
+        canary_id,
+        decision_id,
+        observed_behavior,
+        hard_epistemic_regression=hard_epistemic_regression,
+    )
+
+
+@mcp.tool()
+async def policy_shadow_record(
+    project_id: str,
+    production_policy_id: str,
+    shadow_policy_id: str,
+    decision_id: str,
+    production_action: dict[str, Any],
+    shadow_action: dict[str, Any],
+    observed_production_result: dict[str, Any] | None = None,
+):
+    """Record a non-executing policy comparison; shadow outcomes remain counterfactually unknown."""
+    return await call(
+        policy_lab().record_shadow,
+        project_id,
+        production_policy_id,
+        shadow_policy_id,
+        decision_id,
+        production_action,
+        shadow_action,
+        observed_production_result,
+    )
+
+
+@mcp.tool()
 async def policy_hindsight_record(
     policy_id: str,
     observed_improvement: float | None,
     observed_cost: float | None,
     unexpected_failure: str | None = None,
+    decision_ids: list[str] | None = None,
 ):
-    """Record post-promotion policy calibration data without changing scientific state."""
-    return await call(
+    """Record hindsight, then autonomously assess calibration and rollback evidence."""
+    result = await call(
         policy_lab().record_hindsight,
         policy_id,
         observed_improvement,
         observed_cost,
         unexpected_failure,
+        decision_ids,
     )
+    if "error" in result:
+        return result
+    project_id = str(result["project_id"])
+    calibration = await call(meta_controller().monitor_calibration, project_id)
+    regressions = await call(meta_controller().monitor_promotions, project_id)
+    return {
+        **result,
+        "calibration_opportunities": calibration,
+        "policy_regressions": regressions,
+    }
 
 
 @mcp.tool()
@@ -1288,6 +2196,34 @@ async def brain_step(project_id: str, as_of: str | None = None):
     return _compact_brain_step(result)
 
 
+@mcp.tool()
+async def brain_preview(project_id: str):
+    """Return a non-mutating v3.1 decision preview from current canonical state."""
+    result = await call(brain().brain_step, project_id, None, False)
+    if "error" in result:
+        return result
+    return _compact_brain_step(result)
+
+
+@mcp.tool()
+async def breakthrough_signal_record(
+    project_id: str,
+    hypothesis_status: str,
+    improved_dimensions: list[str],
+    regressed_dimensions: list[str],
+    evidence_family_ids: list[str] | None = None,
+    decision_id: str | None = None,
+):
+    """Record strategic discovery value without changing hypothesis scientific status."""
+    signal = breakthrough_signal(
+        hypothesis_status=hypothesis_status,
+        improved_dimensions=improved_dimensions,
+        regressed_dimensions=regressed_dimensions,
+        evidence_family_ids=evidence_family_ids,
+    )
+    return await call(research().breakthrough_signal_record, project_id, signal, decision_id)
+
+
 def _execution_action_fingerprint(
     experiment_id: str,
     command: str,
@@ -1316,11 +2252,21 @@ async def research_decision_create(
     env: dict[str, str] | None = None,
     python_env: str | None = None,
 ):
-    """Create the ResearchDecision required by research_experiment_execute.
+    """Create a compact execution handoff containing the required decision_id.
 
-    Use this before immediately executing a preregistered experiment. Pass the
-    returned decision_id to research_experiment_execute with the same bound command.
+    Full Brain-step detail remains durable and can be read with
+    research_object_get. Pass decision_id to research_experiment_execute with
+    the same bound command.
     """
+    if _research_runtime_has_code_drift():
+        return {
+            "error": {
+                "type": "RESEARCH_RUNTIME_CODE_DRIFT",
+                "message": "Mounted Research OS source differs from the code loaded by this MCP process; restart is required before creating a decision.",
+                "retryable": False,
+            },
+            "runtime": _runtime_code_version(),
+        }
     step = await call(brain().brain_step, project_id)
     if "error" in step:
         return step
@@ -1333,9 +2279,16 @@ async def research_decision_create(
         step["decision_id"],
         fingerprint,
     )
+    handoff = {
+        "decision_id": step["decision_id"],
+        "experiment_id": experiment_id,
+        "action_fingerprint": fingerprint,
+        "next_tool": "research_experiment_execute",
+        "detail_hint": "Use research_object_get with decision_id for the complete persisted Brain trace.",
+    }
     if "error" in binding:
-        return {**step, "execution_binding_error": binding["error"]}
-    return {**step, "execution_binding": binding["data"]["execution_binding"]}
+        return {**handoff, "execution_binding_error": binding["error"]}
+    return {**handoff, "execution_binding": binding["data"]["execution_binding"]}
 
 
 @mcp.tool()
@@ -1411,8 +2364,7 @@ async def legacy_reserved_run_abandon(
                 "message": "The local job exists or could not be verified absent",
             }
         }
-    abandon_args = (run_id, job_id, rationale, technical_non_scientific) if technical_non_scientific else (run_id, job_id, rationale)
-    return await call(brain().legacy_reserved_run_abandon, *abandon_args)
+    return await call(brain().legacy_reserved_run_abandon, run_id, job_id, rationale, technical_non_scientific)
 
 
 @mcp.tool()
@@ -1434,6 +2386,7 @@ async def brain_result_assess(
     causal_edge_id: str | None = None,
     causal_edge_status: str | None = None,
     actual_information_gain: str = "MEDIUM",
+    information_gain_basis: list[str] | None = None,
     guard_passed: bool | None = None,
     matched_control_passed: bool | None = None,
 ):
@@ -1457,6 +2410,7 @@ async def brain_result_assess(
         causal_edge_id=causal_edge_id,
         causal_edge_status=causal_edge_status,
         actual_information_gain=actual_information_gain,
+        information_gain_basis=information_gain_basis,
         guard_passed=guard_passed,
         matched_control_passed=matched_control_passed,
     )
@@ -1808,6 +2762,78 @@ async def meta_review(project_id: str):
 
 
 @mcp.tool()
+async def improvement_opportunities(project_id: str):
+    """Detect recurring, evidence-backed scientist-behavior weaknesses."""
+    return await call(meta_controller().detect_opportunities, project_id)
+
+
+@mcp.tool()
+async def meta_state_get(project_id: str):
+    """Return compact meta-science state and active policy health."""
+    return await call(meta_controller().state_get, project_id)
+
+
+@mcp.tool()
+async def policy_health_report(project_id: str):
+    """Return the compact v3 production-policy health report."""
+    return await call(meta_controller().policy_health_report, project_id)
+
+
+@mcp.tool()
+async def benchmark_gap_prepare(project_id: str, benchmark_gap_id: str):
+    """Prepare a future-only benchmark authoring proposal; it cannot alter current evaluation."""
+    return await call(meta_controller().benchmark_gap_prepare, project_id, benchmark_gap_id)
+
+
+@mcp.tool()
+async def meta_research_roi(project_id: str):
+    """Return bounded meta-research cost and observed-yield metrics."""
+    return await call(meta_controller().meta_research_roi, project_id)
+
+
+@mcp.tool()
+async def meta_research_run_once(project_id: str):
+    """Run at most one bounded autonomous meta-research campaign."""
+    return await run_meta_research(project_id)
+
+
+@mcp.tool()
+async def policy_regressions_check(project_id: str):
+    """Inspect post-promotion evidence and apply only configured scoped rollback."""
+    return await call(meta_controller().monitor_promotions, project_id)
+
+
+@mcp.tool()
+async def autonomy_config_get(project_id: str):
+    """Return durable policy-autonomy mode and campaign budgets."""
+    return await call(meta_controller().config_get, project_id)
+
+
+@mcp.tool()
+async def autonomy_config_update(project_id: str, update: dict[str, Any]):
+    """Update bounded autonomy settings; default mode remains advisory."""
+    return await call(meta_controller().config_update, project_id, update)
+
+
+@mcp.tool()
+async def policy_model_change_detect(project_id: str, provider: str, model: str):
+    """Create a deduplicated compatibility-evaluation opportunity after a model change."""
+    return await call(meta_controller().model_change_detect, project_id, provider, model)
+
+
+@mcp.tool()
+async def provider_adapter_evaluate(project_id: str, candidate_id: str, evidence_ids: list[str], live_result: str):
+    """Record durable live PASS/FAIL evidence for a proposed provider adapter."""
+    return await call(policy_lab().provider_adapter_evaluate, project_id, candidate_id, evidence_ids, live_result)
+
+
+@mcp.tool()
+async def provider_adapter_promote(project_id: str, candidate_id: str):
+    """Promote only a provider adapter that survived live cross-model evaluation."""
+    return await call(policy_lab().provider_adapter_promote, project_id, candidate_id)
+
+
+@mcp.tool()
 async def meta_lesson_list(project_id: str):
     """List durable research-process lessons without treating them as scientific evidence."""
     return await call(meta_research().list_lessons, project_id)
@@ -1840,8 +2866,13 @@ async def research_null_model_test(
 async def research_decision_outcome_assess(
     decision_id: str, assessment: dict, domain: str | None = None
 ):
-    """Persist S_t, A_t, O_t, R_t, S_t+1 and update scoped strategy memory atomically."""
-    return await call(strategy().decision_outcome_assess, decision_id, assessment, domain)
+    """Persist an outcome, then run one bounded event-driven meta-science pass."""
+    result = await call(strategy().decision_outcome_assess, decision_id, assessment, domain)
+    if "error" in result:
+        return result
+    project_id = str(result["outcome"]["project_id"])
+    meta_result = await run_meta_research(project_id)
+    return {**result, "meta_research": meta_result}
 
 
 @mcp.tool()
@@ -2633,6 +3664,10 @@ async def research_experiment_execute(
     python_env: str | None = None,
     execution_attempt_uuid: str | None = None,
     engineering_task_id: str | None = None,
+    lab_work_item_id: str | None = None,
+    lab_worker_id: str | None = None,
+    lab_session_id: str | None = None,
+    runtime_fingerprint: str | None = None,
 ):
     """Run a preregistered experiment with a ResearchDecision created by research_decision_create.
 
@@ -2649,6 +3684,25 @@ async def research_experiment_execute(
         )
         if "error" in readiness:
             return readiness
+    experiment = await call(research().object_get, experiment_id)
+    if "error" in experiment:
+        return experiment
+    requires_canary = bool(experiment.get("data", {}).get("plan", {}).get("require_exact_runtime_canary"))
+    if requires_canary and not runtime_fingerprint:
+        return {"error": {"type": "RUNTIME_CANARY_REQUIRED", "message": "Provide the exact runtime fingerprint"}}
+    if runtime_fingerprint:
+        canaries = await call(
+            research().objects_list,
+            str(experiment["project_id"]),
+            "RuntimeCanary",
+            {"VERIFIED_REAL"},
+            1,
+            {"runtime_fingerprint": runtime_fingerprint},
+        )
+        if "error" in canaries:
+            return canaries
+        if not canaries:
+            return {"error": {"type": "RUNTIME_CANARY_REQUIRED", "message": "No passing canary matches this exact runtime"}}
     request = {
         "experiment_id": experiment_id,
         "decision_id": decision_id,
@@ -2739,7 +3793,71 @@ async def research_experiment_execute(
             "mapping_error": mapping["error"],
             "retry_safe": True,
         }
-    return {**mapping, "job": job, "retry_safe": True}
+    attachment = None
+    if any(value is not None for value in (lab_work_item_id, lab_worker_id, lab_session_id)):
+        if not all((lab_work_item_id, lab_worker_id, lab_session_id)):
+            return {
+                **mapping,
+                "job": job,
+                "retry_safe": True,
+                "lab_attachment_error": {
+                    "type": "LAB_ATTACHMENT_ARGUMENTS_REQUIRED",
+                    "message": "lab_work_item_id, lab_worker_id, and lab_session_id must be provided together.",
+                },
+            }
+        attachment = await call(
+            lab().attach_experiment_run,
+            lab_work_item_id,
+            lab_worker_id,
+            lab_session_id,
+            mapping["run_id"],
+        )
+    response = {**mapping, "job": job, "retry_safe": True}
+    if attachment is not None:
+        if "error" in attachment:
+            response["lab_attachment_error"] = attachment["error"]
+        else:
+            response["lab_work_item"] = attachment
+    return response
+
+
+@mcp.tool()
+async def research_execution_attest(run_id: str, attestation: dict[str, Any]):
+    """Record typed execution stages. Technical failures cannot become scientific evidence."""
+    return await call(research().run_record_execution_attestation, run_id, attestation)
+
+
+@mcp.tool()
+async def research_technical_result_inspect(
+    run_id: str,
+    decision_id: str,
+    inspection: dict[str, Any],
+    information_gain_basis: list[str],
+    actual_information_gain: str = "INVALID",
+):
+    """Close a technically invalid run without updating scientific belief or evidence."""
+    return await call(
+        research().technical_result_inspection_apply,
+        run_id=run_id,
+        decision_id=decision_id,
+        actual_information_gain=actual_information_gain,
+        information_gain_basis=information_gain_basis,
+        inspection=inspection,
+    )
+
+
+@mcp.tool()
+async def research_execution_episode_summary(episode_attestations: list[dict[str, Any]]):
+    """Validate and aggregate episode packets without collapsing errors into failed candidates."""
+    return await call(aggregate_episode_attestations, episode_attestations)
+
+
+@mcp.tool()
+async def runtime_canary_record(
+    project_id: str, runtime_fingerprint: str, attestation: dict[str, Any]
+):
+    """Record a non-scientific exact-runtime canary reusable by compatible experiments."""
+    return await call(research().runtime_canary_record, project_id, runtime_fingerprint, attestation)
 
 
 @mcp.tool()
@@ -2855,7 +3973,59 @@ async def research_experiment_sync(run_id: str | None = None, job_id: str | None
         "status": updated.get("status", research_status),
         "run": updated,
     }
+    if response["status"] in {
+        "completed", "failed", "cancelled", "TECHNICAL_CANCELLED", "TECHNICAL_ORPHANED"
+    }:
+        lifecycle = await call(lab().experiment_run_terminal, canonical_run_id, response["status"])
+        if "error" in lifecycle:
+            response["lab_lifecycle_error"] = lifecycle["error"]
+        else:
+            response["lab_lifecycle"] = lifecycle
     return response
+
+
+@mcp.tool()
+async def research_experiment_reconcile_orphan(
+    run_id: str,
+    rationale: str,
+    terminal_status: Literal["TECHNICAL_CANCELLED", "TECHNICAL_ORPHANED"] = "TECHNICAL_ORPHANED",
+    technical_non_scientific: bool = False,
+):
+    """Close a submitted canonical run only after the local executor proves it cannot be live.
+
+    This records operations bookkeeping, never a scientific result.  It refuses
+    runs with canonical artifacts or a live local job.
+    """
+    if not technical_non_scientific:
+        return {"error": {"type": "TECHNICAL_NON_SCIENTIFIC_CONFIRMATION_REQUIRED", "message": "Set technical_non_scientific=true after confirming this is not scientific evidence."}}
+    mapping = await call(research().run_resolve, run_id)
+    if "error" in mapping:
+        return mapping
+    job_id = mapping["job_id"]
+    outcome = await call(local.job_status, job_id)
+    if "error" in outcome:
+        runner_status = "missing" if outcome["error"].get("type") == "JOB_NOT_FOUND" else "unknown"
+    else:
+        runner_status = outcome.get("status", "unknown")
+    if runner_status in {"queued", "running", "completed", "failed"}:
+        return {
+            "error": {"type": "EXPERIMENT_RUN_NOT_ORPHANED", "message": f"Local job is {runner_status}; reconciliation would be unsafe."},
+            "run_id": run_id,
+            "job_id": job_id,
+            "runner_status": runner_status,
+        }
+    reconciled = await call(
+        research().run_reconcile_orphan,
+        run_id,
+        job_id,
+        terminal_status,
+        runner_status,
+        rationale,
+    )
+    if "error" in reconciled:
+        return reconciled
+    lifecycle = await call(lab().experiment_run_terminal, run_id, reconciled["status"])
+    return {"run_id": run_id, "job_id": job_id, "runner_status": runner_status, "technical_non_scientific": True, "run": reconciled, "lab_lifecycle": lifecycle}
 
 
 @mcp.tool()
@@ -2979,7 +4149,86 @@ async def status(_: Request):
 
 @mcp.custom_route("/activity", methods=["GET"], include_in_schema=False)
 async def activity(_: Request):
-    return JSONResponse(svc().repo.list_audit(100))
+    return JSONResponse(await asyncio.to_thread(svc().repo.list_audit, 100))
+
+
+def _prioritise_monitor_jobs(running: list, queued: list, recent: list, limit: int = 30) -> list:
+    """Keep active jobs visible even when historical status writes are newer."""
+    selected = []
+    seen = set()
+    for job in [*running, *queued, *recent]:
+        if job.job_id not in seen:
+            selected.append(job)
+            seen.add(job.job_id)
+        if len(selected) == limit:
+            break
+    return selected
+
+
+def _monitor_operational_state() -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None]:
+    """Read blocking local/Research-OS state outside the ASGI event loop."""
+    repository = svc().repo
+    # Read and parse the SQLite job history once.  The previous implementation
+    # did this three times on every dashboard poll, then rewrote status for up
+    # to 30 historical jobs even though only queued/running jobs can change.
+    local_jobs = repository.list_jobs(instance_id="local", limit=1_000)
+    selected_jobs = _prioritise_monitor_jobs(
+        [job for job in local_jobs if job.status == "running"],
+        [job for job in local_jobs if job.status == "queued"],
+        local_jobs,
+    )
+    jobs = []
+    for job in selected_jobs:
+        if job.status in {"running", "queued"}:
+            status = local.job_status(job.job_id, include_logs=False)
+        else:
+            status = {"job_id": job.job_id, "status": job.status, "exit_code": job.exit_code}
+        jobs.append(
+            {
+                "job_id": status["job_id"],
+                "status": status["status"],
+                "exit_code": status["exit_code"],
+                "name": job.name,
+                "started_at": job.started_at.isoformat() if job.started_at else None,
+                "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+            }
+        )
+    live_workers: list[dict[str, Any]] = []
+    live_workers_error = None
+    if settings.gpu_lab_research_database_url:
+        try:
+            live_workers = cockpit().live_workers_by_project()
+        except GPUError as exc:
+            live_workers_error = exc.message
+    return jobs, live_workers, live_workers_error
+
+
+@mcp.custom_route("/monitor", methods=["GET"], include_in_schema=False)
+async def monitor(_: Request):
+    """Return real local-job state and GPU telemetry for the dashboard."""
+    if not settings.gpu_lab_dashboard_monitor_enabled:
+        return JSONResponse(
+            {"enabled": False, "jobs": [], "gpus": [], "monitoring_disabled": True}
+        )
+    if not settings.gpu_lab_enable_local_runner:
+        return JSONResponse({"enabled": False, "jobs": [], "gpus": []})
+    try:
+        gpus = await local.gpu_metrics()
+        gpu_error = None
+    except GPUError as exc:
+        gpus = []
+        gpu_error = exc.message
+    jobs, live_workers, live_workers_error = await asyncio.to_thread(_monitor_operational_state)
+    return JSONResponse(
+        {
+            "enabled": True,
+            "jobs": jobs,
+            "gpus": gpus,
+            "gpu_error": gpu_error,
+            "live_workers_by_project": ResearchBrain._json_safe(live_workers),
+            "live_workers_error": live_workers_error,
+        }
+    )
 
 
 def _research_map_payload(project_id: str) -> dict[str, Any]:
@@ -3059,9 +4308,77 @@ async def terminal_jobs(_: Request):
     return JSONResponse(jobs)
 
 
+@mcp.custom_route("/cockpit/login", methods=["GET"], include_in_schema=False)
+async def cockpit_login_page(_: Request):
+    """Render the private-operator login form without disclosing configuration."""
+    if not settings.lab_ui_enabled:
+        return JSONResponse({"error": "Cockpit is disabled"}, status_code=404)
+    return HTMLResponse("""<!doctype html><title>Chucky Lab login</title><meta name=viewport content=width=device-width,initial-scale=1><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#08101d;color:#e6edf8;font:16px system-ui}form{width:min(360px,90vw);padding:28px;border:1px solid #29415f;border-radius:14px;background:#101c2e}input,button{box-sizing:border-box;width:100%;padding:11px;margin-top:10px;border-radius:8px;border:1px solid #405b80}input{background:#091321;color:#fff}button{background:#3d76ee;color:#fff;font-weight:700}</style><form method=post action=/cockpit/login><h1>Chucky Lab</h1><p>Private operator access</p><label>Password<input name=password type=password required autofocus autocomplete=current-password></label><button>Open cockpit</button></form>""")
+
+
+@mcp.custom_route("/cockpit/login", methods=["POST"], include_in_schema=False)
+async def cockpit_login(request: Request):
+    if not settings.lab_ui_enabled or not settings.gpu_lab_cockpit_password or not settings.gpu_lab_cockpit_session_secret:
+        return JSONResponse({"error": "Cockpit authentication is not configured"}, status_code=503)
+    origin = request.headers.get("origin")
+    host = request.headers.get("host", "")
+    if origin and origin.rstrip("/") not in {f"https://{host}", f"http://{host}"}:
+        return JSONResponse({"error": "Invalid login origin"}, status_code=403)
+    form = parse_qs((await request.body()).decode("utf-8", "replace"))
+    if not password_matches(settings.gpu_lab_cockpit_password, (form.get("password") or [None])[0]):
+        return HTMLResponse("Invalid password", status_code=401)
+    token, _ = issue_session(settings.gpu_lab_cockpit_session_secret)
+    response = RedirectResponse("/", status_code=303)
+    response.set_cookie(_COCKPIT_COOKIE, token, max_age=28_800, httponly=True,
+                        secure=request.url.scheme == "https", samesite="strict", path="/")
+    return response
+
+
+@mcp.custom_route("/cockpit/state", methods=["GET"], include_in_schema=False)
+async def cockpit_state(request: Request):
+    project_id = request.query_params.get("project_id", "").strip()
+    if not project_id:
+        return JSONResponse({"error": "project_id is required"}, status_code=400)
+    try:
+        return JSONResponse(ResearchBrain._json_safe(cockpit().state_get(project_id)))
+    except GPUError as error:
+        return JSONResponse({"error": error.message, "type": error.error_type}, status_code=400)
+
+
+@mcp.custom_route("/cockpit/session", methods=["GET"], include_in_schema=False)
+async def cockpit_session(request: Request):
+    session = _cockpit_session(request)
+    if not session:
+        return JSONResponse({"error": "Cockpit authentication required"}, status_code=401)
+    return JSONResponse({"csrf_token": session.csrf_token})
+
+
+@mcp.custom_route("/cockpit/controls", methods=["POST"], include_in_schema=False)
+async def cockpit_controls(request: Request):
+    session = _cockpit_session(request)
+    if not session or not hmac.compare_digest(request.headers.get("x-csrf-token", ""), session.csrf_token):
+        return JSONResponse({"error": "Invalid CSRF token"}, status_code=403)
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise GPUError("LAB_CONTROL_INVALID", "JSON object required")
+        project_id = str(payload.get("project_id", "")).strip()
+        if not project_id:
+            raise GPUError("RESEARCH_PROJECT_NOT_FOUND", "project_id is required")
+        result = cockpit().controls_set_operator(
+            project_id,
+            autopilot_enabled=payload.get("autopilot_enabled"),
+            auto_continue_enabled=payload.get("auto_continue_enabled"),
+            paused=payload.get("paused"),
+        )
+        return JSONResponse(ResearchBrain._json_safe(result))
+    except GPUError as error:
+        return JSONResponse({"error": error.message, "type": error.error_type}, status_code=400)
+
+
 @mcp.custom_route("/", methods=["GET"], include_in_schema=False)
 async def dashboard(_: Request):
-    return HTMLResponse(DASHBOARD_HTML)
+    return HTMLResponse(COCKPIT_HTML if settings.lab_ui_enabled else DASHBOARD_HTML)
 
 
 def http_app():
@@ -3070,6 +4387,7 @@ def http_app():
     app.add_middleware(McpAcceptCompatibilityMiddleware)
     app.add_middleware(McpClientNetworkPolicyMiddleware)
     app.add_middleware(McpRequestObservabilityMiddleware)
+    app.add_middleware(CockpitAuthMiddleware)
     return app
 
 
@@ -3080,9 +4398,17 @@ def main():
     # Complete schema migration/recovery before accepting MCP traffic so read-only tools remain
     # read-only even on their first request.
     initialize_research_runtime()
+    if settings.gpu_lab_research_database_url:
+        recovered_wakes = cockpit().recover_inflight_wakes()
+        if recovered_wakes["recovered"]:
+            logger.info("Failed unconfirmed browser wake dispatches at startup: %s", recovered_wakes)
     reconciliation = local.reconcile_jobs()
     if reconciliation["reconciled"]:
         logger.info("Reconciled persisted local jobs at startup: %s", reconciliation)
+    if settings.gpu_lab_research_database_url:
+        start_lab_reconciliation_loop()
+    if settings.chatgpt_web_bridge_enabled and settings.autopilot_enabled and settings.auto_continue_enabled:
+        start_browser_wake_loop()
     if args.transport == "streamable-http":
         import uvicorn
 

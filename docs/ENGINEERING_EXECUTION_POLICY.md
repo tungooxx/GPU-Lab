@@ -1,8 +1,8 @@
 # Engineering Execution Policy
 
-Engineering work is provider-neutral and follows: **explore, understand,
-reproduce, plan, edit, test, verify invariants, inspect diff, record, hand back
-to science**.
+Engineering work is provider-neutral and follows `ENGINEERING_PHASES` exactly:
+**RECEIVE, INSPECT, UNDERSTAND, REPRODUCE, PLAN, EDIT, TEST,
+VERIFY_INVARIANTS, REVIEW_DIFF, RECORD, HAND_BACK**.
 
 - Inspect the repository, relevant callers/callees, configuration, and tests before editing.
 - Reproduce a baseline or failure before modifying experimental behavior.

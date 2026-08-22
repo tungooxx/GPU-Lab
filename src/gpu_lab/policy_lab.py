@@ -14,7 +14,9 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from .brain_bench import BenchmarkDecision, BenchmarkPolicy, BenchmarkSplit, ResearchBrainBench
+from .engineering import EngineeringService
 from .errors import GPUError
+from .prompt_compiler import CORE_EPISTEMIC_INVARIANTS, PROVIDERS, PromptCompiler
 from .research import ResearchStore, strategy_learning_eligibility
 
 
@@ -34,6 +36,7 @@ class ResearchPolicyData(BaseModel):
     literature_policy: dict[str, Any] = Field(default_factory=dict)
     generalization_policy: dict[str, Any] = Field(default_factory=dict)
     meta_review_policy: dict[str, Any] = Field(default_factory=dict)
+    core_epistemic_invariants: list[str] = Field(default_factory=lambda: list(CORE_EPISTEMIC_INVARIANTS))
     provider_adapters: dict[str, Any] = Field(default_factory=dict)
     known_failure_modes: list[str] = Field(default_factory=list)
     applicability: dict[str, Any] = Field(default_factory=dict)
@@ -50,6 +53,15 @@ class PromotionPolicy(BaseModel):
     auto_promote_production: bool = False
 
 
+class PolicyDelta(BaseModel):
+    """Validated, data-only change used by the blinded policy runner."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision_policy: dict[str, Any] = Field(default_factory=dict)
+    critic_policy: dict[str, Any] = Field(default_factory=dict)
+
+
 class PolicyLabService:
     """Create and assess finite policy proposals without autonomous deployment."""
 
@@ -63,6 +75,7 @@ class PolicyLabService:
         auto_revise: bool = True,
         max_revisions: int = 1,
         auto_promote_production: bool = False,
+        engineering_service: EngineeringService | None = None,
     ):
         self.store = store
         self.bench = bench
@@ -71,6 +84,8 @@ class PolicyLabService:
         self.auto_revise = auto_revise
         self.max_revisions = max_revisions
         self.promotion_policy = PromotionPolicy(auto_promote_production=auto_promote_production)
+        self.compiler = PromptCompiler()
+        self.engineering_service = engineering_service
 
     def _create(self, project_id: str, kind: str, data: dict[str, Any], event: str, status: str):
         return self.store.object_create(project_id, kind, data, event, status)
@@ -78,10 +93,30 @@ class PolicyLabService:
     def _objects(self, project_id: str, kind: str) -> list[dict[str, Any]]:
         return self.store.objects_list(project_id, kind, limit=None)
 
+    def _compile(self, policy: dict[str, Any], provider: str, runtime: str = "default") -> dict[str, Any]:
+        return self.compiler.compile(policy, provider, runtime)
+
+    def compile_policy(self, policy_id: str, target_provider: str = "GENERIC", target_runtime: str = "default", *, persist: bool = True) -> dict[str, Any]:
+        policy = self.store.object_get(policy_id)
+        if policy["kind"] != "ResearchPolicy":
+            raise GPUError("NOT_A_RESEARCH_POLICY", policy_id)
+        artifact = self._compile(policy, target_provider, target_runtime)
+        if not persist:
+            return artifact
+        existing = next((item for item in self._objects(str(policy["project_id"]), "ResearchPolicyArtifact") if item["data"].get("content_hash") == artifact["content_hash"]), None)
+        if existing:
+            return existing
+        return self._create(str(policy["project_id"]), "ResearchPolicyArtifact", artifact, "RESEARCH_POLICY_PROMPT_COMPILED", "COMPLETED")
+
+    def _compile_production_artifacts(self, policy: dict[str, Any]) -> None:
+        for provider in PROVIDERS:
+            self.compile_policy(str(policy["id"]), provider)
+
     def ensure_production_policy(self, project_id: str) -> dict[str, Any]:
         policies = self._objects(project_id, "ResearchPolicy")
         production = next((p for p in policies if p["status"] == "PRODUCTION"), None)
         if production:
+            self._compile_production_artifacts(production)
             return production
         payload = ResearchPolicyData(
             version=1,
@@ -96,7 +131,10 @@ class PolicyLabService:
             applicability={"scope": "PROJECT"},
             notes="Canonical v2.5 baseline; deterministic v2.2 code remains the implementation source.",
         ).model_dump(mode="json")
-        return self._create(project_id, "ResearchPolicy", payload, "RESEARCH_POLICY_CREATED", "PRODUCTION")
+        transactional_ensure = getattr(self.store, "production_policy_ensure", None)
+        policy = transactional_ensure(project_id, payload) if callable(transactional_ensure) else self._create(project_id, "ResearchPolicy", payload, "RESEARCH_POLICY_CREATED", "PRODUCTION")
+        self._compile_production_artifacts(policy)
+        return policy
 
     def detect_weaknesses(self, project_id: str, component: str | None = None) -> list[dict[str, Any]]:
         outcomes = self._objects(project_id, "ResearchDecisionOutcome")
@@ -145,24 +183,34 @@ class PolicyLabService:
         return "Compare a proposed action with a mechanistically distinct runner-up before selection."
 
     @staticmethod
-    def _hypothesis_payload(source_type: str, observed_problem: str, change: str, component: str) -> dict[str, Any]:
+    def _hypothesis_payload(source_type: str, observed_problem: str, change: str, component: str, source_ids: list[str] | None = None, diagnostic_hypothesis: dict[str, Any] | None = None) -> dict[str, Any]:
         return {
-            "source_type": source_type, "source_ids": [], "observed_problem": observed_problem,
+            "source_type": source_type, "source_ids": source_ids or [], "observed_problem": observed_problem,
             "proposed_change": change, "mechanism_of_improvement": "Makes the decision constraint explicit before action selection.",
             "applicability_conditions": {"component": component},
             "expected_benefits": ["better scientific discrimination"],
             "possible_harms": ["additional reasoning cost", "unnecessary structure in simple cases"],
             "affected_components": [component], "benchmark_predictions": {"strong_next_action_accuracy": "non-decreasing"},
             "regression_risks": ["scope_error_rate", "expected_cost"], "cost_expectation": "LOW",
+            "diagnostic_hypothesis": diagnostic_hypothesis or {},
         }
 
-    def _hypotheses_for(self, project_id: str, source_type: str, problem: str, component: str) -> list[dict[str, Any]]:
-        changes = [
-            "Require an explicit hypothesis-outcome matrix for competing mechanisms.",
-            "Require a runner-up action comparison before selecting repeated diagnostics.",
-            "Require a null-focused critic when a cheap falsifier is available.",
+    def _hypotheses_for(self, project_id: str, source_type: str, problem: str, component: str, *, limit: int = 3, source_ids: list[str] | None = None, diagnostic_hypotheses: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+        changes = {
+            "candidate_generation": "Require an explicit hypothesis-outcome matrix for competing mechanisms.",
+            "ranking": "Require a runner-up action comparison before selecting repeated diagnostics.",
+            "critic": "Require a null-focused critic when a cheap falsifier is available.",
+        }
+        diagnostics = diagnostic_hypotheses or [
+            {"component": "candidate_generation", "mechanism": "candidate diversity"},
+            {"component": "ranking", "mechanism": "ranking trade-off"},
+            {"component": "critic", "mechanism": "critic omission"},
         ]
-        return [self._create(project_id, "PolicyHypothesis", self._hypothesis_payload(source_type, problem, change, component), "POLICY_HYPOTHESIS_CREATED", "CANDIDATE") for change in changes]
+        distinct = [item for item in diagnostics if item.get("component") in changes]
+        return [
+            self._create(project_id, "PolicyHypothesis", self._hypothesis_payload(source_type, problem, changes[item["component"]], component, source_ids, item), "POLICY_HYPOTHESIS_CREATED", "CANDIDATE")
+            for item in distinct[:limit]
+        ]
 
     def _duplicate_negative(self, project_id: str, semantic_change: str) -> dict[str, Any] | None:
         fingerprint = self._fingerprint(semantic_change)
@@ -180,6 +228,9 @@ class PolicyLabService:
             "affected_policy_sections": ["decision_policy", "critic_policy"],
             "semantic_change": proposed, "semantic_fingerprint": self._fingerprint(proposed),
             "implementation_change": {"type": "POLICY_CONSTRAINT", "enabled": True},
+            "patch_type": "POLICY_SEMANTIC", "semantic_before": {}, "semantic_after": {},
+            "generated_prompt_diff": None, "expected_behavior_change": hypothesis["data"]["expected_benefits"],
+            "unintended_behavior_risks": hypothesis["data"]["possible_harms"], "source": hypothesis["data"]["source_type"],
             "prompt_change": None, "code_change": None, "config_change": None,
             "expected_effect": hypothesis["data"]["expected_benefits"],
             "applicability": hypothesis["data"]["applicability_conditions"], "exclusions": [],
@@ -190,22 +241,89 @@ class PolicyLabService:
             return self._create(project_id, "ResearchPolicyPatch", data, "POLICY_PATCH_REJECTED_DUPLICATE", "REJECTED")
         return self._create(project_id, "ResearchPolicyPatch", data, "POLICY_PATCH_CREATED", "CANDIDATE")
 
+    @staticmethod
+    def _policy_delta(semantic_change: Any) -> PolicyDelta:
+        if not isinstance(semantic_change, str) or not semantic_change.strip():
+            raise GPUError("POLICY_PATCH_SEMANTIC_CHANGE_INVALID", "semantic_change must be non-empty text")
+        normalized = semantic_change.lower()
+        if "hypothesis-outcome matrix" in normalized:
+            return PolicyDelta(decision_policy={"required_artifact": "hypothesis_outcome_matrix", "preferred_action_types": ["REPRODUCTION", "CAUSAL_INTERVENTION"]})
+        if "runner-up action comparison" in normalized:
+            return PolicyDelta(decision_policy={"required_artifact": "runner_up_comparison", "preferred_action_types": ["REPRODUCTION", "NULL_MODEL_TEST"]})
+        if "null-focused critic" in normalized:
+            return PolicyDelta(critic_policy={"null_reasoning": "required_when_cheap_falsifier_available"}, decision_policy={"preferred_action_types": ["NULL_MODEL_TEST"]})
+        raise GPUError("POLICY_PATCH_SEMANTIC_CHANGE_INVALID", "unsupported semantic policy change")
+
     def _run_patch(self, patch: dict[str, Any], episode: Any) -> BenchmarkDecision:
         # Candidate behavior is constrained to the blinded payload. A policy patch
         # cannot access labels, costs, tags, or hidden future state.
         payload = episode.visible_payload()
         actions = [a for a in payload["candidate_actions"] if a.get("feasible", True)]
-        preferred = {"NULL_MODEL_TEST", "CAUSAL_INTERVENTION", "REPRODUCTION"}
-        selected = next((a for a in actions if a["action_type"] in preferred), actions[0])
+        delta = self._policy_delta(patch["data"].get("semantic_change"))
+        preferred = delta.decision_policy.get("preferred_action_types", [])
+        selected = next((a for action_type in preferred for a in actions if a["action_type"] == action_type), actions[0])
         return BenchmarkDecision(selected_action_id=selected["action_id"], considered_null_models=["policy-required-null"])
+
+    def _candidate_prompt(self, policy: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+        self._validate_core_patch(patch)
+        delta = self._policy_delta(patch["data"].get("semantic_change")).model_dump(mode="json")
+        candidate = {**policy, "data": {**policy["data"], **{name: {**policy["data"].get(name, {}), **value} for name, value in delta.items() if value}}}
+        return self._compile(candidate, "GENERIC")
+
+    @staticmethod
+    def _validate_core_patch(patch: dict[str, Any]) -> None:
+        attempted = patch["data"].get("core_epistemic_invariants")
+        if attempted is not None and set(attempted) != set(CORE_EPISTEMIC_INVARIANTS):
+            raise GPUError("CORE_POLICY_INVARIANT_VIOLATION", "ordinary patches cannot alter core epistemic invariants")
+        if patch["data"].get("patch_type") == "CORE_POLICY_CHANGE":
+            raise GPUError("CORE_POLICY_CHANGE_REQUIRES_STRONG_REVIEW", "core policy changes require a separate review path")
+        forbidden = {"benchmark_labels", "benchmark_splits", "evaluation_metrics", "promotion_thresholds", "evaluator_change"}
+        if forbidden & set(patch["data"]):
+            raise GPUError("INVALID_POLICY_EXPERIMENT", "candidate patches cannot alter their evaluator")
 
     def evaluate(self, project_id: str, patch_id: str) -> dict[str, Any]:
         patch = self.store.object_get(patch_id)
         if patch["kind"] != "ResearchPolicyPatch":
             raise GPUError("NOT_A_RESEARCH_POLICY_PATCH", patch_id)
+        if str(patch["project_id"]) != str(project_id):
+            raise GPUError("RESEARCH_PROJECT_MISMATCH", patch_id)
+        if patch["data"].get("engineering_task_id") and not patch["data"].get("implementation_verified"):
+            return {
+                "patch": patch,
+                "decision": "IMPLEMENTATION_REQUIRED",
+                "reason": "ENGINEERING_IMPLEMENTATION_NOT_VERIFIED",
+            }
         if patch["status"] == "REJECTED":
             return {"patch": patch, "decision": "REJECTED", "reason": "duplicate or invalid candidate"}
         implementation = patch["data"].get("implementation_change")
+        try:
+            self._policy_delta(patch["data"].get("semantic_change"))
+            baseline_policy = self.store.object_get(patch["data"]["base_policy_id"])
+            baseline_prompt = self._compile(baseline_policy, "GENERIC")
+            candidate_prompt = self._candidate_prompt(baseline_policy, patch)
+        except GPUError as exc:
+            audit = self._create(
+                project_id,
+                "PolicyEvaluationAudit",
+                {
+                    "patch_id": patch_id,
+                    "outcome": "REJECTED_BEFORE_EVALUATION",
+                    "reason_type": exc.error_type,
+                    "reason": exc.message,
+                    "held_out_access": "NONE",
+                    "evaluator_integrity": "PRESERVED",
+                    "leakage_audit": "PASS",
+                },
+                "POLICY_EVALUATOR_FIREWALL_AUDITED",
+                "COMPLETED",
+            )
+            updated = self.store.object_update(
+                patch_id,
+                {"invalid_evaluation_reason": exc.error_type, "evaluation_audit_id": str(audit["id"])},
+                "INVALID_EVALUATION",
+                "POLICY_PATCH_INVALID",
+            )
+            return {"patch": updated, "decision": "INVALID_EVALUATION", "reason": exc.error_type, "audit": audit}
         if not patch["data"].get("semantic_change") or not isinstance(implementation, dict) or not implementation.get("enabled"):
             updated = self.store.object_update(
                 patch_id,
@@ -237,6 +355,21 @@ class PolicyLabService:
             ).model_dump(mode="json")
             for split in BenchmarkSplit
         }
+        adversarial_indices = [
+            index
+            for index, episode in enumerate(episodes)
+            if episode.benchmark_split == BenchmarkSplit.HELD_OUT
+            and (
+                episode.evaluation_rubric.require_null_model
+                or episode.bad_next_actions
+                or episode.known_dead_lineages
+                or episode.forbidden_future_records
+            )
+        ]
+        adversarial_cards = [cards[index] for index in adversarial_indices]
+        adversarial_baseline_cards = [baseline_cards[index] for index in adversarial_indices]
+        adversarial = self.bench.aggregate(adversarial_cards).model_dump(mode="json")
+        adversarial_baseline = self.bench.aggregate(adversarial_baseline_cards).model_dump(mode="json")
         hard_rate_metrics = {
             "future_information_leakage_rate",
             "scope_violation_rate",
@@ -249,6 +382,13 @@ class PolicyLabService:
             if aggregate["metrics"].get(name, {}).get("mean") not in (None, 0)
             and aggregate["metrics"][name]["mean"] > baseline["metrics"].get(name, {}).get("mean", 0)
         ]
+        adversarial_regressions = [
+            name
+            for name in hard_rate_metrics
+            if adversarial["metrics"].get(name, {}).get("mean") not in (None, 0)
+            and adversarial["metrics"][name]["mean"] > adversarial_baseline["metrics"].get(name, {}).get("mean", 0)
+        ]
+        regressions.extend(f"adversarial:{name}" for name in adversarial_regressions)
         held_out = split_cards[BenchmarkSplit.HELD_OUT.value]
         held_out_has_data = held_out["scorecards"] > 0
         no_primary_gain = (
@@ -263,22 +403,25 @@ class PolicyLabService:
         experiment = self._create(project_id, "PolicyExperiment", {
             "baseline_policy_id": patch["data"]["base_policy_id"], "candidate_patch_id": patch_id,
             "policy_hypothesis_id": patch["data"]["policy_hypothesis_id"], "benchmark_version": "brain-bench-v2.5",
+            "evaluator_version": "policy-evaluator-v3",
+            "judge_configuration": {"runner": "deterministic-policy-runner", "blind_candidate_payload": True},
             "splits": {
                 "development": [e.episode_id for e in episodes if e.benchmark_split == BenchmarkSplit.DEVELOPMENT],
                 "validation": [e.episode_id for e in episodes if e.benchmark_split == BenchmarkSplit.VALIDATION],
                 "held_out": [e.episode_id for e in episodes if e.benchmark_split == BenchmarkSplit.HELD_OUT],
             },
-            "models": ["deterministic-policy-runner"], "seeds": [], "results": {"baseline": baseline, "overall": aggregate, "by_split": split_cards},
+            "models": ["deterministic-policy-runner"], "seeds": [], "results": {"baseline": baseline, "overall": aggregate, "by_split": split_cards, "adversarial_falsification": {"episode_ids": [episodes[index].episode_id for index in adversarial_indices], "baseline": adversarial_baseline, "candidate": adversarial, "regressions": adversarial_regressions}},
+            "compiled_prompts": {"baseline": {key: baseline_prompt[key] for key in ("content_hash", "compiled_prompt_tokens")}, "candidate": {key: candidate_prompt[key] for key in ("content_hash", "compiled_prompt_tokens")}},
             "regressions": regressions, "decision": status, "confidence": "LIMITED", "namespace": "BENCHMARK",
         }, "POLICY_EXPERIMENT_COMPLETED", status)
-        updated = self.store.object_update(patch_id, {"experiment_id": str(experiment["id"]), "benchmark_results": aggregate, "regressions": regressions}, status, "POLICY_PATCH_EVALUATED")
+        updated = self.store.object_update(patch_id, {"experiment_id": str(experiment["id"]), "benchmark_results": aggregate, "regressions": regressions, "generated_prompt_diff": {"baseline_hash": baseline_prompt["content_hash"], "candidate_hash": candidate_prompt["content_hash"], "token_delta": candidate_prompt["compiled_prompt_tokens"] - baseline_prompt["compiled_prompt_tokens"]}}, status, "POLICY_PATCH_EVALUATED")
         if status == "REJECTED":
             self._create(project_id, "PolicyNegativeResult", {"proposal": patch_id, "source": "automatic benchmark", "expected_improvement": patch["data"]["expected_effect"], "observed_result": aggregate, "failure_mode": "hard benchmark regression", "regressions": regressions, "benchmark_scope": "development", "models_tested": ["deterministic-policy-runner"], "revisit_condition": "materially different mechanism", "related_policy_patches": [patch_id], "semantic_fingerprint": patch["data"]["semantic_fingerprint"]}, "POLICY_NEGATIVE_RESULT_CREATED", "REJECTED")
         return {"patch": updated, "experiment": experiment, "decision": status}
 
-    def _revise(self, project_id: str, rejected_patch: dict[str, Any]) -> dict[str, Any] | None:
+    def _revise(self, project_id: str, rejected_patch: dict[str, Any], *, max_revisions: int | None = None) -> dict[str, Any] | None:
         revision = int(rejected_patch["data"].get("revision_count", 0)) + 1
-        if revision > self.max_revisions:
+        if revision > (self.max_revisions if max_revisions is None else max_revisions):
             return None
         data = {
             **rejected_patch["data"],
@@ -289,7 +432,36 @@ class PolicyLabService:
         data["semantic_fingerprint"] = self._fingerprint(data["semantic_change"])
         return self._create(project_id, "ResearchPolicyPatch", data, "POLICY_PATCH_REVISED", "CANDIDATE")
 
-    def improve(self, project_id: str, *, idea: str | None = None, paper: str | None = None, failure: str | None = None, component: str | None = None, search: bool = False) -> dict[str, Any]:
+    def _tournament(self, project_id: str, supported: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """Compare surviving candidates on the frozen benchmark; never combine by brute force."""
+        if len(supported) < 2:
+            return None
+        participants = []
+        for evaluation in supported:
+            patch = evaluation["patch"]
+            metrics = patch["data"].get("benchmark_results", {}).get("metrics", {})
+            primary = metrics.get("strong_next_action_recall", {}).get("mean")
+            participants.append({"patch_id": str(patch["id"]), "primary_score": primary if isinstance(primary, (int, float)) else -1.0})
+        ranked = sorted(participants, key=lambda item: (-item["primary_score"], item["patch_id"]))
+        return self._create(
+            project_id,
+            "PolicyTournament",
+            {
+                "candidate_patch_ids": [item["patch_id"] for item in ranked],
+                "primary_metric": "strong_next_action_recall",
+                "ranking": ranked,
+                "winner_patch_id": ranked[0]["patch_id"],
+                "combination_policy": "No combinations evaluated without an explicit complementarity hypothesis.",
+            },
+            "POLICY_TOURNAMENT_COMPLETED",
+            "COMPLETED",
+        )
+
+    def improve(self, project_id: str, *, idea: str | None = None, paper: str | None = None, failure: str | None = None, component: str | None = None, search: bool = False, prompt: bool = False, candidate_budget: int | None = None, max_revisions: int | None = None, source_context: dict[str, list[str]] | None = None, diagnostic_hypotheses: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        if candidate_budget is not None and candidate_budget < 1:
+            raise GPUError("POLICY_CANDIDATE_BUDGET_EXHAUSTED", "candidate_budget must be at least one")
+        if max_revisions is not None and max_revisions < 0:
+            raise GPUError("POLICY_REVISION_BUDGET_INVALID", "max_revisions must be non-negative")
         policy = self.ensure_production_policy(project_id)
         source_type = "USER_IDEA" if idea else "PAPER" if paper else "BENCHMARK_FAILURE" if failure else "INTERNAL_META_REVIEW"
         problem = idea or failure or (
@@ -298,12 +470,16 @@ class PolicyLabService:
             else "Repeated closed-cycle low-value research decisions"
         )
         weaknesses = [] if (idea or paper or failure) else self.detect_weaknesses(project_id, component)
-        hypotheses = self._hypotheses_for(project_id, source_type, problem, component or "experiment_selection")
+        source_ids = sorted({item for values in (source_context or {}).values() for item in values})
+        hypotheses = self._hypotheses_for(project_id, source_type, problem, component or "experiment_selection", limit=candidate_budget or 3, source_ids=source_ids, diagnostic_hypotheses=diagnostic_hypotheses)
         patches = [self._patch(project_id, policy, h) for h in hypotheses]
+        if prompt:
+            for patch in patches:
+                patch["data"].update({"patch_type": "PROMPT_PRESENTATION", "affected_policy_sections": ["decision_policy"], "prompt_mode": True})
         evaluations = [self.evaluate(project_id, str(p["id"])) for p in patches] if self.auto_evaluate else []
         if self.auto_revise:
             revisions = [
-                self._revise(project_id, evaluation["patch"])
+                self._revise(project_id, evaluation["patch"], max_revisions=max_revisions)
                 for evaluation in evaluations
                 if evaluation["decision"] == "REJECTED"
             ]
@@ -311,18 +487,40 @@ class PolicyLabService:
             patches.extend(revisions)
             evaluations.extend(self.evaluate(project_id, str(patch["id"])) for patch in revisions)
         supported = [e for e in evaluations if e["decision"] == "SUPPORTED_ON_BENCHMARK"]
-        run = self._create(project_id, "ImprovementRun", {"input": {"idea": idea, "paper": paper, "failure": failure, "component": component, "search": search}, "base_policy_id": str(policy["id"]), "weakness_ids": [str(w["id"]) for w in weaknesses], "hypothesis_ids": [str(h["id"]) for h in hypotheses], "patch_ids": [str(p["id"]) for p in patches], "evaluation_ids": [str(e["experiment"]["id"]) for e in evaluations if e.get("experiment")], "invalid_patch_ids": [str(e["patch"]["id"]) for e in evaluations if e["decision"] == "INVALID_EVALUATION"], "best_supported_patch_id": str(supported[0]["patch"]["id"]) if supported else None, "recommendation": "PROMOTE" if supported else "REJECT_OR_REVISE", "production_unchanged": True, "namespace": "META_RESEARCH"}, "IMPROVEMENT_RUN_COMPLETED", "COMPLETED")
-        return {"improvement_run": run, "production_policy_id": str(policy["id"]), "weaknesses": weaknesses, "hypotheses": hypotheses, "patches": patches, "evaluations": evaluations, "recommendation": run["data"]["recommendation"]}
+        tournament = self._tournament(project_id, supported)
+        best_patch_id = tournament["data"]["winner_patch_id"] if tournament else str(supported[0]["patch"]["id"]) if supported else None
+        run = self._create(project_id, "ImprovementRun", {"input": {"idea": idea, "paper": paper, "failure": failure, "component": component, "search": search, "prompt": prompt}, "source_context": source_context or {}, "diagnostic_hypotheses": diagnostic_hypotheses or [], "budget": {"candidate_budget": candidate_budget or 3, "max_revisions": self.max_revisions if max_revisions is None else max_revisions}, "base_policy_id": str(policy["id"]), "weakness_ids": [str(w["id"]) for w in weaknesses], "hypothesis_ids": [str(h["id"]) for h in hypotheses], "patch_ids": [str(p["id"]) for p in patches], "evaluation_ids": [str(e["experiment"]["id"]) for e in evaluations if e.get("experiment")], "invalid_patch_ids": [str(e["patch"]["id"]) for e in evaluations if e["decision"] == "INVALID_EVALUATION"], "tournament_id": str(tournament["id"]) if tournament else None, "best_supported_patch_id": best_patch_id, "recommendation": "PROMOTE" if supported else "REJECT_OR_REVISE", "production_unchanged": True, "namespace": "META_RESEARCH"}, "IMPROVEMENT_RUN_COMPLETED", "COMPLETED")
+        return {"improvement_run": run, "production_policy_id": str(policy["id"]), "weaknesses": weaknesses, "hypotheses": hypotheses, "patches": patches, "evaluations": evaluations, "tournament": tournament, "recommendation": run["data"]["recommendation"]}
 
     def promote(self, project_id: str, patch_id: str) -> dict[str, Any]:
         patch = self.store.object_get(patch_id)
+        if patch["kind"] != "ResearchPolicyPatch" or str(patch["project_id"]) != str(project_id):
+            raise GPUError("RESEARCH_PROJECT_MISMATCH", patch_id)
         if patch["status"] not in {"SUPPORTED_ON_BENCHMARK", "CROSS_PROJECT_SUPPORTED", "CROSS_MODEL_SUPPORTED", "RECOMMENDED_FOR_PROMOTION"}:
             raise GPUError("POLICY_PROMOTION_NOT_SUPPORTED", "Policy patch lacks required evidence")
         current = self.ensure_production_policy(project_id)
         next_version = max([int(p["data"].get("version", 0)) for p in self._objects(project_id, "ResearchPolicy")] or [0]) + 1
-        data = {**current["data"], "version": next_version, "parent_policy_id": str(current["id"]), "provenance": {"source_type": "POLICY_PATCH", "patch_id": patch_id}, "notes": f"Promoted patch {patch_id}", "applied_patch_ids": [patch_id]}
+        delta = self._policy_delta(patch["data"]["semantic_change"]).model_dump(mode="json")
+        self._validate_core_patch(patch)
+        prediction = patch["data"].get("benchmark_results", {}).get("metrics", {}).get("strong_next_action_recall", {}).get("mean")
+        experiment_id = patch["data"].get("experiment_id")
+        experiment = self.store.object_get(str(experiment_id)) if experiment_id else None
+        evaluation_provenance = {
+            "benchmark_version": experiment["data"].get("benchmark_version"),
+            "evaluator_version": experiment["data"].get("evaluator_version"),
+            "judge_configuration": experiment["data"].get("judge_configuration"),
+            "policy_experiment_id": str(experiment_id),
+        } if experiment else None
+        data = {**current["data"], **{section: {**current["data"].get(section, {}), **change} for section, change in delta.items() if change}, "version": next_version, "parent_policy_id": str(current["id"]), "provenance": {"source_type": "POLICY_PATCH", "patch_id": patch_id, "evaluation": evaluation_provenance}, "notes": f"Promoted patch {patch_id}", "applied_patch_ids": [patch_id], "applied_policy_delta": delta, "policy_benchmark_prediction": prediction}
+        transactional_promote = getattr(self.store, "production_policy_promote", None)
+        if callable(transactional_promote):
+            promoted = transactional_promote(project_id, str(current["id"]), data)
+            self._compile_production_artifacts(promoted)
+            return promoted
         self.store.object_update(str(current["id"]), {}, "SUPERSEDED", "RESEARCH_POLICY_SUPERSEDED")
-        return self._create(project_id, "ResearchPolicy", data, "RESEARCH_POLICY_PROMOTED", "PRODUCTION")
+        promoted = self._create(project_id, "ResearchPolicy", data, "RESEARCH_POLICY_PROMOTED", "PRODUCTION")
+        self._compile_production_artifacts(promoted)
+        return promoted
 
     def classify_transfer(
         self,
@@ -357,15 +555,372 @@ class PolicyLabService:
             "POLICY_EXPERIMENT_TRANSFER_CLASSIFIED",
         )
 
+    def evaluate_provider_compatibility(self, project_id: str, provider: str, model: str) -> dict[str, Any]:
+        """Persist a compact adapter-compatibility check without claiming live-model transfer.
+
+        Compiling the canonical policy checks that an adapter can express the
+        invariants.  It is intentionally *not* evidence that the named model
+        follows those instructions; such evidence requires an available model
+        runner and is recorded as cross-model support separately.
+        """
+        policy = self.ensure_production_policy(project_id)
+        normalized = provider.strip().upper()
+        target_provider = {"OPENAI": "OPENAI_API", "ANTHROPIC": "CLAUDE_API"}.get(normalized, normalized)
+        if target_provider not in PROVIDERS:
+            target_provider = "GENERIC"
+        artifact = self.compile_policy(str(policy["id"]), target_provider)
+        return self._create(
+            project_id,
+            "PolicyExperiment",
+            {
+                "baseline_policy_id": str(policy["id"]),
+                "candidate_patch_id": None,
+                "policy_hypothesis_id": None,
+                "benchmark_version": "provider-compatibility-v3",
+                "provider": provider,
+                "model": model,
+                "adapter_provider": target_provider,
+                "compiled_prompt": {key: artifact["data"].get(key) for key in ("content_hash", "compiled_prompt_tokens")},
+                "results": {"adapter_compilation": "PASS", "live_model_evaluation": "UNAVAILABLE"},
+                "transfer_classification": "CROSS_MODEL_UNVERIFIED",
+                "namespace": "BENCHMARK",
+            },
+            "POLICY_COMPATIBILITY_EVALUATED",
+            "CROSS_MODEL_UNVERIFIED",
+        )
+
+    def provider_adapter_candidate(self, project_id: str, provider: str, model: str, compatibility_experiment_id: str) -> dict[str, Any]:
+        """Create a non-promotable adapter proposal after a model change.
+
+        Compilation proves only that a canonical policy can be rendered. A
+        separate live provider evaluation must support this candidate before it
+        could become part of a promoted ResearchPolicy.
+        """
+        compatibility = self.store.object_get(compatibility_experiment_id)
+        if compatibility["kind"] != "PolicyExperiment" or str(compatibility["project_id"]) != str(project_id):
+            raise GPUError("POLICY_COMPATIBILITY_EXPERIMENT_REQUIRED", compatibility_experiment_id)
+        normalized = provider.strip().lower()
+        fingerprint = self._fingerprint({"provider": normalized, "model": model, "compatibility": compatibility_experiment_id})
+        existing = next(
+            (item for item in self._objects(project_id, "ProviderAdapterCandidate") if item["data"].get("fingerprint") == fingerprint),
+            None,
+        )
+        if existing:
+            return existing
+        policy = self.ensure_production_policy(project_id)
+        return self._create(
+            project_id,
+            "ProviderAdapterCandidate",
+            {
+                "fingerprint": fingerprint,
+                "base_policy_id": str(policy["id"]),
+                "provider": provider,
+                "model": model,
+                "compatibility_experiment_id": compatibility_experiment_id,
+                "adapter_data": {"provider": normalized, "model": model, "instruction_format": "provider_specific_canonical_policy"},
+                "evaluation_status": "LIVE_MODEL_EVALUATION_REQUIRED",
+                "promotion_status": "NOT_ELIGIBLE_WITHOUT_CROSS_MODEL_SUPPORT",
+                "authority": "CANDIDATE_ONLY",
+            },
+            "PROVIDER_ADAPTER_CANDIDATE_CREATED",
+            "CANDIDATE",
+        )
+
+    def provider_adapter_evaluate(self, project_id: str, candidate_id: str, evidence_ids: list[str], live_result: str) -> dict[str, Any]:
+        """Record bounded live adapter evidence; compilation alone remains insufficient."""
+        candidate = self.store.object_get(candidate_id)
+        if candidate["kind"] != "ProviderAdapterCandidate" or str(candidate["project_id"]) != str(project_id):
+            raise GPUError("PROVIDER_ADAPTER_CANDIDATE_REQUIRED", candidate_id)
+        if candidate["status"] != "CANDIDATE":
+            raise GPUError("PROVIDER_ADAPTER_NOT_EVALUABLE", candidate["status"])
+        if live_result not in {"PASS", "FAIL"} or not evidence_ids:
+            raise GPUError("PROVIDER_ADAPTER_EVIDENCE_INVALID", "PASS/FAIL and at least one durable evidence ID are required")
+        for evidence_id in evidence_ids:
+            evidence = self.store.object_get(str(evidence_id))
+            if str(evidence["project_id"]) != str(project_id):
+                raise GPUError("RESEARCH_PROJECT_MISMATCH", str(evidence_id))
+        status = "CROSS_MODEL_SUPPORTED" if live_result == "PASS" else "REJECTED"
+        experiment = self._create(
+            project_id,
+            "PolicyExperiment",
+            {
+                "baseline_policy_id": candidate["data"]["base_policy_id"],
+                "candidate_patch_id": None,
+                "provider_adapter_candidate_id": candidate_id,
+                "benchmark_version": "provider-adapter-live-v3",
+                "provider": candidate["data"]["provider"],
+                "model": candidate["data"]["model"],
+                "evidence_ids": [str(item) for item in evidence_ids],
+                "results": {"live_model_evaluation": live_result},
+                "transfer_classification": status,
+                "namespace": "BENCHMARK",
+            },
+            "PROVIDER_ADAPTER_EVALUATED",
+            status,
+        )
+        return self.store.object_update(
+            candidate_id,
+            {"evaluation_status": status, "live_evaluation_experiment_id": str(experiment["id"]), "evidence_ids": [str(item) for item in evidence_ids]},
+            status,
+            "PROVIDER_ADAPTER_EVALUATION_RECORDED",
+        )
+
+    def provider_adapter_promote(self, project_id: str, candidate_id: str) -> dict[str, Any]:
+        """Promote only a live-supported adapter into a scoped policy descendant."""
+        candidate = self.store.object_get(candidate_id)
+        if candidate["kind"] != "ProviderAdapterCandidate" or str(candidate["project_id"]) != str(project_id):
+            raise GPUError("PROVIDER_ADAPTER_CANDIDATE_REQUIRED", candidate_id)
+        if candidate["status"] != "CROSS_MODEL_SUPPORTED":
+            raise GPUError("PROVIDER_ADAPTER_PROMOTION_NOT_SUPPORTED", candidate["status"])
+        current = self.ensure_production_policy(project_id)
+        next_version = max([int(policy["data"].get("version", 0)) for policy in self._objects(project_id, "ResearchPolicy")] or [0]) + 1
+        key = str(candidate["data"]["provider"]).strip().lower()
+        data = {
+            **current["data"],
+            "version": next_version,
+            "parent_policy_id": str(current["id"]),
+            "provider_adapters": {**current["data"].get("provider_adapters", {}), key: candidate["data"]["adapter_data"]},
+            "provenance": {"source_type": "PROVIDER_ADAPTER_CANDIDATE", "candidate_id": candidate_id, "live_evaluation_experiment_id": candidate["data"].get("live_evaluation_experiment_id")},
+            "notes": f"Promoted provider adapter {candidate_id}",
+        }
+        transactional_promote = getattr(self.store, "production_policy_promote", None)
+        if callable(transactional_promote):
+            promoted = transactional_promote(project_id, str(current["id"]), data)
+        else:
+            self.store.object_update(str(current["id"]), {}, "SUPERSEDED", "RESEARCH_POLICY_SUPERSEDED")
+            promoted = self._create(project_id, "ResearchPolicy", data, "PROVIDER_ADAPTER_PROMOTED", "PRODUCTION")
+        self._compile_production_artifacts(promoted)
+        self.store.object_update(candidate_id, {"promoted_policy_id": str(promoted["id"]), "promotion_status": "PROMOTED"}, "COMPLETED", "PROVIDER_ADAPTER_PROMOTED")
+        return promoted
+
     def rollback(self, project_id: str, policy_id: str) -> dict[str, Any]:
         target = self.store.object_get(policy_id)
         if target["kind"] != "ResearchPolicy" or str(target["project_id"]) != project_id:
             raise GPUError("INVALID_POLICY_ROLLBACK_TARGET", policy_id)
         current = self.ensure_production_policy(project_id)
         if str(current["id"]) != policy_id:
-            self.store.object_update(str(current["id"]), {}, "SUPERSEDED", "RESEARCH_POLICY_SUPERSEDED")
+            transactional_rollback = getattr(self.store, "production_policy_rollback", None)
+            if callable(transactional_rollback):
+                return transactional_rollback(project_id, str(current["id"]), policy_id)
+            self.store.object_update(str(current["id"]), {}, "ROLLED_BACK", "RESEARCH_POLICY_ROLLED_BACK")
             return self.store.object_update(policy_id, {"rollback_from_policy_id": str(current["id"])}, "PRODUCTION", "RESEARCH_POLICY_ROLLED_BACK")
         return target
+
+    def restrict_policy(self, project_id: str, policy_id: str, status: str, reason: str) -> dict[str, Any]:
+        """Apply a non-destructive lifecycle restriction to a non-production policy."""
+        if status not in {"DEPRECATED", "MODEL_INCOMPATIBLE", "DOMAIN_RESTRICTED"}:
+            raise GPUError("POLICY_LIFECYCLE_STATUS_INVALID", status)
+        policy = self.store.object_get(policy_id)
+        if policy["kind"] != "ResearchPolicy" or str(policy["project_id"]) != str(project_id):
+            raise GPUError("RESEARCH_PROJECT_MISMATCH", policy_id)
+        if policy["status"] == "PRODUCTION":
+            raise GPUError("POLICY_PRODUCTION_RESTRICTION_REQUIRES_ROLLBACK", "rollback or promote a replacement first")
+        return self.store.object_update(
+            policy_id,
+            {"lifecycle_restriction_reason": reason},
+            status,
+            "RESEARCH_POLICY_RESTRICTED",
+        )
+
+    def code_patch_prepare(self, project_id: str, patch_id: str, code_change: dict[str, Any]) -> dict[str, Any]:
+        """Hand a bounded code-bearing policy patch to the existing engineering workflow."""
+        patch = self.store.object_get(patch_id)
+        if patch["kind"] != "ResearchPolicyPatch" or str(patch["project_id"]) != str(project_id):
+            raise GPUError("RESEARCH_PROJECT_MISMATCH", patch_id)
+        if not isinstance(code_change, dict):
+            raise GPUError("POLICY_CODE_CHANGE_INVALID", "code_change must be an object")
+        files = code_change.get("files", [])
+        tests = code_change.get("tests", [])
+        purpose = str(code_change.get("purpose", "")).strip()
+        if not purpose or not isinstance(files, list) or not files or len(files) > 10 or not isinstance(tests, list) or not tests:
+            raise GPUError("POLICY_CODE_CHANGE_INVALID", "purpose, 1-10 files, and tests are required")
+        prohibited = {".env", "docker-compose.yml", "src/gpu_lab/research.py"}
+        if any(str(path) in prohibited for path in files):
+            raise GPUError("POLICY_CODE_CHANGE_CORE_SYSTEM", "core data/security files require stronger review")
+        task_data = {
+            "purpose": purpose,
+            "task_type": "BUG_FIX",
+            "change_request": str(code_change.get("change_request", patch["data"].get("semantic_change", ""))),
+            "relevant_files": [str(path) for path in files],
+            "targeted_tests": [str(test) for test in tests],
+            "broader_tests": ["pytest -q", "ruff check src tests"],
+            "prohibited_changes": sorted(prohibited),
+            "engineering_invariants": {"bounded_policy_patch": True, "scientific_truth_unchanged": True},
+        }
+        if self.engineering_service:
+            task = self.engineering_service.task_create(project_id, **task_data)
+            task = self.store.object_update(
+                str(task["id"]),
+                {"policy_patch_id": patch_id},
+                "OPEN",
+                "POLICY_CODE_ENGINEERING_TASK_LINKED",
+            )
+        else:
+            # Lightweight test stores may not supply the v2.2 service. Keep a
+            # contract-shaped fallback; production always injects the service.
+            task = self._create(
+                project_id,
+                "EngineeringTask",
+                {**task_data, "implementation_guards": [], "policy_patch_id": patch_id, "scientific_result": "NOT_ASSESSED"},
+                "POLICY_CODE_ENGINEERING_TASK_CREATED",
+                "OPEN",
+            )
+        updated = self.store.object_update(
+            patch_id,
+            {"code_change": code_change, "engineering_task_id": str(task["id"]), "implementation_verified": False},
+            "IMPLEMENTED_UNVERIFIED",
+            "POLICY_CODE_PATCH_PREPARED",
+        )
+        return {"patch": updated, "engineering_task": task}
+
+    def code_patch_result_sync(self, project_id: str, task_id: str) -> dict[str, Any] | None:
+        """Advance a code-bearing policy patch only from durable v2.2 evidence.
+
+        Passing implementation checks never counts as policy evidence; it merely
+        unlocks the pre-registered benchmark. This method does not execute code.
+        """
+        task = self.store.object_get(task_id)
+        if task["kind"] != "EngineeringTask" or str(task["project_id"]) != str(project_id):
+            raise GPUError("RESEARCH_PROJECT_MISMATCH", task_id)
+        patch_id = task["data"].get("policy_patch_id")
+        if not patch_id:
+            return None
+        patch = self.store.object_get(str(patch_id))
+        if patch["kind"] != "ResearchPolicyPatch" or str(patch["project_id"]) != str(project_id):
+            raise GPUError("RESEARCH_PROJECT_MISMATCH", str(patch_id))
+        result_id = task["data"].get("latest_result_id")
+        if not result_id:
+            return {"patch": patch, "decision": "IMPLEMENTATION_REQUIRED", "task_id": task_id}
+        result = self.store.object_get(str(result_id))
+        if result["kind"] != "EngineeringResult" or str(result["project_id"]) != str(project_id):
+            raise GPUError("ENGINEERING_RESULT_REQUIRED", str(result_id))
+        verification = result["data"].get("implementation_verification", "UNVERIFIED")
+        ready = verification in {"VERIFIED_TARGETED", "VERIFIED_INTEGRATION", "VERIFIED_REAL_EXECUTION"}
+        if not ready:
+            updated = self.store.object_update(
+                str(patch_id),
+                {"engineering_result_id": str(result_id), "implementation_verified": False, "implementation_failure": verification},
+                "REJECTED",
+                "POLICY_CODE_IMPLEMENTATION_REJECTED",
+            )
+            negative = self._create(
+                project_id,
+                "PolicyNegativeResult",
+                {
+                    "proposal": str(patch_id),
+                    "source": "engineering implementation verification",
+                    "expected_improvement": patch["data"].get("expected_effect"),
+                    "observed_result": {"engineering_result_id": str(result_id), "verification": verification},
+                    "failure_mode": "implementation not verified",
+                    "revisit_condition": "submit a materially different bounded implementation with verified results",
+                    "related_policy_patches": [str(patch_id)],
+                    "semantic_fingerprint": patch["data"].get("semantic_fingerprint"),
+                },
+                "POLICY_NEGATIVE_RESULT_CREATED",
+                "REJECTED",
+            )
+            return {"patch": updated, "decision": "IMPLEMENTATION_REJECTED", "engineering_result": result, "negative_result": negative}
+        updated = self.store.object_update(
+            str(patch_id),
+            {"engineering_result_id": str(result_id), "implementation_verified": True, "implementation_verification": verification},
+            "CANDIDATE",
+            "POLICY_CODE_IMPLEMENTATION_VERIFIED",
+        )
+        evaluation = self.evaluate(project_id, str(patch_id)) if self.auto_evaluate else None
+        return {"patch": updated, "decision": "READY_FOR_EVALUATION", "engineering_result": result, "evaluation": evaluation}
+
+    def start_canary(self, project_id: str, candidate_policy_id: str, percentage: int = 10) -> dict[str, Any]:
+        """Create a bounded prospective canary plan without changing production policy."""
+        if not 1 <= percentage <= 50:
+            raise GPUError("POLICY_CANARY_PERCENTAGE_INVALID", "percentage must be between 1 and 50")
+        candidate = self.store.object_get(candidate_policy_id)
+        if candidate["kind"] != "ResearchPolicy" or str(candidate["project_id"]) != str(project_id):
+            raise GPUError("INVALID_POLICY_CANARY_TARGET", candidate_policy_id)
+        production = self.ensure_production_policy(project_id)
+        if str(production["id"]) == candidate_policy_id:
+            raise GPUError("POLICY_CANARY_BASELINE_INVALID", "candidate must differ from current production policy")
+        return self._create(
+            project_id,
+            "PolicyCanary",
+            {
+                "candidate_policy_id": candidate_policy_id,
+                "baseline_policy_id": str(production["id"]),
+                "percentage": percentage,
+                "scope": candidate["data"].get("applicability", {}).get("scope", "PROJECT"),
+                "decision_count": 0,
+                "stop_conditions": ["hard epistemic regression", "severe negative transfer", "cost budget exceeded"],
+            },
+            "POLICY_CANARY_STARTED",
+            "ACTIVE",
+        )
+
+    def record_canary_observation(
+        self,
+        canary_id: str,
+        decision_id: str,
+        observed_behavior: dict[str, Any],
+        *,
+        hard_epistemic_regression: bool = False,
+    ) -> dict[str, Any]:
+        """Append prospective canary evidence and stop immediately on a hard regression."""
+        canary = self.store.object_get(canary_id)
+        if canary["kind"] != "PolicyCanary":
+            raise GPUError("NOT_A_POLICY_CANARY", canary_id)
+        if canary["status"] != "ACTIVE":
+            raise GPUError("POLICY_CANARY_NOT_ACTIVE", canary_id)
+        observations = list(canary["data"].get("observations", []))
+        if any(item.get("decision_id") == decision_id for item in observations):
+            return canary
+        observations.append(
+            {
+                "decision_id": decision_id,
+                "observed_behavior": observed_behavior,
+                "hard_epistemic_regression": hard_epistemic_regression,
+                "recorded_at": datetime.now(UTC).isoformat(),
+            }
+        )
+        status = "COMPLETED" if hard_epistemic_regression else "ACTIVE"
+        update = {"observations": observations, "decision_count": len(observations)}
+        if hard_epistemic_regression:
+            update["stop_reason"] = "hard epistemic regression"
+        return self.store.object_update(
+            canary_id,
+            update,
+            status,
+            "POLICY_CANARY_STOPPED" if hard_epistemic_regression else "POLICY_CANARY_OBSERVATION_RECORDED",
+        )
+
+    def record_shadow(
+        self,
+        project_id: str,
+        production_policy_id: str,
+        shadow_policy_id: str,
+        decision_id: str,
+        production_action: dict[str, Any],
+        shadow_action: dict[str, Any],
+        observed_production_result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Persist an observational shadow comparison without inventing B's outcome."""
+        production = self.store.object_get(production_policy_id)
+        shadow = self.store.object_get(shadow_policy_id)
+        if any(item["kind"] != "ResearchPolicy" or str(item["project_id"]) != str(project_id) for item in (production, shadow)):
+            raise GPUError("INVALID_POLICY_SHADOW_TARGET", "policies must belong to project")
+        return self._create(
+            project_id,
+            "PolicyShadowEvaluation",
+            {
+                "production_policy_id": production_policy_id,
+                "shadow_policy_id": shadow_policy_id,
+                "decision_id": decision_id,
+                "production_action": production_action,
+                "shadow_action": shadow_action,
+                "observed_production_result": observed_production_result,
+                "counterfactual_status": "COUNTERFACTUAL_UNKNOWN",
+                "interpretation": "Only the production action's result is observed; the shadow action was not executed.",
+            },
+            "POLICY_SHADOW_RECORDED",
+            "COMPLETED",
+        )
 
     def policy_diff(self, base_policy_id: str, candidate_policy_id: str) -> dict[str, Any]:
         base, candidate = self.store.object_get(base_policy_id), self.store.object_get(candidate_policy_id)
@@ -407,6 +962,7 @@ class PolicyLabService:
         observed_improvement: float | None,
         observed_cost: float | None,
         unexpected_failure: str | None = None,
+        decision_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         """Record post-promotion operational evidence without changing scientific state."""
         policy = self.store.object_get(policy_id)
@@ -415,17 +971,35 @@ class PolicyLabService:
         history = list(policy["data"].get("post_promotion_hindsight", []))
         history.append({
             "recorded_at": datetime.now(UTC).isoformat(),
+            "decision_ids": decision_ids or [],
             "observed_improvement": observed_improvement,
             "observed_cost": observed_cost,
             "unexpected_failure": unexpected_failure,
         })
-        predicted = policy["data"].get("benchmark_results", {}).get("strong_next_action_recall")
+        predicted = policy["data"].get("policy_benchmark_prediction")
         calibration = None
         if isinstance(predicted, (int, float)) and observed_improvement is not None:
             calibration = observed_improvement - predicted
-        return self.store.object_update(
+        updated = self.store.object_update(
             policy_id,
             {"post_promotion_hindsight": history, "policy_calibration_error": calibration},
             policy["status"],
             "RESEARCH_POLICY_HINDSIGHT_RECORDED",
         )
+        self._create(
+            str(policy["project_id"]),
+            "PolicyHindsight",
+            {
+                "policy_id": policy_id,
+                "decision_ids": decision_ids or [],
+                "predicted_benefit": predicted,
+                "observed_improvement": observed_improvement,
+                "actual_cost": observed_cost,
+                "unexpected_failure": unexpected_failure,
+                "scope": policy["data"].get("applicability", {}).get("scope", "PROJECT"),
+                "calibration_error": calibration,
+            },
+            "RESEARCH_POLICY_HINDSIGHT_RECORDED",
+            "COMPLETED",
+        )
+        return updated

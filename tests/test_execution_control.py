@@ -90,6 +90,14 @@ class BindingBrain:
         return {"id": args[1], "data": {"execution_binding": {"experiment_id": args[0]}}}
 
 
+class DecisionCreatingBrain(BindingBrain):
+    def brain_step(self, _project_id):
+        return {
+            "decision_id": "decision-id",
+            "large_durable_trace": "x" * 100_000,
+        }
+
+
 class LegacyReservedResearch:
     def object_get(self, _run_id):
         return {
@@ -182,6 +190,23 @@ async def test_execution_decision_bind_exposes_exact_request_fingerprint(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_decision_create_returns_compact_execution_handoff(monkeypatch):
+    brain = DecisionCreatingBrain()
+    monkeypatch.setattr(server, "brain", lambda: brain)
+
+    result = await server.research_decision_create(
+        "project-id", "experiment-id", "python run.py", "/workspace", {"MODE": "test"}, "torch-env"
+    )
+
+    assert result["decision_id"] == "decision-id"
+    assert result["experiment_id"] == "experiment-id"
+    assert result["next_tool"] == "research_experiment_execute"
+    assert result["execution_binding"] == {"experiment_id": "experiment-id"}
+    assert "large_durable_trace" not in result
+    assert brain.args[:2] == ("experiment-id", "decision-id")
+
+
+@pytest.mark.asyncio
 async def test_sync_promotes_reserved_mapping_when_local_job_exists(monkeypatch):
     research = FakeResearch(_mapping("RESERVED"))
     monkeypatch.setattr(server, "research", lambda: research)
@@ -255,7 +280,7 @@ async def test_legacy_reserved_run_abandon_requires_server_verified_missing_job(
     result = await server.legacy_reserved_run_abandon("run-id", "No local job was submitted")
 
     assert result["status"] == "cancelled"
-    assert brain.args == ("run-id", "missing-job", "No local job was submitted")
+    assert brain.args == ("run-id", "missing-job", "No local job was submitted", False)
 
 
 @pytest.mark.asyncio
@@ -283,7 +308,7 @@ async def test_legacy_reserved_run_abandon_allows_only_verified_abandonment_repl
     result = await server.legacy_reserved_run_abandon("run-id", "No local job was submitted")
 
     assert result["status"] == "cancelled"
-    assert brain.args == ("run-id", "missing-job", "No local job was submitted")
+    assert brain.args == ("run-id", "missing-job", "No local job was submitted", False)
 
 
 @pytest.mark.asyncio

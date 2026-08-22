@@ -256,6 +256,74 @@ def test_postgres_outcome_and_project_strategy_are_one_reassessable_transition()
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_postgres_technical_outcome_marks_failed_run_inspected_without_promoting_science():
+    store = ResearchStore(TEST_DATABASE_URL)
+    project = store.project_create(
+        f"technical-inspection-{time.time_ns()}", "Can a failed run be closed once?"
+    )
+    project_id = project["project_id"]
+    decision = store.object_create(
+        project_id,
+        "ResearchDecision",
+        {
+            "agenda_item_id": "agenda-fixture",
+            "selected_action": {
+                "action_type": "ARTIFACT_ANALYSIS",
+                "payload": {"mode": "INSPECT_FAILURE"},
+            },
+        },
+        "RESEARCH_DECISION_SELECTED",
+        "SELECTED",
+    )
+    run = store.object_create(
+        project_id,
+        "ExperimentRun",
+        {"failure": "validity guard polarity"},
+        "EXPERIMENT_FINISHED",
+        "failed",
+    )
+    outcome = {
+        "project_id": project_id,
+        "decision_id": decision["id"],
+        "before_situation_id": "situation-before",
+        "domain": "point-cloud completion",
+        "problem_signature": "technical-guard-polarity",
+        "research_stage": "RESULT_INSPECTION",
+        "conditions": {},
+        "applicability_conditions": {},
+        "action_type": "ARTIFACT_ANALYSIS",
+        "action_parameters_pattern": {"mode": "INSPECT_FAILURE"},
+        "label": "INVALID",
+        "realized_information_gain": "INVALID",
+        "hindsight_assessment": "The held-out access guard had inverted polarity.",
+        "observed_result": {
+            "prediction_outcome": "INVALID_TECHNICAL_VALIDITY_GUARD_POLARITY",
+            "scientific_result": "NOT_ASSESSED",
+        },
+        "experiment_run_ids": [run["id"]],
+        "evidence_family_ids": [],
+        "failure_conditions": ["technical validity guard polarity"],
+        "retrieved_strategy_pattern_ids": [],
+    }
+
+    result = store.decision_outcome_apply(decision["id"], outcome, _situation())
+
+    persisted_run = store.object_get(run["id"])
+    assert persisted_run["status"] == "failed"
+    assert persisted_run["data"]["inspection"] == {
+        "inspection_kind": "TECHNICAL_FAILURE",
+        "decision_id": decision["id"],
+        "decision_outcome_id": result["outcome"]["id"],
+        "assessed_at": persisted_run["data"]["inspection"]["assessed_at"],
+        "execution_status": "failed",
+        "scientific_result": "NOT_ASSESSED",
+    }
+    assert store.experiment_run_first(project_id, {"failed"}, inspected=False) is None
+    assert store.experiment_run_first(project_id, {"failed"}, inspected=True)["id"] == run["id"]
+    assert result["technically_inspected_experiment_runs"][0]["id"] == run["id"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_postgres_strategy_promotes_project_to_domain_then_global_only_with_scope_evidence():
     store = ResearchStore(TEST_DATABASE_URL)
     nonce = str(time.time_ns())

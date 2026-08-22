@@ -32,6 +32,11 @@ class WorkerRequest(BaseModel):
 WORKER_TOKEN = os.environ.get("GPU_LAB_LITERATURE_WORKER_TOKEN", "")
 
 
+def _provider_value(primary: str, compatible: str) -> str | None:
+    """Read worker-local provider configuration without returning credentials."""
+    return os.environ.get(primary) or os.environ.get(compatible)
+
+
 def _configured_retries() -> int:
     try:
         return int(os.environ.get("GPU_LAB_PAPERQA_MAX_RETRIES", "2"))
@@ -41,8 +46,8 @@ def _configured_retries() -> int:
 
 provider = PaperQALiteratureProvider(
     Path(os.environ.get("GPU_LAB_PAPERQA_DIRECTORY", "/papers")),
-    model=os.environ.get("GPU_LAB_PAPERQA_MODEL"),
-    base_url=os.environ.get("GPU_LAB_PAPERQA_BASE_URL"),
+    model=_provider_value("GPU_LAB_PAPERQA_MODEL", "NGHIMMO_MODEL"),
+    base_url=_provider_value("GPU_LAB_PAPERQA_BASE_URL", "NGHIMMO_BASE_URL"),
     embedding_model=os.environ.get("GPU_LAB_PAPERQA_EMBEDDING_MODEL"),
     max_retries=_configured_retries(),
 )
@@ -102,7 +107,7 @@ async def _run_operator(body: WorkerRequest) -> dict:
             "Operator context must not exceed 200000 UTF-8 bytes",
         )
     configuration_error = provider.configuration_error()
-    api_key = os.environ.get("OPENAI_API_KEY", "")
+    api_key = _provider_value("OPENAI_API_KEY", "NGHIMMO_API_KEY") or ""
     if configuration_error or not provider.model or not provider.base_url or not api_key:
         raise GPUError(
             "RESEARCH_OPERATOR_UNAVAILABLE",
@@ -179,7 +184,7 @@ async def _run_operator(body: WorkerRequest) -> dict:
 async def dispatch(request: Request) -> JSONResponse:
     operation = request.path_params["operation"]
     if operation == "health":
-        api_key_configured = bool(os.environ.get("OPENAI_API_KEY"))
+        api_key_configured = bool(_provider_value("OPENAI_API_KEY", "NGHIMMO_API_KEY"))
         configuration_error = provider.configuration_error()
         return JSONResponse(
             {

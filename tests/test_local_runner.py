@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from pathlib import Path
 
 import pytest
@@ -62,6 +63,45 @@ def test_local_job_environment_excludes_gateway_secrets(monkeypatch, tmp_path):
     } & environment.keys()
 
 
+def test_parse_gpu_metrics_keeps_only_complete_numeric_nvidia_rows():
+    metrics = LocalRunner._parse_gpu_metrics(
+        "0, NVIDIA RTX 4090, 24564, 12000, 87, 64\n"
+        "malformed row\n"
+        "1, NVIDIA RTX 4090, unknown, 200, 5, 41\n"
+    )
+
+    assert metrics == [
+        {
+            "index": 0,
+            "name": "NVIDIA RTX 4090",
+            "memory_total_mb": 24564,
+            "memory_used_mb": 12000,
+            "utilization_percent": 87,
+            "temperature_c": 64,
+        }
+    ]
+
+
+def test_job_status_can_skip_expensive_log_reading(tmp_path):
+    runner = _runner(tmp_path)
+    job = Job(
+        job_id="local_status_without_logs",
+        instance_id="local",
+        repo_path=str(runner.workspace),
+        command="echo done",
+        status="completed",
+    )
+    runner.repo.save_job(job)
+    jobdir = runner.workspace / ".gpu-lab" / "jobs" / job.job_id
+    jobdir.mkdir(parents=True)
+    (jobdir / "stdout.log").write_text("large output is deliberately omitted")
+    (jobdir / "exit_code").write_text("0")
+
+    status = runner.job_status(job.job_id, include_logs=False)
+
+    assert status == {"job_id": job.job_id, "status": "completed", "exit_code": 0}
+
+
 def test_mcp_wildcard_accept_header_allows_json_response():
     headers = [(b"accept", b"text/html, */*"), (b"content-type", b"application/json")]
 
@@ -110,6 +150,21 @@ async def test_call_audits_only_scrubbed_arguments(monkeypatch):
     assert "hidden" not in payload
     assert "top-secret" not in payload
     assert "[REDACTED]" in payload
+
+
+@pytest.mark.asyncio
+async def test_call_runs_synchronous_tools_off_the_event_loop(monkeypatch):
+    class FakeRepository:
+        def audit(self, *_args):
+            return None
+
+    class FakeService:
+        repo = FakeRepository()
+
+    monkeypatch.setattr("gpu_lab.server.svc", lambda: FakeService())
+    event_loop_thread = threading.get_ident()
+
+    assert await call(threading.get_ident) != event_loop_thread
 
 
 def test_mcp_network_policy_blocks_only_the_isolated_worker_subnet():

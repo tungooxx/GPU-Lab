@@ -30,6 +30,12 @@ class Settings(BaseSettings):
     gpu_lab_policy_auto_revise: bool = True
     gpu_lab_policy_auto_promote_production: bool = False
     gpu_lab_policy_max_revisions: int = Field(default=1, ge=0, le=3)
+    # v3 defaults to narrowly-scoped autonomy; domain/global still require an
+    # explicit operator choice and every run remains budgeted.
+    gpu_lab_policy_autonomy_mode: str = "AUTO_PROJECT"
+    gpu_lab_policy_meta_candidate_budget: int = Field(default=3, ge=1, le=10)
+    gpu_lab_policy_meta_benchmark_budget: int = Field(default=6, ge=1, le=30)
+    gpu_lab_policy_meta_literature_budget: int = Field(default=1, ge=0, le=5)
     gpu_lab_embedding_provider: str = "local-hash"
     gpu_lab_embedding_dimension: int = Field(default=384, ge=32, le=4096)
     gpu_lab_research_operator_provider: str = "disabled"
@@ -42,6 +48,19 @@ class Settings(BaseSettings):
     gpu_lab_executable_paper_worker_token: str | None = None
     gpu_lab_approval_secret: str | None = None
     gpu_lab_denied_mcp_client_cidrs: str = ""
+    lab_ui_enabled: bool = False
+    chatgpt_web_bridge_enabled: bool = False
+    autopilot_enabled: bool = False
+    auto_continue_enabled: bool = False
+    live_browser_preview_enabled: bool = False
+    chatgpt_web_profile_root: Path = Path("/var/lib/gpu-lab/chatgpt-web")
+    gpu_lab_worker_max_turns_per_work_item: int = Field(default=20, ge=1, le=100)
+    gpu_lab_worker_max_consecutive_continues: int = Field(default=3, ge=1, le=20)
+    gpu_lab_browser_wake_poll_seconds: int = Field(default=5, ge=1, le=60)
+    gpu_lab_lease_reconciliation_poll_seconds: int = Field(default=30, ge=5, le=300)
+    gpu_lab_dashboard_monitor_enabled: bool = True
+    gpu_lab_cockpit_password: str | None = None
+    gpu_lab_cockpit_session_secret: str | None = None
     fastmcp_host: str = "127.0.0.1"
     fastmcp_port: int = 8000
 
@@ -56,6 +75,14 @@ class Settings(BaseSettings):
         normalized = value.strip().lower()
         if normalized not in {"disabled", "paperqa-http"}:
             raise ValueError("GPU_LAB_LITERATURE_PROVIDER must be disabled or paperqa-http")
+        return normalized
+
+    @field_validator("gpu_lab_policy_autonomy_mode")
+    @classmethod
+    def valid_policy_autonomy_mode(cls, value: str) -> str:
+        normalized = value.strip().upper()
+        if normalized not in {"ADVISORY", "AUTO_PROJECT", "AUTO_DOMAIN", "AUTO_GLOBAL"}:
+            raise ValueError("GPU_LAB_POLICY_AUTONOMY_MODE is invalid")
         return normalized
 
     @field_validator("gpu_lab_embedding_provider")
