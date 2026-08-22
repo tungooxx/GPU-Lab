@@ -4149,7 +4149,7 @@ async def status(_: Request):
 
 @mcp.custom_route("/activity", methods=["GET"], include_in_schema=False)
 async def activity(_: Request):
-    return JSONResponse(svc().repo.list_audit(100))
+    return JSONResponse(await asyncio.to_thread(svc().repo.list_audit, 100))
 
 
 def _prioritise_monitor_jobs(running: list, queued: list, recent: list, limit: int = 30) -> list:
@@ -4165,17 +4165,8 @@ def _prioritise_monitor_jobs(running: list, queued: list, recent: list, limit: i
     return selected
 
 
-@mcp.custom_route("/monitor", methods=["GET"], include_in_schema=False)
-async def monitor(_: Request):
-    """Return real local-job state and GPU telemetry for the dashboard."""
-    if not settings.gpu_lab_enable_local_runner:
-        return JSONResponse({"enabled": False, "jobs": [], "gpus": []})
-    try:
-        gpus = await local.gpu_metrics()
-        gpu_error = None
-    except GPUError as exc:
-        gpus = []
-        gpu_error = exc.message
+def _monitor_operational_state() -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None]:
+    """Read blocking local/Research-OS state outside the ASGI event loop."""
     repository = svc().repo
     selected_jobs = _prioritise_monitor_jobs(
         repository.list_jobs(instance_id="local", status="running", limit=30),
@@ -4195,13 +4186,28 @@ async def monitor(_: Request):
                 "completed_at": job.completed_at.isoformat() if job.completed_at else None,
             }
         )
-    live_workers = []
+    live_workers: list[dict[str, Any]] = []
     live_workers_error = None
     if settings.gpu_lab_research_database_url:
         try:
             live_workers = cockpit().live_workers_by_project()
         except GPUError as exc:
             live_workers_error = exc.message
+    return jobs, live_workers, live_workers_error
+
+
+@mcp.custom_route("/monitor", methods=["GET"], include_in_schema=False)
+async def monitor(_: Request):
+    """Return real local-job state and GPU telemetry for the dashboard."""
+    if not settings.gpu_lab_enable_local_runner:
+        return JSONResponse({"enabled": False, "jobs": [], "gpus": []})
+    try:
+        gpus = await local.gpu_metrics()
+        gpu_error = None
+    except GPUError as exc:
+        gpus = []
+        gpu_error = exc.message
+    jobs, live_workers, live_workers_error = await asyncio.to_thread(_monitor_operational_state)
     return JSONResponse(
         {
             "enabled": True,
