@@ -4168,14 +4168,21 @@ def _prioritise_monitor_jobs(running: list, queued: list, recent: list, limit: i
 def _monitor_operational_state() -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None]:
     """Read blocking local/Research-OS state outside the ASGI event loop."""
     repository = svc().repo
+    # Read and parse the SQLite job history once.  The previous implementation
+    # did this three times on every dashboard poll, then rewrote status for up
+    # to 30 historical jobs even though only queued/running jobs can change.
+    local_jobs = repository.list_jobs(instance_id="local", limit=1_000)
     selected_jobs = _prioritise_monitor_jobs(
-        repository.list_jobs(instance_id="local", status="running", limit=30),
-        repository.list_jobs(instance_id="local", status="queued", limit=30),
-        repository.list_jobs(instance_id="local", limit=30),
+        [job for job in local_jobs if job.status == "running"],
+        [job for job in local_jobs if job.status == "queued"],
+        local_jobs,
     )
     jobs = []
     for job in selected_jobs:
-        status = local.job_status(job.job_id, include_logs=False)
+        if job.status in {"running", "queued"}:
+            status = local.job_status(job.job_id, include_logs=False)
+        else:
+            status = {"job_id": job.job_id, "status": job.status, "exit_code": job.exit_code}
         jobs.append(
             {
                 "job_id": status["job_id"],
