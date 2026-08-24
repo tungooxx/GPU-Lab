@@ -656,8 +656,17 @@ class ResearchStrategyService:
         }
         return self.store.decision_outcome_apply(decision_id, outcome_data, after)
 
-    def null_model_create(self, project_id: str, data: dict[str, Any]) -> dict[str, Any]:
-        draft = NullModelDraft.model_validate(data)
+    def null_model_create(
+        self, project_id: str, data: NullModelDraft | dict[str, Any]
+    ) -> dict[str, Any]:
+        try:
+            draft = NullModelDraft.model_validate(data)
+        except ValidationError as exc:
+            raise GPUError(
+                "INVALID_NULL_MODEL",
+                "Null model is missing required fields or contains invalid values.",
+                details={"validation_errors": exc.errors(include_url=False)},
+            ) from exc
         target = self.store.object_get(draft.target_entity_id)
         if str(target["project_id"]) != project_id or target["kind"] not in {
             "Claim",

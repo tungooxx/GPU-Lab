@@ -51,7 +51,7 @@ from .qd import HypothesisDraft, HypothesisQDService
 from .research import ResearchStore
 from .research_operators import HttpResearchOperatorProvider, ResearchOperatorService
 from .service import GPUService
-from .strategy import DecisionOutcomeAssessment, ResearchStrategyService
+from .strategy import DecisionOutcomeAssessment, NullModelDraft, ResearchStrategyService
 from .terminal import TERMINAL_HTML
 
 logger = logging.getLogger(__name__)
@@ -824,6 +824,70 @@ def research_operators() -> ResearchOperatorService:
                     ),
                 )
     return research_operator_service
+
+
+def deterministic_null_model_critique(
+    project_id: str, target_claim: str, context: dict[str, Any]
+) -> dict[str, Any]:
+    """Return an offline, non-promoting checklist when model operators are disabled."""
+    _ = project_id  # The output is advisory only and intentionally not persisted.
+    context_text = json.dumps(context, sort_keys=True, default=str)
+    controls = [
+        (
+            "Random perturbation control",
+            "The observed effect is caused by any perturbation rather than the claimed mechanism.",
+            "Apply a random perturbation matched for location, norm, and schedule.",
+        ),
+        (
+            "Magnitude-matched perturbation control",
+            "The effect follows perturbation magnitude rather than semantic or causal content.",
+            "Match the intervention magnitude while varying the proposed causal content.",
+        ),
+        (
+            "Metric or sampling artifact control",
+            "The result is an artifact of the metric, split, sampler, or evaluator.",
+            "Re-evaluate with a preregistered alternate metric, seed, and sampling protocol.",
+        ),
+        (
+            "Checkpoint or seed artifact control",
+            "The effect is specific to a checkpoint or random seed.",
+            "Repeat the matched intervention across independent checkpoints and seeds.",
+        ),
+        (
+            "Implementation artifact control",
+            "The observed effect arises from an implementation or data-path error.",
+            "Use an independently checked implementation and verify the intervention trace.",
+        ),
+    ]
+    return {
+        "target_claim": target_claim,
+        "alternative_explanations": [
+            {
+                "name": name,
+                "mechanism": mechanism,
+                "why_plausible": "This is a standard competing explanation that remains possible without a matched control.",
+                "evidence_for": [],
+                "evidence_against": [],
+                "discriminating_control": control,
+                "estimated_cost": "LOW",
+            }
+            for name, mechanism, control in controls
+        ],
+        "missing_controls": [control for _name, _mechanism, control in controls],
+        "promotion_risk": "No causal promotion is justified until a relevant matched null control is assessed.",
+        "recommended_null_test": controls[0][2],
+        "provenance": {
+            "operator_name": "NullModelCritic",
+            "provider": "builtin-deterministic",
+            "model": "none",
+            "model_version": None,
+            "prompt_version": "offline-null-checklist-v1",
+            "schema_version": "1.0",
+            "context_hash": hashlib.sha256(context_text.encode()).hexdigest(),
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        },
+        "warning": "Offline deterministic checklist only; it is advisory and cannot promote scientific truth.",
+    }
 
 
 def branches() -> ExperimentBranchService:
@@ -2737,12 +2801,9 @@ async def research_null_model_critique(
     project_id: str, target_claim: str, context: dict
 ):
     """Generate typed cheap null explanations and controls without scientific promotion."""
-    return await call(
-        research_operators().null_model_critique,
-        project_id,
-        target_claim,
-        context,
-    )
+    if settings.gpu_lab_research_operator_provider == "disabled":
+        return await call(deterministic_null_model_critique, project_id, target_claim, context)
+    return await call(research_operators().null_model_critique, project_id, target_claim, context)
 
 
 @mcp.tool()
@@ -2943,7 +3004,7 @@ async def meta_lesson_list(project_id: str):
 
 
 @mcp.tool()
-async def research_null_model_create(project_id: str, null_model: dict):
+async def research_null_model_create(project_id: str, null_model: NullModelDraft):
     """Register an explicit alternative explanation; it cannot itself promote scientific truth."""
     return await call(strategy().null_model_create, project_id, null_model)
 

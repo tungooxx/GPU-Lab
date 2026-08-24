@@ -18,6 +18,14 @@ def test_invalid_decision_outcome_assessment_is_a_typed_error():
     assert exc_info.value.details["validation_errors"]
 
 
+def test_invalid_null_model_is_a_typed_error():
+    with pytest.raises(GPUError) as exc_info:
+        ResearchStrategyService(None).null_model_create("project", {"name": "incomplete"})
+
+    assert exc_info.value.error_type == "INVALID_NULL_MODEL"
+    assert exc_info.value.details["validation_errors"]
+
+
 class StrategyStore:
     def __init__(self, patterns=None, decisions=None, outcomes=None):
         self.patterns = patterns or []
