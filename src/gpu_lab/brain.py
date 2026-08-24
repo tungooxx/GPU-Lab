@@ -1286,7 +1286,7 @@ class ResearchBrain:
         agenda_item_id: str,
         prediction_outcome: str,
         guard_condition_outcome: str,
-        condition_evaluations: dict[str, bool],
+        condition_evaluations: dict[str, bool] | list[dict[str, Any]],
         evidence_supporting: list[str],
         evidence_against: list[str],
         unexpected_observations: list[str],
@@ -1351,7 +1351,33 @@ class ResearchBrain:
             # Bind the supplied outcome to the server-side preregistered text.
             # This avoids requiring clients to round-trip long Unicode condition keys.
             condition_evaluations = {pass_condition: guard_passed}
-        elif set(condition_evaluations) != {pass_condition} or not all(
+        elif not isinstance(condition_evaluations, dict):
+            # Older clients represented an evaluation as an array of objects.
+            # Never let that transport mismatch become an INTERNAL_ERROR; accept
+            # the unambiguous one-item form and normalize it to the durable
+            # preregistered condition map.
+            if (
+                isinstance(condition_evaluations, list)
+                and len(condition_evaluations) == 1
+                and isinstance(condition_evaluations[0], dict)
+                and isinstance(
+                    condition_evaluations[0].get(
+                        "passed", condition_evaluations[0].get("value")
+                    ),
+                    bool,
+                )
+            ):
+                condition_evaluations = {
+                    pass_condition: condition_evaluations[0].get(
+                        "passed", condition_evaluations[0].get("value")
+                    )
+                }
+            else:
+                raise GPUError(
+                    "EXPERIMENT_GUARD_EVALUATION_INVALID",
+                    "Provide one boolean evaluation for the frozen pass_condition, or guard_passed.",
+                )
+        if set(condition_evaluations) != {pass_condition} or not all(
             isinstance(value, bool) for value in condition_evaluations.values()
         ):
             raise GPUError(

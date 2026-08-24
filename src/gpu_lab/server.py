@@ -51,7 +51,7 @@ from .qd import HypothesisDraft, HypothesisQDService
 from .research import ResearchStore
 from .research_operators import HttpResearchOperatorProvider, ResearchOperatorService
 from .service import GPUService
-from .strategy import ResearchStrategyService
+from .strategy import DecisionOutcomeAssessment, ResearchStrategyService
 from .terminal import TERMINAL_HTML
 
 logger = logging.getLogger(__name__)
@@ -2474,7 +2474,7 @@ async def brain_result_assess(
     agenda_item_id: str,
     prediction_outcome: str,
     guard_condition_outcome: str,
-    condition_evaluations: dict[str, bool],
+    condition_evaluations: dict[str, bool] | list[dict[str, Any]],
     evidence_supporting: list[str],
     evidence_against: list[str],
     unexpected_observations: list[str],
@@ -2967,7 +2967,7 @@ async def research_null_model_test(
 
 @mcp.tool()
 async def research_decision_outcome_assess(
-    decision_id: str, assessment: dict, domain: str | None = None
+    decision_id: str, assessment: DecisionOutcomeAssessment, domain: str | None = None
 ):
     """Persist an outcome, then run one bounded event-driven meta-science pass."""
     result = await call(strategy().decision_outcome_assess, decision_id, assessment, domain)

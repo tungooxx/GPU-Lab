@@ -729,3 +729,27 @@ def test_assessment_binds_guard_boolean_to_frozen_condition():
     )
 
     assert store.applied["evidence_data"]["condition_evaluations"] == {"metric > 0": False}
+
+
+def test_assessment_normalizes_legacy_array_guard_evaluation():
+    store = AssessmentStore()
+    brain = ResearchBrain(store)
+
+    brain.result_assess(
+        run_id="run",
+        decision_id="decision",
+        hypothesis_id="hypothesis",
+        agenda_item_id="agenda",
+        prediction_outcome="Guard failed",
+        guard_condition_outcome="FAIL",
+        condition_evaluations=[{"passed": False}],
+        evidence_supporting=[],
+        evidence_against=[],
+        unexpected_observations=[],
+        alternative_explanations=[],
+        scope="fixture",
+        hypothesis_transition="BLOCKED",
+        rationale="The frozen guard failed",
+    )
+
+    assert store.applied["evidence_data"]["condition_evaluations"] == {"metric > 0": False}
