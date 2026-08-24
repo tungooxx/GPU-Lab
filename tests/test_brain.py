@@ -139,7 +139,7 @@ def test_hasi_benchmark_enforces_reproduction_then_causal_intervention():
     agenda = {
         "data": {
             "question": episode.scientific_question,
-            "reproduction_required": True,
+            "reproduction_gate_scope": "BASELINE_COMPARISON",
             "candidate_experiments": [
                 {
                     "action_type": state_substitution.action_type,
@@ -172,6 +172,29 @@ def test_hasi_benchmark_enforces_reproduction_then_causal_intervention():
     selected = max(after, key=lambda candidate: candidate.score.priority)
     assert selected.action_type == "CAUSAL_INTERVENTION"
     assert selected.payload["benchmark_action_id"] == "state-substitution"
+
+
+def test_incomplete_reproduction_does_not_block_causal_development():
+    agenda = {
+        "data": {
+            "question": "Does the frozen causal intervention discriminate mechanisms?",
+            # Legacy state may retain this boolean.  Without an explicit
+            # publication/baseline scope it is not an execution prerequisite.
+            "reproduction_required": True,
+            "candidate_experiments": [
+                {
+                    "action_type": "CAUSAL_INTERVENTION",
+                    "prediction": "The preregistered metric differs from control.",
+                    "payload": {"development_stage": "CAUSAL_DEVELOPMENT"},
+                }
+            ],
+        }
+    }
+    brain = ResearchBrain(CandidateStore(reproductions=[{"id": "baseline", "status": "PARTIAL"}]))
+
+    selected = brain._candidate_actions("project", agenda, [])
+
+    assert selected[0].action_type == "CAUSAL_INTERVENTION"
 
 
 def test_provider_failure_selects_an_alternative_action():
@@ -349,6 +372,78 @@ def test_causal_execution_is_authorized_without_a_separate_approval():
 
     assert authorized["requires_human_approval"] is False
     assert authorized["approved"] is True
+
+
+class FrozenExperimentDecisionStore:
+    def __init__(self):
+        self.persisted = None
+        self.objects = {
+            "experiment": {
+                "id": "experiment",
+                "project_id": "project",
+                "kind": "Experiment",
+                "status": "PREREGISTERED",
+                "data": {
+                    "hypothesis_id": "hypothesis",
+                    "frozen": True,
+                    "plan": {
+                        "research_question": "Does frozen MSRS A0C distinguish the proposed mechanism?",
+                        "prediction": "The preregistered A0C metric improves over the matched control.",
+                        "pass_condition": "Metric exceeds the frozen threshold.",
+                        "fail_condition": "Metric does not exceed the frozen threshold.",
+                        "interpretation_if_pass": "Support the scoped MSRS mechanism.",
+                        "interpretation_if_fail": "Do not support the scoped MSRS mechanism.",
+                    },
+                },
+            },
+            "hypothesis": {
+                "id": "hypothesis",
+                "project_id": "project",
+                "kind": "Hypothesis",
+                "status": "ACTIVE",
+                "data": {},
+            },
+        }
+
+    def object_get(self, object_id):
+        return self.objects[object_id]
+
+    def brain_decision_create(self, project_id, candidates, selected_index, decision_data):
+        self.persisted = (project_id, candidates, selected_index, decision_data)
+        selected = {**candidates[selected_index], "id": "candidate"}
+        return {"decision": {"id": "decision", "data": {**decision_data, "selected_action": selected}}}
+
+
+def test_experiment_execution_decision_uses_frozen_question_and_prediction():
+    store = FrozenExperimentDecisionStore()
+    brain = ResearchBrain(store)
+    brain.brain_step = lambda _project_id, persist=False: {
+        "agenda_item": {"id": "agenda"},
+        "scientific_state": {"research_question": "agenda-level question"},
+    }
+
+    result = brain.experiment_execution_decision_create("project", "experiment")
+
+    selected = result["decision"]["data"]["selected_action"]
+    assert selected["question_addressed"] == "Does frozen MSRS A0C distinguish the proposed mechanism?"
+    assert selected["predicted_outcomes"] == ["The preregistered A0C metric improves over the matched control."]
+    assert selected["payload"]["prospective_prediction"] == selected["predicted_outcomes"][0]
+    assert result["decision"]["data"]["question"] == selected["question_addressed"]
+
+
+def test_experiment_execution_decision_preserves_discovery_gate():
+    store = FrozenExperimentDecisionStore()
+    brain = ResearchBrain(store)
+
+    def blocked(*_args, **_kwargs):
+        raise GPUError("DISCOVERY_ROUND_INCOMPLETE", "Complete FAR first")
+
+    brain.brain_step = blocked
+    with pytest.raises(GPUError) as error:
+        brain.experiment_execution_decision_create("project", "experiment")
+
+    assert error.value.error_type == "DISCOVERY_ROUND_INCOMPLETE"
+    assert store.persisted is None
 
 
 class LegacyRepairStore:

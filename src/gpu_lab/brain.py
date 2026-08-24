@@ -81,6 +81,7 @@ EXECUTABLE_ACTIONS = {
     "RANDOM_CONTROL",
     "MAGNITUDE_MATCHED_CONTROL",
 }
+REPRODUCTION_GATE_SCOPES = {"BASELINE_COMPARISON", "PUBLICATION"}
 
 
 class ActionScore(BaseModel):
@@ -398,6 +399,7 @@ class ResearchBrain:
         related_contradiction_ids: list[str] | None = None,
         candidate_experiments: list[dict[str, Any]] | None = None,
         reproduction_required: bool = False,
+        reproduction_gate_scope: str | None = None,
     ) -> dict:
         agenda = self._expect(agenda_id, "ResearchAgenda")
         references = [
@@ -426,6 +428,12 @@ class ResearchBrain:
             if "action_type" not in candidate:
                 raise GPUError("INVALID_RESEARCH_ACTION_TYPE", "Candidate action_type is required")
             self._configured_candidate(candidate, question, blocking_hypothesis_ids or [])
+        scope = str(reproduction_gate_scope or "").upper()
+        if scope and scope not in REPRODUCTION_GATE_SCOPES:
+            raise GPUError(
+                "INVALID_REPRODUCTION_GATE_SCOPE",
+                "Use BASELINE_COMPARISON or PUBLICATION",
+            )
         return self.store.agenda_item_create_atomic(
             agenda_id,
             {
@@ -438,7 +446,11 @@ class ResearchBrain:
                 "related_anomaly_ids": related_anomaly_ids or [],
                 "related_contradiction_ids": related_contradiction_ids or [],
                 "candidate_experiments": experiments,
+                # Retained as historical metadata only.  An unscoped boolean
+                # must not make unrelated causal-development work wait on an
+                # incomplete reproduction.
                 "reproduction_required": reproduction_required,
+                "reproduction_gate_scope": scope or None,
             },
         )
 
@@ -1136,6 +1148,101 @@ class ResearchBrain:
             "RESEARCH_DECISION_BOUND_TO_EXPERIMENT",
         )
 
+    def experiment_execution_decision_create(
+        self, project_id: str, experiment_id: str
+    ) -> dict:
+        """Create an executable decision from one frozen experiment plan.
+
+        The ordinary Brain ranker selects an agenda-level action.  It is not a
+        valid source for an execution decision for an already preregistered
+        experiment: its question and predicted outcome may belong to another
+        agenda item.  Evaluate that ranker's discovery gates in dry-run mode,
+        then materialize the exact frozen plan as the selected action.
+        """
+        experiment = self._expect(experiment_id, "Experiment")
+        if str(experiment["project_id"]) != str(project_id):
+            raise GPUError("RESEARCH_PROJECT_MISMATCH", "Experiment and project differ")
+        if experiment["data"].get("frozen") is not True:
+            raise GPUError(
+                "EXPERIMENT_PLAN_NOT_FROZEN",
+                "Execution decisions require a frozen preregistered experiment plan",
+            )
+        plan = experiment["data"].get("plan")
+        if not isinstance(plan, dict):
+            raise GPUError("EXPERIMENT_PLAN_INCOMPLETE", "Experiment plan is missing")
+        question = plan.get("research_question")
+        prediction = plan.get("prediction")
+        if not isinstance(question, str) or not question.strip():
+            raise GPUError("EXPERIMENT_PLAN_INCOMPLETE", "Missing research_question")
+        if not isinstance(prediction, str) or not prediction.strip():
+            raise GPUError("EXPERIMENT_PLAN_INCOMPLETE", "Missing prediction")
+        hypothesis_id = str(experiment["data"].get("hypothesis_id") or "")
+        if not hypothesis_id:
+            raise GPUError("EXPERIMENT_PLAN_INCOMPLETE", "Experiment has no hypothesis_id")
+        hypothesis = self._expect(hypothesis_id, "Hypothesis")
+        if str(hypothesis["project_id"]) != str(project_id):
+            raise GPUError("RESEARCH_PROJECT_MISMATCH", "Experiment and hypothesis differ")
+
+        # This is intentionally a dry run: it retains all discovery/staleness
+        # guards but must never write an unrelated generic ResearchDecision.
+        gate = self.brain_step(project_id, persist=False)
+        action_type = str(plan.get("action_type", "FROZEN_DIAGNOSTIC")).upper()
+        if action_type not in EXECUTABLE_ACTIONS:
+            raise GPUError("EXPERIMENT_ACTION_NOT_EXECUTABLE", action_type)
+        selected = ActionCandidate(
+            action_type=action_type,
+            question_addressed=question.strip(),
+            hypotheses_discriminated=[hypothesis_id],
+            predicted_outcomes=[prediction.strip()],
+            required_resources=["frozen preregistered experiment plan"],
+            payload={
+                "experiment_id": experiment_id,
+                "frozen": True,
+                "prospective_prediction": prediction.strip(),
+                "pass_condition": plan.get("pass_condition"),
+                "fail_condition": plan.get("fail_condition"),
+                "interpretation_if_pass": plan.get("interpretation_if_pass"),
+                "interpretation_if_fail": plan.get("interpretation_if_fail"),
+            },
+            score=ActionScore(
+                scientific_importance=4,
+                expected_discrimination=4,
+                expected_information_gain=4,
+                feasibility=4,
+                compute_cost=1,
+                engineering_cost=1,
+                execution_risk=1,
+            ),
+        ).checked().persisted_data()
+        decision_data = {
+            "request_id": str(uuid.uuid4()),
+            "brain_step_id": str(uuid.uuid4()),
+            "agenda_item_id": str(gate["agenda_item"]["id"]),
+            "question": question.strip(),
+            "hypotheses_affected": [hypothesis_id],
+            "selected_action": selected,
+            "state_snapshot": {
+                "research_state": gate.get("scientific_state", {}),
+                "execution_experiment_id": experiment_id,
+            },
+            "brain_policy_version": BRAIN_POLICY_VERSION,
+            "strategy_policy_version": STRATEGY_POLICY_VERSION,
+            "scoring_policy_version": SCORING_POLICY_VERSION,
+            "decision_role": "SCIENTIFIC_ACTION",
+            "rationale": "Selected the exact frozen preregistered experiment plan after the current Brain/discovery gates passed.",
+            "result_that_changes_belief": [prediction.strip()],
+            "pass_means": plan.get("interpretation_if_pass"),
+            "fail_means": plan.get("interpretation_if_fail"),
+            "remains_unresolved": question.strip(),
+            "frozen_experiment_id": experiment_id,
+            "frozen_prediction": prediction.strip(),
+            "prospective_prediction_id": None,
+            "status": "SELECTED",
+        }
+        return self.store.brain_decision_create(
+            project_id, [selected], 0, decision_data
+        )
+
     def authorize_execution(
         self, experiment_id: str, decision_id: str, request_fingerprint: str
     ) -> dict:
@@ -1524,9 +1631,16 @@ class ResearchBrain:
             project_id, "Reproduction", limit=None, **temporal
         )
         baseline_reproduced = any(item["status"] == "REPRODUCED" for item in reproductions)
+        reproduction_gate_scope = str(
+            agenda_item["data"].get("reproduction_gate_scope") or ""
+        ).upper()
+        # Reproduction is required to support an external baseline comparison
+        # or a publication-facing claim.  It is not a prerequisite for an
+        # already preregistered internal causal-development experiment.
         needs_reproduction = (
-            bool(agenda_item["data"].get("reproduction_required")) and not baseline_reproduced
-        ) or (bool(reproductions) and not baseline_reproduced)
+            reproduction_gate_scope in REPRODUCTION_GATE_SCOPES
+            and not baseline_reproduced
+        )
         if needs_reproduction:
             return [
                 ActionCandidate(

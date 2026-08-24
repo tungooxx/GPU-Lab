@@ -167,7 +167,9 @@ class MetaResearchService:
         if unfinished:
             recommendations.append("Recover unfinished experiment runs before submitting replacements.")
         if incomplete_reproductions:
-            recommendations.append("Complete baseline reproduction before internal causal intervention.")
+            recommendations.append(
+                "Complete baseline reproduction before baseline comparison or publication-facing claims."
+            )
         if branches_without_comparison:
             recommendations.append("Create ComparativeLessons for completed branch alternatives.")
         repeated_dead = [key for key, count in failed_assumptions.items() if count >= 2]

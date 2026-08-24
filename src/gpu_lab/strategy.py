@@ -225,7 +225,12 @@ class ResearchStrategyService:
         )
         if uninspected:
             research_stage = "RESULT_INSPECTION"
-        elif reproductions and not baseline_reproduced:
+        elif (
+            str(agenda_item["data"].get("reproduction_gate_scope") or "").upper()
+            in {"BASELINE_COMPARISON", "PUBLICATION"}
+            and reproductions
+            and not baseline_reproduced
+        ):
             research_stage = "REPRODUCTION"
         elif not hypotheses:
             research_stage = "HYPOTHESIS_GENERATION"

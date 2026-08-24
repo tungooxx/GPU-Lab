@@ -19,6 +19,14 @@ def test_vast_status_tool_has_provider_specific_name():
     assert "gpu_status" not in names
 
 
+def test_vast_start_tool_is_exposed_as_a_mutating_provider_operation():
+    tool = mcp._tool_manager._tools["gpu_start"]
+
+    assert tool.annotations.readOnlyHint is False
+    assert tool.annotations.destructiveHint is False
+    assert tool.annotations.openWorldHint is True
+
+
 @pytest.mark.asyncio
 async def test_improve_start_search_uses_resolved_literature_provider(monkeypatch):
     class Candidate:
@@ -78,6 +86,51 @@ def test_research_decision_creation_is_explicitly_discoverable():
         "command",
     ]
     assert "research_experiment_execute" in tool.description
+
+
+def test_discovery_candidate_contract_exposes_prediction_shape():
+    schema = mcp._tool_manager._tools["discovery_candidate_submit"].fn_metadata.arg_model.model_json_schema()
+    candidate = schema["$defs"]["DiscoveryCandidateInput"]
+
+    assert candidate["properties"]["predictions"] == {
+        "description": "One or more non-empty, discriminating prediction statements.",
+        "items": {"type": "string"},
+        "minItems": 1,
+        "title": "Predictions",
+        "type": "array",
+    }
+    assert {"mechanism", "predictions", "falsifier"} <= set(candidate["required"])
+    assert "discriminating_prediction" not in candidate["properties"]
+
+
+def test_hypothesis_qd_screen_exposes_the_backend_hypothesis_draft_contract():
+    schema = mcp._tool_manager._tools["hypothesis_qd_screen"].fn_metadata.arg_model.model_json_schema()
+    draft = schema["$defs"]["HypothesisDraft"]
+
+    assert {"mechanism", "prediction", "kill_condition", "niche_id", "scope"} <= set(draft["required"])
+    assert draft["properties"]["mechanism"]["minLength"] == 10
+    embedding = draft["properties"]["embedding"]
+    assert any(
+        item.get("type") == "array" and item.get("items") == {"type": "number"}
+        for item in embedding["anyOf"]
+    )
+
+
+def test_operational_tool_contracts_expose_backend_enums_and_required_objects():
+    message = mcp._tool_manager._tools["lab_message_send"].fn_metadata.arg_model.model_json_schema()
+    task = mcp._tool_manager._tools["engineering_task_create"].fn_metadata.arg_model.model_json_schema()
+    work = mcp._tool_manager._tools["lab_work_create"].fn_metadata.arg_model.model_json_schema()
+    review = mcp._tool_manager._tools["engineering_diff_review"].fn_metadata.arg_model.model_json_schema()
+    preflight = mcp._tool_manager._tools["deterministic_preflight_run"].fn_metadata.arg_model.model_json_schema()
+
+    assert "ENGINEERING_HANDOFF" in message["properties"]["message_type"]["enum"]
+    assert "HANDOFF" in message["properties"]["message_type"]["enum"]
+    assert "BUG_FIX" in task["properties"]["task_type"]["enum"]
+    assert {"created_by", "created_session_id"} <= set(work["required"])
+    typed_review = review["$defs"]["EngineeringDiffReviewInput"]
+    assert {"files_changed", "diff_summary", "unrelated_changes", "scientific_variable_drift"} <= set(typed_review["required"])
+    checks = preflight["properties"]["checks"]["additionalProperties"]["anyOf"]
+    assert any(item.get("$ref", "").endswith("/DeterministicPreflightCheck") for item in checks)
 
 
 def test_every_mcp_tool_has_chatgpt_metadata():

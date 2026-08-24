@@ -250,6 +250,36 @@ def test_orphaned_running_work_without_a_lease_is_recovered():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_live_lease_is_never_orphan_reclaimed_for_an_active_session():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store, lease_seconds=30)
+    project_id = store.project_create(f"lab-live-lease-{time.time_ns()}", "Lease authority") ["project_id"]
+    joined = lab.join(None, "live-lease-worker", "CODEX", project_id)
+    work = lab.create_work(
+        project_id, "REVIEW", "Keep ownership", "Live lease is authoritative", "REVIEWER",
+        joined["worker"]["id"], created_session_id=joined["session_id"],
+    )
+    claimed = lab.claim_work(work["id"], joined["worker"]["id"], joined["session_id"])
+    lab.start_work(claimed["id"], joined["worker"]["id"], joined["session_id"])
+    # Reproduce the formerly unsafe projection: session remains ACTIVE but its
+    # heartbeat looks stale.  Its unexpired lease must still win.
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE research_worker_sessions SET status='ACTIVE',last_heartbeat_at="
+            "NOW() - INTERVAL '1 hour' WHERE id=%s",
+            (joined["session_id"],),
+        )
+
+    recovered = lab.recover_stale_leases(project_id)
+
+    assert recovered["recovered"] == 0
+    current = lab.work_get(work["id"])
+    assert current["status"] == "RUNNING"
+    assert current["assigned_session_id"] == joined["session_id"]
+    assert current["lease_id"] == claimed["lease_id"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_start_work_explains_an_unknown_work_item_id():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)

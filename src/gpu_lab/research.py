@@ -126,6 +126,7 @@ RESEARCH_OBJECT_STATUSES = {
     "COMPLETED",
     "DEFERRED",
     "FAILED",
+    "EXPIRED",
     "IMPLEMENTED_UNVERIFIED",
     "INCONCLUSIVE",
     "OPEN",
@@ -4278,6 +4279,10 @@ class ResearchStore:
             "run_id": str(run["id"]),
             "job_id": job_id,
             "idempotency_key": idempotency_key,
+            # Public canonical retry token.  Keep idempotency_key for older
+            # clients, but callers should never have to infer it from a
+            # reservation response.
+            "execution_attempt_uuid": idempotency_key,
             "status": run["status"],
             "run": run,
             "idempotent_replay": idempotent_replay,

@@ -42,6 +42,17 @@ def test_requirements_path_accepts_file_or_directory(tmp_path):
     assert runner._requirements_path("project/requirements.txt") == requirements
 
 
+def test_environment_resolver_accepts_local_status_directory_and_python_path(tmp_path):
+    runner = _runner(tmp_path)
+    environment = runner.settings.gpu_lab_local_env_root / "canonical"
+    python = environment / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("")
+
+    assert runner._environment_from_python(str(environment)) == environment
+    assert runner._environment_from_python(str(python)) == environment
+
+
 def test_local_job_environment_excludes_gateway_secrets(monkeypatch, tmp_path):
     runner = _runner(tmp_path)
     monkeypatch.setenv("PATH", "/usr/local/bin")
@@ -315,6 +326,28 @@ def test_reconcile_marks_foreign_running_job_unknown(tmp_path):
 
     assert result == {"reconciled": 1, "completed": 0, "failed": 0, "unknown": 1}
     assert runner.repo.get_job(job.job_id).status == "unknown"
+
+
+def test_queued_job_recovers_running_state_from_durable_wrapper_pid(monkeypatch, tmp_path):
+    runner = _runner(tmp_path)
+    job = Job(
+        job_id="local_gateway_interrupted",
+        instance_id="local",
+        repo_path=str(runner.workspace),
+        command="sleep 300",
+        status="queued",
+        metadata={"submission_claimed_at": "2000-01-01T00:00:00+00:00"},
+    )
+    runner.repo.save_job(job)
+    jobdir = runner.workspace / ".gpu-lab" / "jobs" / job.job_id
+    jobdir.mkdir(parents=True)
+    (jobdir / "process.pid").write_text("4242")
+    monkeypatch.setattr(runner, "_process_identity", lambda pid: "live-child" if pid == 4242 else None)
+
+    status = runner.job_status(job.job_id, include_logs=False)
+
+    assert status["status"] == "running"
+    assert runner.repo.get_job(job.job_id).metadata["recovered_from_durable_pid"] is True
 
 
 def test_reconcile_finalizes_job_from_persisted_exit_code(tmp_path):

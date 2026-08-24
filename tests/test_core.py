@@ -1,4 +1,5 @@
 import pytest
+import shlex
 
 from gpu_lab.config import Settings
 from gpu_lab.db import Repository
@@ -41,6 +42,25 @@ def test_provider_prefers_direct_public_ssh_mapping():
     )
     assert item.hostname == "191.223.212.127"
     assert item.ssh_port == 31708
+
+
+@pytest.mark.asyncio
+async def test_gpu_list_marks_provider_missing_instances_without_deleting_history(tmp_path):
+    service = GPUService(Settings(gpu_lab_database_url=f"sqlite:///{tmp_path / 'db.sqlite'}"))
+    stale = Instance(id="vast_old", provider_instance_id="old", status="running")
+    current = Instance(id="vast_current", provider_instance_id="current", status="running")
+    service.repo.save_instance(stale)
+
+    class Provider:
+        async def list_instances(self):
+            return [current]
+
+    service.provider = Provider()
+    items = await service.gpu_list()
+
+    assert {item["id"] for item in items} == {"vast_old", "vast_current"}
+    assert next(item for item in items if item["id"] == "vast_old")["status"] == "provider_missing"
+    assert service.repo.get_instance("vast_old").metadata["provider_visible"] is False
 
 
 @pytest.mark.asyncio
@@ -115,6 +135,28 @@ async def test_vast_creation_requests_direct_ssh(monkeypatch):
     assert captured["payload"]["runtype"] == "ssh_direct"
 
 
+@pytest.mark.asyncio
+async def test_vast_start_requests_running_state_and_refreshes_instance(monkeypatch):
+    provider = VastProvider("not-a-real-key")
+    captured = {}
+
+    async def fake_request(method, path, **kwargs):
+        captured.update(method=method, path=path, payload=kwargs["json"])
+        return {"success": True}
+
+    async def fake_get_instance(instance_id):
+        assert instance_id == "123"
+        return Instance(id="vast_123", provider_instance_id="123", status="scheduling")
+
+    monkeypatch.setattr(provider, "_request", fake_request)
+    monkeypatch.setattr(provider, "get_instance", fake_get_instance)
+    item = await provider.start_instance("vast_123")
+    await provider.client.aclose()
+
+    assert captured == {"method": "PUT", "path": "/instances/123", "payload": {"state": "running"}}
+    assert item.status == "scheduling"
+
+
 def test_database_persists_models(tmp_path):
     db = Repository(tmp_path / "state.db")
     db.save_instance(Instance(id="vast_1", provider_instance_id="1"))
@@ -161,3 +203,33 @@ async def test_remote_exec_is_disabled(tmp_path):
     )
     with pytest.raises(GPUError, match="REMOTE_EXEC"):
         await service.remote_exec("vast_1", "id")
+
+
+@pytest.mark.asyncio
+async def test_remote_experiment_submission_quotes_the_tmux_pane_once(tmp_path):
+    service = GPUService(Settings(gpu_lab_database_url=f"sqlite:///{tmp_path / 'db.sqlite'}"))
+    instance = Instance(id="vast_1", provider_instance_id="1", gpu_model="RTX")
+    service.repo.save_instance(instance)
+    captured = {}
+
+    class SSH:
+        async def run(self, _instance, command, _timeout):
+            captured["command"] = command
+            return "12345\n", "", 0
+
+    service.ssh = SSH()
+    await service.experiment_submit(
+        "vast_1",
+        f"{service.settings.gpu_lab_remote_root}/repos/repo",
+        "python run.py --label 'causal development'",
+        env={"MODE": "causal development"},
+        job_id="exp_quote_regression",
+    )
+
+    tmux_command = captured["command"].split(" && tmux display-message", 1)[0].rsplit(" && ", 1)[1]
+    tokens = shlex.split(tmux_command)
+    assert tokens[:5] == ["tmux", "new-session", "-d", "-s", "exp_quote_regression"]
+    pane_command = tokens[5]
+    assert pane_command.startswith("setsid sh -c ")
+    assert "exit $code" in pane_command
+    assert "stdout.log" in pane_command and "stderr.log" in pane_command

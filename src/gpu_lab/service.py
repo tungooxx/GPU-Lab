@@ -42,8 +42,22 @@ class GPUService:
 
     async def gpu_list(self) -> list[dict]:
         if self.provider:
-            for item in await self.provider.list_instances():
+            visible = await self.provider.list_instances()
+            visible_ids = {item.id for item in visible}
+            for item in visible:
                 self.repo.save_instance(item)
+            # Preserve historical instance/job references, but never present an
+            # instance missing from Vast as live.  A later provider refresh can
+            # revive the record if it reappears (for example after scheduling).
+            for item in self.repo.list_instances():
+                if item.provider == "vast" and item.id not in visible_ids:
+                    item.status = "provider_missing"
+                    item.metadata = {
+                        **item.metadata,
+                        "provider_visible": False,
+                        "provider_missing_at": datetime.now(UTC).isoformat(),
+                    }
+                    self.repo.save_instance(item)
         return [x.model_dump(mode="json", exclude={"metadata"}) for x in self.repo.list_instances()]
 
     async def gpu_status(self, instance_id: str) -> dict:
@@ -123,6 +137,15 @@ class GPUService:
             "instance": item.model_dump(mode="json", exclude={"metadata"}),
             "chosen_offer_id": offer_id,
             "reason": "explicit offer selected by caller",
+        }
+
+    async def gpu_start(self, instance_id: str) -> dict:
+        item = await self._provider().start_instance(instance_id)
+        self.repo.save_instance(item)
+        return {
+            "instance": item.model_dump(mode="json", exclude={"metadata"}),
+            "requested_state": "running",
+            "note": "Vast may report scheduling until host resources are available.",
         }
 
     async def gpu_stop(self, instance_id: str) -> dict:
@@ -209,10 +232,31 @@ class GPUService:
         timeout_seconds: int | None = None,
         artifact_patterns: list[str] | None = None,
         metadata: dict | None = None,
+        job_id: str | None = None,
     ) -> dict:
         item = self._instance(instance_id)
         repo_path = self._remote_path(repo_path)
-        job_id = "exp_" + uuid.uuid4().hex[:16]
+        # The canonical Research OS executor reserves this identity before a
+        # process is launched.  Keeping it here makes remote submission
+        # idempotent at the same boundary as local submission.
+        job_id = job_id or "exp_" + uuid.uuid4().hex[:16]
+        if not re.fullmatch(r"(?:exp|remote)_[A-Za-z0-9_-]{8,80}", job_id):
+            raise GPUError("INVALID_REMOTE_JOB_ID", "Remote job ID is invalid")
+        existing = self.repo.get_job(job_id)
+        if existing:
+            if (
+                existing.instance_id != instance_id
+                or existing.repo_path != repo_path
+                or existing.command != command
+            ):
+                raise GPUError("REMOTE_JOB_ID_REUSED", "Job ID is bound to a different remote command")
+            return {
+                "job_id": job_id,
+                "status": existing.status,
+                "experiment": existing.name,
+                "instance": {"id": instance_id, "gpu": item.gpu_model},
+                "idempotent_replay": True,
+            }
         jobdir = f"{self.settings.gpu_lab_remote_root}/jobs/{job_id}"
         safe_env = " ".join(
             f"{k}={q(v)}"
@@ -229,7 +273,25 @@ class GPUService:
             started_at=datetime.now(UTC),
             metadata={**(metadata or {}), "artifact_patterns": artifact_patterns or []},
         )
-        bootstrap = f"mkdir -p {q(jobdir)}/{{metrics,plots,checkpoints,artifacts}}; printf '%s\\n' {q(command)} > {q(jobdir + '/command.sh')}; printf '%s' {q(job.model_dump_json())} > {q(jobdir + '/metadata.json')}; cd {q(repo_path)} && tmux new-session -d -s {q(job_id)} 'setsid sh -c {q((safe_env + ' ' if safe_env else '') + command + '; code=$?; echo $code > ' + jobdir + '/exit_code; exit $code')} > {q(jobdir + '/stdout.log')} 2> {q(jobdir + '/stderr.log')}' && tmux display-message -p -t {q(job_id)} '#{{pane_pid}}'"
+        # Quote the pane command once as the final tmux argument.  Do not wrap
+        # it in literal single quotes: ``q(inner)`` may itself contain quotes.
+        inner = (
+            (safe_env + " " if safe_env else "")
+            + command
+            + f"; code=$?; echo $code > {q(jobdir + '/exit_code')}; exit $code"
+        )
+        pane_command = (
+            f"setsid sh -c {q(inner)} "
+            f"> {q(jobdir + '/stdout.log')} "
+            f"2> {q(jobdir + '/stderr.log')}"
+        )
+        bootstrap = (
+            f"mkdir -p {q(jobdir)}/{{metrics,plots,checkpoints,artifacts}}; "
+            f"printf '%s\\n' {q(command)} > {q(jobdir + '/command.sh')}; "
+            f"printf '%s' {q(job.model_dump_json())} > {q(jobdir + '/metadata.json')}; "
+            f"cd {q(repo_path)} && tmux new-session -d -s {q(job_id)} {q(pane_command)} "
+            f"&& tmux display-message -p -t {q(job_id)} '#{{pane_pid}}'"
+        )
         out, err, code = await self.ssh.run(item, bootstrap, 60)
         if code:
             raise GPUError("JOB_SUBMIT_FAILED", err.strip() or out.strip())

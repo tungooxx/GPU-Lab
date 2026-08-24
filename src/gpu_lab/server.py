@@ -10,13 +10,13 @@ import re
 import threading
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 from urllib.parse import parse_qs
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -43,10 +43,11 @@ from .executable_papers import ExecutablePaperService, HttpExecutablePaperProvid
 from .lab import LabController
 from .literature import HttpLiteratureProvider, LiteratureService
 from .local_runner import LocalRunner
+from .ssh import q
 from .meta_controller import MetaResearchController
 from .meta_research import MetaResearchService
 from .policy_lab import PolicyLabService
-from .qd import HypothesisQDService
+from .qd import HypothesisDraft, HypothesisQDService
 from .research import ResearchStore
 from .research_operators import HttpResearchOperatorProvider, ResearchOperatorService
 from .service import GPUService
@@ -222,6 +223,7 @@ _OPEN_WORLD_TOOLS = {
     "vast_gpu_status",
     "gpu_search",
     "gpu_create",
+    "gpu_start",
     "gpu_stop",
     "gpu_destroy",
     "repo_checkout",
@@ -252,6 +254,75 @@ class GenericToolResult(BaseModel):
     """Stable structured envelope for dynamically shaped GPU Lab results."""
 
     result: Any
+
+
+class DiscoveryCandidateInput(BaseModel):
+    """Public MCP contract for a proposal-time discovery candidate.
+
+    ``predictions`` is deliberately an array of plain-language, discriminating
+    predictions. There is no separate ``discriminating_prediction`` object in
+    the Research OS persistence model.
+    """
+
+    title: str | None = Field(default=None, description="Optional short proposal title.")
+    mechanism: str = Field(description="Mechanistic account the candidate proposes.")
+    predictions: list[str] = Field(
+        min_length=1,
+        description="One or more non-empty, discriminating prediction statements.",
+    )
+    falsifier: str = Field(description="Observation that would count against the mechanism.")
+    diversity_signature: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Structured scientific dimensions used for diversity and distance, for example "
+            "{\"causal_object\": \"...\", \"representation\": \"...\"}."
+        ),
+    )
+    scientific_dimensions: dict[str, Any] | None = Field(
+        default=None,
+        description="Backward-compatible alias for diversity_signature.",
+    )
+    payload: dict[str, Any] | None = Field(
+        default=None,
+        description="Backward-compatible payload; only payload.scientific_dimensions is read for diversity.",
+    )
+    mechanistic_niche: str | None = Field(default=None, description="Optional advisory niche label.")
+    architecture_lineage: str | None = Field(default=None, description="Optional architecture lineage.")
+    parent_candidate_ids: list[str] | None = Field(default=None, description="Optional parent candidate IDs.")
+    genealogy_relation: str | None = Field(default=None, description="Optional genealogy relation label.")
+    quality_components: dict[str, float] | None = Field(
+        default=None, description="Optional numeric quality-component scores."
+    )
+    expected_failure_modes: list[str] | None = Field(
+        default=None, description="Optional anticipated failure modes."
+    )
+
+
+class EngineeringDiffReviewInput(BaseModel):
+    files_changed: list[str] = Field(description="Repository-relative files changed by the implementation.")
+    diff_summary: str = Field(min_length=1, description="Bounded summary of the implementation diff.")
+    unrelated_changes: bool = Field(description="Whether unrelated changes were detected.")
+    scientific_variable_drift: bool = Field(description="Whether the frozen scientific variable drifted.")
+    prohibited_changes_detected: list[str] = Field(default_factory=list)
+
+
+class DeterministicPreflightCheck(BaseModel):
+    passed: bool
+    warning: str | None = None
+    detail: str | None = None
+
+
+EngineeringTaskType = Literal[
+    "REPOSITORY_INSPECTION", "BUG_REPRODUCTION", "BUG_FIX", "BASELINE_REPAIR",
+    "EXPERIMENT_INSTRUMENTATION", "SCIENTIFIC_INTERVENTION_IMPLEMENTATION",
+    "CONTROL_IMPLEMENTATION", "METRIC_IMPLEMENTATION", "DATA_PIPELINE_CHANGE",
+    "REPRODUCTION_IMPLEMENTATION", "EXPERIMENT_PROTOTYPE", "REFACTOR_REQUIRED_FOR_EXPERIMENT",
+]
+LabMessageType = Literal[
+    "REQUEST_REVIEW", "REQUEST_DATA", "REQUEST_IMPLEMENTATION", "SHARE_FINDING",
+    "CHALLENGE_INTERPRETATION", "HANDOFF", "BLOCKER", "CROSS_PROJECT_RELEVANCE",
+    "COORDINATION", "INFORMATION", "ENGINEERING_HANDOFF",
+]
 
 
 _GENERIC_RESULT_SCHEMA = GenericToolResult.model_json_schema()
@@ -1005,6 +1076,12 @@ async def gpu_create(
 
 
 @mcp.tool()
+async def gpu_start(instance_id: str):
+    """Start or resume a stopped Vast instance; the provider may briefly report scheduling."""
+    return await call(svc().gpu_start, instance_id)
+
+
+@mcp.tool()
 async def gpu_stop(instance_id: str):
     """Stop an instance while preserving data when Vast supports it."""
     return await call(svc().gpu_stop, instance_id)
@@ -1081,7 +1158,8 @@ async def experiment_list(
 @mcp.tool()
 async def activity_recent(limit: int = 50):
     """List recent MCP tool calls, their sanitized inputs, outcomes, and durations."""
-    return svc().repo.list_audit(min(max(limit, 1), 100))
+    entries = svc().repo.list_audit(min(max(limit, 1), 100))
+    return await asyncio.to_thread(_activity_with_project_context, entries)
 
 
 @mcp.tool()
@@ -1181,11 +1259,16 @@ async def discovery_round_recommend_assignments(discovery_round_id: str, worker_
 @mcp.tool()
 async def discovery_candidate_submit(
     discovery_round_id: str, candidate_batch_id: str, worker_id: str, session_id: str,
-    candidate: dict[str, Any],
+    candidate: DiscoveryCandidateInput,
 ):
-    """Persist one immutable proposal-time discovery candidate in the caller's own open batch."""
+    """Persist one immutable proposal-time candidate in the caller's open batch.
+
+    ``candidate.predictions`` must be a non-empty array of strings. There is
+    no ``candidate.discriminating_prediction`` field; each item in
+    ``predictions`` is a discriminating prediction.
+    """
     return await call(distributed_discovery().submit_candidate, discovery_round_id, candidate_batch_id,
-                      worker_id, session_id, candidate)
+                      worker_id, session_id, candidate.model_dump(exclude_none=True))
 
 
 @mcp.tool()
@@ -1361,21 +1444,25 @@ async def lab_work_list(project_id: str, statuses: list[str] | None = None, limi
 @mcp.tool()
 async def lab_work_create(
     project_id: str, kind: str, title: str, description: str, scientific_role: str,
-    created_by: str | None = None, priority: float = 0, expected_value: float | None = None,
+    created_by: str, created_session_id: str, priority: float = 0, expected_value: float | None = None,
     estimated_cost: float | None = None, related_refs: dict[str, Any] | None = None,
     dependencies: list[dict] | None = None, equivalence_key: str | None = None,
-    parent_work_item_id: str | None = None, created_session_id: str | None = None,
+    parent_work_item_id: str | None = None,
     authority_key: str | None = None, gate_id: str | None = None,
     canonical_subject_version: str | None = None, authority_status: str = "SUPPORTING",
     subject_id: str | None = None, recovery_policy: dict[str, Any] | None = None,
     dormant_until_dependencies: bool = False,
 ):
     """Create dependency-aware project work; authoritative gate work is idempotently reused."""
-    return await call(lab().create_work, project_id, kind, title, description, scientific_role,
-                      created_by, priority, expected_value, estimated_cost, related_refs,
-                      dependencies, equivalence_key, parent_work_item_id, created_session_id,
-                      authority_key, gate_id, canonical_subject_version, authority_status,
-                      subject_id, recovery_policy, dormant_until_dependencies)
+    return await call(
+        lab().create_work, project_id, kind, title, description, scientific_role,
+        created_by=created_by, created_session_id=created_session_id, priority=priority,
+        expected_value=expected_value, estimated_cost=estimated_cost, related_refs=related_refs,
+        dependencies=dependencies, equivalence_key=equivalence_key, parent_work_item_id=parent_work_item_id,
+        authority_key=authority_key, gate_id=gate_id, canonical_subject_version=canonical_subject_version,
+        authority_status=authority_status, subject_id=subject_id, recovery_policy=recovery_policy,
+        dormant_until_dependencies=dormant_until_dependencies,
+    )
 
 
 @mcp.tool()
@@ -1418,11 +1505,16 @@ async def scientific_gate_work_ensure(
 
 @mcp.tool()
 async def deterministic_preflight_run(
-    gate_id: str, worker_id: str, session_id: str, checks: dict[str, Any],
+    gate_id: str, worker_id: str, session_id: str,
+    checks: dict[str, bool | DeterministicPreflightCheck],
     validator_version: str = "lab-coordination-v3.2.2-gates-v1",
 ):
     """Persist a normalized immutable mechanical readiness result for a gate subject version."""
-    return await call(lab().preflight_run, gate_id, worker_id, session_id, checks, validator_version)
+    normalized_checks = {
+        name: value.model_dump(exclude_none=True) if isinstance(value, DeterministicPreflightCheck) else value
+        for name, value in checks.items()
+    }
+    return await call(lab().preflight_run, gate_id, worker_id, session_id, normalized_checks, validator_version)
 
 
 @mcp.tool()
@@ -1512,7 +1604,7 @@ async def lab_heartbeat(session_id: str, work_item_id: str | None = None, lease_
 
 
 @mcp.tool()
-async def lab_message_send(project_id: str, from_worker_id: str, from_session_id: str, message_type: str, subject: str,
+async def lab_message_send(project_id: str, from_worker_id: str, from_session_id: str, message_type: LabMessageType, subject: str,
                            body: str, to_worker_id: str | None = None, to_role: str | None = None,
                            reference_ids: list[str] | None = None, priority: int = 0,
                            broadcast_scope: str | None = None):
@@ -1598,7 +1690,7 @@ async def research_object_get(object_id: str, as_of: str | None = None):
 async def engineering_task_create(
     project_id: str,
     purpose: str,
-    task_type: str,
+    task_type: EngineeringTaskType,
     change_request: str = "",
     repository: str = "",
     repository_root: str = "",
@@ -1672,9 +1764,10 @@ async def engineering_task_update(task_id: str, status: str, update: dict[str, A
 
 
 @mcp.tool()
-async def engineering_diff_review(task_id: str, review: dict[str, Any]):
+async def engineering_diff_review(task_id: str, review: EngineeringDiffReviewInput):
     """Persist a diff review and block material scientific design drift."""
-    return await call(engineering().diff_review, task_id, review)
+    parsed = review if isinstance(review, EngineeringDiffReviewInput) else EngineeringDiffReviewInput.model_validate(review)
+    return await call(engineering().diff_review, task_id, parsed.model_dump())
 
 
 @mcp.tool()
@@ -2156,8 +2249,13 @@ async def research_agenda_item_create(
     related_contradiction_ids: list[str] | None = None,
     candidate_experiments: list[dict] | None = None,
     reproduction_required: bool = False,
+    reproduction_gate_scope: Literal["BASELINE_COMPARISON", "PUBLICATION"] | None = None,
 ):
-    """Persist one scored scientific unknown and its candidate experiments."""
+    """Persist one scored scientific unknown and candidate experiments.
+
+    A reproduction gate is scoped only to BASELINE_COMPARISON or PUBLICATION;
+    it does not block internal causal-development experiments.
+    """
     return await call(
         brain().agenda_item_create,
         agenda_id,
@@ -2170,6 +2268,7 @@ async def research_agenda_item_create(
         related_contradiction_ids,
         candidate_experiments,
         reproduction_required,
+        reproduction_gate_scope,
     )
 
 
@@ -2267,7 +2366,7 @@ async def research_decision_create(
             },
             "runtime": _runtime_code_version(),
         }
-    step = await call(brain().brain_step, project_id)
+    step = await call(brain().experiment_execution_decision_create, project_id, experiment_id)
     if "error" in step:
         return step
     fingerprint = _execution_action_fingerprint(
@@ -2276,11 +2375,11 @@ async def research_decision_create(
     binding = await call(
         brain().execution_decision_bind,
         experiment_id,
-        step["decision_id"],
+        step["decision"]["id"],
         fingerprint,
     )
     handoff = {
-        "decision_id": step["decision_id"],
+        "decision_id": step["decision"]["id"],
         "experiment_id": experiment_id,
         "action_fingerprint": fingerprint,
         "next_tool": "research_experiment_execute",
@@ -2657,7 +2756,11 @@ async def research_operator_critique(operator_name: str, project_id: str, contex
     )
 
 
-async def _hypothesis_draft_with_embedding(draft: dict) -> dict:
+async def _hypothesis_draft_with_embedding(draft: HypothesisDraft | dict) -> dict:
+    # Tool parameters are parsed into HypothesisDraft by FastMCP.  Preserve
+    # dict support for internal callers while keeping the public schema exact.
+    if isinstance(draft, HypothesisDraft):
+        draft = draft.model_dump(mode="json")
     if draft.get("embedding") or settings.gpu_lab_embedding_provider == "disabled":
         return draft
     try:
@@ -2670,13 +2773,13 @@ async def _hypothesis_draft_with_embedding(draft: dict) -> dict:
 
 
 @mcp.tool()
-async def hypothesis_qd_screen(project_id: str, draft: dict):
-    """Compare a typed draft with active/dead ideas using retrieval and structured mechanisms."""
+async def hypothesis_qd_screen(project_id: str, draft: HypothesisDraft):
+    """Screen a fully typed hypothesis draft; this is novelty triage, never scientific evidence."""
     return await call(qd().screen, project_id, await _hypothesis_draft_with_embedding(draft))
 
 
 @mcp.tool()
-async def hypothesis_qd_create(project_id: str, draft: dict):
+async def hypothesis_qd_create(project_id: str, draft: HypothesisDraft):
     """Persist a screened hypothesis with niche, ancestry, similarity, and scientific difference."""
     created = await call(qd().create, project_id, await _hypothesis_draft_with_embedding(draft))
     if "error" not in created and settings.gpu_lab_embedding_provider != "disabled":
@@ -3668,13 +3771,15 @@ async def research_experiment_execute(
     lab_worker_id: str | None = None,
     lab_session_id: str | None = None,
     runtime_fingerprint: str | None = None,
+    instance_id: str | None = None,
 ):
     """Run a preregistered experiment with a ResearchDecision created by research_decision_create.
 
     Retries must reuse execution_attempt_uuid. Every response returns the
     canonical experiment_id, run_id, and job_id after identity reservation.
     """
-    if not settings.gpu_lab_enable_local_runner:
+    executor = "vast" if instance_id else "local"
+    if executor == "local" and not settings.gpu_lab_enable_local_runner:
         return {"error": {"type": "LOCAL_RUNNER_DISABLED"}}
     if engineering_task_id:
         readiness = await call(
@@ -3703,6 +3808,7 @@ async def research_experiment_execute(
             return canaries
         if not canaries:
             return {"error": {"type": "RUNTIME_CANARY_REQUIRED", "message": "No passing canary matches this exact runtime"}}
+    execution_attempt_uuid = execution_attempt_uuid or str(uuid.uuid4())
     request = {
         "experiment_id": experiment_id,
         "decision_id": decision_id,
@@ -3710,17 +3816,19 @@ async def research_experiment_execute(
         "working_directory": working_directory,
         "env": env or {},
         "python_env": python_env,
+        "instance_id": instance_id,
     }
     fingerprint = hashlib.sha256(
         json.dumps(request, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    idempotency_key = execution_attempt_uuid or f"auto:{fingerprint}"
+    idempotency_key = execution_attempt_uuid
     action_fingerprint = _execution_action_fingerprint(
         experiment_id, command, working_directory, env, python_env
     )
-    job_id = (
-        "local_" + hashlib.sha256(f"{experiment_id}:{idempotency_key}".encode()).hexdigest()[:24]
-    )
+    job_prefix = "remote" if instance_id else "local"
+    job_id = job_prefix + "_" + hashlib.sha256(
+        f"{experiment_id}:{idempotency_key}".encode()
+    ).hexdigest()[:24]
     reservation = await call(
         research().run_reserve,
         experiment_id,
@@ -3728,7 +3836,8 @@ async def research_experiment_execute(
         job_id,
         fingerprint,
         {
-            "executor": "local",
+            "executor": executor,
+            "instance_id": instance_id,
             "decision_id": decision_id,
             "command": command,
             "working_directory": working_directory,
@@ -3754,15 +3863,48 @@ async def research_experiment_execute(
             "authorization_error": authorization["error"],
             "retry_safe": True,
         }
-    job = await call(
-        local.submit,
-        command,
-        working_directory,
-        "research-" + experiment_id[:8],
-        env,
-        python_env,
-        reservation["job_id"],
-    )
+    if instance_id:
+        remote_env = dict(env or {})
+        remote_command = command
+        if python_env:
+            python_path = PurePosixPath(python_env)
+            if not python_path.is_absolute() or python_path.name not in {"python", "python3"}:
+                return {
+                    **reservation,
+                    "execution_attempt_uuid": idempotency_key,
+                    "status": "RESERVED",
+                    "submission_error": {"type": "INVALID_REMOTE_PYTHON_PATH", "message": "python_env must be an absolute path ending in bin/python or bin/python3 for Vast execution."},
+                    "retry_safe": True,
+                }
+            # Do not pass a literal "$PATH" via the environment map (its
+            # values are shell-quoted by the remote runner).  Prefix only the
+            # selected reviewed interpreter while retaining the remote PATH.
+            remote_command = (
+                f"VIRTUAL_ENV={q(str(python_path.parent.parent))} "
+                f"PATH={q(str(python_path.parent))}:$PATH {command}"
+            )
+        job = await call(
+            svc().experiment_submit,
+            instance_id,
+            working_directory,
+            remote_command,
+            "research-" + experiment_id[:8],
+            remote_env,
+            None,
+            None,
+            {"canonical_run_id": reservation["run_id"], "executor": "vast"},
+            reservation["job_id"],
+        )
+    else:
+        job = await call(
+            local.submit,
+            command,
+            working_directory,
+            "research-" + experiment_id[:8],
+            env,
+            python_env,
+            reservation["job_id"],
+        )
     if "error" in job:
         return {
             "experiment_id": reservation["experiment_id"],
@@ -3812,7 +3954,7 @@ async def research_experiment_execute(
             lab_session_id,
             mapping["run_id"],
         )
-    response = {**mapping, "job": job, "retry_safe": True}
+    response = {**mapping, "job": job, "retry_safe": True, "execution_attempt_uuid": idempotency_key}
     if attachment is not None:
         if "error" in attachment:
             response["lab_attachment_error"] = attachment["error"]
@@ -3876,16 +4018,19 @@ async def research_experiment_sync(run_id: str | None = None, job_id: str | None
         if job_mapping["run_id"] != mapping["run_id"]:
             return {"error": {"type": "EXECUTION_IDENTIFIER_MISMATCH"}}
     canonical_run_id, canonical_job_id = mapping["run_id"], mapping["job_id"]
+    executor = mapping.get("run", {}).get("data", {}).get("executor", "local")
+    is_remote = executor == "vast"
+    status_fn = svc().experiment_status if is_remote else local.job_status
     outcome = None
     if mapping["status"] == "RESERVED":
-        outcome = await call(local.job_status, canonical_job_id)
+        outcome = await call(status_fn, canonical_job_id)
         if "error" in outcome:
             return {
                 **mapping,
                 "retry_safe": True,
                 "recovery_action": "RETRY_EXECUTION",
                 "message": (
-                    "No local process was submitted. Retry research_experiment_execute with the "
+                    "No executor process was submitted. Retry research_experiment_execute with the "
                     "same experiment_id, decision_id, command, and execution_attempt_uuid."
                 ),
             }
@@ -3896,7 +4041,7 @@ async def research_experiment_sync(run_id: str | None = None, job_id: str | None
                 "retry_safe": True,
                 "recovery_action": "RETRY_EXECUTION",
                 "message": (
-                    "The local job does not prove that a process launched. Retry "
+                    "The executor job does not prove that a process launched. Retry "
                     "research_experiment_execute with the original execution arguments."
                 ),
             }
@@ -3911,7 +4056,7 @@ async def research_experiment_sync(run_id: str | None = None, job_id: str | None
         mapping = promoted
     if mapping["status"] == "RESULT_INSPECTED":
         return {**mapping, "retry_safe": True, "recovery_action": "NONE"}
-    outcome = outcome or await call(local.job_status, canonical_job_id)
+    outcome = outcome or await call(status_fn, canonical_job_id)
     if "error" in outcome:
         return {
             **mapping,
@@ -3921,7 +4066,10 @@ async def research_experiment_sync(run_id: str | None = None, job_id: str | None
             "recovery_action": "INSPECT_OR_RETRY",
             "runner_error": outcome["error"],
         }
-    artifacts = await call(local.artifacts, canonical_job_id)
+    artifacts = await call(
+        svc().artifact_list if is_remote else local.artifacts,
+        canonical_job_id,
+    )
     if isinstance(artifacts, dict) and "error" in artifacts:
         return {
             **mapping,
@@ -3931,7 +4079,7 @@ async def research_experiment_sync(run_id: str | None = None, job_id: str | None
             "recovery_action": "INSPECT_OR_RETRY",
             "artifact_error": artifacts["error"],
         }
-    runtime = await call(local.status)
+    runtime = await call(svc().gpu_status, mapping["run"]["data"]["instance_id"]) if is_remote else await call(local.status)
     if "error" in runtime:
         runtime = {"error": runtime["error"]}
     runner_status = outcome["status"]
@@ -4149,7 +4297,45 @@ async def status(_: Request):
 
 @mcp.custom_route("/activity", methods=["GET"], include_in_schema=False)
 async def activity(_: Request):
-    return JSONResponse(await asyncio.to_thread(svc().repo.list_audit, 100))
+    entries = await asyncio.to_thread(svc().repo.list_audit, 100)
+    return JSONResponse(await asyncio.to_thread(_activity_with_project_context, entries))
+
+
+def _activity_with_project_context(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Add an optional project identity to sanitized historical audit rows."""
+    project_cache: dict[str, dict[str, Any] | None] = {}
+
+    def uuid_values(value: Any) -> list[str]:
+        if isinstance(value, str):
+            try:
+                uuid.UUID(value)
+            except (ValueError, AttributeError):
+                return []
+            return [value]
+        if isinstance(value, dict):
+            return [candidate for item in value.values() for candidate in uuid_values(item)]
+        if isinstance(value, (list, tuple)):
+            return [candidate for item in value for candidate in uuid_values(item)]
+        return []
+
+    enriched = []
+    for entry in entries:
+        result = dict(entry)
+        for candidate in uuid_values(entry.get("arguments", {})):
+            if candidate not in project_cache:
+                try:
+                    project_cache[candidate] = research().project_get(candidate)
+                except GPUError as exc:
+                    if exc.error_type != "RESEARCH_PROJECT_NOT_FOUND":
+                        raise
+                    project_cache[candidate] = None
+            project = project_cache[candidate]
+            if project:
+                result["project_id"] = str(project["id"])
+                result["project_name"] = project.get("name")
+                break
+        enriched.append(result)
+    return enriched
 
 
 def _prioritise_monitor_jobs(running: list, queued: list, recent: list, limit: int = 30) -> list:

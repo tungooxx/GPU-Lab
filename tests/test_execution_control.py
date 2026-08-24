@@ -13,6 +13,13 @@ class FakeResearch:
     def run_resolve(self, _identifier):
         return self.mapping
 
+    def object_get(self, experiment_id):
+        return {
+            "id": experiment_id,
+            "project_id": "project-id",
+            "data": {"plan": {}},
+        }
+
     def run_update(self, run_id, result):
         self.updates.append((run_id, result))
         return {"id": run_id, "status": result["status"], "data": result}
@@ -76,6 +83,30 @@ class UnprovenLocal:
         return {"job_id": "local_reserved_job", "status": self.status}
 
 
+class RemoteRunner:
+    def __init__(self):
+        self.submit_args = None
+        self.repo = type("AuditRepo", (), {"audit": staticmethod(lambda *_args, **_kwargs: None)})()
+
+    async def experiment_submit(self, *args):
+        self.submit_args = args
+        return {"job_id": args[-1], "status": "running", "instance": {"id": args[0]}}
+
+    async def experiment_status(self, job_id):
+        return {"job_id": job_id, "status": "completed", "exit_code": 0, "logs_tail": ["ok"]}
+
+    async def artifact_list(self, _job_id):
+        return []
+
+    async def gpu_status(self, instance_id):
+        return {"instance_id": instance_id}
+
+
+class TerminalLab:
+    def experiment_run_terminal(self, *_args):
+        return {"status": "ok"}
+
+
 class AuthorizingBrain:
     def authorize_execution(self, *_args):
         return {"authorized": True}
@@ -91,9 +122,9 @@ class BindingBrain:
 
 
 class DecisionCreatingBrain(BindingBrain):
-    def brain_step(self, _project_id):
+    def experiment_execution_decision_create(self, _project_id, _experiment_id):
         return {
-            "decision_id": "decision-id",
+            "decision": {"id": "decision-id"},
             "large_durable_trace": "x" * 100_000,
         }
 
@@ -253,6 +284,43 @@ async def test_execute_does_not_mark_queued_replay_as_started(monkeypatch):
     assert result["runner_status"] == "queued"
     assert result["recovery_action"] == "RETRY_EXECUTION"
     assert research.promotions == 0
+
+
+@pytest.mark.asyncio
+async def test_execute_uses_canonical_remote_submission_and_absolute_python(monkeypatch):
+    research = FakeResearch(_mapping("RESERVED"))
+    research.run_reserve = lambda *_args: research.mapping
+    runner = RemoteRunner()
+    monkeypatch.setattr(server, "research", lambda: research)
+    monkeypatch.setattr(server, "brain", lambda: AuthorizingBrain())
+    monkeypatch.setattr(server, "svc", lambda: runner)
+
+    result = await server.research_experiment_execute(
+        "experiment-id", "decision-id", "python train.py", "/workspace/repos/plancarry",
+        python_env="/workspace/repos/plancarry/.venv/bin/python",
+        execution_attempt_uuid="attempt-id", instance_id="vast_1",
+    )
+
+    assert result["execution_attempt_uuid"] == "attempt-id"
+    assert runner.submit_args[0] == "vast_1"
+    assert runner.submit_args[-1] == "local_reserved_job"
+    assert "VIRTUAL_ENV=" in runner.submit_args[2]
+
+
+@pytest.mark.asyncio
+async def test_sync_uses_remote_status_artifacts_and_runtime(monkeypatch):
+    mapping = _mapping("running")
+    mapping["run"]["data"].update({"executor": "vast", "instance_id": "vast_1"})
+    research = FakeResearch(mapping)
+    runner = RemoteRunner()
+    monkeypatch.setattr(server, "research", lambda: research)
+    monkeypatch.setattr(server, "svc", lambda: runner)
+    monkeypatch.setattr(server, "lab", lambda: TerminalLab())
+
+    result = await server.research_experiment_sync(run_id="run-id")
+
+    assert result["status"] == "completed"
+    assert research.updates[0][1]["runtime"] == {"instance_id": "vast_1"}
 
 
 @pytest.mark.asyncio

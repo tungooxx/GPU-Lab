@@ -1,5 +1,7 @@
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 
@@ -43,6 +45,20 @@ def test_hyperparameter_only_variants_share_a_scientific_equivalence_key():
     first = {"data": {"diversity_signature": {"representation": "token-grid", "learning_rate": 0.001}}}
     second = {"data": {"diversity_signature": {"representation": "token-grid", "learning_rate": 0.01}}}
     assert DistributedDiscoveryService._scientific_equivalence_key(first) == DistributedDiscoveryService._scientific_equivalence_key(second)
+
+
+def test_scientific_snapshot_records_have_a_stable_canonical_order():
+    service = DistributedDiscoveryService.__new__(DistributedDiscoveryService)
+    service.store = type("Store", (), {"state_get": staticmethod(lambda _project: {
+        "state_freshness": {"research_state_version": 2, "world_model_version": None},
+        "canonical_state": {"negative_results": []},
+        "objects": [
+            {"id": "b", "kind": "Claim", "status": "ACTIVE", "data": {"v": 2}},
+            {"id": "a", "kind": "Claim", "status": "ACTIVE", "data": {"v": 1}},
+        ],
+    })})()
+
+    assert [item["id"] for item in service._scientific_snapshot("project")["records"]] == ["a", "b"]
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
@@ -165,6 +181,105 @@ def test_isolated_round_blocks_peer_finding_messages_and_detects_stale_state():
     assert dde.stale_check(round_["id"])["stale"] is True
     assert dde.stale_check(round_["id"], mark_stale=True)["round"]["status"] == "STALE"
     assert batch["data"]["worker_session_id"] == first["session_id"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_engineering_bookkeeping_does_not_self_stale_a_discovery_round():
+    store = ResearchStore(TEST_DATABASE_URL)
+    dde = DistributedDiscoveryService(store)
+    project_id = store.project_create(f"dde-engineering-bookkeeping-{time.time_ns()}", "Snapshot scope")['project_id']
+    round_ = dde.create_round(project_id, None, "MECHANISM_SEARCH")
+
+    store.object_create(project_id, "EngineeringTask", {"purpose": "non-scientific review"}, "ENGINEERING_DIFF_REVIEWED")
+
+    result = dde.stale_check(round_["id"])
+    assert result["stale"] is False
+    assert result["changed_scientific_record_count"] == 0
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_brain_portfolio_bookkeeping_does_not_invalidate_the_archive_it_consumes():
+    store = ResearchStore(TEST_DATABASE_URL)
+    dde = DistributedDiscoveryService(store)
+    project_id = store.project_create(f"dde-control-plane-{time.time_ns()}", "Archive freshness")['project_id']
+    round_ = dde.create_round(project_id, None, "MECHANISM_SEARCH")
+
+    for kind in ("HypothesisPortfolio", "ResearchSituation", "CandidatePortfolio", "ResearchActionCandidate", "ResearchDecision"):
+        store.object_create(project_id, kind, {"control_plane": True}, "BRAIN_BOOKKEEPING")
+
+    result = dde.stale_check(round_["id"])
+    assert result["stale"] is False
+    assert result["changed_scientific_record_count"] == 0
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_stale_transition_expires_open_batches_and_makes_them_visibly_non_writeable():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab, dde = LabController(store), DistributedDiscoveryService(store)
+    project_id = store.project_create(f"dde-stale-open-{time.time_ns()}", "Stale open batch")['project_id']
+    worker = lab.join(None, "stale-open", "CODEX", project_id)
+    round_ = dde.create_round(project_id, None, "MECHANISM_SEARCH")
+    batch = dde.join_round(round_["id"], worker["worker"]["id"], worker["session_id"], "CAUSAL_INVERSION", "FAR")
+    store.object_create(project_id, "Claim", {"statement": "external scientific change", "scope": "test"}, "CLAIM_CREATED")
+
+    stale = dde.stale_check(round_["id"], mark_stale=True)
+    assert stale["round"]["status"] == "STALE"
+    view = dde.batch_get(round_["id"], batch["id"], worker["session_id"])
+    assert view["status"] == "EXPIRED"
+    assert view["effective_status"] == "EXPIRED"
+    assert view["writeable"] is False
+    assert view["recovery_action"] == "CREATE_FRESH_ROUND"
+    assert next(member for member in dde._members(round_["id"]) if member["candidate_batch_id"] == batch["id"])["status"] == "EXPIRED"
+
+    with pytest.raises(GPUError) as exc:
+        dde.submit_candidate(round_["id"], batch["id"], worker["worker"]["id"], worker["session_id"], _candidate("late", {"causal_object": "late"}))
+    assert exc.value.error_type == "DISCOVERY_ROUND_NOT_GENERATING"
+    assert exc.value.response()["error"] == {
+        "type": "DISCOVERY_ROUND_NOT_GENERATING",
+        "message": "Discovery round is not accepting candidate submissions.",
+        "retryable": False,
+        "actual_round_phase": "STALE",
+        "stale": True,
+        "batch_effective_status": "EXPIRED",
+        "recovery_action": "CREATE_FRESH_ROUND",
+    }
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_stale_transition_and_candidate_submission_leave_no_joined_active_batch():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab, dde = LabController(store), DistributedDiscoveryService(store)
+    project_id = store.project_create(f"dde-stale-race-{time.time_ns()}", "Stale race")['project_id']
+    worker = lab.join(None, "stale-race", "CODEX", project_id)
+    round_ = dde.create_round(project_id, None, "MECHANISM_SEARCH")
+    batch = dde.join_round(round_["id"], worker["worker"]["id"], worker["session_id"], "CAUSAL_INVERSION", "FAR")
+    store.object_create(project_id, "Claim", {"statement": "external scientific change", "scope": "test"}, "CLAIM_CREATED")
+    barrier = Barrier(2)
+
+    def mark_stale():
+        barrier.wait()
+        return dde.stale_check(round_["id"], mark_stale=True)
+
+    def submit():
+        barrier.wait()
+        try:
+            return dde.submit_candidate(round_["id"], batch["id"], worker["worker"]["id"], worker["session_id"], _candidate("racing", {"causal_object": "race"}))
+        except GPUError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        stale_future = pool.submit(mark_stale)
+        submit_future = pool.submit(submit)
+        stale_result = stale_future.result()
+        submit_result = submit_future.result()
+
+    # The two state transitions share the parent round lock. A submission may
+    # win before expiry, but after staleness commits the batch can never remain
+    # ACTIVE/JOINED or advertise write authority.
+    assert stale_result["stale"] is True
+    assert not isinstance(submit_result, Exception) or submit_result.error_type == "DISCOVERY_ROUND_NOT_GENERATING"
+    view = dde.batch_get(round_["id"], batch["id"], worker["session_id"])
+    assert (view["status"], view["effective_status"], view["writeable"]) == ("EXPIRED", "EXPIRED", False)
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")

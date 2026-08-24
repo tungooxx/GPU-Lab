@@ -34,7 +34,7 @@ COORDINATION_VERSION = "lab-coordination-v3.2.2-gates-v1"
 MESSAGE_TYPES = {
     "REQUEST_REVIEW", "REQUEST_DATA", "REQUEST_IMPLEMENTATION", "SHARE_FINDING",
     "CHALLENGE_INTERPRETATION", "HANDOFF", "BLOCKER", "CROSS_PROJECT_RELEVANCE",
-    "COORDINATION", "INFORMATION",
+    "COORDINATION", "INFORMATION", "ENGINEERING_HANDOFF",
 }
 
 
@@ -1054,7 +1054,7 @@ class LabController:
         at all.  A live session is required for such an item to remain owned;
         otherwise it is recovered just like an expired lease.
         """
-        now, recovered = self._now(), 0
+        now, recovered, projection_repairs = self._now(), 0, 0
         changed_projects: set[str] = set()
         with self.store._connect() as conn, conn.cursor() as cur:
             sql = "SELECT l.*,w.project_id,w.kind,w.related_refs FROM lab_work_leases l JOIN lab_work_items w ON w.id=l.work_item_id WHERE l.released_at IS NULL AND l.expires_at<%s"
@@ -1085,17 +1085,68 @@ class LabController:
                 recovered += 1
                 changed_projects.add(str(lease["project_id"]))
 
-            # Do not trust a lease to be present.  A WorkItem in an owned
-            # state is valid only while its assigned session is heartbeat-live.
-            # This catches old/manual rows and partial failures where the lease
-            # write was lost after the WorkItem status committed.
+            # A renewable lease is the ownership authority.  Repair legacy or
+            # partially-written WorkItem/session projections from that source
+            # before any dashboard or worker state is returned.
+            sql = (
+                "SELECT l.id AS live_lease_id,l.work_item_id,l.worker_id,l.worker_session_id,"
+                "w.project_id,w.status,w.assigned_worker_id,w.assigned_session_id,w.lease_id "
+                "FROM lab_work_leases l JOIN lab_work_items w ON w.id=l.work_item_id "
+                "WHERE l.released_at IS NULL AND l.expires_at>=%s"
+            )
+            args = [now]
+            if project_id:
+                sql += " AND w.project_id=%s"
+                args.append(project_id)
+            sql += " FOR UPDATE OF w SKIP LOCKED"
+            cur.execute(sql, args)
+            for lease in cur.fetchall():
+                projection_matches = (
+                    str(lease["assigned_worker_id"] or "") == str(lease["worker_id"])
+                    and str(lease["assigned_session_id"] or "") == str(lease["worker_session_id"])
+                    and str(lease["lease_id"] or "") == str(lease["live_lease_id"])
+                    and lease["status"] in {"CLAIMED", "RUNNING"}
+                )
+                if projection_matches:
+                    continue
+                status = lease["status"] if lease["status"] in {"CLAIMED", "RUNNING"} else "CLAIMED"
+                cur.execute(
+                    "UPDATE lab_work_items SET status=%s,assigned_worker_id=%s,assigned_session_id=%s,"
+                    "lease_id=%s,updated_at=%s WHERE id=%s",
+                    (status, lease["worker_id"], lease["worker_session_id"], lease["live_lease_id"], now, lease["work_item_id"]),
+                )
+                cur.execute(
+                    "UPDATE research_worker_sessions SET status='BUSY',current_work_item_id=%s "
+                    "WHERE id=%s AND status NOT IN ('DISCONNECTED','EXPIRED')",
+                    (lease["work_item_id"], lease["worker_session_id"]),
+                )
+                cur.execute(
+                    "UPDATE research_worker_sessions SET status=CASE WHEN status='BUSY' THEN 'ACTIVE' ELSE status END,"
+                    "current_work_item_id=NULL WHERE current_work_item_id=%s AND id<>%s",
+                    (lease["work_item_id"], lease["worker_session_id"]),
+                )
+                self._event(cur, lease["project_id"], "LEASE_PROJECTION_REPAIRED", lease["work_item_id"], {
+                    "lease_id": str(lease["live_lease_id"]), "worker_id": str(lease["worker_id"]),
+                    "session_id": str(lease["worker_session_id"]),
+                })
+                projection_repairs += 1
+                changed_projects.add(str(lease["project_id"]))
+
+            # Do not trust a lease to be present.  This scan is exclusively
+            # for old/manual rows and partial failures where the lease write
+            # was lost after the WorkItem status committed.  A live lease is
+            # the ownership authority and was reconciled above, so an ACTIVE
+            # (or temporarily stale-projected) session can never cause its
+            # unexpired lease to be orphan-reclaimed here.
             threshold = now - timedelta(seconds=self.lease_seconds)
             sql = (
                 "SELECT w.*,s.status AS session_status,s.last_heartbeat_at "
                 "FROM lab_work_items w LEFT JOIN research_worker_sessions s "
                 "ON s.id=w.assigned_session_id WHERE w.status IN ('CLAIMED','RUNNING')"
+                " AND NOT EXISTS (SELECT 1 FROM lab_work_leases l "
+                "WHERE l.work_item_id=w.id AND l.released_at IS NULL AND l.expires_at>=%s)"
             )
-            args: list[Any] = []
+            args: list[Any] = [now]
             if project_id:
                 sql += " AND w.project_id=%s"
                 args.append(project_id)
@@ -1150,7 +1201,7 @@ class LabController:
                 changed_projects.add(str(item["project_id"]))
         for changed_project in changed_projects:
             self.resolve_dependencies(changed_project)
-        return {"recovered": recovered}
+        return {"recovered": recovered, "projection_repairs": projection_repairs}
 
     def message_send(self, project_id: str, from_worker_id: str, from_session_id: str, message_type: str,
                      subject: str, body: str, to_worker_id: str | None = None,
@@ -1224,7 +1275,17 @@ class LabController:
     def _active_workers(self, project_id: str) -> list[dict]:
         threshold = self._now() - timedelta(seconds=self.lease_seconds)
         with self.store._connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT s.id AS session_id,s.worker_id,w.display_name,s.status,s.active_role,s.current_work_item_id,s.last_heartbeat_at FROM research_worker_sessions s JOIN research_workers w ON w.id=s.worker_id WHERE s.current_project_id=%s AND s.status NOT IN ('DISCONNECTED','EXPIRED') AND s.last_heartbeat_at>=%s ORDER BY s.last_heartbeat_at DESC", (project_id, threshold))
+            cur.execute(
+                "SELECT s.id AS session_id,s.worker_id,w.display_name,"
+                "CASE WHEN EXISTS(SELECT 1 FROM lab_work_leases l WHERE l.worker_session_id=s.id "
+                "AND l.released_at IS NULL AND l.expires_at>=%s) THEN 'BUSY' "
+                "WHEN s.status='BUSY' THEN 'ACTIVE' ELSE s.status END AS status,"
+                "s.active_role,s.current_work_item_id,s.last_heartbeat_at "
+                "FROM research_worker_sessions s JOIN research_workers w ON w.id=s.worker_id "
+                "WHERE s.current_project_id=%s AND s.status NOT IN ('DISCONNECTED','EXPIRED') "
+                "AND s.last_heartbeat_at>=%s ORDER BY s.last_heartbeat_at DESC",
+                (self._now(), project_id, threshold),
+            )
             return [self._record(row) for row in cur.fetchall()]
 
     def state_get(
