@@ -162,9 +162,29 @@ class DistributedDiscoveryService:
             agenda = self.store.object_get(agenda_item_id)
             if agenda["kind"] != "AgendaItem" or str(agenda["project_id"]) != str(project_id):
                 raise GPUError("DISCOVERY_AGENDA_ITEM_INVALID", agenda_item_id)
+        baseline_signature: dict[str, Any] = {}
+        baseline_signature_source: dict[str, Any] | None = None
+        if triggering_decision_id:
+            decision = self.store.object_get(triggering_decision_id)
+            if decision["kind"] != "ResearchDecision" or str(decision["project_id"]) != str(project_id):
+                raise GPUError("DISCOVERY_TRIGGERING_DECISION_INVALID", str(triggering_decision_id))
+            selected = decision.get("data", {}).get("selected_action", {})
+            try:
+                baseline_signature = self._signature(selected)
+            except GPUError as exc:
+                if exc.error_type != "DISCOVERY_DIVERSITY_SIGNATURE_REQUIRED":
+                    raise
+            if baseline_signature:
+                baseline_signature_source = {
+                    "kind": "ResearchDecision",
+                    "id": str(triggering_decision_id),
+                    "selected_action_id": selected.get("id"),
+                }
         data = {
             "implementation_version": DDE_VERSION, "agenda_item_id": agenda_item_id,
             "triggering_decision_id": triggering_decision_id, "search_regime": search_regime.upper(),
+            "baseline_signature": baseline_signature,
+            "baseline_signature_source": baseline_signature_source,
             "phase": "INDEPENDENT_GENERATION", "peer_visibility": "HIDDEN",
             "independent_generation": True, "required_distance_coverage": self.reservations(search_regime),
             "generation_budget": budget, "frozen_state": snapshot,
@@ -279,6 +299,7 @@ class DistributedDiscoveryService:
         snapshot = self._scientific_snapshot(project_id)
         reservations = self.reservations(search_regime)
         characterized = []
+        baseline_signature: dict[str, Any] | None = None
         for index, raw in enumerate(candidates):
             try:
                 signature = self._signature(raw)
@@ -286,8 +307,15 @@ class DistributedDiscoveryService:
                 if exc.error_type != "DISCOVERY_DIVERSITY_SIGNATURE_REQUIRED":
                     raise
                 signature = {}
+            if signature and baseline_signature is None:
+                # Match Brain._discovery_portfolio semantics: the first serious
+                # candidate is the read-only comparison baseline.  Comparing to
+                # an empty signature makes every explicit causal_object look
+                # ORTHOGONAL and collapses NEAR/MID/FAR coverage.
+                baseline_signature = dict(signature)
             distance = classify_scientific_distance(
-                {"payload": {"scientific_dimensions": signature}}, {"payload": {"scientific_dimensions": {}}},
+                {"payload": {"scientific_dimensions": signature}},
+                {"payload": {"scientific_dimensions": baseline_signature or {}}},
             ) if signature else {"scientific_distance": "UNCHARACTERIZED", "reason": "Existing candidate lacks a structured DiversitySignature"}
             characterized.append({
                 "index": index, "title": raw.get("title") or raw.get("action_type", f"candidate-{index}"),
@@ -304,6 +332,7 @@ class DistributedDiscoveryService:
             "read_only": True, "implementation_version": DDE_VERSION,
             "frozen_scientific_snapshot_hash": self._hash(snapshot["records"]),
             "search_regime": search_regime.upper(), "required_distance_coverage": reservations,
+            "baseline_signature": baseline_signature or {},
             "candidates": characterized, "effective_niche_count": len(niches),
             "niche_distribution": dict(niches), "scientific_distance_distribution": dict(coverage),
             "unfilled_distance_slots": [key for key, amount in reservations.items() if amount and not coverage[key]],
