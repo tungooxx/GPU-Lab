@@ -179,6 +179,28 @@ async def test_destroy_requires_confirmation(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_destroy_treats_provider_404_as_already_deleted_and_keeps_history(tmp_path):
+    service = GPUService(Settings(gpu_lab_database_url=f"sqlite:///{tmp_path / 'db.sqlite'}"))
+    service.repo.save_instance(Instance(id="vast_deleted", provider_instance_id="deleted", status="running"))
+
+    class Provider:
+        async def destroy_instance(self, _instance_id):
+            raise GPUError("PROVIDER_NOT_FOUND", "Vast returned 404", details={"status_code": 404})
+
+    service.provider = Provider()
+    result = await service.gpu_destroy("vast_deleted", "DESTROY")
+
+    assert result == {
+        "instance_id": "vast_deleted",
+        "status": "ALREADY_DELETED",
+        "historical_record_retained": True,
+    }
+    saved = service.repo.get_instance("vast_deleted")
+    assert saved.status == "destroyed"
+    assert saved.metadata["provider_already_deleted"] is True
+
+
+@pytest.mark.asyncio
 async def test_artifact_path_traversal_is_rejected(tmp_path):
     service = GPUService(Settings(gpu_lab_database_url=f"sqlite:///{tmp_path / 'db.sqlite'}"))
     service.repo.save_job(

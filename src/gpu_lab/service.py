@@ -51,6 +51,8 @@ class GPUService:
             # revive the record if it reappears (for example after scheduling).
             for item in self.repo.list_instances():
                 if item.provider == "vast" and item.id not in visible_ids:
+                    if item.status == "destroyed":
+                        continue
                     item.status = "provider_missing"
                     item.metadata = {
                         **item.metadata,
@@ -160,11 +162,28 @@ class GPUService:
             raise GPUError(
                 "CONFIRMATION_REQUIRED", "Pass confirmation='DESTROY' to destroy an instance"
             )
-        await self._provider().destroy_instance(instance_id)
         item = self._instance(instance_id)
+        already_deleted = False
+        try:
+            await self._provider().destroy_instance(instance_id)
+        except GPUError as exc:
+            if exc.error_type != "PROVIDER_NOT_FOUND":
+                raise
+            already_deleted = True
         item.status = "destroyed"
+        item.metadata = {
+            **item.metadata,
+            "provider_visible": False,
+            "provider_deleted_at": datetime.now(UTC).isoformat(),
+            "provider_deletion_confirmed": not already_deleted,
+            "provider_already_deleted": already_deleted,
+        }
         self.repo.save_instance(item)
-        return {"instance_id": instance_id, "status": "destroyed"}
+        return {
+            "instance_id": instance_id,
+            "status": "ALREADY_DELETED" if already_deleted else "destroyed",
+            "historical_record_retained": True,
+        }
 
     async def repo_checkout(
         self,
