@@ -57,6 +57,7 @@ from .strategy_transfer_v35 import (
     StrategyPatternCreate,
     StrategyTransferApply,
     StrategyTransferOutcomeRecord,
+    StrategyTransferHindsightRecord,
     StrategyTransferPropose,
     StrategyTransferService,
     StrategyScope,
@@ -3222,6 +3223,12 @@ async def strategy_transfer_apply(candidate_id: str, application: StrategyTransf
 async def strategy_transfer_outcome_record(candidate_id: str, outcome: StrategyTransferOutcomeRecord):
     """Record prospective positive, negative, neutral, inconclusive, or invalid transfer evidence."""
     return await call(strategy_transfer().outcome_record, candidate_id, outcome)
+
+
+@mcp.tool()
+async def strategy_transfer_hindsight_record(outcome_id: str, hindsight: StrategyTransferHindsightRecord):
+    """Append a later transfer calibration record without revising target scientific evidence."""
+    return await call(strategy_transfer().hindsight_record, outcome_id, hindsight)
 
 
 @mcp.tool()

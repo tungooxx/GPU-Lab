@@ -172,6 +172,16 @@ class StrategyTransferOutcomeRecord(BaseModel):
         return value
 
 
+class StrategyTransferHindsightRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    prediction_was_accurate: bool | None = None
+    observed_generalization: str = Field(min_length=1, max_length=10_000)
+    later_correction_reversed_interpretation: bool = False
+    anchoring_or_diversity_impact: str | None = Field(default=None, max_length=10_000)
+    rationale: str = Field(min_length=1, max_length=20_000)
+
+
 class StrategyTransferService:
     """Invariant-preserving service.  No API here copies source scientific data."""
 
@@ -310,6 +320,18 @@ class StrategyTransferService:
         eligible_domain = len(targets) >= 2 and len(positive) >= 2 and len(factor_signatures) >= 2
         eligible_global = eligible_domain and len(domains) >= 2 and len({tuple(sorted(x["data"].get("independence_factors", {}).items())) for x in positive}) >= 3
         return {"strategy_id": strategy_id, "current_scope": pattern["data"].get("scope"), "current_maturity": pattern["data"].get("maturity"), "outcomes": {"positive": len(positive), "negative": sum(x["status"] == TransferOutcomeKind.NEGATIVE_TRANSFER for x in valid), "invalid": len(outcomes) - len(valid), "target_projects": len(targets), "domains": len(domains)}, "eligible_domain_promotion": eligible_domain, "eligible_global_promotion": eligible_global, "fail_closed_note": "Promotion is a separate reversible meta-scientific decision; counts alone never promote."}
+
+    def hindsight_record(self, outcome_id: str, hindsight: StrategyTransferHindsightRecord) -> dict[str, Any]:
+        outcome = self.store.object_get(outcome_id)
+        if outcome["kind"] != "StrategyTransferOutcome":
+            raise GPUError("NOT_A_STRATEGY_TRANSFER_OUTCOME", outcome_id)
+        record = self.store.object_create(
+            str(outcome["project_id"]), "StrategyTransferHindsight",
+            {"strategy_transfer_outcome_id": outcome_id, **hindsight.model_dump(mode="json"), "recorded_at": self._now()},
+            "STRATEGY_TRANSFER_HINDSIGHT_RECORDED", "COMPLETED",
+        )
+        self.store.object_update(outcome_id, {"latest_hindsight_id": str(record["id"])}, outcome["status"], "STRATEGY_TRANSFER_HINDSIGHT_LINKED")
+        return record
 
     def promotion_decide(self, strategy_id: str, target_scope: StrategyScope, rationale: str, correction_case_ids: list[str] | None = None) -> dict[str, Any]:
         """Make a durable, reversible scope decision after an explicit evidence check."""

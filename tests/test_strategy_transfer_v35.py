@@ -14,6 +14,7 @@ from gpu_lab.strategy_transfer_v35 import (
     StrategyScope,
     StrategyTransferApply,
     StrategyTransferOutcomeRecord,
+    StrategyTransferHindsightRecord,
     StrategyTransferPropose,
     StrategyTransferService,
     TransferOutcomeKind,
@@ -96,6 +97,8 @@ def test_transfer_is_prospective_and_does_not_expose_source_science():
     ))
     assert outcome["outcome"]["status"] == "POSITIVE_TRANSFER"
     assert store.object_get(pattern["id"])["data"]["transfer_counts"]["positive"] == 1
+    hindsight = service.hindsight_record(outcome["outcome"]["id"], StrategyTransferHindsightRecord(observed_generalization="Not yet assessed.", rationale="Awaiting an independent target context."))
+    assert hindsight["kind"] == "StrategyTransferHindsight"
 
 
 def test_negative_transfer_requires_applicability_refinement():
