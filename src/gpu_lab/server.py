@@ -4052,6 +4052,12 @@ async def research_experiment_execute(
     Retries must reuse execution_attempt_uuid. Every response returns the
     canonical experiment_id, run_id, and job_id after identity reservation.
     """
+    # ``local`` was historically accepted by callers as an executor label,
+    # but it is not a Vast instance.  Normalize it before identity reservation
+    # so it cannot route a canonical local run through the remote service.
+    requested_instance_id = instance_id
+    if instance_id and instance_id.strip().lower() in {"local", "local_runner"}:
+        instance_id = None
     executor = "vast" if instance_id else "local"
     if executor == "local" and not settings.gpu_lab_enable_local_runner:
         return {"error": {"type": "LOCAL_RUNNER_DISABLED"}}
@@ -4112,6 +4118,7 @@ async def research_experiment_execute(
         {
             "executor": executor,
             "instance_id": instance_id,
+            "requested_instance_id": requested_instance_id,
             "decision_id": decision_id,
             "command": command,
             "working_directory": working_directory,

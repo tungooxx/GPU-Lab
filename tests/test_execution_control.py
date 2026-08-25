@@ -83,6 +83,16 @@ class UnprovenLocal:
         return {"job_id": "local_reserved_job", "status": self.status}
 
 
+class CapturingLocal(UnprovenLocal):
+    def __init__(self, status):
+        super().__init__(status)
+        self.submit_args = None
+
+    async def submit(self, *args):
+        self.submit_args = args
+        return await super().submit(*args)
+
+
 class RemoteRunner:
     def __init__(self):
         self.submit_args = None
@@ -284,6 +294,31 @@ async def test_execute_does_not_mark_queued_replay_as_started(monkeypatch):
     assert result["runner_status"] == "queued"
     assert result["recovery_action"] == "RETRY_EXECUTION"
     assert research.promotions == 0
+
+
+@pytest.mark.asyncio
+async def test_execute_normalizes_local_instance_label_before_reservation(monkeypatch):
+    research = FakeResearch(_mapping("RESERVED"))
+    captured_reservation = {}
+    def reserve(*args):
+        captured_reservation["execution"] = args[-1]
+        return research.mapping
+    research.run_reserve = reserve
+    runner = CapturingLocal("queued")
+    monkeypatch.setattr(server.settings, "gpu_lab_enable_local_runner", True)
+    monkeypatch.setattr(server, "research", lambda: research)
+    monkeypatch.setattr(server, "brain", lambda: AuthorizingBrain())
+    monkeypatch.setattr(server, "local", runner)
+
+    result = await server.research_experiment_execute(
+        "experiment-id", "decision-id", "echo ok", execution_attempt_uuid="attempt-id", instance_id="local"
+    )
+
+    assert result["status"] == "RESERVED"
+    assert captured_reservation["execution"]["executor"] == "local"
+    assert captured_reservation["execution"]["instance_id"] is None
+    assert captured_reservation["execution"]["requested_instance_id"] == "local"
+    assert runner.submit_args is not None
 
 
 @pytest.mark.asyncio

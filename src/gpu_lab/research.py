@@ -4285,6 +4285,45 @@ class ResearchStore:
             existing = cur.fetchone()
             if existing:
                 if existing["request_fingerprint"] != request_fingerprint:
+                    # v3.5.1 routing repair: old gateways treated the string
+                    # ``instance_id=local`` as a Vast target.  An untouched
+                    # reserved attempt may be safely retried as local using
+                    # its original UUID.  This is intentionally narrow: a
+                    # submitted/terminal run, a real instance, or any other
+                    # request difference remains an idempotency violation.
+                    cur.execute(
+                        "SELECT project_id,status,data FROM research_objects WHERE id=%s FOR UPDATE",
+                        (existing["run_id"],),
+                    )
+                    prior_run = cur.fetchone()
+                    prior_data = prior_run["data"] if prior_run else {}
+                    safe_local_route_repair = (
+                        prior_run is not None
+                        and existing["status"] == "RESERVED"
+                        and prior_run["status"] == "RESERVED"
+                        and prior_data.get("executor") == "vast"
+                        and str(prior_data.get("instance_id", "")).strip().lower() in {"local", "local_runner"}
+                        and execution.get("executor") == "local"
+                        and execution.get("instance_id") is None
+                        and not prior_data.get("submission_status")
+                    )
+                    if safe_local_route_repair:
+                        repaired_data = {**prior_data, **execution, "request_fingerprint": request_fingerprint, "routing_repaired_at": now.isoformat(), "routing_repair_reason": "LOCAL_INSTANCE_ID_NORMALIZED"}
+                        cur.execute(
+                            "UPDATE research_objects SET data=%s WHERE id=%s",
+                            (json.dumps(repaired_data), existing["run_id"]),
+                        )
+                        cur.execute(
+                            "UPDATE research_execution_attempts SET request_fingerprint=%s,updated_at=%s WHERE run_id=%s",
+                            (request_fingerprint, now, existing["run_id"]),
+                        )
+                        self._event(
+                            cur, prior_run["project_id"], "EXPERIMENT_EXECUTION_ROUTING_REPAIRED",
+                            existing["run_id"], {"from_executor": "vast", "from_instance_id": prior_data.get("instance_id"), "to_executor": "local"},
+                        )
+                        return self._execution_mapping(
+                            cur, existing["run_id"], existing["job_id"], idempotency_key, True
+                        )
                     raise GPUError(
                         "IDEMPOTENCY_KEY_REUSED",
                         "The execution key is already bound to a different request",
