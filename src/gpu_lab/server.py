@@ -216,6 +216,7 @@ _DESTRUCTIVE_TOOLS = {
     "research_null_model_create",
     "research_null_model_test",
     "research_decision_outcome_assess",
+    "research_canonical_assessment_reconcile",
     "executable_paper_action_approve",
 }
 _OPEN_WORLD_TOOLS = {
@@ -4147,6 +4148,23 @@ async def research_technical_result_inspect(
         actual_information_gain=actual_information_gain,
         information_gain_basis=information_gain_basis,
         inspection=inspection,
+    )
+
+
+@mcp.tool()
+async def research_canonical_assessment_reconcile(
+    run_id: str,
+    decision_id: str,
+    canonical_assessment_record_ids: list[str],
+    rationale: str,
+):
+    """Mark an already-assessed terminal run inspected without creating or reassessing science."""
+    return await call(
+        research().canonical_assessment_inspection_reconcile,
+        run_id,
+        decision_id,
+        canonical_assessment_record_ids,
+        rationale,
     )
 
 

@@ -209,6 +209,7 @@ def test_strategy_writes_are_not_advertised_as_read_only():
         "research_null_model_create",
         "research_null_model_test",
         "research_decision_outcome_assess",
+        "research_canonical_assessment_reconcile",
     ):
         annotations = mcp._tool_manager._tools[name].annotations
         assert annotations.readOnlyHint is False
