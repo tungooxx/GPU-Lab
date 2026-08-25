@@ -306,6 +306,18 @@ class EngineeringDiffReviewInput(BaseModel):
     prohibited_changes_detected: list[str] = Field(default_factory=list)
 
 
+class ResearchStateUpdateInput(BaseModel):
+    """The bounded cache fields that may guide the next discriminating test."""
+
+    established_facts: list[str] | None = Field(
+        default=None,
+        description="Evidence-backed facts; this cache does not replace EvidenceUnit records.",
+    )
+    current_best_explanation: str | None = Field(default=None)
+    highest_value_unknown: str | None = Field(default=None)
+    next_discriminating_experiments: list[str] | None = Field(default=None)
+
+
 class DeterministicPreflightCheck(BaseModel):
     passed: bool
     warning: str | None = None
@@ -2199,9 +2211,13 @@ async def world_model_consistency_check(project_id: str, as_of: str | None = Non
 
 
 @mcp.tool()
-async def research_state_update(project_id: str, update: dict):
+async def research_state_update(project_id: str, update: ResearchStateUpdateInput):
     """Persist the evidence-backed research focus that guides the next discriminating test."""
-    return await call(research().project_state_update, project_id, update)
+    return await call(
+        research().project_state_update,
+        project_id,
+        update.model_dump(exclude_unset=True),
+    )
 
 
 @mcp.tool()

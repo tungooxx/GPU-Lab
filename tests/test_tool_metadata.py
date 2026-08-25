@@ -133,6 +133,20 @@ def test_operational_tool_contracts_expose_backend_enums_and_required_objects():
     assert any(item.get("$ref", "").endswith("/DeterministicPreflightCheck") for item in checks)
 
 
+def test_research_state_update_exposes_its_bounded_cache_fields():
+    schema = mcp._tool_manager._tools["research_state_update"].fn_metadata.arg_model.model_json_schema()
+    update = schema["$defs"]["ResearchStateUpdateInput"]
+
+    assert set(update["properties"]) == {
+        "established_facts",
+        "current_best_explanation",
+        "highest_value_unknown",
+        "next_discriminating_experiments",
+    }
+    assert "current_focus" not in update["properties"]
+    assert "evidence_refs" not in update["properties"]
+
+
 def test_every_mcp_tool_has_chatgpt_metadata():
     for tool in mcp._tool_manager._tools.values():
         assert tool.title
