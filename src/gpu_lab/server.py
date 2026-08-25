@@ -163,6 +163,7 @@ _READ_ONLY_TOOLS = {
     "research_benchmark_list",
     "research_benchmark_episode_get",
     "research_benchmark_policy_run",
+    "research_benchmark_v35_strategy_transfer_cases",
     "research_benchmark_compare",
     "improve_status",
     "policy_get",
@@ -203,6 +204,9 @@ _READ_ONLY_TOOLS = {
     "research_operator_critique",
     "research_strategy_list",
     "research_strategy_dataset_export",
+    "strategy_transfer_get",
+    "strategy_promotion_status",
+    "strategy_registry_summary",
     "decision_epistemic_audit",
     "paper_ask",
     "reproduction_status",
@@ -1986,6 +1990,12 @@ async def research_benchmark_list():
         }
         for episode in episodes
     ]
+
+
+@mcp.tool()
+async def research_benchmark_v35_strategy_transfer_cases():
+    """List v3.5 strategy-transfer contract cases without project evidence or outcome leakage."""
+    return ResearchBrainBench.strategy_transfer_v35_cases()
 
 
 @mcp.tool()

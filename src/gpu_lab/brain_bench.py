@@ -11,6 +11,7 @@ from typing import Any, Protocol
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .errors import GPUError
+from .strategy_transfer_bench_v35 import contract_summary as strategy_transfer_v35_contract_summary
 
 
 class ProvenanceKind(StrEnum):
@@ -226,6 +227,15 @@ class ResearchBrainBench:
 
     def __init__(self, root: Path):
         self.root = root
+
+    @staticmethod
+    def strategy_transfer_v35_cases() -> dict[str, object]:
+        """Expose the v3.5 meta-scientific contract suite alongside BrainBench.
+
+        These cases evaluate transfer isolation and lifecycle invariants, not
+        blinded project science or future outcomes.
+        """
+        return strategy_transfer_v35_contract_summary()
 
     def load_episode(self, episode: str | Path) -> BenchmarkEpisode:
         path = Path(episode)
