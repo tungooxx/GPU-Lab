@@ -52,6 +52,15 @@ from .research import ResearchStore
 from .research_operators import HttpResearchOperatorProvider, ResearchOperatorService
 from .service import GPUService
 from .strategy import DecisionOutcomeAssessment, NullModelDraft, ResearchStrategyService
+from .strategy_transfer_v35 import (
+    StrategyApplicabilityAssessment,
+    StrategyPatternCreate,
+    StrategyTransferApply,
+    StrategyTransferOutcomeRecord,
+    StrategyTransferPropose,
+    StrategyTransferService,
+    StrategyScope,
+)
 from .terminal import TERMINAL_HTML
 
 logger = logging.getLogger(__name__)
@@ -93,6 +102,7 @@ settings, service, research_store, research_brain, brain_bench_service, epistemi
     None,
 )
 meta_controller_service: MetaResearchController | None = None
+strategy_transfer_service: StrategyTransferService | None = None
 cockpit_controller_service: CockpitController | None = None
 browser_wake_dispatcher: BrowserWakeDispatcher | None = None
 browser_wake_loop_thread: threading.Thread | None = None
@@ -993,6 +1003,15 @@ def strategy() -> ResearchStrategyService:
             if strategy_service is None:
                 strategy_service = ResearchStrategyService(research())
     return strategy_service
+
+
+def strategy_transfer() -> StrategyTransferService:
+    global strategy_transfer_service
+    if strategy_transfer_service is None:
+        with _singleton_lock:
+            if strategy_transfer_service is None:
+                strategy_transfer_service = StrategyTransferService(research())
+    return strategy_transfer_service
 
 
 async def call(fn, *args, **kwargs):
@@ -3155,6 +3174,77 @@ async def research_strategy_list(project_id: str | None = None, as_of: str | Non
 async def research_strategy_dataset_export(project_id: str | None = None):
     """Export versioned observational policy-transition data for offline future evaluation."""
     return await call(strategy().dataset_export, project_id)
+
+
+@mcp.tool()
+async def strategy_pattern_create(project_id: str, pattern: StrategyPatternCreate):
+    """Create an explicit methodological StrategyPattern; it never imports source scientific evidence."""
+    return await call(strategy_transfer().pattern_create, project_id, pattern)
+
+
+@mcp.tool()
+async def strategy_search(
+    target_project_id: str,
+    context: dict[str, str | bool | int | float],
+    decision_id: str | None = None,
+    discovery_mode: Literal["STATE_ONLY_GENERATION", "STRATEGY_AUGMENTED_GENERATION"] = "STRATEGY_AUGMENTED_GENERATION",
+    limit: int = 5,
+):
+    """Retrieve a bounded set of transferable methods, never cross-project scientific claims or evidence."""
+    return await call(strategy_transfer().search, target_project_id, context, decision_id=decision_id, discovery_mode=discovery_mode, limit=limit)
+
+
+@mcp.tool()
+async def strategy_transfer_propose(target_project_id: str, proposal: StrategyTransferPropose):
+    """Freeze a prospective target-side strategy-transfer candidate before use."""
+    return await call(strategy_transfer().propose, target_project_id, proposal)
+
+
+@mcp.tool()
+async def strategy_transfer_get(candidate_id: str):
+    """Read one prospective strategy-transfer candidate and its frozen applicability context."""
+    return await call(research().object_get, candidate_id)
+
+
+@mcp.tool()
+async def strategy_applicability_assess(candidate_id: str, assessment: StrategyApplicabilityAssessment):
+    """Screen a transfer using structured applicability conditions before any target use."""
+    return await call(strategy_transfer().applicability_assess, candidate_id, assessment)
+
+
+@mcp.tool()
+async def strategy_transfer_apply(candidate_id: str, application: StrategyTransferApply):
+    """Apply only an eligible transfer and freeze its target-side transfer hypothesis."""
+    return await call(strategy_transfer().apply, candidate_id, application)
+
+
+@mcp.tool()
+async def strategy_transfer_outcome_record(candidate_id: str, outcome: StrategyTransferOutcomeRecord):
+    """Record prospective positive, negative, neutral, inconclusive, or invalid transfer evidence."""
+    return await call(strategy_transfer().outcome_record, candidate_id, outcome)
+
+
+@mcp.tool()
+async def strategy_promotion_status(strategy_id: str):
+    """Evaluate evidence for a reversible scope-promotion decision without auto-promoting."""
+    return await call(strategy_transfer().promotion_status, strategy_id)
+
+
+@mcp.tool()
+async def strategy_promotion_decide(
+    strategy_id: str,
+    target_scope: StrategyScope,
+    rationale: str,
+    correction_case_ids: list[str] | None = None,
+):
+    """Make an evidence-checked, reversible strategy scope-promotion decision; never auto-promote."""
+    return await call(strategy_transfer().promotion_decide, strategy_id, target_scope, rationale, correction_case_ids)
+
+
+@mcp.tool()
+async def strategy_registry_summary(project_id: str | None = None):
+    """Summarize the isolated v3.5 strategy registry and unresolved transfer lifecycle states."""
+    return await call(strategy_transfer().registry_summary, project_id)
 
 
 @mcp.tool()

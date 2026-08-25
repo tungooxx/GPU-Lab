@@ -70,6 +70,14 @@ RESEARCH_OBJECT_KINDS = (
     "ResearchDecisionOutcome",
     "ResearchStrategyPattern",
     "StrategyOutcome",
+    # v3.5 Cross-Project Strategy Learning Engine.  These are meta-scientific
+    # records: they can transfer a method, never scientific evidence or truth.
+    "StrategyTransferCandidate",
+    "StrategyTransferHypothesis",
+    "StrategyTransferOutcome",
+    "StrategyRetrievalEvent",
+    "StrategyPromotionDecision",
+    "StrategyTransferHindsight",
     "EngineeringTask",
     "EngineeringResult",
     "ResearchPolicy",
@@ -187,6 +195,17 @@ RESEARCH_OBJECT_STATUSES = {
     "RESOLVED_REVISE",
     "RESOLVED_REJECT",
     "RESOLVED_NARROW_SCOPE",
+    "SCREENED_OUT",
+    "ELIGIBLE",
+    "APPLIED",
+    "NOT_APPLIED",
+    "INVALID_TRANSFER",
+    "NEGATIVE_TRANSFER",
+    "NEUTRAL_TRANSFER",
+    "POSITIVE_TRANSFER",
+    "PROSPECTIVE_TESTING",
+    "CROSS_PROJECT_SUPPORTED",
+    "CROSS_DOMAIN_SUPPORTED",
 }
 
 # Orthogonal epistemic classifications. These are metadata about the role and
