@@ -2656,7 +2656,7 @@ async def brain_result_assess(
     matched_control_passed: bool | None = None,
 ):
     """Inspect a real result and explicitly update evidence, belief, agenda, and WorldModel."""
-    return await call(
+    assessed = await call(
         brain().result_assess,
         run_id=run_id,
         decision_id=decision_id,
@@ -2679,6 +2679,10 @@ async def brain_result_assess(
         guard_passed=guard_passed,
         matched_control_passed=matched_control_passed,
     )
+    if "error" in assessed:
+        return assessed
+    work_items = await call(lab().experiment_run_inspected, run_id)
+    return {**assessed, "work_item_reconciliation": work_items}
 
 
 @mcp.tool()
@@ -4159,13 +4163,17 @@ async def research_canonical_assessment_reconcile(
     rationale: str,
 ):
     """Mark an already-assessed terminal run inspected without creating or reassessing science."""
-    return await call(
+    reconciled = await call(
         research().canonical_assessment_inspection_reconcile,
         run_id,
         decision_id,
         canonical_assessment_record_ids,
         rationale,
     )
+    if "error" in reconciled:
+        return reconciled
+    work_items = await call(lab().experiment_run_inspected, run_id)
+    return {**reconciled, "work_item_reconciliation": work_items}
 
 
 @mcp.tool()

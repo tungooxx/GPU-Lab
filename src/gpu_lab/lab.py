@@ -1006,6 +1006,34 @@ class LabController:
                 changed += 1
         return {"result_ready": changed}
 
+    def experiment_run_inspected(self, run_id: str) -> dict[str, int]:
+        """Close detached execution work once its canonical result is inspected."""
+        now, completed = self._now(), 0
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT project_id,status FROM research_objects WHERE id=%s AND kind='ExperimentRun' FOR UPDATE",
+                (run_id,),
+            )
+            run = cur.fetchone()
+            if not run:
+                raise GPUError("EXPERIMENT_RUN_NOT_FOUND", run_id)
+            if run["status"] != "RESULT_INSPECTED":
+                return {"completed": 0}
+            cur.execute(
+                "SELECT * FROM lab_work_items WHERE (related_refs->>'experiment_run_id'=%s "
+                "OR related_refs->>'run_id'=%s OR related_refs->'experiment_run_ids' ? %s "
+                "OR related_refs->'run_ids' ? %s) AND status='RESULT_READY' FOR UPDATE",
+                (run_id, run_id, run_id, run_id),
+            )
+            for item in cur.fetchall():
+                cur.execute(
+                    "UPDATE lab_work_items SET status='COMPLETED',blocked_reason=%s,updated_at=%s WHERE id=%s",
+                    ("Canonical ExperimentRun inspected; execution work is complete.", now, item["id"]),
+                )
+                self._event(cur, item["project_id"], "WORK_ITEM_RESULT_INSPECTED_COMPLETED", item["id"], {"run_id": run_id})
+                completed += 1
+        return {"completed": completed}
+
     def repair_dependencies(
         self, work_item_id: str, worker_id: str, session_id: str, dependencies: list[dict], rationale: str
     ) -> dict:

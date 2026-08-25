@@ -9,6 +9,7 @@ from typing import Any
 import psycopg
 from psycopg.rows import dict_row
 
+from .discovery import BRAIN_POLICY_VERSION
 from .errors import GPUError
 from .execution_validity import normalize_execution_attestation
 
@@ -3986,7 +3987,11 @@ class ResearchStore:
             "research_state_version": int(object_freshness["object_count"] or 0),
             "world_model_version": str(world_model["id"]) if world_model else None,
             "research_policy_version": policy["version"] if policy else None,
+            # Persisted decision provenance intentionally remains historical;
+            # expose runtime policy separately so callers do not mistake one
+            # for the other after a code deployment.
             "brain_policy_version": decision["version"] if decision else None,
+            "runtime_brain_policy_version": BRAIN_POLICY_VERSION,
             "state_updated_at": object_freshness["latest_object_at"].isoformat() if object_freshness["latest_object_at"] else None,
             "latest_scientific_event_at": event_freshness["latest_scientific_event_at"].isoformat() if event_freshness["latest_scientific_event_at"] else None,
             "scientific_event_count": int(event_freshness["event_count"] or 0),

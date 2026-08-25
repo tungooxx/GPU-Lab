@@ -312,6 +312,9 @@ def test_attached_execution_cannot_return_to_ready_after_worker_disconnect():
     assert lab.experiment_run_terminal(run["id"], "completed") == {"result_ready": 1}
     assert lab.work_get(work["id"])["status"] == "RESULT_READY"
     assert lab.work_list(project_id, ["READY"]) == []
+    store.object_update(run["id"], {"inspection": {"mode": "fixture"}}, "RESULT_INSPECTED")
+    assert lab.experiment_run_inspected(run["id"]) == {"completed": 1}
+    assert lab.work_get(work["id"])["status"] == "COMPLETED"
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
