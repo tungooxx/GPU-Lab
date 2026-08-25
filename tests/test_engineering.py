@@ -220,6 +220,19 @@ def test_task_start_requires_inspection_and_passing_baseline():
     assert service.task_get(task["id"])["data"]["baseline_verified"] is False
 
 
+def test_task_start_preserves_inspected_file_hash_records():
+    service = EngineeringService(Store())
+    task = service.task_create("project", "Inspect", "REPOSITORY_INSPECTION")
+
+    started = service.task_start(
+        task["id"],
+        {"files_read": [{"path": "src/model.py", "sha256": "a" * 64}]},
+        {"commands_run": ["pytest -q"], "passed": True},
+    )
+
+    assert started["data"]["inspection"]["files_read"][0]["sha256"] == "a" * 64
+
+
 def test_result_requires_task_start_evidence():
     service = EngineeringService(Store())
     task = service.task_create(

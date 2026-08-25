@@ -16,7 +16,7 @@ from urllib.parse import parse_qs
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -342,6 +342,45 @@ class CorrectionChallengeInput(BaseModel):
     proposed_discriminating_test: str | None = None
     reasoning_only: bool | None = None
     confidence: float | None = None
+
+
+class EngineeringInspectedFile(BaseModel):
+    """A repository file inspected before an engineering change."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1)
+    sha256: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("sha256", "hash"),
+        description="Optional content SHA-256 captured during inspection.",
+    )
+
+
+class EngineeringInspectionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    files_read: list[str | EngineeringInspectedFile] = Field(
+        min_length=1,
+        validation_alias=AliasChoices("files_read", "files", "repository_files"),
+        description="One or more inspected repository paths, optionally with their SHA-256 values.",
+    )
+    symbols_checked: list[str] = Field(default_factory=list)
+    relevant_callers: list[str] = Field(default_factory=list)
+    notes: str = ""
+
+
+class EngineeringBaselineInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    commands_run: list[str] = Field(
+        min_length=1,
+        validation_alias=AliasChoices("commands_run", "commands"),
+        description="At least one command run against the inspected baseline.",
+    )
+    passed: bool
+    summary: str = ""
+    artifacts: list[str] = Field(default_factory=list)
 
 
 class DeterministicPreflightCheck(BaseModel):
@@ -1842,9 +1881,18 @@ async def engineering_task_get(task_id: str):
 
 
 @mcp.tool()
-async def engineering_task_start(task_id: str, inspection: dict[str, Any], baseline: dict[str, Any]):
+async def engineering_task_start(
+    task_id: str,
+    inspection: EngineeringInspectionInput,
+    baseline: EngineeringBaselineInput,
+):
     """Record repository inspection and a passing baseline before implementation work."""
-    return await call(engineering().task_start, task_id, inspection, baseline)
+    return await call(
+        engineering().task_start,
+        task_id,
+        inspection.model_dump(exclude_none=True),
+        baseline.model_dump(exclude_none=True),
+    )
 
 
 @mcp.tool()

@@ -8,6 +8,8 @@ from gpu_lab.server import (
     _compact_research_state,
     _prioritise_monitor_jobs,
     _safe_request_id,
+    EngineeringBaselineInput,
+    EngineeringInspectionInput,
     mcp,
 )
 
@@ -154,6 +156,30 @@ def test_correction_challenge_contract_exposes_issue_type_enum():
     assert "CAUSAL_OVERREACH" in challenge["properties"]["issue_type"]["enum"]
     assert "OTHER_STRUCTURED" in challenge["properties"]["issue_type"]["enum"]
     assert challenge["additionalProperties"] is False
+
+
+def test_engineering_task_start_exposes_inspection_and_baseline_contracts():
+    schema = mcp._tool_manager._tools["engineering_task_start"].fn_metadata.arg_model.model_json_schema()
+    inspection = schema["$defs"]["EngineeringInspectionInput"]
+    baseline = schema["$defs"]["EngineeringBaselineInput"]
+    inspected_file = schema["$defs"]["EngineeringInspectedFile"]
+
+    assert inspection["properties"]["files_read"]["minItems"] == 1
+    assert baseline["properties"]["commands_run"]["minItems"] == 1
+    assert "passed" in baseline["required"]
+    assert {"path", "sha256"} <= set(inspected_file["properties"])
+
+
+def test_engineering_task_start_accepts_compatible_file_and_command_aliases():
+    inspection = EngineeringInspectionInput.model_validate(
+        {"files": [{"path": "src/model.py", "hash": "a" * 64}]}
+    )
+    baseline = EngineeringBaselineInput.model_validate(
+        {"commands": ["pytest -q"], "passed": True}
+    )
+
+    assert inspection.files_read[0].sha256 == "a" * 64
+    assert baseline.commands_run == ["pytest -q"]
 
 
 def test_every_mcp_tool_has_chatgpt_metadata():
