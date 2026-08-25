@@ -215,17 +215,17 @@ class StrategyTransferService:
             raise GPUError("STRATEGY_CORE_INVARIANT_AUTHORITY_REQUIRED", "CORE_INVARIANT must be authority class CORE")
         if draft.parent_strategy_id:
             parent = self.store.object_get(draft.parent_strategy_id)
-            if parent["kind"] != "ResearchStrategyPattern":
+            if parent["kind"] != "StrategyPatternV35":
                 raise GPUError("NOT_A_STRATEGY_PATTERN", draft.parent_strategy_id)
         data = {**draft.model_dump(mode="json"), "created_at": self._now(), "transfer_counts": {"retrieved": 0, "considered": 0, "applied": 0, "positive": 0, "negative": 0, "neutral": 0, "invalid": 0, "inconclusive": 0}, "genealogy": ([{"relation": "DERIVED_FROM", "strategy_id": draft.parent_strategy_id}] if draft.parent_strategy_id else [])}
-        return self.store.object_create(project_id, "ResearchStrategyPattern", data, "STRATEGY_PATTERN_CREATED", "ACTIVE")
+        return self.store.object_create(project_id, "StrategyPatternV35", data, "STRATEGY_PATTERN_CREATED", "ACTIVE")
 
     def search(self, target_project_id: str, context: dict[str, str | bool | int | float], *, decision_id: str | None = None, discovery_mode: str = "STRATEGY_AUGMENTED_GENERATION", limit: int = 5) -> dict[str, Any]:
         self.store.project_get(target_project_id)
         if discovery_mode == "STATE_ONLY_GENERATION":
             return {"mode": discovery_mode, "strategies": [], "anchoring_protected": True, "note": "No cross-project strategy context was retrieved."}
         candidates = []
-        for item in self.store.objects_global_list("ResearchStrategyPattern", {"ACTIVE", "WEAKENED"}, limit=None):
+        for item in self.store.objects_global_list("StrategyPatternV35", {"ACTIVE", "WEAKENED"}, limit=None):
             if str(item["project_id"]) == str(target_project_id):
                 continue
             data = item["data"]
@@ -267,13 +267,16 @@ class StrategyTransferService:
 
     def propose(self, target_project_id: str, proposal: StrategyTransferPropose) -> dict[str, Any]:
         pattern = self.store.object_get(proposal.strategy_id)
-        if pattern["kind"] != "ResearchStrategyPattern":
+        if pattern["kind"] != "StrategyPatternV35":
             raise GPUError("NOT_A_STRATEGY_PATTERN", proposal.strategy_id)
         if str(pattern["project_id"]) == str(target_project_id):
             raise GPUError("STRATEGY_TRANSFER_SOURCE_EQUALS_TARGET", "Use local strategy selection rather than cross-project transfer")
         self.store.project_get(target_project_id)
         if proposal.decision_id:
             self._instrument_decision(proposal.decision_id, "considered_strategy_ids", [proposal.strategy_id], target_project_id)
+        counts = {**pattern["data"].get("transfer_counts", {})}
+        counts["considered"] = int(counts.get("considered", 0)) + 1
+        self.store.object_update(str(pattern["id"]), {"transfer_counts": counts}, pattern["status"], "STRATEGY_CONSIDERED")
         data = {**proposal.model_dump(), "source_project_id": str(pattern["project_id"]), "source_strategy_snapshot": self._safe_pattern(pattern), "status": TransferStatus.PROPOSED, "prospective_frozen_at": self._now(), "scientific_evidence_transfer": "FORBIDDEN"}
         return self.store.object_create(target_project_id, "StrategyTransferCandidate", data, "STRATEGY_TRANSFER_PROPOSED", TransferStatus.PROPOSED)
 
@@ -286,6 +289,10 @@ class StrategyTransferService:
         candidate = self._candidate(candidate_id, {TransferStatus.ELIGIBLE})
         if application.decision_id:
             self._instrument_decision(application.decision_id, "applied_strategy_ids", [candidate["data"]["strategy_id"]], str(candidate["project_id"]))
+        pattern = self.store.object_get(candidate["data"]["strategy_id"])
+        counts = {**pattern["data"].get("transfer_counts", {})}
+        counts["applied"] = int(counts.get("applied", 0)) + 1
+        self.store.object_update(str(pattern["id"]), {"transfer_counts": counts}, pattern["status"], "STRATEGY_APPLIED")
         hypothesis = self.store.object_create(str(candidate["project_id"]), "StrategyTransferHypothesis", {"transfer_candidate_id": candidate_id, "strategy_id": candidate["data"]["strategy_id"], "prediction": candidate["data"]["predicted_benefit"], "failure_prediction": candidate["data"]["predicted_failure"], "applicability_assumptions": candidate["data"].get("applicability_assessment"), "frozen_at": self._now()}, "STRATEGY_TRANSFER_HYPOTHESIS_FROZEN", "PROSPECTIVE_TESTING")
         updated = self.store.object_update(candidate_id, {"application": application.model_dump(), "transfer_hypothesis_id": str(hypothesis["id"]), "applied_at": self._now()}, TransferStatus.APPLIED, "STRATEGY_TRANSFER_APPLIED")
         return {"candidate": updated, "transfer_hypothesis": hypothesis}
@@ -309,7 +316,7 @@ class StrategyTransferService:
 
     def promotion_status(self, strategy_id: str) -> dict[str, Any]:
         pattern = self.store.object_get(strategy_id)
-        if pattern["kind"] != "ResearchStrategyPattern":
+        if pattern["kind"] != "StrategyPatternV35":
             raise GPUError("NOT_A_STRATEGY_PATTERN", strategy_id)
         outcomes = [x for x in self.store.objects_global_list("StrategyTransferOutcome", limit=None) if x["data"].get("strategy_id") == strategy_id]
         valid = [x for x in outcomes if x["status"] != TransferOutcomeKind.INVALID_TRANSFER]
@@ -336,12 +343,15 @@ class StrategyTransferService:
     def promotion_decide(self, strategy_id: str, target_scope: StrategyScope, rationale: str, correction_case_ids: list[str] | None = None) -> dict[str, Any]:
         """Make a durable, reversible scope decision after an explicit evidence check."""
         pattern = self.store.object_get(strategy_id)
-        if pattern["kind"] != "ResearchStrategyPattern":
+        if pattern["kind"] != "StrategyPatternV35":
             raise GPUError("NOT_A_STRATEGY_PATTERN", strategy_id)
         status = self.promotion_status(strategy_id)
-        if target_scope == StrategyScope.DOMAIN and not status["eligible_domain_promotion"]:
+        current_scope = StrategyScope(pattern["data"].get("scope", StrategyScope.PROJECT))
+        scope_rank = {StrategyScope.PROJECT: 0, StrategyScope.DOMAIN: 1, StrategyScope.GLOBAL: 2}
+        is_demotion = scope_rank[target_scope] < scope_rank[current_scope]
+        if target_scope == StrategyScope.DOMAIN and not is_demotion and not status["eligible_domain_promotion"]:
             raise GPUError("STRATEGY_PROMOTION_EVIDENCE_INSUFFICIENT", "Cross-project prospective support with independent contexts is required")
-        if target_scope == StrategyScope.GLOBAL and not status["eligible_global_promotion"]:
+        if target_scope == StrategyScope.GLOBAL and not is_demotion and not status["eligible_global_promotion"]:
             raise GPUError("STRATEGY_PROMOTION_EVIDENCE_INSUFFICIENT", "Cross-domain prospective support with independent contexts is required")
         correction_case_ids = correction_case_ids or []
         for case_id in correction_case_ids:
@@ -352,16 +362,25 @@ class StrategyTransferService:
         prior_maturity = pattern["data"].get("maturity")
         decision = self.store.object_create(
             str(pattern["project_id"]), "StrategyPromotionDecision",
-            {"strategy_id": strategy_id, "from_scope": prior_scope, "to_scope": target_scope, "rationale": rationale, "promotion_status": status, "correction_case_ids": correction_case_ids, "reversible": True, "decided_at": self._now()},
-            "STRATEGY_SCOPE_PROMOTION_DECIDED", "COMPLETED",
+            {"strategy_id": strategy_id, "from_scope": prior_scope, "to_scope": target_scope, "rationale": rationale, "promotion_status": status, "correction_case_ids": correction_case_ids, "reversible": True, "policy_lab_followup": "REQUIRES_IMPROVEMENT_OPPORTUNITY_AND_POLICY_HYPOTHESIS", "decided_at": self._now()},
+            "STRATEGY_SCOPE_DEMOTION_DECIDED" if is_demotion else "STRATEGY_SCOPE_PROMOTION_DECIDED", "COMPLETED",
         )
-        maturity = StrategyMaturity.CROSS_DOMAIN_SUPPORTED if target_scope == StrategyScope.GLOBAL else StrategyMaturity.CROSS_PROJECT_SUPPORTED
-        updated = self.store.object_update(strategy_id, {"scope": target_scope, "maturity": maturity, "promotion_history": [*pattern["data"].get("promotion_history", []), {"decision_id": str(decision["id"]), "from_scope": prior_scope, "from_maturity": prior_maturity, "to_scope": target_scope, "to_maturity": maturity, "at": self._now()}]}, "ACTIVE", "STRATEGY_SCOPE_PROMOTED")
+        maturity = StrategyMaturity.WEAKENED if is_demotion else (StrategyMaturity.CROSS_DOMAIN_SUPPORTED if target_scope == StrategyScope.GLOBAL else StrategyMaturity.CROSS_PROJECT_SUPPORTED)
+        updated = self.store.object_update(strategy_id, {"scope": target_scope, "maturity": maturity, "promotion_history": [*pattern["data"].get("promotion_history", []), {"decision_id": str(decision["id"]), "from_scope": prior_scope, "from_maturity": prior_maturity, "to_scope": target_scope, "to_maturity": maturity, "at": self._now()}]}, "WEAKENED" if is_demotion else "ACTIVE", "STRATEGY_SCOPE_NARROWED" if is_demotion else "STRATEGY_SCOPE_PROMOTED")
         return {"promotion_decision": decision, "strategy": updated}
 
     def registry_summary(self, project_id: str | None = None) -> dict[str, Any]:
-        patterns = self.store.objects_global_list("ResearchStrategyPattern", limit=None) if project_id is None else self.store.objects_list(project_id, "ResearchStrategyPattern", limit=None)
-        rows = [self._safe_pattern(x) for x in patterns]
+        patterns = self.store.objects_global_list("StrategyPatternV35", limit=None) if project_id is None else self.store.objects_list(project_id, "StrategyPatternV35", limit=None)
+        rows = []
+        for pattern in patterns:
+            row = self._safe_pattern(pattern)
+            # Project name is presentation metadata only; scientific state is
+            # intentionally absent from this cross-project registry view.
+            try:
+                row["source_project_name"] = self.store.project_get(str(pattern["project_id"])).get("name")
+            except GPUError:
+                row["source_project_name"] = None
+            rows.append(row)
         return {"version": "strategy-transfer-v3.5", "patterns": rows, "summary": {"total": len(rows), "by_scope": {scope: sum(x["scope"] == scope for x in rows) for scope in StrategyScope}, "global_without_prospective_transfer": [x["id"] for x in rows if x["scope"] == StrategyScope.GLOBAL and not x["transfer_counts"].get("positive")]}}
 
     def _candidate(self, candidate_id: str, allowed: set[TransferStatus]) -> dict[str, Any]:

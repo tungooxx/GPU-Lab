@@ -97,6 +97,9 @@ def test_transfer_is_prospective_and_does_not_expose_source_science():
     ))
     assert outcome["outcome"]["status"] == "POSITIVE_TRANSFER"
     assert store.object_get(pattern["id"])["data"]["transfer_counts"]["positive"] == 1
+    assert store.object_get(pattern["id"])["data"]["transfer_counts"]["retrieved"] == 1
+    assert store.object_get(pattern["id"])["data"]["transfer_counts"]["considered"] == 1
+    assert store.object_get(pattern["id"])["data"]["transfer_counts"]["applied"] == 1
     hindsight = service.hindsight_record(outcome["outcome"]["id"], StrategyTransferHindsightRecord(observed_generalization="Not yet assessed.", rationale="Awaiting an independent target context."))
     assert hindsight["kind"] == "StrategyTransferHindsight"
 
@@ -117,6 +120,12 @@ def test_negative_transfer_requires_applicability_refinement():
 def test_state_only_discovery_is_not_anchored():
     service = StrategyTransferService(Store())
     assert service.search("b", {}, discovery_mode="STATE_ONLY_GENERATION")["strategies"] == []
+
+
+def test_legacy_patterns_are_not_reinterpreted_as_v35_patterns():
+    store = Store()
+    store.object_create("a", "ResearchStrategyPattern", {"scope_level": "GLOBAL"}, "FIXTURE")
+    assert StrategyTransferService(store).search("b", {})["strategies"] == []
 
 
 def test_promotion_fails_closed_without_independent_prospective_support():

@@ -69,6 +69,9 @@ RESEARCH_OBJECT_KINDS = (
     "ResearchSituation",
     "ResearchDecisionOutcome",
     "ResearchStrategyPattern",
+    # Typed v3.5 patterns live beside the legacy v2 observational patterns.
+    # Keeping a distinct kind avoids silently reinterpreting historical data.
+    "StrategyPatternV35",
     "StrategyOutcome",
     # v3.5 Cross-Project Strategy Learning Engine.  These are meta-scientific
     # records: they can transfer a method, never scientific evidence or truth.

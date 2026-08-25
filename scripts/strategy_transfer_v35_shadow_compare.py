@@ -32,7 +32,7 @@ def main() -> None:
             continue
         # Avoid service.search because shadow mode must be read-only.
         candidates = []
-        for pattern in store.objects_global_list("ResearchStrategyPattern", {"ACTIVE", "WEAKENED"}, limit=None):
+        for pattern in store.objects_global_list("StrategyPatternV35", {"ACTIVE", "WEAKENED"}, limit=None):
             if str(pattern["project_id"]) == args.project_id:
                 continue
             required = pattern["data"].get("applicability", {}).get("required_conditions", {})
