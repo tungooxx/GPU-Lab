@@ -147,6 +147,15 @@ def test_research_state_update_exposes_its_bounded_cache_fields():
     assert "evidence_refs" not in update["properties"]
 
 
+def test_correction_challenge_contract_exposes_issue_type_enum():
+    schema = mcp._tool_manager._tools["correction_challenge_submit"].fn_metadata.arg_model.model_json_schema()
+    challenge = schema["$defs"]["CorrectionChallengeInput"]
+
+    assert "CAUSAL_OVERREACH" in challenge["properties"]["issue_type"]["enum"]
+    assert "OTHER_STRUCTURED" in challenge["properties"]["issue_type"]["enum"]
+    assert challenge["additionalProperties"] is False
+
+
 def test_every_mcp_tool_has_chatgpt_metadata():
     for tool in mcp._tool_manager._tools.values():
         assert tool.title

@@ -16,7 +16,7 @@ from urllib.parse import parse_qs
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -316,6 +316,32 @@ class ResearchStateUpdateInput(BaseModel):
     current_best_explanation: str | None = Field(default=None)
     highest_value_unknown: str | None = Field(default=None)
     next_discriminating_experiments: list[str] | None = Field(default=None)
+
+
+class CorrectionChallengeInput(BaseModel):
+    """Public contract for one isolated correction challenge."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    issue_type: Literal[
+        "CAUSAL_OVERREACH", "CORRELATION_AS_CAUSATION", "SCOPE_OVERREACH", "MISSING_NULL",
+        "MISSING_CONTROL", "INVALID_INTERVENTION", "IMPLEMENTATION_CONFOUND", "METRIC_ARTIFACT",
+        "EVIDENCE_CONTRADICTION", "EVIDENCE_DEPENDENCE", "INVALID_REPLICATION",
+        "WORLD_MODEL_INCONSISTENCY", "LITERATURE_CONTRADICTION", "NOVELTY_OVERCLAIM",
+        "GENERALIZATION_OVERCLAIM", "DATASET_ARTIFACT", "CHECKPOINT_DEPENDENCE",
+        "EVALUATOR_DEPENDENCE", "UNJUSTIFIED_ARCHITECTURE_INFERENCE", "COUNTERFACTUAL_OVERCLAIM",
+        "OTHER_STRUCTURED",
+    ]
+    issue_statement: str = Field(min_length=1, max_length=12_000)
+    target_component: str | None = None
+    severity: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"] | None = None
+    evidence_refs: list[str] | None = None
+    missing_evidence: list[str] | None = None
+    proposed_counterexample: str | None = None
+    proposed_null: str | None = None
+    proposed_discriminating_test: str | None = None
+    reasoning_only: bool | None = None
+    confidence: float | None = None
 
 
 class DeterministicPreflightCheck(BaseModel):
@@ -1450,10 +1476,16 @@ async def correction_case_join(
 
 @mcp.tool()
 async def correction_challenge_submit(
-    correction_case_id: str, worker_id: str, session_id: str, challenge: dict[str, Any],
+    correction_case_id: str, worker_id: str, session_id: str, challenge: CorrectionChallengeInput,
 ):
     """Submit exactly one structured critique for the caller's own isolated correction slot."""
-    return await call(correction().submit_challenge, correction_case_id, worker_id, session_id, challenge)
+    return await call(
+        correction().submit_challenge,
+        correction_case_id,
+        worker_id,
+        session_id,
+        challenge.model_dump(exclude_none=True),
+    )
 
 
 @mcp.tool()
