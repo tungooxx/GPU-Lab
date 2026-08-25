@@ -1373,12 +1373,17 @@ async def discovery_round_create(
     project_id: str, search_regime: Literal["EXPLOIT", "MECHANISM_SEARCH", "DIVERGENT_SEARCH", "PARADIGM_RESET"],
     agenda_item_id: str | None = None, triggering_decision_id: str | None = None,
     generation_budget: dict[str, int] | None = None, policy_version: str | None = None,
-    brain_policy_version: str | None = None,
+    brain_policy_version: str | None = None, baseline_signature: dict[str, Any] | None = None,
 ):
-    """Freeze canonical state and start an isolated v3.3 discovery round; never executes an experiment."""
+    """Freeze canonical state and start an isolated v3.3 discovery round; never executes an experiment.
+
+    Agenda-only rounds may provide a structured baseline. Otherwise the first
+    submitted serious candidate becomes the immutable comparison baseline.
+    """
     return await call(distributed_discovery().create_round, project_id, agenda_item_id, search_regime,
                       triggering_decision_id=triggering_decision_id, generation_budget=generation_budget,
-                      policy_version=policy_version, brain_policy_version=brain_policy_version)
+                      policy_version=policy_version, brain_policy_version=brain_policy_version,
+                      baseline_signature=baseline_signature)
 
 
 @mcp.tool()

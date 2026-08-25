@@ -6,6 +6,7 @@ from threading import Barrier
 import pytest
 
 from gpu_lab.discovery_v33 import DistributedDiscoveryService
+from gpu_lab.discovery import classify_scientific_distance
 from gpu_lab.errors import GPUError
 from gpu_lab.lab import LabController
 from gpu_lab.research import ResearchStore
@@ -59,6 +60,28 @@ def test_scientific_snapshot_records_have_a_stable_canonical_order():
     })})()
 
     assert [item["id"] for item in service._scientific_snapshot("project")["records"]] == ["a", "b"]
+
+
+def test_explicit_round_baseline_allows_all_distance_classes():
+    baseline = {"representation": "point-tokens", "state_variable": "anchor-state"}
+
+    near = classify_scientific_distance(
+        {"scientific_dimensions": baseline}, {"scientific_dimensions": baseline}
+    )
+    mid = classify_scientific_distance(
+        {"scientific_dimensions": {**baseline, "state_variable": "global-state"}},
+        {"scientific_dimensions": baseline},
+    )
+    far = classify_scientific_distance(
+        {"scientific_dimensions": {**baseline, "representation": "voxel-grid"}},
+        {"scientific_dimensions": baseline},
+    )
+    orthogonal = classify_scientific_distance(
+        {"scientific_dimensions": {**baseline, "causal_object": "joint-objective"}},
+        {"scientific_dimensions": baseline},
+    )
+
+    assert [near["scientific_distance"], mid["scientific_distance"], far["scientific_distance"], orthogonal["scientific_distance"]] == ["NEAR", "MID", "FAR", "ORTHOGONAL"]
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")

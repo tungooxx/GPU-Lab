@@ -153,6 +153,7 @@ class DistributedDiscoveryService:
         self, project_id: str, agenda_item_id: str | None, search_regime: str,
         *, triggering_decision_id: str | None = None, generation_budget: dict[str, int] | None = None,
         policy_version: str | None = None, brain_policy_version: str | None = None,
+        baseline_signature: dict[str, Any] | None = None,
     ) -> dict:
         snapshot = self._scientific_snapshot(project_id)
         budget = {"max_workers": 4, "max_candidates_per_batch": 3, "max_generation_waves": 2, "max_literature_calls": 1, "max_synthesis_rounds": 1, **(generation_budget or {})}
@@ -162,19 +163,32 @@ class DistributedDiscoveryService:
             agenda = self.store.object_get(agenda_item_id)
             if agenda["kind"] != "AgendaItem" or str(agenda["project_id"]) != str(project_id):
                 raise GPUError("DISCOVERY_AGENDA_ITEM_INVALID", agenda_item_id)
-        baseline_signature: dict[str, Any] = {}
+        resolved_baseline_signature: dict[str, Any] | None = None
         baseline_signature_source: dict[str, Any] | None = None
+        if baseline_signature is not None:
+            try:
+                resolved_baseline_signature = self._signature(
+                    {"diversity_signature": baseline_signature}
+                )
+            except GPUError as exc:
+                if exc.error_type in {
+                    "DISCOVERY_DIVERSITY_SIGNATURE_REQUIRED",
+                    "DISCOVERY_DIVERSITY_SIGNATURE_INVALID",
+                }:
+                    raise GPUError("DISCOVERY_BASELINE_SIGNATURE_INVALID", exc.message) from exc
+                raise
+            baseline_signature_source = {"kind": "EXPLICIT_ROUND_BASELINE"}
         if triggering_decision_id:
             decision = self.store.object_get(triggering_decision_id)
             if decision["kind"] != "ResearchDecision" or str(decision["project_id"]) != str(project_id):
                 raise GPUError("DISCOVERY_TRIGGERING_DECISION_INVALID", str(triggering_decision_id))
             selected = decision.get("data", {}).get("selected_action", {})
             try:
-                baseline_signature = self._signature(selected)
+                resolved_baseline_signature = self._signature(selected)
             except GPUError as exc:
                 if exc.error_type != "DISCOVERY_DIVERSITY_SIGNATURE_REQUIRED":
                     raise
-            if baseline_signature:
+            if resolved_baseline_signature:
                 baseline_signature_source = {
                     "kind": "ResearchDecision",
                     "id": str(triggering_decision_id),
@@ -183,8 +197,12 @@ class DistributedDiscoveryService:
         data = {
             "implementation_version": DDE_VERSION, "agenda_item_id": agenda_item_id,
             "triggering_decision_id": triggering_decision_id, "search_regime": search_regime.upper(),
-            "baseline_signature": baseline_signature,
+            # Agenda-only rounds cannot be compared to an empty structure. If
+            # no canonical baseline was supplied, submit_candidate atomically
+            # freezes the first serious candidate as the round baseline.
+            "baseline_signature": resolved_baseline_signature,
             "baseline_signature_source": baseline_signature_source,
+            "baseline_status": "READY" if resolved_baseline_signature else "PENDING_FIRST_CANDIDATE",
             "phase": "INDEPENDENT_GENERATION", "peer_visibility": "HIDDEN",
             "independent_generation": True, "required_distance_coverage": self.reservations(search_regime),
             "generation_budget": budget, "frozen_state": snapshot,
@@ -522,7 +540,33 @@ class DistributedDiscoveryService:
             candidate_ids = batch["data"].get("candidate_ids", [])
             if len(candidate_ids) >= round_["data"]["generation_budget"]["max_candidates_per_batch"]:
                 raise GPUError("DISCOVERY_BATCH_CANDIDATE_BUDGET_EXHAUSTED", batch_id)
-            distance = classify_scientific_distance({"payload": {"scientific_dimensions": signature}}, {"payload": {"scientific_dimensions": round_["data"].get("baseline_signature", {})}})
+            candidate_id = str(uuid.uuid4())
+            baseline = round_["data"].get("baseline_signature")
+            if not baseline:
+                # This happens only for a newly-created AgendaItem-only round.
+                # The parent-row lock makes baseline selection deterministic for
+                # concurrent submitters and records the baseline provenance.
+                updated_round_data = {
+                    **round_["data"],
+                    "baseline_signature": dict(signature),
+                    "baseline_signature_source": {
+                        "kind": "DiscoveryCandidate",
+                        "id": candidate_id,
+                        "selection": "FIRST_SERIOUS_CANDIDATE",
+                    },
+                    "baseline_status": "READY",
+                    "baseline_initialized_at": now.isoformat(),
+                }
+                cur.execute(
+                    "UPDATE research_objects SET data=%s WHERE id=%s",
+                    (self._json(updated_round_data), round_id),
+                )
+                round_ = {**round_, "data": updated_round_data}
+                baseline = signature
+            distance = classify_scientific_distance(
+                {"payload": {"scientific_dimensions": signature}},
+                {"payload": {"scientific_dimensions": baseline}},
+            )
             requested = member["requested_distance"]
             data = {
                 "implementation_version": DDE_VERSION, "discovery_round_id": round_id, "candidate_batch_id": batch_id,
@@ -544,7 +588,6 @@ class DistributedDiscoveryService:
                 "independent_generation": bool(member["independent_generation"]), "selected_for_portfolio": False,
                 "selected_for_execution": False,
             }
-            candidate_id = str(uuid.uuid4())
             cur.execute("INSERT INTO research_objects(id,project_id,kind,status,data,created_at) VALUES(%s,%s,'DiscoveryCandidate','PROPOSED',%s,%s)", (candidate_id, round_["project_id"], self._json(data), now))
             self.store._event(cur, round_["project_id"], "DISCOVERY_CANDIDATE_PROPOSED", candidate_id, json.loads(self._json({"round_id": round_id, "batch_id": batch_id, "mechanistic_niche": data["mechanistic_niche"], "scientific_distance": data["scientific_distance"]})))
             batch_data = {**batch["data"], "candidate_ids": [*candidate_ids, candidate_id]}
