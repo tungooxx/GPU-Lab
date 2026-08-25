@@ -112,6 +112,24 @@ class DistributedDiscoveryService:
 
     def _scientific_snapshot(self, project_id: str, *, legacy_full_data: bool = False) -> dict[str, Any]:
         state = self.store.state_get(project_id)
+        selected_niche_baselines = sorted(
+            [
+                {
+                    "id": str(item["id"]),
+                    "active_best_hypothesis_id": str(item["data"]["active_best_hypothesis_id"]),
+                    "diversity_signature": self._signature(
+                        {"diversity_signature": item["data"].get("diversity_signature")}
+                    ),
+                    "data_hash": self._hash(item["data"]),
+                }
+                for item in state["objects"]
+                if item["kind"] == "HypothesisNiche"
+                and item["status"] == "ACTIVE"
+                and item["data"].get("active_best_hypothesis_id")
+                and item["data"].get("diversity_signature")
+            ],
+            key=lambda item: item["id"],
+        )
         records = sorted([
             # A frozen discovery snapshot needs an immutable identity and
             # content hash, not a second copy of every historical document.
@@ -134,6 +152,32 @@ class DistributedDiscoveryService:
             "stagnation_ids": [item["id"] for item in records if item["kind"] == "StagnationState"],
             "architecture_lineage_ids": [item["id"] for item in records if item["kind"] == "ArchitectureLineage"],
             "breakthrough_signal_ids": [item["id"] for item in records if item["kind"] == "BreakthroughSignal"],
+            # This is the narrow structural baseline needed to classify a
+            # discovery round. It is frozen alongside the scientific records,
+            # rather than being read from mutable project state at submission.
+            "selected_niche_baselines": selected_niche_baselines,
+        }
+
+    @staticmethod
+    def _baseline_from_snapshot(snapshot: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        candidates = list(snapshot.get("selected_niche_baselines", []))
+        if not candidates:
+            raise GPUError(
+                "DISCOVERY_BASELINE_REQUIRED",
+                "Provide baseline_signature, a triggering decision with a signature, or select an active HypothesisNiche.",
+            )
+        if len(candidates) > 1:
+            raise GPUError(
+                "DISCOVERY_BASELINE_AMBIGUOUS",
+                "Multiple active selected HypothesisNiches exist; provide baseline_signature explicitly.",
+                details={"selected_niche_ids": [item["id"] for item in candidates]},
+            )
+        niche = candidates[0]
+        return dict(niche["diversity_signature"]), {
+            "kind": "HypothesisNiche",
+            "id": niche["id"],
+            "active_best_hypothesis_id": niche["active_best_hypothesis_id"],
+            "data_hash": niche["data_hash"],
         }
 
     @staticmethod
@@ -194,15 +238,16 @@ class DistributedDiscoveryService:
                     "id": str(triggering_decision_id),
                     "selected_action_id": selected.get("id"),
                 }
+        if not resolved_baseline_signature:
+            resolved_baseline_signature, baseline_signature_source = self._baseline_from_snapshot(
+                snapshot
+            )
         data = {
             "implementation_version": DDE_VERSION, "agenda_item_id": agenda_item_id,
             "triggering_decision_id": triggering_decision_id, "search_regime": search_regime.upper(),
-            # Agenda-only rounds cannot be compared to an empty structure. If
-            # no canonical baseline was supplied, submit_candidate atomically
-            # freezes the first serious candidate as the round baseline.
             "baseline_signature": resolved_baseline_signature,
             "baseline_signature_source": baseline_signature_source,
-            "baseline_status": "READY" if resolved_baseline_signature else "PENDING_FIRST_CANDIDATE",
+            "baseline_status": "READY",
             "phase": "INDEPENDENT_GENERATION", "peer_visibility": "HIDDEN",
             "independent_generation": True, "required_distance_coverage": self.reservations(search_regime),
             "generation_budget": budget, "frozen_state": snapshot,
@@ -540,29 +585,12 @@ class DistributedDiscoveryService:
             candidate_ids = batch["data"].get("candidate_ids", [])
             if len(candidate_ids) >= round_["data"]["generation_budget"]["max_candidates_per_batch"]:
                 raise GPUError("DISCOVERY_BATCH_CANDIDATE_BUDGET_EXHAUSTED", batch_id)
-            candidate_id = str(uuid.uuid4())
             baseline = round_["data"].get("baseline_signature")
             if not baseline:
-                # This happens only for a newly-created AgendaItem-only round.
-                # The parent-row lock makes baseline selection deterministic for
-                # concurrent submitters and records the baseline provenance.
-                updated_round_data = {
-                    **round_["data"],
-                    "baseline_signature": dict(signature),
-                    "baseline_signature_source": {
-                        "kind": "DiscoveryCandidate",
-                        "id": candidate_id,
-                        "selection": "FIRST_SERIOUS_CANDIDATE",
-                    },
-                    "baseline_status": "READY",
-                    "baseline_initialized_at": now.isoformat(),
-                }
-                cur.execute(
-                    "UPDATE research_objects SET data=%s WHERE id=%s",
-                    (self._json(updated_round_data), round_id),
+                raise GPUError(
+                    "DISCOVERY_BASELINE_REQUIRED",
+                    "This legacy round has no frozen canonical baseline; create a fresh round.",
                 )
-                round_ = {**round_, "data": updated_round_data}
-                baseline = signature
             distance = classify_scientific_distance(
                 {"payload": {"scientific_dimensions": signature}},
                 {"payload": {"scientific_dimensions": baseline}},
@@ -588,6 +616,7 @@ class DistributedDiscoveryService:
                 "independent_generation": bool(member["independent_generation"]), "selected_for_portfolio": False,
                 "selected_for_execution": False,
             }
+            candidate_id = str(uuid.uuid4())
             cur.execute("INSERT INTO research_objects(id,project_id,kind,status,data,created_at) VALUES(%s,%s,'DiscoveryCandidate','PROPOSED',%s,%s)", (candidate_id, round_["project_id"], self._json(data), now))
             self.store._event(cur, round_["project_id"], "DISCOVERY_CANDIDATE_PROPOSED", candidate_id, json.loads(self._json({"round_id": round_id, "batch_id": batch_id, "mechanistic_niche": data["mechanistic_niche"], "scientific_distance": data["scientific_distance"]})))
             batch_data = {**batch["data"], "candidate_ids": [*candidate_ids, candidate_id]}

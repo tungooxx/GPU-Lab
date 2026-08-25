@@ -84,6 +84,34 @@ def test_explicit_round_baseline_allows_all_distance_classes():
     assert [near["scientific_distance"], mid["scientific_distance"], far["scientific_distance"], orthogonal["scientific_distance"]] == ["NEAR", "MID", "FAR", "ORTHOGONAL"]
 
 
+def test_snapshot_baseline_requires_exactly_one_selected_active_niche():
+    signature, source = DistributedDiscoveryService._baseline_from_snapshot(
+        {
+            "selected_niche_baselines": [
+                {
+                    "id": "niche-1",
+                    "active_best_hypothesis_id": "hypothesis-1",
+                    "diversity_signature": {"representation": "point-tokens"},
+                    "data_hash": "frozen-hash",
+                }
+            ]
+        }
+    )
+
+    assert signature == {"representation": "point-tokens"}
+    assert source["kind"] == "HypothesisNiche"
+
+    with pytest.raises(GPUError) as missing:
+        DistributedDiscoveryService._baseline_from_snapshot({"selected_niche_baselines": []})
+    assert missing.value.error_type == "DISCOVERY_BASELINE_REQUIRED"
+
+    with pytest.raises(GPUError) as ambiguous:
+        DistributedDiscoveryService._baseline_from_snapshot(
+            {"selected_niche_baselines": [{"id": "a"}, {"id": "b"}]}
+        )
+    assert ambiguous.value.error_type == "DISCOVERY_BASELINE_AMBIGUOUS"
+
+
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_round_isolates_batches_then_archives_distinct_candidates():
     store = ResearchStore(TEST_DATABASE_URL)
