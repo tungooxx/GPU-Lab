@@ -1373,6 +1373,12 @@ async def lab_join(
 
 
 @mcp.tool()
+async def lab_session_renew(session_id: str, worker_id: str, project_id: str):
+    """Renew one expired Lab session identity without restoring work or lease ownership."""
+    return await call(lab().renew_session, session_id, worker_id, project_id)
+
+
+@mcp.tool()
 async def lab_state_get(project_id: str, session_id: str | None = None):
     """Read compact project-scoped operational state; it is not a second scientific truth store."""
     return await call(lab().state_get, project_id, session_id)
@@ -4367,6 +4373,16 @@ async def research_experiment_sync(run_id: str | None = None, job_id: str | None
             "retry_safe": True,
             "recovery_action": "INSPECT_OR_RETRY",
             "runner_error": outcome["error"],
+        }
+    if outcome.get("status") == "cancellation_incomplete" or outcome.get("cancellation_incomplete"):
+        return {
+            **mapping,
+            "status": "CANCELLATION_INCOMPLETE",
+            "runner_status": outcome.get("status"),
+            "process_group_alive": outcome.get("process_group_alive", True),
+            "retry_safe": False,
+            "recovery_action": "CANCEL_PROCESS_GROUP",
+            "message": "Cancellation removed a wrapper but the job process group is still alive; do not reconcile or retry until termination is verified.",
         }
     artifacts = await call(
         svc().artifact_list if is_remote else local.artifacts,

@@ -112,6 +112,11 @@ class RemoteRunner:
         return {"instance_id": instance_id}
 
 
+class CancellationIncompleteRemote(RemoteRunner):
+    async def experiment_status(self, job_id):
+        return {"job_id": job_id, "status": "cancellation_incomplete", "cancellation_incomplete": True, "process_group_alive": True, "exit_code": None, "logs_tail": []}
+
+
 class TerminalLab:
     def experiment_run_terminal(self, *_args):
         return {"status": "ok"}
@@ -356,6 +361,21 @@ async def test_sync_uses_remote_status_artifacts_and_runtime(monkeypatch):
 
     assert result["status"] == "completed"
     assert research.updates[0][1]["runtime"] == {"instance_id": "vast_1"}
+
+
+@pytest.mark.asyncio
+async def test_sync_reports_incomplete_cancellation_without_marking_unknown(monkeypatch):
+    mapping = _mapping("running")
+    mapping["run"]["data"].update({"executor": "vast", "instance_id": "vast_1"})
+    research = FakeResearch(mapping)
+    monkeypatch.setattr(server, "research", lambda: research)
+    monkeypatch.setattr(server, "svc", lambda: CancellationIncompleteRemote())
+
+    result = await server.research_experiment_sync(run_id="run-id")
+
+    assert result["status"] == "CANCELLATION_INCOMPLETE"
+    assert result["recovery_action"] == "CANCEL_PROCESS_GROUP"
+    assert research.updates == []
 
 
 @pytest.mark.asyncio

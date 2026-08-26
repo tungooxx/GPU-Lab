@@ -253,5 +253,43 @@ async def test_remote_experiment_submission_quotes_the_tmux_pane_once(tmp_path):
     assert tokens[:5] == ["tmux", "new-session", "-d", "-s", "exp_quote_regression"]
     pane_command = tokens[5]
     assert pane_command.startswith("setsid sh -c ")
+    assert "process_group.pid" in pane_command
     assert "exit $code" in pane_command
     assert "stdout.log" in pane_command and "stderr.log" in pane_command
+
+
+@pytest.mark.asyncio
+async def test_remote_cancel_requires_process_group_termination(tmp_path):
+    service = GPUService(Settings(gpu_lab_database_url=f"sqlite:///{tmp_path / 'db.sqlite'}"))
+    service.repo.save_instance(Instance(id="vast_1", provider_instance_id="1", gpu_model="RTX"))
+    service.repo.save_job(Job(job_id="exp_cancel_group", instance_id="vast_1", repo_path="/workspace/repo", command="python run.py", remote_pid=12345, status="running"))
+    captured = {}
+
+    class SSH:
+        async def run(self, _instance, command, _timeout):
+            captured["command"] = command
+            return "process_group_alive\n", "", 0
+
+    service.ssh = SSH()
+    result = await service.experiment_cancel("exp_cancel_group")
+
+    assert result["status"] == "cancellation_incomplete"
+    assert result["terminated"] is False
+    assert "kill -TERM -- -$pgid" in captured["command"]
+    assert "kill -KILL -- -$pgid" in captured["command"]
+
+
+@pytest.mark.asyncio
+async def test_remote_cancel_reports_terminated_only_after_group_check(tmp_path):
+    service = GPUService(Settings(gpu_lab_database_url=f"sqlite:///{tmp_path / 'db.sqlite'}"))
+    service.repo.save_instance(Instance(id="vast_1", provider_instance_id="1", gpu_model="RTX"))
+    service.repo.save_job(Job(job_id="exp_cancel_done", instance_id="vast_1", repo_path="/workspace/repo", command="python run.py", remote_pid=12345, status="running"))
+
+    class SSH:
+        async def run(self, *_args):
+            return "terminated\n", "", 0
+
+    service.ssh = SSH()
+    result = await service.experiment_cancel("exp_cancel_done")
+
+    assert result == {"job_id": "exp_cancel_done", "status": "cancelled", "terminated": True, "process_group_alive": False}

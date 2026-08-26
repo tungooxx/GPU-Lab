@@ -478,10 +478,32 @@ class LocalRunner:
             raise GPUError("JOB_NOT_FOUND", f"No local job named {job_id}")
         if not job.remote_pid or job.remote_pid <= 0:
             raise GPUError("JOB_PID_UNKNOWN", f"No valid process ID for {job_id}")
+        def group_alive() -> bool:
+            try:
+                os.kill(-job.remote_pid, 0)
+                return True
+            except (PermissionError, ProcessLookupError):
+                return False
         try:
             os.killpg(job.remote_pid, signal.SIGTERM)
         except (PermissionError, ProcessLookupError):
             pass
+        for _ in range(5):
+            if not group_alive():
+                break
+            __import__("time").sleep(1)
+        if group_alive():
+            try:
+                os.killpg(job.remote_pid, signal.SIGKILL)
+            except (PermissionError, ProcessLookupError):
+                pass
+            __import__("time").sleep(1)
+        if group_alive():
+            job.metadata.update({"cancellation_requested_at": datetime.now(UTC).isoformat(), "cancellation_incomplete": True})
+            self.repo.save_job(job)
+            return {"job_id": job_id, "status": "cancellation_incomplete", "terminated": False, "process_group_alive": True, "recovery_action": "CANCEL_PROCESS_GROUP"}
         job.status, job.completed_at = "cancelled", datetime.now(UTC)
+        job.metadata.pop("cancellation_requested_at", None)
+        job.metadata.pop("cancellation_incomplete", None)
         self.repo.save_job(job)
-        return {"job_id": job_id, "status": "cancelled"}
+        return {"job_id": job_id, "status": "cancelled", "terminated": True, "process_group_alive": False}

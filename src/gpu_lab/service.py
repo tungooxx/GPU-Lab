@@ -295,7 +295,8 @@ class GPUService:
         # Quote the pane command once as the final tmux argument.  Do not wrap
         # it in literal single quotes: ``q(inner)`` may itself contain quotes.
         inner = (
-            (safe_env + " " if safe_env else "")
+            f"echo $$ > {q(jobdir + '/process_group.pid')}; "
+            + (safe_env + " " if safe_env else "")
             + command
             + f"; code=$?; echo $code > {q(jobdir + '/exit_code')}; exit $code"
         )
@@ -335,11 +336,11 @@ class GPUService:
         jd = f"{self.settings.gpu_lab_remote_root}/jobs/{job_id}"
         out, _, _ = await self.ssh.run(
             item,
-            f"if tmux has-session -t {q(job_id)} 2>/dev/null; then echo running; elif [ -f {q(jd + '/exit_code')} ]; then echo exit:$(cat {q(jd + '/exit_code')}); else echo unknown; fi; tail -n 50 {q(jd + '/stdout.log')} {q(jd + '/stderr.log')} 2>/dev/null",
+            f"pgid=''; [ -f {q(jd + '/process_group.pid')} ] && pgid=$(cat {q(jd + '/process_group.pid')} 2>/dev/null || true); case \"$pgid\" in ''|*[!0-9]*) group_alive=false;; *) kill -0 -- -$pgid 2>/dev/null && group_alive=true || group_alive=false;; esac; if [ \"$group_alive\" = true ]; then echo process_running; elif tmux has-session -t {q(job_id)} 2>/dev/null; then echo running; elif [ -f {q(jd + '/exit_code')} ]; then echo exit:$(cat {q(jd + '/exit_code')}); else echo unknown; fi; tail -n 50 {q(jd + '/stdout.log')} {q(jd + '/stderr.log')} 2>/dev/null",
             30,
         )
         first, *logs = out.splitlines()
-        if first == "running":
+        if first in {"running", "process_running"}:
             job.status = "running"
         elif first.startswith("exit:"):
             job.exit_code = int(first.split(":", 1)[1])
@@ -347,10 +348,15 @@ class GPUService:
             job.completed_at = datetime.now(UTC)
         else:
             job.status = "unknown"
+        cancellation_incomplete = bool(
+            first == "process_running" and job.metadata.get("cancellation_requested_at")
+        )
         self.repo.save_job(job)
         return {
             "job_id": job_id,
-            "status": job.status,
+            "status": "cancellation_incomplete" if cancellation_incomplete else job.status,
+            "cancellation_incomplete": cancellation_incomplete,
+            "process_group_alive": first == "process_running",
             "pid": job.remote_pid,
             "exit_code": job.exit_code,
             "start_time": job.started_at,
@@ -387,18 +393,40 @@ class GPUService:
         if not job:
             raise GPUError("JOB_NOT_FOUND", f"No job named {job_id}")
         item = self._instance(job.instance_id)
+        jobdir = f"{self.settings.gpu_lab_remote_root}/jobs/{job_id}"
+        # The job command is launched by ``setsid`` and writes its session / process
+        # group leader.  Killing tmux alone only removes the wrapper pane and can
+        # orphan CUDA children.  TERM first, then KILL only if the group survives.
+        cancel_command = (
+            f"pgfile={q(jobdir + '/process_group.pid')}; "
+            "pgid=''; [ -f \"$pgfile\" ] && pgid=$(cat \"$pgfile\" 2>/dev/null || true); "
+            f"case \"$pgid\" in ''|*[!0-9]*) pgid={int(job.remote_pid or 0)};; esac; "
+            "if [ \"$pgid\" -gt 0 ] 2>/dev/null; then "
+            "kill -TERM -- -$pgid 2>/dev/null || true; "
+            "for n in 1 2 3 4 5; do kill -0 -- -$pgid 2>/dev/null || break; sleep 1; done; "
+            "if kill -0 -- -$pgid 2>/dev/null; then kill -KILL -- -$pgid 2>/dev/null || true; sleep 1; fi; "
+            "fi; "
+            f"tmux kill-session -t {q(job_id)} 2>/dev/null || true; "
+            "if [ \"$pgid\" -gt 0 ] 2>/dev/null && kill -0 -- -$pgid 2>/dev/null; then echo process_group_alive; "
+            f"elif tmux has-session -t {q(job_id)} 2>/dev/null; then echo tmux_alive; else echo terminated; fi"
+        )
         out, _, _ = await self.ssh.run(
             item,
-            f"tmux kill-session -t {q(job_id)} 2>/dev/null || true; sleep 1; tmux has-session -t {q(job_id)} 2>/dev/null && echo alive || echo terminated",
+            cancel_command,
             30,
         )
         if "terminated" not in out:
-            raise GPUError("JOB_CANCEL_FAILED", "Process session is still running", True)
+            job.metadata["cancellation_requested_at"] = datetime.now(UTC).isoformat()
+            job.metadata["cancellation_incomplete"] = True
+            self.repo.save_job(job)
+            return {"job_id": job_id, "status": "cancellation_incomplete", "terminated": False, "process_group_alive": "process_group_alive" in out, "retry_safe": False, "recovery_action": "CANCEL_PROCESS_GROUP"}
         job.status = "cancelled"
         job.completed_at = datetime.now(UTC)
+        job.metadata.pop("cancellation_requested_at", None)
+        job.metadata.pop("cancellation_incomplete", None)
         self.repo.save_job(job)
-        self.repo.event(job_id, "cancelled", "tmux session terminated")
-        return {"job_id": job_id, "status": "cancelled", "terminated": True}
+        self.repo.event(job_id, "cancelled", "tmux session and process group terminated")
+        return {"job_id": job_id, "status": "cancelled", "terminated": True, "process_group_alive": False}
 
     async def artifact_list(self, job_id: str) -> list[dict]:
         job = self.repo.get_job(job_id)

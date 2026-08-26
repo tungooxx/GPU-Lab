@@ -311,6 +311,38 @@ class LabController:
         return {"worker": self._record(worker), "session_id": session_id, "recovered": recovered,
                 "lab_state": self.state_get(project_id, session_id, reconcile=False)}
 
+    def renew_session(self, session_id: str, worker_id: str, project_id: str) -> dict:
+        """Restore an expired session identity without resurrecting its lease.
+
+        Expiry remains meaningful for work ownership: this operation never
+        changes a WorkItem, a lease, or an attached execution.  It only avoids
+        forcing a worker to create an unnecessary successor identity before it
+        can continue coordination work.
+        """
+        now = self._now()
+        with self.store._connect() as conn, conn.cursor() as cur:
+            self._worker(cur, worker_id)
+            cur.execute(
+                "SELECT * FROM research_worker_sessions WHERE id=%s AND worker_id=%s "
+                "AND current_project_id=%s FOR UPDATE",
+                (session_id, worker_id, project_id),
+            )
+            session = cur.fetchone()
+            if not session:
+                raise GPUError("LAB_SESSION_NOT_FOUND", session_id)
+            if session["status"] == "DISCONNECTED":
+                raise GPUError("LAB_SESSION_NOT_RENEWABLE", "Disconnected sessions require lab_join")
+            cur.execute(
+                "UPDATE research_worker_sessions SET status='ACTIVE',last_heartbeat_at=%s,"
+                "disconnected_at=NULL,current_work_item_id=NULL,active_role=NULL WHERE id=%s",
+                (now, session_id),
+            )
+            self._event(cur, project_id, "WORKER_SESSION_RENEWED", None, {
+                "worker_id": worker_id, "session_id": session_id,
+                "previous_status": session["status"], "lease_restored": False,
+            })
+        return {"session_id": session_id, "worker_id": worker_id, "project_id": project_id, "renewed": True, "lease_restored": False, "lab_state": self.state_get(project_id, session_id, reconcile=False)}
+
     def gate_ensure(
         self, project_id: str, gate_key: str, scientific_object_id: str,
         canonical_subject_version: str, worker_id: str, session_id: str,
