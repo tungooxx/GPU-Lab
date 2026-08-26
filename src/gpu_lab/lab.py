@@ -587,6 +587,53 @@ class LabController:
         dependency_changes = self.resolve_dependencies(project_id)
         return {"work_items_superseded": superseded, **dependency_changes}
 
+    def supersede_gate_version(
+        self, old_gate_id: str, successor_gate_id: str, worker_id: str,
+        session_id: str, rationale: str,
+    ) -> dict[str, Any]:
+        """Retire one stale gate version without retiring its scientific subject.
+
+        A subject can legitimately receive a newer canonical version after a
+        harness or deterministic-preflight repair.  Subject-level supersession
+        is unsafe here because both gate versions refer to the same science.
+        """
+        if not rationale.strip():
+            raise GPUError("SCIENTIFIC_GATE_SUPERSESSION_RATIONALE_REQUIRED", "rationale")
+        now = self._now()
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM scientific_gates WHERE id=ANY(%s) FOR UPDATE", ([old_gate_id, successor_gate_id],))
+            gates = {str(item["id"]): item for item in cur.fetchall()}
+            old, successor = gates.get(old_gate_id), gates.get(successor_gate_id)
+            if not old or not successor:
+                raise GPUError("SCIENTIFIC_GATE_NOT_FOUND", "old or successor gate")
+            self._session(cur, session_id, worker_id, str(old["project_id"]))
+            if str(old["project_id"]) != str(successor["project_id"]):
+                raise GPUError("RESEARCH_PROJECT_MISMATCH", successor_gate_id)
+            if old["scientific_object_id"] != successor["scientific_object_id"] or old["gate_key"] != successor["gate_key"]:
+                raise GPUError("SCIENTIFIC_GATE_SUPERSESSION_MISMATCH", "Gate subject and key must match")
+            if old["canonical_subject_version"] == successor["canonical_subject_version"]:
+                raise GPUError("SCIENTIFIC_GATE_SUPERSESSION_SAME_VERSION", old_gate_id)
+            if old["status"] in {"PASS", "FAIL", "INVALID"}:
+                raise GPUError("SCIENTIFIC_GATE_NOT_SUPERSEDABLE", old["status"])
+            cur.execute(
+                "UPDATE scientific_gates SET status='SUPERSEDED',superseded_by=%s,invalidation_reason=%s,resolved_at=%s WHERE id=%s",
+                (successor_gate_id, rationale.strip()[:4000], now, old_gate_id),
+            )
+            cur.execute(
+                "UPDATE lab_work_items SET status='SUPERSEDED',authority_status='SUPERSEDED',superseded_by=%s,"
+                "invalidated_reason=%s,invalidated_at=%s,updated_at=%s WHERE gate_id=%s "
+                "AND status=ANY(%s)",
+                (successor_gate_id, rationale.strip()[:4000], now, now, old_gate_id, list(ACTIVE_WORK_STATUSES)),
+            )
+            self._event(cur, old["project_id"], "SCIENTIFIC_GATE_VERSION_SUPERSEDED", old_gate_id, {
+                "successor_gate_id": successor_gate_id,
+                "old_version": old["canonical_subject_version"],
+                "successor_version": successor["canonical_subject_version"],
+                "rationale": rationale.strip()[:4000],
+            })
+        dependency_changes = self.resolve_dependencies(str(old["project_id"]))
+        return {"old_gate_id": old_gate_id, "successor_gate_id": successor_gate_id, "status": "SUPERSEDED", "dependency_changes": dependency_changes}
+
     def create_work(self, project_id: str, kind: str, title: str, description: str,
                     scientific_role: str, created_by: str | None = None, priority: float = 0,
                     expected_value: float | None = None, estimated_cost: float | None = None,
@@ -787,8 +834,19 @@ class LabController:
                 raise GPUError("LAB_DEPENDENCY_TARGET_REQUIRED", "target_id")
             if target_type not in {"WORK_ITEM", "SCIENTIFIC_GATE", "RESEARCH_OBJECT", "EXPERIMENT_RUN", "ENGINEERING_RESULT", "RESEARCH_DECISION", "EVIDENCE_UNIT", "ARTIFACT"}:
                 raise GPUError("LAB_DEPENDENCY_TYPE_INVALID", target_type)
+            required_statuses = dependency.get("required_statuses", [])
+            exists_only = dependency.get("allow_exists_only", False)
+            if not isinstance(required_statuses, list) or any(not isinstance(status, str) or not status.strip() for status in required_statuses):
+                raise GPUError("LAB_DEPENDENCY_REQUIRED_STATUS_INVALID", target_id)
+            if not required_statuses and exists_only is not True:
+                raise GPUError(
+                    "LAB_DEPENDENCY_REQUIRED_STATUS_REQUIRED",
+                    "Specify required_statuses or explicitly set allow_exists_only=true",
+                )
+            if exists_only is not True and "allow_exists_only" in dependency and not isinstance(exists_only, bool):
+                raise GPUError("LAB_DEPENDENCY_EXISTS_ONLY_INVALID", target_id)
             cur.execute("INSERT INTO lab_work_dependencies(id,work_item_id,target_type,target_id,required_statuses,invalidating_statuses,description,created_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",
-                        (str(uuid.uuid4()), work_item_id, target_type, target_id, json.dumps(dependency.get("required_statuses", [])), json.dumps(dependency.get("invalidating_statuses", [])), str(dependency.get("description", "")), now))
+                        (str(uuid.uuid4()), work_item_id, target_type, target_id, json.dumps(required_statuses), json.dumps(dependency.get("invalidating_statuses", [])), str(dependency.get("description", "")), now))
 
     def resolve_dependencies(self, project_id: str) -> dict[str, int]:
         """Reconcile dependency-gated work without leaving unsafe READY items claimable."""

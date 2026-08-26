@@ -1731,6 +1731,18 @@ async def scientific_subject_supersede(
 
 
 @mcp.tool()
+async def scientific_gate_version_supersede(
+    old_gate_id: str, successor_gate_id: str, worker_id: str, session_id: str,
+    rationale: str,
+):
+    """Retire a stale gate version while preserving the underlying scientific subject and history."""
+    return await call(
+        lab().supersede_gate_version, old_gate_id, successor_gate_id,
+        worker_id, session_id, rationale,
+    )
+
+
+@mcp.tool()
 async def lab_work_claim(work_item_id: str, worker_id: str, session_id: str,
                          role: str | None = None, lease_seconds: int | None = None):
     """Atomically claim one READY WorkItem and create its renewable lease."""

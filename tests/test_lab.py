@@ -41,6 +41,21 @@ def test_two_workers_claim_distinct_work_and_messages_are_not_evidence():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_dependency_requires_explicit_status_or_exists_only_marker():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project = store.project_create(f"lab-dependency-status-{time.time_ns()}", "Dependency validation")
+    worker = lab.join(None, "dependency-status-worker", "CODEX", project["project_id"])
+    with pytest.raises(GPUError) as exc_info:
+        lab.create_work(
+            project["project_id"], "VALIDATION", "Missing status", "Must not become ready.",
+            "VALIDATOR", worker["worker"]["id"], created_session_id=worker["session_id"],
+            dependencies=[{"target_type": "RESEARCH_OBJECT", "target_id": str(uuid.uuid4())}],
+        )
+    assert exc_info.value.error_type == "LAB_DEPENDENCY_REQUIRED_STATUS_REQUIRED"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_browser_runtime_marks_first_successful_connection_attached():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)
