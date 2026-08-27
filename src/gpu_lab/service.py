@@ -331,6 +331,24 @@ class GPUService:
         job = self.repo.get_job(job_id)
         if not job:
             raise GPUError("JOB_NOT_FOUND", f"No job named {job_id}")
+        # ``experiment_cancel`` records this state only after its process-group
+        # probe confirms termination.  Never turn that durable terminal fact
+        # back into ``unknown`` merely because a cancelled job has no user exit
+        # code file (SIGTERM/SIGKILL normally prevents it from being written).
+        if job.status == "cancelled":
+            return {
+                "job_id": job_id,
+                "status": "cancelled",
+                "cancellation_verified": True,
+                "cancellation_incomplete": False,
+                "process_group_alive": False,
+                "pid": job.remote_pid,
+                "exit_code": job.exit_code,
+                "start_time": job.started_at,
+                "end_time": job.completed_at,
+                "logs_tail": [],
+                "artifact_count": len(await self.artifact_list(job_id)),
+            }
         item = self._instance(job.instance_id)
         jd = f"{self.settings.gpu_lab_remote_root}/jobs/{job_id}"
         out, _, _ = await self.ssh.run(
@@ -347,14 +365,21 @@ class GPUService:
             job.completed_at = datetime.now(UTC)
         else:
             job.status = "unknown"
-        cancellation_incomplete = bool(
-            first == "process_running" and job.metadata.get("cancellation_requested_at")
-        )
+        cancellation_requested = bool(job.metadata.get("cancellation_requested_at"))
+        cancellation_incomplete = bool(first == "process_running" and cancellation_requested)
+        cancellation_pending_verification = bool(first == "unknown" and cancellation_requested)
         self.repo.save_job(job)
         return {
             "job_id": job_id,
-            "status": "cancellation_incomplete" if cancellation_incomplete else job.status,
+            "status": (
+                "cancellation_incomplete"
+                if cancellation_incomplete
+                else "cancellation_pending_verification"
+                if cancellation_pending_verification
+                else job.status
+            ),
             "cancellation_incomplete": cancellation_incomplete,
+            "cancellation_pending_verification": cancellation_pending_verification,
             "process_group_alive": first == "process_running",
             "pid": job.remote_pid,
             "exit_code": job.exit_code,
@@ -400,25 +425,36 @@ class GPUService:
             f"pgfile={q(jobdir + '/process_group.pid')}; "
             "pgid=''; [ -f \"$pgfile\" ] && pgid=$(cat \"$pgfile\" 2>/dev/null || true); "
             f"case \"$pgid\" in ''|*[!0-9]*) pgid={int(job.remote_pid or 0)};; esac; "
+            "case \"$pgid\" in ''|*[!0-9]*) pid_verified=false;; *) pid_verified=true;; esac; "
             "if [ \"$pgid\" -gt 0 ] 2>/dev/null; then "
             "kill -TERM -- -$pgid 2>/dev/null || true; "
             "for n in 1 2 3 4 5; do kill -0 -- -$pgid 2>/dev/null || break; sleep 1; done; "
             "if kill -0 -- -$pgid 2>/dev/null; then kill -KILL -- -$pgid 2>/dev/null || true; sleep 1; fi; "
             "fi; "
             f"tmux kill-session -t {q(job_id)} 2>/dev/null || true; "
-            "if [ \"$pgid\" -gt 0 ] 2>/dev/null && kill -0 -- -$pgid 2>/dev/null; then echo process_group_alive; "
-            f"elif tmux has-session -t {q(job_id)} 2>/dev/null; then echo tmux_alive; else echo terminated; fi"
+            "if [ \"$pid_verified\" != true ]; then echo pid_unverified; "
+            "elif kill -0 -- -$pgid 2>/dev/null; then echo process_group_alive; "
+            f"elif tmux has-session -t {q(job_id)} 2>/dev/null; then echo tmux_alive; else echo terminated_verified; fi"
         )
         out, _, _ = await self.ssh.run(
             item,
             cancel_command,
             30,
         )
-        if "terminated" not in out:
+        if "terminated_verified" not in out:
             job.metadata["cancellation_requested_at"] = datetime.now(UTC).isoformat()
-            job.metadata["cancellation_incomplete"] = True
+            job.metadata["cancellation_incomplete"] = "process_group_alive" in out
             self.repo.save_job(job)
-            return {"job_id": job_id, "status": "cancellation_incomplete", "terminated": False, "process_group_alive": "process_group_alive" in out, "retry_safe": False, "recovery_action": "CANCEL_PROCESS_GROUP"}
+            pending = "process_group_alive" not in out
+            return {
+                "job_id": job_id,
+                "status": "cancellation_pending_verification" if pending else "cancellation_incomplete",
+                "terminated": False,
+                "process_group_alive": "process_group_alive" in out,
+                "cancellation_pending_verification": pending,
+                "retry_safe": False,
+                "recovery_action": "VERIFY_PROCESS_GROUP" if pending else "CANCEL_PROCESS_GROUP",
+            }
         job.status = "cancelled"
         job.completed_at = datetime.now(UTC)
         job.metadata.pop("cancellation_requested_at", None)

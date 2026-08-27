@@ -4354,6 +4354,23 @@ async def research_experiment_sync(run_id: str | None = None, job_id: str | None
                     "same experiment_id, decision_id, command, and execution_attempt_uuid."
                 ),
             }
+        if outcome.get("status") in {"cancellation_incomplete", "cancellation_pending_verification"}:
+            return {
+                **mapping,
+                "status": (
+                    "CANCELLATION_INCOMPLETE"
+                    if outcome.get("status") == "cancellation_incomplete"
+                    else "CANCELLATION_PENDING_VERIFICATION"
+                ),
+                "runner_status": outcome.get("status"),
+                "process_group_alive": outcome.get("process_group_alive", False),
+                "retry_safe": False,
+                "recovery_action": (
+                    "CANCEL_PROCESS_GROUP"
+                    if outcome.get("status") == "cancellation_incomplete"
+                    else "VERIFY_PROCESS_GROUP"
+                ),
+            }
         if outcome.get("status") not in {"running", "completed", "failed", "cancelled"}:
             return {
                 **mapping,
@@ -4395,6 +4412,16 @@ async def research_experiment_sync(run_id: str | None = None, job_id: str | None
             "retry_safe": False,
             "recovery_action": "CANCEL_PROCESS_GROUP",
             "message": "Cancellation removed a wrapper but the job process group is still alive; do not reconcile or retry until termination is verified.",
+        }
+    if outcome.get("status") == "cancellation_pending_verification" or outcome.get("cancellation_pending_verification"):
+        return {
+            **mapping,
+            "status": "CANCELLATION_PENDING_VERIFICATION",
+            "runner_status": outcome.get("status"),
+            "process_group_alive": outcome.get("process_group_alive", False),
+            "retry_safe": False,
+            "recovery_action": "VERIFY_PROCESS_GROUP",
+            "message": "Cancellation was requested, but the executor has not yet proved that the process group exited; do not reconcile or retry yet.",
         }
     artifacts = await call(
         svc().artifact_list if is_remote else local.artifacts,

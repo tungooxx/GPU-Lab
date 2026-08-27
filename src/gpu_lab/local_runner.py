@@ -382,6 +382,17 @@ class LocalRunner:
                 job.remote_pid = int(pid_file.read_text().strip())
             except ValueError:
                 pass
+        # A successful cancellation is terminal even when SIGTERM/SIGKILL
+        # prevented the child from writing its normal exit-code file.
+        if job.status == "cancelled":
+            result = {"job_id": job_id, "status": "cancelled", "exit_code": job.exit_code}
+            if include_logs:
+                logs = ""
+                for file in (jobdir / "stdout.log", jobdir / "stderr.log"):
+                    if file.exists():
+                        logs += file.read_text(errors="replace")[-65536:]
+                result["logs_tail"] = logs
+            return result
         if code_file.is_file():
             try:
                 job.exit_code = int(code_file.read_text().strip())

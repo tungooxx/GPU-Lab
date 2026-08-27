@@ -311,9 +311,43 @@ async def test_remote_cancel_reports_terminated_only_after_group_check(tmp_path)
 
     class SSH:
         async def run(self, *_args):
-            return "terminated\n", "", 0
+            return "terminated_verified\n", "", 0
 
     service.ssh = SSH()
     result = await service.experiment_cancel("exp_cancel_done")
 
     assert result == {"job_id": "exp_cancel_done", "status": "cancelled", "terminated": True, "process_group_alive": False}
+
+
+@pytest.mark.asyncio
+async def test_remote_cancel_keeps_unverified_termination_pending(tmp_path):
+    service = GPUService(Settings(gpu_lab_database_url=f"sqlite:///{tmp_path / 'db.sqlite'}"))
+    service.repo.save_instance(Instance(id="vast_1", provider_instance_id="1", gpu_model="RTX"))
+    service.repo.save_job(Job(job_id="exp_cancel_unverified", instance_id="vast_1", repo_path="/workspace/repo", command="python run.py", status="running"))
+
+    class SSH:
+        async def run(self, *_args):
+            return "pid_unverified\n", "", 0
+
+    service.ssh = SSH()
+    result = await service.experiment_cancel("exp_cancel_unverified")
+
+    assert result["status"] == "cancellation_pending_verification"
+    assert result["terminated"] is False
+    assert result["recovery_action"] == "VERIFY_PROCESS_GROUP"
+
+
+@pytest.mark.asyncio
+async def test_remote_status_does_not_turn_verified_cancellation_unknown(tmp_path):
+    service = GPUService(Settings(gpu_lab_database_url=f"sqlite:///{tmp_path / 'db.sqlite'}"))
+    service.repo.save_instance(Instance(id="vast_1", provider_instance_id="1", gpu_model="RTX"))
+    service.repo.save_job(Job(job_id="exp_cancelled", instance_id="vast_1", repo_path="/workspace/repo", command="python run.py", remote_pid=12345, status="cancelled"))
+
+    async def no_artifacts(_job_id):
+        return []
+
+    service.artifact_list = no_artifacts
+    result = await service.experiment_status("exp_cancelled")
+
+    assert result["status"] == "cancelled"
+    assert result["cancellation_verified"] is True

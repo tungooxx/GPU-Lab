@@ -117,6 +117,11 @@ class CancellationIncompleteRemote(RemoteRunner):
         return {"job_id": job_id, "status": "cancellation_incomplete", "cancellation_incomplete": True, "process_group_alive": True, "exit_code": None, "logs_tail": []}
 
 
+class CancellationPendingRemote(RemoteRunner):
+    async def experiment_status(self, job_id):
+        return {"job_id": job_id, "status": "cancellation_pending_verification", "cancellation_pending_verification": True, "process_group_alive": False, "exit_code": None, "logs_tail": []}
+
+
 class TerminalLab:
     def experiment_run_terminal(self, *_args):
         return {"status": "ok"}
@@ -375,6 +380,21 @@ async def test_sync_reports_incomplete_cancellation_without_marking_unknown(monk
 
     assert result["status"] == "CANCELLATION_INCOMPLETE"
     assert result["recovery_action"] == "CANCEL_PROCESS_GROUP"
+    assert research.updates == []
+
+
+@pytest.mark.asyncio
+async def test_sync_reports_pending_cancellation_without_marking_unknown(monkeypatch):
+    mapping = _mapping("running")
+    mapping["run"]["data"].update({"executor": "vast", "instance_id": "vast_1"})
+    research = FakeResearch(mapping)
+    monkeypatch.setattr(server, "research", lambda: research)
+    monkeypatch.setattr(server, "svc", lambda: CancellationPendingRemote())
+
+    result = await server.research_experiment_sync(run_id="run-id")
+
+    assert result["status"] == "CANCELLATION_PENDING_VERIFICATION"
+    assert result["recovery_action"] == "VERIFY_PROCESS_GROUP"
     assert research.updates == []
 
 
