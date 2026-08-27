@@ -14,6 +14,30 @@ def test_quote_is_shell_safe():
     assert q("a; rm -rf /") == "'a; rm -rf /'"
 
 
+@pytest.mark.asyncio
+async def test_repo_checkout_resolves_fetch_head_to_one_detached_commit(tmp_path):
+    service = GPUService(Settings(gpu_lab_database_url=f"sqlite:///{tmp_path / 'db.sqlite'}"))
+    service.repo.save_instance(Instance(id="vast_test", provider_instance_id="test"))
+    captured = {}
+
+    async def fake_run(instance, command, timeout):
+        captured["command"] = command
+        return "a" * 40 + "\n", "", 0
+
+    service.ssh.run = fake_run
+    result = await service.repo_checkout(
+        "vast_test", "git@github.com:example/repo.git", commit="a" * 40
+    )
+
+    command = captured["command"]
+    assert "git clone --depth 1 --no-checkout" in command
+    assert "git fetch --depth 1 origin " + "a" * 40 in command
+    assert "git rev-parse --verify FETCH_HEAD^{commit}" in command
+    assert 'git checkout --detach "$resolved_ref"' in command
+    assert "git checkout --detach FETCH_HEAD" not in command
+    assert result["commit"] == "a" * 40
+
+
 def test_provider_normalizes_connection_metadata():
     item = VastProvider.normalize(
         {

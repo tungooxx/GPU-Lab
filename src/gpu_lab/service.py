@@ -198,16 +198,15 @@ class GPUService:
         if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
             raise GPUError("INVALID_REPOSITORY_NAME", "Repository name contains unsafe characters")
         path = self._remote_path(f"{self.settings.gpu_lab_remote_root}/repos/{name}")
-        clone_branch = f" --branch {q(branch)}" if branch else ""
         fetch_ref = q(commit or branch or "HEAD")
-        checkout_ref = "FETCH_HEAD" if commit else "HEAD"
         command = (
             f'mkdir -p {q(self.settings.gpu_lab_remote_root + "/repos")} && '
             f'if [ -d {q(path + "/.git")} ]; then '
             f'cd {q(path)} && test -z "$(git status --porcelain)" || exit 42; '
-            f'git fetch --depth 1 origin {fetch_ref}; '
-            f'else git clone --depth 1 --single-branch{clone_branch} {q(repo_url)} {q(path)}; fi && '
-            f'cd {q(path)} && git checkout --detach {checkout_ref} && git rev-parse HEAD'
+            f'else git clone --depth 1 --no-checkout {q(repo_url)} {q(path)}; fi && '
+            f'cd {q(path)} && git fetch --depth 1 origin {fetch_ref} && '
+            f'resolved_ref=$(git rev-parse --verify FETCH_HEAD^{{commit}}) && '
+            f'git checkout --detach "$resolved_ref" && git rev-parse HEAD'
         )
         out, err, code = await self.ssh.run(item, command, 300)
         if code == 42:
