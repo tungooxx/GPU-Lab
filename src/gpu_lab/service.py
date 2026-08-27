@@ -260,6 +260,8 @@ class GPUService:
         job_id = job_id or "exp_" + uuid.uuid4().hex[:16]
         if not re.fullmatch(r"(?:exp|remote)_[A-Za-z0-9_-]{8,80}", job_id):
             raise GPUError("INVALID_REMOTE_JOB_ID", "Remote job ID is invalid")
+        if timeout_seconds is not None and not 1 <= timeout_seconds <= 604800:
+            raise GPUError("INVALID_WALL_TIME_LIMIT", "timeout_seconds must be between 1 and 604800")
         existing = self.repo.get_job(job_id)
         if existing:
             if (
@@ -289,15 +291,26 @@ class GPUService:
             command=command,
             remote_session=job_id,
             started_at=datetime.now(UTC),
-            metadata={**(metadata or {}), "artifact_patterns": artifact_patterns or []},
+            metadata={
+                **(metadata or {}),
+                "artifact_patterns": artifact_patterns or [],
+                "max_wall_seconds": timeout_seconds,
+            },
         )
         # Quote the pane command once as the final tmux argument.  Do not wrap
         # it in literal single quotes: ``q(inner)`` may itself contain quotes.
+        guarded_command = (
+            f"timeout --foreground --signal=TERM --kill-after=30s {int(timeout_seconds)}s sh -c {q(command)}"
+            if timeout_seconds is not None
+            else command
+        )
         inner = (
             f"echo $$ > {q(jobdir + '/process_group.pid')}; "
             + (safe_env + " " if safe_env else "")
-            + command
-            + f"; code=$?; echo $code > {q(jobdir + '/exit_code')}; exit $code"
+            + guarded_command
+            + f"; code=$?; echo $code > {q(jobdir + '/exit_code')}; "
+            + (f"if [ $code -eq 124 ]; then echo MAX_WALL_SECONDS > {q(jobdir + '/termination_reason')}; fi; " if timeout_seconds is not None else "")
+            + "exit $code"
         )
         pane_command = (
             f"setsid sh -c {q(inner)} "

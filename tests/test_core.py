@@ -283,6 +283,24 @@ async def test_remote_experiment_submission_quotes_the_tmux_pane_once(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_remote_experiment_submission_enforces_wall_time_limit(tmp_path):
+    service = GPUService(Settings(gpu_lab_database_url=f"sqlite:///{tmp_path / 'db.sqlite'}"))
+    service.repo.save_instance(Instance(id="vast_1", provider_instance_id="1", gpu_model="RTX"))
+    captured = {}
+
+    class SSH:
+        async def run(self, _instance, command, _timeout):
+            captured["command"] = command
+            return "12345\n", "", 0
+
+    service.ssh = SSH()
+    await service.experiment_submit("vast_1", "/workspace/GPU-Lab/repos/repo", "python run.py", timeout_seconds=120, job_id="exp_wall_limit")
+    assert "timeout --foreground --signal=TERM --kill-after=30s 120s sh -c" in captured["command"]
+    assert "python run.py" in captured["command"]
+    assert "MAX_WALL_SECONDS" in captured["command"]
+
+
+@pytest.mark.asyncio
 async def test_remote_cancel_requires_process_group_termination(tmp_path):
     service = GPUService(Settings(gpu_lab_database_url=f"sqlite:///{tmp_path / 'db.sqlite'}"))
     service.repo.save_instance(Instance(id="vast_1", provider_instance_id="1", gpu_model="RTX"))
