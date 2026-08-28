@@ -171,6 +171,51 @@ def test_v36_feature_gated_scheduler_claims_existing_work_or_records_healthy_idl
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_speculation_classes_and_expensive_budget_are_enforced():
+    store = ResearchStore(TEST_DATABASE_URL)
+    disabled = LabController(store)
+    project_id = store.project_create(f"lab-v36-speculation-{time.time_ns()}", "v3.6 speculation")["project_id"]
+    joined = disabled.join(None, "v36-speculation-worker", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    objective = disabled.canonical_objective_create(project_id, "SCIENTIFIC", "Speculation", "Which bounded preparation is justified?")
+    branch = disabled.hypothesis_branch_create(project_id, objective["id"])
+    safe = disabled.create_work(
+        project_id, "ANALYSIS", "Safe metric audit", "Outcome-independent inspection", "RESULT_INSPECTOR",
+        worker_id, created_session_id=session_id, canonical_objective_id=objective["id"], branch_id=branch["id"],
+        speculation_class="SAFE_SPECULATIVE",
+    )
+    assert safe["speculation_class"] == "SAFE_SPECULATIVE"
+    with pytest.raises(GPUError, match="LAB_WORK_SPECULATION_CONDITION_REQUIRED"):
+        disabled.create_work(
+            project_id, "ANALYSIS", "Bad conditional", "No trigger", "RESULT_INSPECTOR",
+            worker_id, created_session_id=session_id, canonical_objective_id=objective["id"], branch_id=branch["id"],
+            speculation_class="CONDITIONAL_SPECULATIVE",
+        )
+    with pytest.raises(GPUError, match="LAB_SPECULATIVE_WORK_POLICY_DISABLED"):
+        disabled.create_work(
+            project_id, "RUN_EXPERIMENT", "Gated expensive run", "Not approved", "EXPERIMENT_OWNER",
+            worker_id, created_session_id=session_id, canonical_objective_id=objective["id"], branch_id=branch["id"],
+            speculation_class="EXPENSIVE_SPECULATIVE", related_refs={"brain_approval": "B1"}, expected_value=1,
+        )
+
+    enabled = LabController(store, feature_flags={"SPECULATIVE_WORK_POLICY": True})
+    enabled.budget_set(project_id, worker_id, session_id, {"max_concurrent_expensive_speculative_runs": 1})
+    first = enabled.create_work(
+        project_id, "RUN_EXPERIMENT", "Approved expensive run", "Bounded approved run", "EXPERIMENT_OWNER",
+        worker_id, created_session_id=session_id, canonical_objective_id=objective["id"], branch_id=branch["id"],
+        speculation_class="EXPENSIVE_SPECULATIVE", related_refs={"brain_approval": "B1"}, expected_value=1,
+    )
+    enabled.claim_work(first["id"], worker_id, session_id)
+    second = enabled.create_work(
+        project_id, "RUN_EXPERIMENT", "Second approved run", "Must wait for budget", "EXPERIMENT_OWNER",
+        worker_id, created_session_id=session_id, canonical_objective_id=objective["id"], branch_id=branch["id"],
+        speculation_class="EXPENSIVE_SPECULATIVE", related_refs={"brain_approval": "B2"}, expected_value=1,
+    )
+    with pytest.raises(GPUError, match="LAB_SPECULATIVE_BUDGET_EXCEEDED"):
+        enabled.claim_work(second["id"], worker_id, session_id)
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_browser_runtime_marks_first_successful_connection_attached():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)

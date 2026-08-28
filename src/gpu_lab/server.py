@@ -1836,6 +1836,8 @@ async def lab_work_create(
     subject_id: str | None = None, recovery_policy: dict[str, Any] | None = None,
     dormant_until_dependencies: bool = False,
     canonical_objective_id: str | None = None, branch_id: str | None = None,
+    speculation_class: str = "NON_SPECULATIVE", speculation_condition: dict[str, Any] | None = None,
+    resource_class: str | None = None,
     dependency_scope: str = "WORKITEM_LOCAL",
 ):
     """Create dependency-aware project work; authoritative gate work is idempotently reused."""
@@ -1848,6 +1850,8 @@ async def lab_work_create(
         authority_status=authority_status, subject_id=subject_id, recovery_policy=recovery_policy,
         dormant_until_dependencies=dormant_until_dependencies,
         canonical_objective_id=canonical_objective_id, branch_id=branch_id,
+        speculation_class=speculation_class, speculation_condition=speculation_condition,
+        resource_class=resource_class,
         dependency_scope=dependency_scope,
     )
 

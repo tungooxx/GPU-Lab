@@ -33,6 +33,8 @@ OBJECTIVE_STATUSES = {"ACTIVE", "BLOCKED", "RESOLVED", "SUPERSEDED", "PAUSED", "
 PROPOSAL_STATUSES = {"PROPOSED", "MERGED_INTO_EXISTING", "SATISFIED_BY_TERMINAL", "MATERIALIZED", "REJECTED_DUPLICATE", "REJECTED_LOW_VALUE", "REJECTED_STALE", "SUPERSEDED"}
 DEPENDENCY_SCOPES = {"WORKITEM_LOCAL", "BRANCH", "PORTFOLIO", "OBJECTIVE_GLOBAL"}
 BRANCH_STATES = {"OPEN", "WAITING", "BLOCKED", "SUPPORTED_WITHIN_SCOPE", "WEAKENED", "REFUTED", "RESOLVED", "SUPERSEDED", "ABANDONED"}
+SPECULATION_CLASSES = {"NON_SPECULATIVE", "SAFE_SPECULATIVE", "CONDITIONAL_SPECULATIVE", "EXPENSIVE_SPECULATIVE"}
+RESOURCE_CLASSES = {"REASONING", "ENGINEERING", "GPU", "TRAINING", "LITERATURE", "REVIEW", "SYNTHESIS"}
 GATE_STATUSES = {"PENDING", "PREFLIGHT_FAILED", "AWAITING_SEMANTIC_REVIEW", "PASS", "FAIL", "INVALID", "SUPERSEDED"}
 PREFLIGHT_STATUSES = {"PASS", "FAIL"}
 COORDINATION_VERSION = "lab-coordination-v3.2.2-gates-v1"
@@ -219,6 +221,9 @@ class LabController:
                 ALTER TABLE research_workers ADD COLUMN IF NOT EXISTS idle_reason TEXT;
                 ALTER TABLE research_workers ADD COLUMN IF NOT EXISTS idle_since TIMESTAMPTZ;
                 ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS canonical_objective_id UUID REFERENCES canonical_objectives(id);
+                ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS speculation_class TEXT NOT NULL DEFAULT 'NON_SPECULATIVE';
+                ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS speculation_condition JSONB NOT NULL DEFAULT '{}'::jsonb;
+                ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS resource_class TEXT NOT NULL DEFAULT 'REASONING';
                 DO $$ BEGIN
                     ALTER TABLE lab_work_items ADD CONSTRAINT lab_work_items_branch_fk
                         FOREIGN KEY(branch_id) REFERENCES hypothesis_branches(id) NOT VALID;
@@ -411,6 +416,7 @@ class LabController:
         allowed = {
             "max_active_workers", "max_parallel_branches", "max_concurrent_gpu_runs",
             "max_concurrent_training_runs", "max_concurrent_expensive_llm_tasks",
+            "max_concurrent_expensive_speculative_runs",
             "project_compute_budget", "project_llm_budget",
         }
         if not isinstance(limits, dict) or set(limits) - allowed:
@@ -446,8 +452,12 @@ class LabController:
             if cur.fetchone()["count"] >= max_workers:
                 raise GPUError("LAB_WORKER_BUDGET_EXCEEDED", "max_active_workers")
         max_branches = int(limits.get("max_parallel_branches", 0) or 0)
-        if max_branches:
-            cur.execute("SELECT count(*) AS count FROM lab_work_items WHERE project_id=%s AND status=ANY(%s)", (project_id, list(active)))
+        if max_branches and item.get("branch_id"):
+            cur.execute(
+                "SELECT count(DISTINCT branch_id) AS count FROM lab_work_items "
+                "WHERE project_id=%s AND status=ANY(%s) AND branch_id IS NOT NULL AND branch_id<>%s",
+                (project_id, list(active), item["branch_id"]),
+            )
             if cur.fetchone()["count"] >= max_branches:
                 raise GPUError("LAB_BRANCH_BUDGET_EXCEEDED", "max_parallel_branches")
         kind = item["kind"].upper()
@@ -471,6 +481,47 @@ class LabController:
             cur.execute("SELECT COALESCE(sum(estimated_cost), 0) AS cost FROM lab_work_items WHERE project_id=%s AND status=ANY(%s)", (project_id, list(active)))
             if float(cur.fetchone()["cost"]) + float(item["estimated_cost"]) > compute_budget:
                 raise GPUError("LAB_COMPUTE_BUDGET_EXCEEDED", "project_compute_budget")
+        max_expensive_speculative = int(limits.get("max_concurrent_expensive_speculative_runs", 0) or 0)
+        if max_expensive_speculative and item.get("speculation_class") == "EXPENSIVE_SPECULATIVE":
+            cur.execute(
+                "SELECT count(*) AS count FROM lab_work_items WHERE project_id=%s "
+                "AND speculation_class='EXPENSIVE_SPECULATIVE' AND status=ANY(%s)",
+                (project_id, list(active)),
+            )
+            if cur.fetchone()["count"] >= max_expensive_speculative:
+                raise GPUError("LAB_SPECULATIVE_BUDGET_EXCEEDED", "max_concurrent_expensive_speculative_runs")
+        if item.get("canonical_objective_id"):
+            cur.execute(
+                "SELECT * FROM hypothesis_portfolios WHERE project_id=%s AND canonical_objective_id=%s "
+                "AND status='ACTIVE' ORDER BY created_at DESC LIMIT 1 FOR SHARE",
+                (project_id, item["canonical_objective_id"]),
+            )
+            portfolio = cur.fetchone()
+            if portfolio:
+                def active_count(where: str, args: list[Any]) -> int:
+                    cur.execute(
+                        "SELECT count(*) AS count FROM lab_work_items WHERE project_id=%s "
+                        "AND canonical_objective_id=%s AND status=ANY(%s) AND " + where,
+                        [project_id, item["canonical_objective_id"], list(active), *args],
+                    )
+                    return int(cur.fetchone()["count"])
+                if portfolio["branch_budget"] and item.get("branch_id"):
+                    cur.execute(
+                        "SELECT count(DISTINCT branch_id) AS count FROM lab_work_items WHERE project_id=%s "
+                        "AND canonical_objective_id=%s AND status=ANY(%s) AND branch_id IS NOT NULL AND branch_id<>%s",
+                        (project_id, item["canonical_objective_id"], list(active), item["branch_id"]),
+                    )
+                    if int(cur.fetchone()["count"]) >= int(portfolio["branch_budget"]):
+                        raise GPUError("PORTFOLIO_BRANCH_BUDGET_EXCEEDED", str(portfolio["id"]))
+                if portfolio["scientific_concurrency_budget"] and active_count("TRUE", []) >= int(portfolio["scientific_concurrency_budget"]):
+                    raise GPUError("PORTFOLIO_SCIENTIFIC_CONCURRENCY_EXCEEDED", str(portfolio["id"]))
+                resource_limit = {
+                    "GPU": portfolio["gpu_concurrency_budget"],
+                    "TRAINING": portfolio["training_concurrency_budget"],
+                    "REASONING": portfolio["reasoning_concurrency_budget"],
+                }.get(item.get("resource_class"))
+                if resource_limit and active_count("resource_class=%s", [item.get("resource_class")]) >= int(resource_limit):
+                    raise GPUError("PORTFOLIO_RESOURCE_BUDGET_EXCEEDED", str(item.get("resource_class")))
 
     def join(self, worker_id: str | None, worker_name: str | None, runtime_type: str,
              project_id: str, capabilities: dict[str, Any] | None = None,
@@ -852,11 +903,28 @@ class LabController:
                     dormant_until_dependencies: bool = False,
                     canonical_objective_id: str | None = None,
                     branch_id: str | None = None,
+                    speculation_class: str = "NON_SPECULATIVE",
+                    speculation_condition: dict[str, Any] | None = None,
+                    resource_class: str | None = None,
                     dependency_scope: str = "WORKITEM_LOCAL") -> dict:
         now, ident = self._now(), str(uuid.uuid4())
         dependencies = dependencies or []
         authority_status = self._validate(authority_status, AUTHORITY_STATUSES, "LAB_WORK_AUTHORITY_STATUS")
         dependency_scope = self._validate(dependency_scope, DEPENDENCY_SCOPES, "LAB_WORK_DEPENDENCY_SCOPE")
+        speculation_class = self._validate(speculation_class, SPECULATION_CLASSES, "LAB_WORK_SPECULATION_CLASS")
+        inferred_resource = "TRAINING" if kind.upper() == "TRAINING_RUN" else "GPU" if kind.upper() == "RUN_EXPERIMENT" else "REVIEW" if kind.upper() in {"REVIEW", "CORRECTION"} else "REASONING"
+        resource_class = self._validate(resource_class or inferred_resource, RESOURCE_CLASSES, "LAB_WORK_RESOURCE_CLASS")
+        speculation_condition = speculation_condition or {}
+        if not isinstance(speculation_condition, dict):
+            raise GPUError("LAB_WORK_SPECULATION_CONDITION_INVALID", "speculation_condition must be an object")
+        if speculation_class == "CONDITIONAL_SPECULATIVE":
+            if not branch_id or not speculation_condition.get("condition") or not speculation_condition.get("invalidation_trigger"):
+                raise GPUError("LAB_WORK_SPECULATION_CONDITION_REQUIRED", "conditional speculative work requires branch_id, condition, and invalidation_trigger")
+        if speculation_class == "EXPENSIVE_SPECULATIVE":
+            if not self.feature_flags.get("SPECULATIVE_WORK_POLICY"):
+                raise GPUError("LAB_SPECULATIVE_WORK_POLICY_DISABLED", "Set SPECULATIVE_WORK_POLICY=true after staged review")
+            if not branch_id or not related_refs or not related_refs.get("brain_approval") or expected_value is None:
+                raise GPUError("LAB_EXPENSIVE_SPECULATION_APPROVAL_REQUIRED", "branch_id, related_refs.brain_approval, and expected_value")
         if dormant_until_dependencies and not dependencies:
             raise GPUError("LAB_DORMANT_WORK_DEPENDENCY_REQUIRED", "A dormant conditional branch needs dependencies")
         existing_id: str | None = None
@@ -951,12 +1019,13 @@ class LabController:
             try:
                 cur.execute(
                     "INSERT INTO lab_work_items(id,project_id,kind,title,description,scientific_role,status,priority,expected_value,estimated_cost,"
-                    "created_by,parent_work_item_id,branch_id,related_refs,equivalence_key,authority_key,gate_id,canonical_subject_version,authority_status,subject_id,recovery_policy,canonical_objective_id,dependency_scope,created_at,updated_at) "
-                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    "created_by,parent_work_item_id,branch_id,related_refs,equivalence_key,authority_key,gate_id,canonical_subject_version,authority_status,subject_id,recovery_policy,canonical_objective_id,speculation_class,speculation_condition,resource_class,dependency_scope,created_at,updated_at) "
+                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (ident, project_id, kind, title, description, scientific_role, status, priority, expected_value, estimated_cost,
                      created_by, parent_work_item_id, branch_id, json.dumps(related_refs or {}), equivalence_key, authority_key, gate_id,
                      canonical_subject_version, authority_status, subject_id, json.dumps(recovery_policy or {}),
-                     canonical_objective_id, dependency_scope, now, now),
+                     canonical_objective_id, speculation_class, json.dumps(speculation_condition), resource_class,
+                     dependency_scope, now, now),
                 )
             except Exception as exc:
                 if getattr(exc, "sqlstate", None) == "23505":
@@ -1203,7 +1272,9 @@ class LabController:
         result: dict | None = None
         with self.store._connect() as conn, conn.cursor() as cur:
             self._worker(cur, worker_id)
-            cur.execute("SELECT project_id,kind,estimated_cost,status FROM lab_work_items WHERE id=%s FOR UPDATE", (work_item_id,))
+            # Budget and portfolio policy use structured branch/resource/speculation
+            # fields.  Claiming a partial row would silently bypass newer limits.
+            cur.execute("SELECT * FROM lab_work_items WHERE id=%s FOR UPDATE", (work_item_id,))
             target = cur.fetchone()
             if not target:
                 raise GPUError("LAB_WORK_NOT_FOUND", work_item_id)
@@ -2121,6 +2192,10 @@ class LabController:
         ready = [
             item for item in self.work_list(project_id, ["READY"], limit)
             if item.get("authority_status") == "AUTHORITATIVE"
+            # Deterministic reallocation never adds a second worker to an
+            # already-covered branch. A separately authorized correction or
+            # review can still be explicitly claimed outside this allocator.
+            and not (item.get("branch_id") and coverage.get(str(item["branch_id"]), {}).get("active_worker_count", 0) > 0)
         ]
 
         def rank(item: dict) -> tuple:
