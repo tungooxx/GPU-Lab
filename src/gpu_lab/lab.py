@@ -2151,6 +2151,68 @@ class LabController:
                 assignments.append({"worker_id": worker["id"], "suggested_work_item_id": None, "reason": "IDLE_NO_EXISTING_ACTIONABLE_WORK"})
         return {"projection_version": "v3.6-shadow", "assignments": assignments, "unassigned_ready_work_item_ids": [item["id"] for item in ready if item["id"] not in used], "planner_action": "DO_NOT_CREATE_WORK" if not ready else "CLAIM_EXISTING_ONLY"}
 
+    def portfolio_production_audit(self, project_id: str) -> dict:
+        """Read-only v3.6 coordination audit; no scheduler mutation or planning."""
+        coverage = self.branch_coverage_get(project_id)
+        ready = [item for item in self.work_list(project_id, ["READY"], 500) if item.get("authority_status") == "AUTHORITATIVE"]
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,display_name,worker_type,availability_state,availability_updated_at,idle_reason,idle_since "
+                "FROM research_workers WHERE enabled=TRUE ORDER BY display_name"
+            )
+            workers = [self._record(row) or {} for row in cur.fetchall()]
+            cur.execute(
+                "SELECT w.id,w.branch_id,w.dependency_scope,d.target_type,d.target_id FROM lab_work_items w "
+                "LEFT JOIN lab_work_dependencies d ON d.work_item_id=w.id "
+                "WHERE w.project_id=%s AND w.status IN ('WAITING_DEPENDENCY','BLOCKED','DORMANT') ORDER BY w.created_at,d.created_at",
+                (project_id,),
+            )
+            waiting_rows = [self._record(row) or {} for row in cur.fetchall()]
+            cur.execute(
+                "SELECT w.id,w.status,w.branch_id,w.scientific_role,w.resource_class,w.speculation_class,w.related_refs "
+                "FROM lab_work_items w WHERE w.project_id=%s AND w.status=ANY(%s) ORDER BY w.created_at",
+                (project_id, ["CLAIMED", "RUNNING", "RUNNING_DETACHED", "RESULT_READY"]),
+            )
+            active = [self._record(row) or {} for row in cur.fetchall()]
+
+        available = [item for item in workers if item.get("availability_state") == "AVAILABLE"]
+        idle = [item for item in workers if item.get("availability_state") == "IDLE"]
+        by_scope: dict[str, int] = {}
+        for item in waiting_rows:
+            by_scope[item.get("dependency_scope") or "WORKITEM_LOCAL"] = by_scope.get(item.get("dependency_scope") or "WORKITEM_LOCAL", 0) + 1
+        overconcentrated = [item for item in coverage if item["active_worker_count"] > 1]
+        uncovered = [item for item in coverage if item["next_actionability"] == "PLANNER_EVALUATION_REQUIRED"]
+        no_work = [item for item in coverage if item["status"] in {"OPEN", "WAITING"} and not item["active_work_item_ids"]]
+        detached = [item for item in active if item["status"] == "RUNNING_DETACHED"]
+        speculative = [item for item in active if item.get("speculation_class") != "NON_SPECULATIVE"]
+        review_branches: dict[str, int] = {}
+        for item in active:
+            if item.get("resource_class") == "REVIEW":
+                key = str(item.get("branch_id") or "UNSCOPED")
+                review_branches[key] = review_branches.get(key, 0) + 1
+        amplification = []
+        if idle and ready:
+            amplification.append("IDLE_WORKERS_WITH_EXISTING_READY_CANONICAL_WORK")
+        if overconcentrated:
+            amplification.append("SAME_BRANCH_OVERCONCENTRATION")
+        if sum(review_branches.values()) > 1 and len(review_branches) == 1:
+            amplification.append("REVIEW_CAPACITY_CONCENTRATION")
+        return {
+            "audit_version": "v3.6-read-only", "project_id": project_id,
+            "workers": {"available": available, "idle": idle, "all": workers},
+            "waiting_work_by_dependency_scope": by_scope,
+            "unresolved_branches": [item for item in coverage if item["status"] in {"OPEN", "WAITING", "BLOCKED", "WEAKENED", "SUPPORTED_WITHIN_SCOPE"}],
+            "actionable_uncovered_branches": uncovered,
+            "independent_branches_without_work": no_work,
+            "branches_with_excessive_worker_concentration": overconcentrated,
+            "existing_ready_canonical_work": ready,
+            "long_running_detached_work": detached,
+            "speculative_work_active": speculative,
+            "review_work_by_branch": review_branches,
+            "potential_coordination_amplification": amplification,
+            "mutated": False,
+        }
+
     def _parallel_plan_record(self, project_id: str, portfolio_id: str | None,
                               assignments: list[dict], rationale: dict) -> dict:
         """Persist a versioned allocation decision; it contains no scientific conclusion."""

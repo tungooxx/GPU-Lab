@@ -1718,6 +1718,11 @@ async def research_portfolio_scheduler_shadow(project_id: str, limit: int = 50):
     return await call(lab().portfolio_scheduler_shadow, project_id, limit)
 
 @mcp.tool()
+async def research_portfolio_production_audit(project_id: str):
+    """Read-only v3.6 audit of availability, branch coverage, waits, and coordination risks."""
+    return await call(lab().portfolio_production_audit, project_id)
+
+@mcp.tool()
 async def research_portfolio_assign_existing(project_id: str, worker_id: str, session_id: str,
                                              limit: int = 50):
     """Feature-gated v3.6 assignment: claim existing authoritative READY work or explicitly mark one worker idle.

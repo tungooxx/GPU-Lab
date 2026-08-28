@@ -216,6 +216,29 @@ def test_v36_speculation_classes_and_expensive_budget_are_enforced():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_production_audit_and_cockpit_portfolio_are_read_only():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    cockpit = CockpitController(store, lab)
+    project_id = store.project_create(f"lab-v36-audit-{time.time_ns()}", "v3.6 audit")["project_id"]
+    joined = lab.join(None, f"v36-audit-worker-{time.time_ns()}", "CODEX", project_id)
+    objective = lab.canonical_objective_create(project_id, "SCIENTIFIC", "Audit", "What coordination capacity is useful?")
+    branch = lab.hypothesis_branch_create(project_id, objective["id"], mechanistic_niche_id="strong-null")
+    work = lab.create_work(
+        project_id, "ANALYSIS", "Ready branch analysis", "Existing canonical work", "RESULT_INSPECTOR",
+        joined["worker"]["id"], created_session_id=joined["session_id"],
+        canonical_objective_id=objective["id"], branch_id=branch["id"],
+    )
+    before = lab.work_get(work["id"])
+    audit = lab.portfolio_production_audit(project_id)
+    state = cockpit.state_get(project_id)
+    assert audit["mutated"] is False
+    assert audit["existing_ready_canonical_work"] == []  # supporting work is never scheduler authority
+    assert state["portfolio_scheduler"]["branch_coverage"][0]["branch_id"] == branch["id"]
+    assert lab.work_get(work["id"])["work_version"] == before["work_version"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_browser_runtime_marks_first_successful_connection_attached():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)
