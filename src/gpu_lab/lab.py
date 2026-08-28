@@ -224,6 +224,8 @@ class LabController:
                 ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS speculation_class TEXT NOT NULL DEFAULT 'NON_SPECULATIVE';
                 ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS speculation_condition JSONB NOT NULL DEFAULT '{}'::jsonb;
                 ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS resource_class TEXT NOT NULL DEFAULT 'REASONING';
+                ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS preferred_worker_id UUID REFERENCES research_workers(id);
+                ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS affinity_reason TEXT;
                 DO $$ BEGIN
                     ALTER TABLE lab_work_items ADD CONSTRAINT lab_work_items_branch_fk
                         FOREIGN KEY(branch_id) REFERENCES hypothesis_branches(id) NOT VALID;
@@ -1083,7 +1085,9 @@ class LabController:
                     speculation_class: str = "NON_SPECULATIVE",
                     speculation_condition: dict[str, Any] | None = None,
                     resource_class: str | None = None,
-                    dependency_scope: str = "WORKITEM_LOCAL") -> dict:
+                    dependency_scope: str = "WORKITEM_LOCAL",
+                    preferred_worker_id: str | None = None,
+                    affinity_reason: str | None = None) -> dict:
         now, ident = self._now(), str(uuid.uuid4())
         dependencies = dependencies or []
         authority_status = self._validate(authority_status, AUTHORITY_STATUSES, "LAB_WORK_AUTHORITY_STATUS")
@@ -1113,6 +1117,12 @@ class LabController:
                 raise GPUError("LAB_WORK_CREATOR_SESSION_REQUIRED", "created_by and created_session_id")
             self._worker(cur, created_by)
             self._session(cur, created_session_id, created_by, project_id)
+            if preferred_worker_id:
+                self._worker(cur, preferred_worker_id)
+                if not affinity_reason or not affinity_reason.strip():
+                    raise GPUError("LAB_WORK_AFFINITY_REASON_REQUIRED", "affinity_reason")
+            elif affinity_reason:
+                raise GPUError("LAB_WORK_AFFINITY_WORKER_REQUIRED", "preferred_worker_id")
             if self.feature_flags.get("WORK_PROPOSAL_MODE") and authority_status == "AUTHORITATIVE" and not gate_id:
                 cur.execute("SELECT worker_type FROM research_workers WHERE id=%s", (created_by,))
                 creator = cur.fetchone()
@@ -1196,13 +1206,13 @@ class LabController:
             try:
                 cur.execute(
                     "INSERT INTO lab_work_items(id,project_id,kind,title,description,scientific_role,status,priority,expected_value,estimated_cost,"
-                    "created_by,parent_work_item_id,branch_id,related_refs,equivalence_key,authority_key,gate_id,canonical_subject_version,authority_status,subject_id,recovery_policy,canonical_objective_id,speculation_class,speculation_condition,resource_class,dependency_scope,created_at,updated_at) "
-                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    "created_by,parent_work_item_id,branch_id,related_refs,equivalence_key,authority_key,gate_id,canonical_subject_version,authority_status,subject_id,recovery_policy,canonical_objective_id,speculation_class,speculation_condition,resource_class,dependency_scope,preferred_worker_id,affinity_reason,created_at,updated_at) "
+                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (ident, project_id, kind, title, description, scientific_role, status, priority, expected_value, estimated_cost,
                      created_by, parent_work_item_id, branch_id, json.dumps(related_refs or {}), equivalence_key, authority_key, gate_id,
                      canonical_subject_version, authority_status, subject_id, json.dumps(recovery_policy or {}),
                      canonical_objective_id, speculation_class, json.dumps(speculation_condition), resource_class,
-                     dependency_scope, now, now),
+                     dependency_scope, preferred_worker_id, affinity_reason.strip()[:1000] if affinity_reason else None, now, now),
                 )
             except Exception as exc:
                 if getattr(exc, "sqlstate", None) == "23505":
@@ -1228,6 +1238,7 @@ class LabController:
                 "canonical_objective_id": canonical_objective_id, "dependency_scope": dependency_scope,
                 "branch_id": branch_id, "equivalence_key": equivalence_key,
                 "resource_class": resource_class, "speculation_class": speculation_class,
+                "preferred_worker_id": preferred_worker_id,
                 "dormant_until_dependencies": dormant_until_dependencies,
             })
         self.resolve_dependencies(project_id)
@@ -2554,8 +2565,11 @@ class LabController:
             # Lower active-worker concentration is better; branchless work is
             # valid but ranks after a genuinely under-covered scientific branch.
             concentration = int(branch.get("active_worker_count", 0)) if branch else 10_000
+            # Affinity preserves useful context when possible, but it is never
+            # an ownership lock: any eligible available worker may still claim.
+            affinity = 0 if str(item.get("preferred_worker_id") or "") == str(worker_id) else 1
             actionability = 0 if branch.get("next_actionability") == "READY_EXISTING_WORK" else 1
-            return (concentration, actionability, -float(item.get("priority") or 0), str(item["id"]))
+            return (concentration, affinity, actionability, -float(item.get("priority") or 0), str(item["id"]))
 
         chosen: dict | None = None
         for candidate in sorted(ready, key=rank):

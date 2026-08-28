@@ -248,6 +248,46 @@ def test_v36_feature_gated_scheduler_claims_existing_work_or_records_healthy_idl
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_worker_affinity_prefers_context_without_becoming_exclusive():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store, feature_flags={"BRANCH_AWARE_ASSIGNMENT": True})
+    project_id = store.project_create(f"lab-v36-affinity-{time.time_ns()}", "v3.6 affinity")["project_id"]
+    first = lab.join(None, f"v36-affinity-first-{time.time_ns()}", "CODEX", project_id)
+    preferred = lab.join(None, f"v36-affinity-preferred-{time.time_ns()}", "CODEX", project_id)
+    first_id, first_session = first["worker"]["id"], first["session_id"]
+    preferred_id, preferred_session = preferred["worker"]["id"], preferred["session_id"]
+    objective = lab.canonical_objective_create(project_id, "SCIENTIFIC", "Affinity", "Who can inspect this output?")
+    preferred_branch = lab.hypothesis_branch_create(project_id, objective["id"])
+    other_branch = lab.hypothesis_branch_create(project_id, objective["id"])
+    lab.hypothesis_portfolio_ensure(project_id, objective["id"])
+    preferred_gate = lab.gate_ensure(project_id, "RESULT_INSPECTION", "affinity-preferred", "v1", first_id, first_session)
+    other_gate = lab.gate_ensure(project_id, "RESULT_INSPECTION", "affinity-other", "v1", first_id, first_session)
+    preferred_work = lab.create_work(
+        project_id, "REVIEW", "Preferred", "Prior context exists.", "RESULT_INSPECTOR", first_id,
+        created_session_id=first_session, gate_id=preferred_gate["id"], authority_key=preferred_gate["authority_key"],
+        canonical_subject_version="v1", authority_status="AUTHORITATIVE", subject_id="affinity-preferred",
+        branch_id=preferred_branch["id"], preferred_worker_id=preferred_id, affinity_reason="Prior execution context.",
+    )
+    other_work = lab.create_work(
+        project_id, "REVIEW", "Other", "Independent work.", "RESULT_INSPECTOR", first_id,
+        created_session_id=first_session, gate_id=other_gate["id"], authority_key=other_gate["authority_key"],
+        canonical_subject_version="v1", authority_status="AUTHORITATIVE", subject_id="affinity-other", branch_id=other_branch["id"],
+    )
+    assert lab.portfolio_assign_existing(project_id, preferred_id, preferred_session)["work_item"]["id"] == preferred_work["id"]
+    assert lab.portfolio_assign_existing(project_id, first_id, first_session)["work_item"]["id"] == other_work["id"]
+    lab.start_work(other_work["id"], first_id, first_session)
+    lab.complete_work(other_work["id"], first_id, first_session, "Done")
+    fallback_gate = lab.gate_ensure(project_id, "RESULT_INSPECTION", "affinity-fallback", "v1", first_id, first_session)
+    fallback_work = lab.create_work(
+        project_id, "REVIEW", "Fallback", "Context preferred but not required.", "RESULT_INSPECTOR", first_id,
+        created_session_id=first_session, gate_id=fallback_gate["id"], authority_key=fallback_gate["authority_key"],
+        canonical_subject_version="v1", authority_status="AUTHORITATIVE", subject_id="affinity-fallback",
+        branch_id=other_branch["id"], preferred_worker_id=preferred_id, affinity_reason="Preferred worker is busy.",
+    )
+    assert lab.portfolio_assign_existing(project_id, first_id, first_session)["work_item"]["id"] == fallback_work["id"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_v36_speculation_classes_and_expensive_budget_are_enforced():
     store = ResearchStore(TEST_DATABASE_URL)
     disabled = LabController(store)

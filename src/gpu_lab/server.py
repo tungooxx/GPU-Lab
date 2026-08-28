@@ -1875,8 +1875,9 @@ async def lab_work_create(
     speculation_class: str = "NON_SPECULATIVE", speculation_condition: dict[str, Any] | None = None,
     resource_class: str | None = None,
     dependency_scope: str = "WORKITEM_LOCAL",
+    preferred_worker_id: str | None = None, affinity_reason: str | None = None,
 ):
-    """Create dependency-aware project work; authoritative gate work is idempotently reused."""
+    """Create dependency-aware work; optional worker affinity is never exclusive."""
     return await call(
         lab().create_work, project_id, kind, title, description, scientific_role,
         created_by=created_by, created_session_id=created_session_id, priority=priority,
@@ -1889,6 +1890,7 @@ async def lab_work_create(
         speculation_class=speculation_class, speculation_condition=speculation_condition,
         resource_class=resource_class,
         dependency_scope=dependency_scope,
+        preferred_worker_id=preferred_worker_id, affinity_reason=affinity_reason,
     )
 
 
