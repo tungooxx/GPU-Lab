@@ -248,6 +248,43 @@ def test_v36_feature_gated_scheduler_claims_existing_work_or_records_healthy_idl
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_objective_global_dependency_blocks_assignment_but_branch_local_wait_does_not():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store, feature_flags={"BRANCH_AWARE_ASSIGNMENT": True})
+    project_id = store.project_create(f"lab-v36-global-scope-{time.time_ns()}", "v3.6 dependency scope")["project_id"]
+    worker = lab.join(None, f"v36-global-worker-{time.time_ns()}", "CODEX", project_id)
+    worker_id, session_id = worker["worker"]["id"], worker["session_id"]
+    objective = lab.canonical_objective_create(project_id, "SCIENTIFIC", "Scope", "Which dependency scope is blocking?")
+    first_branch = lab.hypothesis_branch_create(project_id, objective["id"])
+    second_branch = lab.hypothesis_branch_create(project_id, objective["id"])
+    lab.hypothesis_portfolio_ensure(project_id, objective["id"])
+    gate = lab.gate_ensure(project_id, "RESULT_INSPECTION", "global-ready", "v1", worker_id, session_id)
+    ready = lab.gate_work_ensure(gate["id"], "REVIEW", "Independent", "Should run absent global block.", "RESULT_INSPECTOR", worker_id, session_id, branch_id=second_branch["id"])
+    local_pending = store.object_create(project_id, "ExperimentRun", {"label": "local"}, "EXPERIMENT_STARTED", "running")
+    local_wait = lab.create_work(
+        project_id, "VALIDATION", "Local prerequisite", "Must not block an independent branch.", "VALIDATOR", worker_id,
+        created_session_id=session_id, canonical_objective_id=objective["id"], branch_id=first_branch["id"],
+        dependency_scope="BRANCH", dependencies=[{"target_type": "EXPERIMENT_RUN", "target_id": local_pending["id"], "required_statuses": ["completed"]}],
+    )
+    pending = store.object_create(project_id, "ExperimentRun", {"label": "global"}, "EXPERIMENT_STARTED", "running")
+    global_wait = lab.create_work(
+        project_id, "VALIDATION", "Global prerequisite", "Blocks this objective only.", "VALIDATOR", worker_id,
+        created_session_id=session_id, canonical_objective_id=objective["id"], branch_id=first_branch["id"],
+        dependency_scope="OBJECTIVE_GLOBAL", dependencies=[{"target_type": "EXPERIMENT_RUN", "target_id": pending["id"], "required_statuses": ["completed"]}],
+    )
+    assert global_wait["status"] == "WAITING_DEPENDENCY"
+    blocked = lab.portfolio_assign_existing(project_id, worker_id, session_id)
+    assert blocked["status"] == "IDLE"
+    assert blocked["idle_reason"] == "OBJECTIVE_GLOBAL_DEPENDENCY_BLOCK"
+    assert blocked["global_blocks"][0]["id"] == global_wait["id"]
+    assert lab.work_planner_candidates(project_id)["planner_action"] == "IDLE_OBJECTIVE_GLOBAL_BLOCK"
+    store.object_update(pending["id"], {}, "completed", "EXPERIMENT_COMPLETED")
+    assert lab.resolve_dependencies(project_id)["ready"] == 1
+    assert lab.work_get(local_wait["id"])["status"] == "WAITING_DEPENDENCY"
+    assert lab.portfolio_assign_existing(project_id, worker_id, session_id)["work_item"]["id"] == ready["id"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_v36_worker_affinity_prefers_context_without_becoming_exclusive():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store, feature_flags={"BRANCH_AWARE_ASSIGNMENT": True})

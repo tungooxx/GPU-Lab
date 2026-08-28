@@ -2317,6 +2317,7 @@ class LabController:
         """Agenda-aware planning input. It never creates work merely to occupy idle workers."""
         coverage = self.branch_coverage_get(project_id)
         ready = self.work_list(project_id, ["READY"], limit)
+        global_blocks = self._objective_global_blocks(project_id)
         active_branch_ids = {str(item["branch_id"]) for item in ready if item.get("branch_id")}
         undercovered = [branch for branch in coverage if branch["status"] in {"OPEN", "WAITING"} and branch["active_work_count"] == 0]
         return {
@@ -2324,20 +2325,37 @@ class LabController:
             "ready_canonical_work": [item for item in ready if item.get("authority_status") == "AUTHORITATIVE"],
             "branch_coverage": coverage,
             "undercovered_branches": undercovered,
-            "planner_action": "CLAIM_EXISTING" if ready else "CONSIDER_PROPOSAL" if undercovered else "IDLE",
+            "objective_global_blocks": global_blocks,
+            "planner_action": "IDLE_OBJECTIVE_GLOBAL_BLOCK" if global_blocks else "CLAIM_EXISTING" if ready else "CONSIDER_PROPOSAL" if undercovered else "IDLE",
             "materialization_requires": "approved WorkProposal or authorized planner/gate transition",
         }
+
+    def _objective_global_blocks(self, project_id: str) -> list[dict]:
+        """Return durable global blockers without widening branch-local waits."""
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,blocked_reason,branch_id,status FROM lab_work_items WHERE project_id=%s "
+                "AND dependency_scope='OBJECTIVE_GLOBAL' AND status IN ('WAITING_DEPENDENCY','BLOCKED','DORMANT','REPLAN_REQUIRED') "
+                "ORDER BY created_at,id",
+                (project_id,),
+            )
+            return [self._record(row) or {} for row in cur.fetchall()]
 
     def portfolio_scheduler_shadow(self, project_id: str, limit: int = 50) -> dict:
         """Read-only v3.6 scheduling recommendation; existing READY canonical work always wins."""
         coverage = {item["branch_id"]: item for item in self.branch_coverage_get(project_id)}
         ready = [item for item in self.work_list(project_id, ["READY"], limit) if item.get("authority_status") == "AUTHORITATIVE"]
+        global_blocks = self._objective_global_blocks(project_id)
         with self.store._connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT id,display_name,worker_type,availability_state FROM research_workers WHERE enabled=TRUE ORDER BY created_at")
             workers = [self._record(row) or {} for row in cur.fetchall()]
         assignments, used = [], set()
         for worker in workers:
             if worker["availability_state"] not in {"AVAILABLE", "IDLE"}:
+                continue
+            if global_blocks:
+                assignments.append({"worker_id": worker["id"], "suggested_work_item_id": None,
+                                    "reason": "OBJECTIVE_GLOBAL_DEPENDENCY_BLOCK", "global_blocks": global_blocks})
                 continue
             candidate = next((item for item in ready if item["id"] not in used), None)
             if candidate:
@@ -2346,7 +2364,10 @@ class LabController:
                 assignments.append({"worker_id": worker["id"], "suggested_work_item_id": candidate["id"], "branch_id": candidate.get("branch_id"), "reason": "EXISTING_READY_CANONICAL_WORK", "dependency_scope": candidate.get("dependency_scope"), "branch_coverage": branch})
             else:
                 assignments.append({"worker_id": worker["id"], "suggested_work_item_id": None, "reason": "IDLE_NO_EXISTING_ACTIONABLE_WORK"})
-        return {"projection_version": "v3.6-shadow", "assignments": assignments, "unassigned_ready_work_item_ids": [item["id"] for item in ready if item["id"] not in used], "planner_action": "DO_NOT_CREATE_WORK" if not ready else "CLAIM_EXISTING_ONLY"}
+        return {"projection_version": "v3.6-shadow", "assignments": assignments,
+                "unassigned_ready_work_item_ids": [item["id"] for item in ready if item["id"] not in used],
+                "objective_global_blocks": global_blocks,
+                "planner_action": "OBJECTIVE_GLOBAL_BLOCK" if global_blocks else "DO_NOT_CREATE_WORK" if not ready else "CLAIM_EXISTING_ONLY"}
 
     def portfolio_historical_replay(self, project_id: str, limit: int = 1000) -> dict:
         """Read-only replay of the operational information known at each event.
@@ -2506,6 +2527,7 @@ class LabController:
             "audit_version": "v3.6-read-only", "project_id": project_id,
             "workers": {"available": available, "idle": idle, "all": workers},
             "waiting_work_by_dependency_scope": by_scope,
+            "objective_global_blocks": [item for item in waiting_rows if item.get("dependency_scope") == "OBJECTIVE_GLOBAL"],
             "unresolved_branches": [item for item in coverage if item["status"] in {"OPEN", "WAITING", "BLOCKED", "WEAKENED", "SUPPORTED_WITHIN_SCOPE"}],
             "actionable_uncovered_branches": uncovered,
             "independent_branches_without_work": no_work,
@@ -2554,6 +2576,22 @@ class LabController:
             self._session(cur, session_id, worker_id, project_id)
             if worker.get("availability_state") not in {"AVAILABLE", "IDLE"}:
                 raise GPUError("LAB_WORKER_NOT_AVAILABLE", str(worker.get("availability_state")))
+
+        global_blocks = self._objective_global_blocks(project_id)
+        if global_blocks:
+            now = self._now()
+            idle_reason = "OBJECTIVE_GLOBAL_DEPENDENCY_BLOCK"
+            with self.store._connect() as conn, conn.cursor() as cur:
+                self._session(cur, session_id, worker_id, project_id)
+                cur.execute(
+                    "UPDATE research_workers SET availability_state='IDLE',availability_updated_at=%s,idle_reason=%s,idle_since=%s WHERE id=%s",
+                    (now, idle_reason, now, worker_id),
+                )
+            plan = self._parallel_plan_record(
+                project_id, None, [{"worker_id": worker_id, "session_id": session_id, "work_item_id": None}],
+                {"reason": idle_reason, "global_block_work_item_ids": [item["id"] for item in global_blocks], "new_work_created": False},
+            )
+            return {"status": "IDLE", "idle_reason": idle_reason, "global_blocks": global_blocks, "plan": plan}
 
         coverage = {entry["branch_id"]: entry for entry in self.branch_coverage_get(project_id)}
         ready = [
