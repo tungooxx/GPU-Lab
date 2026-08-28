@@ -1846,6 +1846,12 @@ async def hypothesis_branch_create(
         architecture_lineage_id, priority, branch_dependencies, branch_blocking_scope,
     )
 
+@mcp.tool()
+async def hypothesis_branch_transition(branch_id: str, worker_id: str, session_id: str,
+                                       state: str, rationale: str):
+    """Resolve/refute one branch; only its active descendant WorkItems are retired."""
+    return await call(lab().hypothesis_branch_transition, branch_id, worker_id, session_id, state, rationale)
+
 
 @mcp.tool()
 async def lab_work_create(

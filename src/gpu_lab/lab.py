@@ -440,6 +440,29 @@ class LabController:
             cur.execute("SELECT * FROM hypothesis_branches WHERE id=%s", (ident,))
             return self._record(cur.fetchone()) or {}
 
+    def hypothesis_branch_transition(self, branch_id: str, worker_id: str, session_id: str,
+                                     state: str, rationale: str) -> dict:
+        """Resolve/refute one branch and retire only its active descendants."""
+        state = self._validate(state, BRANCH_STATES, "HYPOTHESIS_BRANCH_STATE")
+        if state not in {"RESOLVED", "REFUTED", "ABANDONED", "SUPERSEDED", "WEAKENED", "SUPPORTED_WITHIN_SCOPE"}:
+            raise GPUError("HYPOTHESIS_BRANCH_TRANSITION_INVALID", state)
+        if not rationale.strip():
+            raise GPUError("HYPOTHESIS_BRANCH_RATIONALE_REQUIRED", "rationale")
+        now = self._now()
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM hypothesis_branches WHERE id=%s FOR UPDATE", (branch_id,))
+            branch = cur.fetchone()
+            if not branch:
+                raise GPUError("HYPOTHESIS_BRANCH_NOT_FOUND", branch_id)
+            self._session(cur, session_id, worker_id, str(branch["project_id"]))
+            cur.execute("UPDATE hypothesis_branches SET state=%s,resolved_at=CASE WHEN %s IN ('RESOLVED','REFUTED','ABANDONED','SUPERSEDED') THEN %s ELSE resolved_at END WHERE id=%s", (state, state, now, branch_id))
+            retired = 0
+            if state in {"REFUTED", "ABANDONED", "SUPERSEDED"}:
+                cur.execute("UPDATE lab_work_items SET status='INVALIDATED',invalidated_reason=%s,invalidated_at=%s,updated_at=%s,work_version=work_version+1 WHERE branch_id=%s AND status=ANY(%s)", (f"Branch {state}: {rationale.strip()}", now, now, branch_id, list(ACTIVE_WORK_STATUSES)))
+                retired = cur.rowcount
+            self._event(cur, branch["project_id"], "HYPOTHESIS_BRANCH_TRANSITIONED", branch_id, {"state": state, "retired_descendants": retired})
+        return {"branch_id": branch_id, "state": state, "retired_descendants": retired}
+
     @staticmethod
     def _canonical_json_hash(value: Any) -> str:
         return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
