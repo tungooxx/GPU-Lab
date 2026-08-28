@@ -517,6 +517,33 @@ def test_v36_concurrent_schedulers_cannot_assign_two_work_items_to_one_session()
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_controller_restart_reconstructs_waiting_branch_and_reclaims_after_dependency():
+    store = ResearchStore(TEST_DATABASE_URL)
+    flags = {"WAITING_WORK_RELEASE": True, "BRANCH_AWARE_ASSIGNMENT": True}
+    lab = LabController(store, feature_flags=flags)
+    project_id = store.project_create(f"lab-v36-restart-{time.time_ns()}", "v3.6 restart durability")["project_id"]
+    joined = lab.join(None, f"v36-restart-worker-{time.time_ns()}", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    objective = lab.canonical_objective_create(project_id, "SCIENTIFIC", "Restart", "Does waiting work survive restart?")
+    branch = lab.hypothesis_branch_create(project_id, objective["id"])
+    lab.hypothesis_portfolio_ensure(project_id, objective["id"])
+    gate = lab.gate_ensure(project_id, "RESULT_INSPECTION", "restart-run", "v1", worker_id, session_id)
+    work = lab.gate_work_ensure(gate["id"], "REVIEW", "Inspect after restart", "Wait for canonical run.", "RESULT_INSPECTOR", worker_id, session_id, branch_id=branch["id"])
+    run = store.object_create(project_id, "ExperimentRun", {"label": "pending"}, "EXPERIMENT_STARTED", "running")
+    lab.claim_work(work["id"], worker_id, session_id)
+    lab.block_work(work["id"], worker_id, session_id, [{"target_type": "EXPERIMENT_RUN", "target_id": run["id"], "required_statuses": ["completed"]}])
+
+    restarted = LabController(ResearchStore(TEST_DATABASE_URL), feature_flags=flags)
+    coverage = restarted.branch_coverage_get(project_id)
+    assert coverage[0]["waiting_work_item_ids"] == [work["id"]]
+    assert coverage[0]["active_worker_count"] == 0
+    store.object_update(run["id"], {}, "completed", "EXPERIMENT_COMPLETED")
+    assert restarted.resolve_dependencies(project_id)["ready"] == 1
+    assigned = restarted.portfolio_assign_existing(project_id, worker_id, session_id)
+    assert assigned["work_item"]["id"] == work["id"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_unsatisfied_dependency_demotes_ready_work_and_blocks_claim():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)
