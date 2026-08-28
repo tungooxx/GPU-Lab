@@ -56,6 +56,16 @@ def test_dependency_requires_explicit_status_or_exists_only_marker():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_dependency_target_type_is_never_inferred_from_a_uuid():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project = store.project_create(f"lab-dependency-type-{time.time_ns()}", "Typed dependency")
+    joined = lab.join(None, "typed-dependency-worker", "CODEX", project["project_id"])
+    with pytest.raises(GPUError, match="LAB_DEPENDENCY_TARGET_TYPE_REQUIRED"):
+        lab.create_work(project["project_id"], "REVIEW", "Type required", "No inference", "REVIEWER", joined["worker"]["id"], created_session_id=joined["session_id"], dependencies=[{"target_id": str(uuid.uuid4()), "required_statuses": ["COMPLETED"]}])
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_v355_objective_is_versioned_and_proposals_merge_into_existing_work():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)
@@ -205,7 +215,7 @@ def test_unsatisfied_dependency_demotes_ready_work_and_blocks_claim():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
-def test_dependency_reconciliation_supersedes_duplicate_equivalent_dormant_work():
+def test_dormant_equivalence_is_reserved_before_it_can_wake():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)
     project_id = store.project_create(f"lab-equivalence-reconcile-{time.time_ns()}", "Equivalent work") ["project_id"]
@@ -220,20 +230,16 @@ def test_dependency_reconciliation_supersedes_duplicate_equivalent_dormant_work(
         worker["worker"]["id"], created_session_id=worker["session_id"], dependencies=dependency,
         equivalence_key="same-review", dormant_until_dependencies=True,
     )
-    duplicate = lab.create_work(
-        project_id, "REVIEW", "Duplicate review", "Same review", "ADVERSARIAL_REVIEWER",
-        worker["worker"]["id"], created_session_id=worker["session_id"], dependencies=dependency,
-        equivalence_key="same-review", dormant_until_dependencies=True,
-    )
+    with pytest.raises(GPUError, match="LAB_EQUIVALENT_WORK_ACTIVE"):
+        lab.create_work(
+            project_id, "REVIEW", "Duplicate review", "Same review", "ADVERSARIAL_REVIEWER",
+            worker["worker"]["id"], created_session_id=worker["session_id"], dependencies=dependency,
+            equivalence_key="same-review", dormant_until_dependencies=True,
+        )
     claimed = lab.claim_work(prerequisite["id"], worker["worker"]["id"], worker["session_id"])
     lab.complete_work(claimed["id"], worker["worker"]["id"], worker["session_id"], summary="Implemented")
-    # complete_work invokes dependency reconciliation itself; the explicit
-    # second pass must be idempotent rather than recreating either work item.
     assert lab.resolve_dependencies(project_id) == {"ready": 0, "waiting": 0, "invalidated": 0}
     assert lab.work_get(first["id"])["status"] == "READY"
-    reconciled = lab.work_get(duplicate["id"])
-    assert reconciled["status"] == "SUPERSEDED"
-    assert reconciled["superseded_by"] == first["id"]
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")

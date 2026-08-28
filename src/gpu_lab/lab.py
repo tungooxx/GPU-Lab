@@ -27,6 +27,7 @@ ACTIVE_WORK_STATUSES = {
     "READY", "CLAIMED", "RUNNING", "RUNNING_DETACHED", "RESULT_READY", "WAITING_DEPENDENCY", "BLOCKED",
     "REPLAN_REQUIRED",
 }
+EQUIVALENCE_ACTIVE_WORK_STATUSES = ACTIVE_WORK_STATUSES | {"DORMANT"}
 AUTHORITY_STATUSES = {"AUTHORITATIVE", "SUPPORTING", "RECOVERY_TEMPLATE", "OBSOLETE", "SUPERSEDED"}
 OBJECTIVE_STATUSES = {"ACTIVE", "BLOCKED", "RESOLVED", "SUPERSEDED", "PAUSED", "CANCELLED"}
 PROPOSAL_STATUSES = {"PROPOSED", "MERGED_INTO_EXISTING", "SATISFIED_BY_TERMINAL", "MATERIALIZED", "REJECTED_DUPLICATE", "REJECTED_LOW_VALUE", "REJECTED_STALE", "SUPERSEDED"}
@@ -86,7 +87,7 @@ class LabController:
                 DROP INDEX IF EXISTS lab_work_items_active_equivalence_unique;
                 CREATE UNIQUE INDEX lab_work_items_active_equivalence_unique
                     ON lab_work_items(project_id,equivalence_key)
-                    WHERE equivalence_key IS NOT NULL AND status IN ('READY','CLAIMED','RUNNING','RUNNING_DETACHED','RESULT_READY','WAITING_DEPENDENCY','BLOCKED');
+                    WHERE equivalence_key IS NOT NULL AND status IN ('DORMANT','READY','CLAIMED','RUNNING','RUNNING_DETACHED','RESULT_READY','WAITING_DEPENDENCY','BLOCKED');
                 CREATE INDEX IF NOT EXISTS lab_work_items_project_status_priority_idx
                     ON lab_work_items(project_id,status,priority DESC,created_at);
                 CREATE TABLE IF NOT EXISTS lab_work_dependencies (
@@ -297,7 +298,7 @@ class LabController:
                 existing_id = str(row["id"]) if row else None
                 existing_terminal = bool(row and row["status"] == "COMPLETED")
             if not existing_id and equivalence_key_hint:
-                cur.execute("SELECT id,status FROM lab_work_items WHERE project_id=%s AND equivalence_key=%s AND status=ANY(%s) ORDER BY created_at LIMIT 1", (project_id, equivalence_key_hint, list(ACTIVE_WORK_STATUSES | {"COMPLETED"})))
+                cur.execute("SELECT id,status FROM lab_work_items WHERE project_id=%s AND equivalence_key=%s AND status=ANY(%s) ORDER BY created_at LIMIT 1", (project_id, equivalence_key_hint, list(EQUIVALENCE_ACTIVE_WORK_STATUSES | {"COMPLETED"})))
                 row = cur.fetchone()
                 existing_id = str(row["id"]) if row else None
                 existing_terminal = bool(row and row["status"] == "COMPLETED")
@@ -1020,7 +1021,9 @@ class LabController:
     ) -> None:
         cur.execute("DELETE FROM lab_work_dependencies WHERE work_item_id=%s", (work_item_id,))
         for dependency in dependencies:
-            target_type = str(dependency.get("target_type", "RESEARCH_OBJECT")).upper()
+            if "target_type" not in dependency or not str(dependency.get("target_type", "")).strip():
+                raise GPUError("LAB_DEPENDENCY_TARGET_TYPE_REQUIRED", "Specify target_type explicitly; WorkItem UUIDs are not ResearchObjects")
+            target_type = str(dependency["target_type"]).upper()
             target_id = str(dependency.get("target_id", ""))
             if not target_id:
                 raise GPUError("LAB_DEPENDENCY_TARGET_REQUIRED", "target_id")
@@ -1093,7 +1096,7 @@ class LabController:
                         cur.execute(
                             "SELECT id FROM lab_work_items WHERE project_id=%s AND equivalence_key=%s "
                             "AND id<>%s AND status=ANY(%s) ORDER BY created_at,id LIMIT 1 FOR UPDATE",
-                            (project_id, item["equivalence_key"], item["id"], list(ACTIVE_WORK_STATUSES)),
+                            (project_id, item["equivalence_key"], item["id"], list(EQUIVALENCE_ACTIVE_WORK_STATUSES)),
                         )
                         equivalent = cur.fetchone()
                         if equivalent:
@@ -1932,7 +1935,7 @@ class LabController:
                 sql += " AND canonical_subject_version=%s"
                 args.append(canonical_subject_version)
             sql += " ORDER BY CASE WHEN status=ANY(%s) THEN 0 WHEN status='COMPLETED' THEN 1 ELSE 2 END,created_at LIMIT 1"
-            args.append(list(ACTIVE_WORK_STATUSES))
+            args.append(list(EQUIVALENCE_ACTIVE_WORK_STATUSES))
             cur.execute(sql, args)
             row = cur.fetchone()
             if not row:
