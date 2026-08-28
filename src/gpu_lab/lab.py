@@ -1131,12 +1131,26 @@ class LabController:
             cur.execute("UPDATE research_worker_sessions SET status='BUSY' WHERE id=%s", (session_id,)) if work_item_id else None
             cur.execute("UPDATE research_worker_sessions SET last_heartbeat_at=%s WHERE id=%s", (now, session_id))
             if work_item_id:
-                cur.execute("UPDATE lab_work_leases SET heartbeat_at=%s,expires_at=%s WHERE work_item_id=%s AND worker_session_id=%s AND released_at IS NULL RETURNING id", (now, expiry, work_item_id, session_id))
-                if not cur.fetchone():
+                cur.execute("UPDATE lab_work_leases SET heartbeat_at=%s,expires_at=%s,lease_version=lease_version+1 WHERE work_item_id=%s AND worker_session_id=%s AND released_at IS NULL RETURNING id,lease_version", (now, expiry, work_item_id, session_id))
+                lease = cur.fetchone()
+                if not lease:
                     raise GPUError("LAB_LEASE_NOT_OWNED", work_item_id)
-            return {"session_id": session_id, "work_item_id": work_item_id, "heartbeat_at": now, "expires_at": expiry if work_item_id else None}
+            return {"session_id": session_id, "work_item_id": work_item_id, "heartbeat_at": now, "expires_at": expiry if work_item_id else None, "lease_version": lease["lease_version"] if work_item_id else None}
 
-    def start_work(self, work_item_id: str, worker_id: str, session_id: str) -> dict:
+    def _require_fresh_work_context(self, cur, item: dict, session_id: str,
+                                    expected_work_version: int | None,
+                                    expected_lease_version: int | None) -> None:
+        if expected_work_version is not None and item["work_version"] != expected_work_version:
+            raise GPUError("STALE_WORK_CONTEXT", json.dumps({"work_item_id": str(item["id"]), "expected_work_version": expected_work_version, "current_work_version": item["work_version"]}))
+        if expected_lease_version is not None:
+            cur.execute("SELECT lease_version FROM lab_work_leases WHERE id=%s AND worker_session_id=%s AND released_at IS NULL", (item["lease_id"], session_id))
+            lease = cur.fetchone()
+            if not lease or lease["lease_version"] != expected_lease_version:
+                raise GPUError("STALE_WORK_CONTEXT", json.dumps({"work_item_id": str(item["id"]), "expected_lease_version": expected_lease_version, "current_lease_version": lease["lease_version"] if lease else None}))
+
+    def start_work(self, work_item_id: str, worker_id: str, session_id: str,
+                   expected_work_version: int | None = None,
+                   expected_lease_version: int | None = None) -> dict:
         """Mark an owned claim as running without changing scientific state."""
         now = self._now()
         with self.store._connect() as conn, conn.cursor() as cur:
@@ -1147,14 +1161,17 @@ class LabController:
             self._session(cur, session_id, worker_id, str(item["project_id"]))
             if str(item["assigned_worker_id"]) != str(worker_id) or str(item["assigned_session_id"]) != str(session_id):
                 raise GPUError("LAB_WORK_NOT_OWNED", work_item_id)
+            self._require_fresh_work_context(cur, item, session_id, expected_work_version, expected_lease_version)
             if item["status"] not in {"CLAIMED", "RUNNING"}:
                 raise GPUError("LAB_WORK_NOT_STARTABLE", work_item_id)
-            cur.execute("UPDATE lab_work_items SET status='RUNNING',updated_at=%s WHERE id=%s", (now, work_item_id))
+            cur.execute("UPDATE lab_work_items SET status='RUNNING',updated_at=%s,work_version=work_version+1 WHERE id=%s", (now, work_item_id))
             self._event(cur, item["project_id"], "WORK_STARTED", work_item_id, {"worker_id": worker_id, "session_id": session_id})
         return self.work_get(work_item_id)
 
     def release_work(self, work_item_id: str, worker_id: str, session_id: str,
-                     reason: str = "RELEASED", dependencies: list[dict] | None = None) -> dict:
+                     reason: str = "RELEASED", dependencies: list[dict] | None = None,
+                     expected_work_version: int | None = None,
+                     expected_lease_version: int | None = None) -> dict:
         now = self._now()
         with self.store._connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT * FROM lab_work_items WHERE id=%s FOR UPDATE", (work_item_id,))
@@ -1164,6 +1181,7 @@ class LabController:
             self._session(cur, session_id, worker_id, str(item["project_id"]))
             if str(item["assigned_worker_id"]) != str(worker_id) or str(item["assigned_session_id"]) != str(session_id):
                 raise GPUError("LAB_WORK_NOT_OWNED", work_item_id)
+            self._require_fresh_work_context(cur, item, session_id, expected_work_version, expected_lease_version)
             waiting_dependency = reason.strip().upper() == "WAITING_DEPENDENCY"
             if dependencies is not None:
                 self._replace_dependencies(cur, work_item_id, dependencies, now)
@@ -1176,8 +1194,8 @@ class LabController:
                 "Waiting dependency requires an explicit dependency record."
                 if waiting_dependency and not has_dependencies else None
             )
-            cur.execute("UPDATE lab_work_leases SET released_at=%s,release_reason=%s WHERE id=%s AND released_at IS NULL", (now, reason, item["lease_id"]))
-            cur.execute("UPDATE lab_work_items SET status=%s,assigned_worker_id=NULL,assigned_session_id=NULL,lease_id=NULL,blocked_reason=%s,updated_at=%s WHERE id=%s", (next_status, blocked_reason, now, work_item_id))
+            cur.execute("UPDATE lab_work_leases SET released_at=%s,release_reason=%s,lease_version=lease_version+1 WHERE id=%s AND released_at IS NULL", (now, reason, item["lease_id"]))
+            cur.execute("UPDATE lab_work_items SET status=%s,assigned_worker_id=NULL,assigned_session_id=NULL,lease_id=NULL,blocked_reason=%s,updated_at=%s,work_version=work_version+1 WHERE id=%s", (next_status, blocked_reason, now, work_item_id))
             cur.execute("UPDATE research_worker_sessions SET current_work_item_id=NULL,active_role=NULL,status='ACTIVE',last_heartbeat_at=%s WHERE id=%s", (now, session_id))
             self._event(cur, item["project_id"], "WORK_RELEASED", work_item_id, {"worker_id": worker_id, "reason": reason, "next_status": next_status})
         if waiting_dependency and has_dependencies:
@@ -1294,7 +1312,9 @@ class LabController:
         return self.work_get(work_item_id)
 
     def complete_work(self, work_item_id: str, worker_id: str, session_id: str,
-                      summary: str = "", output_object_ids: list[str] | None = None) -> dict:
+                      summary: str = "", output_object_ids: list[str] | None = None,
+                      expected_work_version: int | None = None,
+                      expected_lease_version: int | None = None) -> dict:
         now = self._now()
         with self.store._connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT * FROM lab_work_items WHERE id=%s FOR UPDATE", (work_item_id,))
@@ -1304,8 +1324,9 @@ class LabController:
             self._session(cur, session_id, worker_id, str(item["project_id"]))
             if str(item["assigned_worker_id"]) != str(worker_id) or str(item["assigned_session_id"]) != str(session_id):
                 raise GPUError("LAB_WORK_NOT_OWNED", work_item_id)
-            cur.execute("UPDATE lab_work_leases SET released_at=%s,release_reason='COMPLETED' WHERE id=%s AND released_at IS NULL", (now, item["lease_id"]))
-            cur.execute("UPDATE lab_work_items SET status='COMPLETED',completed_at=%s,updated_at=%s WHERE id=%s", (now, now, work_item_id))
+            self._require_fresh_work_context(cur, item, session_id, expected_work_version, expected_lease_version)
+            cur.execute("UPDATE lab_work_leases SET released_at=%s,release_reason='COMPLETED',lease_version=lease_version+1 WHERE id=%s AND released_at IS NULL", (now, item["lease_id"]))
+            cur.execute("UPDATE lab_work_items SET status='COMPLETED',completed_at=%s,updated_at=%s,work_version=work_version+1 WHERE id=%s", (now, now, work_item_id))
             cur.execute("UPDATE research_worker_sessions SET current_work_item_id=NULL,active_role=NULL,status='ACTIVE',last_heartbeat_at=%s WHERE id=%s", (now, session_id))
             self._event(cur, item["project_id"], "WORK_COMPLETED", work_item_id, {"worker_id": worker_id, "summary": summary[:4000], "output_object_ids": output_object_ids or []})
         self.resolve_dependencies(str(item["project_id"]))

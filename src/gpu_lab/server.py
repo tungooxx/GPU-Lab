@@ -1807,16 +1807,20 @@ async def lab_work_claim(work_item_id: str, worker_id: str, session_id: str,
 
 
 @mcp.tool()
-async def lab_work_start(work_item_id: str, worker_id: str, session_id: str):
+async def lab_work_start(work_item_id: str, worker_id: str, session_id: str,
+                         expected_work_version: int | None = None,
+                         expected_lease_version: int | None = None):
     """Mark work already claimed by this session as actively running."""
-    return await call(lab().start_work, work_item_id, worker_id, session_id)
+    return await call(lab().start_work, work_item_id, worker_id, session_id, expected_work_version, expected_lease_version)
 
 
 @mcp.tool()
 async def lab_work_release(work_item_id: str, worker_id: str, session_id: str,
-                           reason: str = "RELEASED", dependencies: list[dict] | None = None):
+                           reason: str = "RELEASED", dependencies: list[dict] | None = None,
+                           expected_work_version: int | None = None,
+                           expected_lease_version: int | None = None):
     """Release only work owned by this session; GPU execution is never cancelled."""
-    return await call(lab().release_work, work_item_id, worker_id, session_id, reason, dependencies)
+    return await call(lab().release_work, work_item_id, worker_id, session_id, reason, dependencies, expected_work_version, expected_lease_version)
 
 
 @mcp.tool()
@@ -1844,9 +1848,11 @@ async def lab_work_repair_dependencies(
 
 @mcp.tool()
 async def lab_work_complete(work_item_id: str, worker_id: str, session_id: str,
-                            summary: str = "", output_object_ids: list[str] | None = None):
+                            summary: str = "", output_object_ids: list[str] | None = None,
+                            expected_work_version: int | None = None,
+                            expected_lease_version: int | None = None):
     """Complete owned work after its canonical scientific or engineering outputs were persisted."""
-    return await call(lab().complete_work, work_item_id, worker_id, session_id, summary, output_object_ids)
+    return await call(lab().complete_work, work_item_id, worker_id, session_id, summary, output_object_ids, expected_work_version, expected_lease_version)
 
 
 @mcp.tool()
