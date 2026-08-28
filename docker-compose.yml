@@ -71,7 +71,8 @@ services:
       dockerfile: literature.Dockerfile
     env_file:
       # Credentials are loaded directly by the isolated worker, never through an MCP tool call.
-      - ${GPU_LAB_LITERATURE_ENV_FILE:-F:/Newgeneration/VLM/.env}
+      - path: ${GPU_LAB_LITERATURE_ENV_FILE:-F:/Newgeneration/VLM/.env}
+        required: false
     environment:
       GPU_LAB_LITERATURE_WORKER_TOKEN: ${GPU_LAB_LITERATURE_WORKER_TOKEN:-}
       GPU_LAB_PAPERQA_DIRECTORY: /papers
