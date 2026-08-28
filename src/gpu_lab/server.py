@@ -1651,6 +1651,35 @@ async def canonical_projection_shadow_v355(project_id: str):
 
 
 @mcp.tool()
+async def canonical_objective_create(
+    project_id: str, objective_type: str, title: str, scientific_question: str,
+    current_goal: str = "", priority: float = 0,
+    parent_objective_id: str | None = None,
+):
+    """Create a versioned canonical objective; changing its scientific meaning requires a successor version."""
+    return await call(
+        lab().canonical_objective_create, project_id, objective_type, title,
+        scientific_question, current_goal, priority, parent_objective_id,
+    )
+
+
+@mcp.tool()
+async def lab_work_propose(
+    project_id: str, worker_id: str, session_id: str, proposed_mode: str,
+    proposed_role: str, rationale: str, canonical_objective_id: str | None = None,
+    target_id: str | None = None, authority_key_hint: str | None = None,
+    equivalence_key_hint: str | None = None, expected_scientific_value: float | None = None,
+    dependency_refs: list[dict[str, Any]] | None = None,
+):
+    """Record proposed work and merge it into an existing authoritative/equivalent item when one exists."""
+    return await call(
+        lab().work_propose, project_id, worker_id, session_id, proposed_mode,
+        proposed_role, rationale, canonical_objective_id, target_id, authority_key_hint,
+        equivalence_key_hint, expected_scientific_value, dependency_refs,
+    )
+
+
+@mcp.tool()
 async def lab_work_create(
     project_id: str, kind: str, title: str, description: str, scientific_role: str,
     created_by: str, created_session_id: str, priority: float = 0, expected_value: float | None = None,
@@ -1661,6 +1690,7 @@ async def lab_work_create(
     canonical_subject_version: str | None = None, authority_status: str = "SUPPORTING",
     subject_id: str | None = None, recovery_policy: dict[str, Any] | None = None,
     dormant_until_dependencies: bool = False,
+    canonical_objective_id: str | None = None, dependency_scope: str = "WORKITEM_LOCAL",
 ):
     """Create dependency-aware project work; authoritative gate work is idempotently reused."""
     return await call(
@@ -1671,6 +1701,7 @@ async def lab_work_create(
         authority_key=authority_key, gate_id=gate_id, canonical_subject_version=canonical_subject_version,
         authority_status=authority_status, subject_id=subject_id, recovery_policy=recovery_policy,
         dormant_until_dependencies=dormant_until_dependencies,
+        canonical_objective_id=canonical_objective_id, dependency_scope=dependency_scope,
     )
 
 

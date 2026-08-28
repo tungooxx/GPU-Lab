@@ -28,6 +28,8 @@ ACTIVE_WORK_STATUSES = {
     "REPLAN_REQUIRED",
 }
 AUTHORITY_STATUSES = {"AUTHORITATIVE", "SUPPORTING", "RECOVERY_TEMPLATE", "OBSOLETE", "SUPERSEDED"}
+OBJECTIVE_STATUSES = {"ACTIVE", "BLOCKED", "RESOLVED", "SUPERSEDED", "PAUSED", "CANCELLED"}
+PROPOSAL_STATUSES = {"PROPOSED", "MERGED_INTO_EXISTING", "SATISFIED_BY_TERMINAL", "MATERIALIZED", "REJECTED_DUPLICATE", "REJECTED_LOW_VALUE", "REJECTED_STALE", "SUPERSEDED"}
 GATE_STATUSES = {"PENDING", "PREFLIGHT_FAILED", "AWAITING_SEMANTIC_REVIEW", "PASS", "FAIL", "INVALID", "SUPERSEDED"}
 PREFLIGHT_STATUSES = {"PASS", "FAIL"}
 COORDINATION_VERSION = "lab-coordination-v3.2.2-gates-v1"
@@ -215,6 +217,73 @@ class LabController:
     def authority_key(project_id: str, scientific_object_id: str, canonical_subject_version: str, gate_key: str) -> str:
         """Return the stable identity for one current scientific transition."""
         return ":".join((str(project_id), str(scientific_object_id), str(canonical_subject_version), str(gate_key).upper()))
+
+    def canonical_objective_create(self, project_id: str, objective_type: str, title: str,
+                                   scientific_question: str, current_goal: str = "",
+                                   priority: float = 0, parent_objective_id: str | None = None) -> dict:
+        """Create one versioned objective; active meaning is never overwritten in place."""
+        if not title.strip() or not scientific_question.strip():
+            raise GPUError("CANONICAL_OBJECTIVE_FIELDS_REQUIRED", "title and scientific_question")
+        now, ident = self._now(), str(uuid.uuid4())
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM research_projects WHERE id=%s", (project_id,))
+            if not cur.fetchone():
+                raise GPUError("RESEARCH_PROJECT_NOT_FOUND", project_id)
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"objective:{project_id}:{title.strip()}",))
+            cur.execute("SELECT * FROM canonical_objectives WHERE project_id=%s AND title=%s ORDER BY version DESC LIMIT 1 FOR UPDATE", (project_id, title.strip()))
+            previous = cur.fetchone()
+            if previous and previous["status"] == "ACTIVE":
+                if previous["scientific_question"] == scientific_question.strip() and previous["current_goal"] == current_goal.strip():
+                    return self._record(previous) or {}
+                raise GPUError("CANONICAL_OBJECTIVE_VERSION_TRANSITION_REQUIRED", str(previous["id"]))
+            version = int(previous["version"]) + 1 if previous else 1
+            cur.execute("INSERT INTO canonical_objectives(id,project_id,version,objective_type,title,scientific_question,status,priority,current_goal,parent_objective_id,supersedes_objective_id,created_at,updated_at) VALUES(%s,%s,%s,%s,%s,%s,'ACTIVE',%s,%s,%s,%s,%s,%s)", (ident, project_id, version, objective_type.strip().upper(), title.strip(), scientific_question.strip(), priority, current_goal.strip(), parent_objective_id, previous["id"] if previous else None, now, now))
+            if previous:
+                cur.execute("UPDATE canonical_objectives SET status='SUPERSEDED',superseded_by_objective_id=%s,updated_at=%s WHERE id=%s", (ident, now, previous["id"]))
+            self._event(cur, project_id, "CANONICAL_OBJECTIVE_CREATED", ident, {"version": version, "supersedes": str(previous["id"]) if previous else None})
+            cur.execute("SELECT * FROM canonical_objectives WHERE id=%s", (ident,))
+            return self._record(cur.fetchone()) or {}
+
+    def work_propose(self, project_id: str, worker_id: str, session_id: str, proposed_mode: str,
+                     proposed_role: str, rationale: str, canonical_objective_id: str | None = None,
+                     target_id: str | None = None, authority_key_hint: str | None = None,
+                     equivalence_key_hint: str | None = None, expected_scientific_value: float | None = None,
+                     dependency_refs: list[dict] | None = None) -> dict:
+        """Persist a worker proposal and merge it into existing canonical work when possible."""
+        if not proposed_mode.strip() or not proposed_role.strip() or not rationale.strip():
+            raise GPUError("WORK_PROPOSAL_FIELDS_REQUIRED", "proposed_mode, proposed_role, and rationale")
+        if dependency_refs is not None and not isinstance(dependency_refs, list):
+            raise GPUError("INVALID_WORK_PROPOSAL_DEPENDENCIES", "dependency_refs must be a list")
+        now, ident = self._now(), str(uuid.uuid4())
+        with self.store._connect() as conn, conn.cursor() as cur:
+            self._worker(cur, worker_id); self._session(cur, session_id, worker_id, project_id)
+            if canonical_objective_id:
+                cur.execute(
+                    "SELECT id,status FROM canonical_objectives WHERE id=%s AND project_id=%s FOR SHARE",
+                    (canonical_objective_id, project_id),
+                )
+                objective = cur.fetchone()
+                if not objective:
+                    raise GPUError("CANONICAL_OBJECTIVE_NOT_FOUND", canonical_objective_id)
+                if objective["status"] != "ACTIVE":
+                    raise GPUError("CANONICAL_OBJECTIVE_NOT_ACTIVE", str(objective["status"]))
+            existing_id = None
+            existing_terminal = False
+            if authority_key_hint:
+                cur.execute("SELECT id,status FROM lab_work_items WHERE project_id=%s AND authority_key=%s AND authority_status='AUTHORITATIVE' AND status=ANY(%s) ORDER BY created_at LIMIT 1", (project_id, authority_key_hint, list(ACTIVE_WORK_STATUSES | {"COMPLETED"})))
+                row = cur.fetchone()
+                existing_id = str(row["id"]) if row else None
+                existing_terminal = bool(row and row["status"] == "COMPLETED")
+            if not existing_id and equivalence_key_hint:
+                cur.execute("SELECT id,status FROM lab_work_items WHERE project_id=%s AND equivalence_key=%s AND status=ANY(%s) ORDER BY created_at LIMIT 1", (project_id, equivalence_key_hint, list(ACTIVE_WORK_STATUSES | {"COMPLETED"})))
+                row = cur.fetchone()
+                existing_id = str(row["id"]) if row else None
+                existing_terminal = bool(row and row["status"] == "COMPLETED")
+            status = "SATISFIED_BY_TERMINAL" if existing_terminal else "MERGED_INTO_EXISTING" if existing_id else "PROPOSED"
+            cur.execute("INSERT INTO lab_work_proposals(id,project_id,proposed_by_worker_id,canonical_objective_id,target_id,proposed_mode,proposed_role,proposed_authority_key_hint,proposed_equivalence_key_hint,rationale,expected_scientific_value,dependency_refs,status,canonical_work_item_id,created_at,updated_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (ident, project_id, worker_id, canonical_objective_id, target_id, proposed_mode, proposed_role, authority_key_hint, equivalence_key_hint, rationale.strip(), expected_scientific_value, json.dumps(dependency_refs or []), status, existing_id, now, now))
+            self._event(cur, project_id, "WORK_PROPOSAL_" + status, ident, {"canonical_work_item_id": existing_id})
+            cur.execute("SELECT * FROM lab_work_proposals WHERE id=%s", (ident,))
+            return self._record(cur.fetchone()) or {}
 
     @staticmethod
     def _canonical_json_hash(value: Any) -> str:
@@ -680,10 +749,16 @@ class LabController:
                     gate_id: str | None = None, canonical_subject_version: str | None = None,
                     authority_status: str = "SUPPORTING", subject_id: str | None = None,
                     recovery_policy: dict[str, Any] | None = None,
-                    dormant_until_dependencies: bool = False) -> dict:
+                    dormant_until_dependencies: bool = False,
+                    canonical_objective_id: str | None = None,
+                    dependency_scope: str = "WORKITEM_LOCAL") -> dict:
         now, ident = self._now(), str(uuid.uuid4())
         dependencies = dependencies or []
         authority_status = self._validate(authority_status, AUTHORITY_STATUSES, "LAB_WORK_AUTHORITY_STATUS")
+        dependency_scope = self._validate(
+            dependency_scope, {"WORKITEM_LOCAL", "BRANCH", "PORTFOLIO", "OBJECTIVE_GLOBAL"},
+            "LAB_WORK_DEPENDENCY_SCOPE",
+        )
         if dormant_until_dependencies and not dependencies:
             raise GPUError("LAB_DORMANT_WORK_DEPENDENCY_REQUIRED", "A dormant conditional branch needs dependencies")
         existing_id: str | None = None
@@ -695,6 +770,16 @@ class LabController:
                 raise GPUError("LAB_WORK_CREATOR_SESSION_REQUIRED", "created_by and created_session_id")
             self._worker(cur, created_by)
             self._session(cur, created_session_id, created_by, project_id)
+            if canonical_objective_id:
+                cur.execute(
+                    "SELECT status FROM canonical_objectives WHERE id=%s AND project_id=%s FOR SHARE",
+                    (canonical_objective_id, project_id),
+                )
+                objective = cur.fetchone()
+                if not objective:
+                    raise GPUError("CANONICAL_OBJECTIVE_NOT_FOUND", canonical_objective_id)
+                if objective["status"] != "ACTIVE":
+                    raise GPUError("CANONICAL_OBJECTIVE_NOT_ACTIVE", objective["status"])
             if gate_id:
                 cur.execute("SELECT * FROM scientific_gates WHERE id=%s AND project_id=%s FOR UPDATE", (gate_id, project_id))
                 gate = cur.fetchone()
@@ -730,11 +815,12 @@ class LabController:
             try:
                 cur.execute(
                     "INSERT INTO lab_work_items(id,project_id,kind,title,description,scientific_role,status,priority,expected_value,estimated_cost,"
-                    "created_by,parent_work_item_id,related_refs,equivalence_key,authority_key,gate_id,canonical_subject_version,authority_status,subject_id,recovery_policy,created_at,updated_at) "
-                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    "created_by,parent_work_item_id,related_refs,equivalence_key,authority_key,gate_id,canonical_subject_version,authority_status,subject_id,recovery_policy,canonical_objective_id,dependency_scope,created_at,updated_at) "
+                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (ident, project_id, kind, title, description, scientific_role, status, priority, expected_value, estimated_cost,
                      created_by, parent_work_item_id, json.dumps(related_refs or {}), equivalence_key, authority_key, gate_id,
-                     canonical_subject_version, authority_status, subject_id, json.dumps(recovery_policy or {}), now, now),
+                     canonical_subject_version, authority_status, subject_id, json.dumps(recovery_policy or {}),
+                     canonical_objective_id, dependency_scope, now, now),
                 )
             except Exception as exc:
                 if getattr(exc, "sqlstate", None) == "23505":
@@ -757,6 +843,7 @@ class LabController:
             self._event(cur, project_id, "WORK_ITEM_CREATED", ident, {
                 "kind": kind, "title": title, "status": status, "gate_id": gate_id,
                 "authority_key": authority_key, "authority_status": authority_status,
+                "canonical_objective_id": canonical_objective_id, "dependency_scope": dependency_scope,
                 "dormant_until_dependencies": dormant_until_dependencies,
             })
         self.resolve_dependencies(project_id)

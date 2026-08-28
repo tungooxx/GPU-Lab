@@ -56,6 +56,37 @@ def test_dependency_requires_explicit_status_or_exists_only_marker():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v355_objective_is_versioned_and_proposals_merge_into_existing_work():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-v355-proposal-{time.time_ns()}", "v3.5.5 proposal arbitration")["project_id"]
+    joined = lab.join(None, "v355-worker", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    objective = lab.canonical_objective_create(
+        project_id, "SCIENTIFIC", "Inspect E201", "Does E201 satisfy the frozen metric contract?",
+    )
+    assert objective["version"] == 1
+    assert lab.canonical_objective_create(
+        project_id, "SCIENTIFIC", "Inspect E201", "Does E201 satisfy the frozen metric contract?",
+    )["id"] == objective["id"]
+    with pytest.raises(GPUError, match="CANONICAL_OBJECTIVE_VERSION_TRANSITION_REQUIRED"):
+        lab.canonical_objective_create(project_id, "SCIENTIFIC", "Inspect E201", "A different question")
+
+    authority = lab.authority_key(project_id, "E201", "v4", "RESULT_INSPECTION")
+    canonical = lab.create_work(
+        project_id, "REVIEW", "Inspect E201", "Canonical review", "RESULT_INSPECTOR", worker_id,
+        created_session_id=session_id, authority_key=authority, authority_status="AUTHORITATIVE",
+        canonical_subject_version="v4", subject_id="E201", canonical_objective_id=objective["id"],
+    )
+    proposal = lab.work_propose(
+        project_id, worker_id, session_id, "RESULT_INSPECTION", "RESULT_INSPECTOR", "same inspection",
+        canonical_objective_id=objective["id"], target_id="E201", authority_key_hint=authority,
+    )
+    assert proposal["status"] == "MERGED_INTO_EXISTING"
+    assert proposal["canonical_work_item_id"] == canonical["id"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_browser_runtime_marks_first_successful_connection_attached():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)
