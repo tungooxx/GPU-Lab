@@ -1718,6 +1718,16 @@ async def research_portfolio_scheduler_shadow(project_id: str, limit: int = 50):
     return await call(lab().portfolio_scheduler_shadow, project_id, limit)
 
 @mcp.tool()
+async def research_portfolio_assign_existing(project_id: str, worker_id: str, session_id: str,
+                                             limit: int = 50):
+    """Feature-gated v3.6 assignment: claim existing authoritative READY work or explicitly mark one worker idle.
+
+    It never creates adjacent work.  Enable BRANCH_AWARE_ASSIGNMENT only after
+    reviewing the shadow scheduler output.
+    """
+    return await call(lab().portfolio_assign_existing, project_id, worker_id, session_id, limit)
+
+@mcp.tool()
 async def canonical_execution_projection_get(project_id: str):
     """Show current canonical runs separately from historical/non-canonical physical runs."""
     return await call(lab().canonical_execution_projection, project_id)
@@ -1784,6 +1794,7 @@ async def canonical_objective_create(
 async def lab_work_propose(
     project_id: str, worker_id: str, session_id: str, proposed_mode: str,
     proposed_role: str, rationale: str, canonical_objective_id: str | None = None,
+    hypothesis_branch_id: str | None = None,
     target_id: str | None = None, authority_key_hint: str | None = None,
     equivalence_key_hint: str | None = None, expected_scientific_value: float | None = None,
     dependency_refs: list[dict[str, Any]] | None = None,
@@ -1791,7 +1802,7 @@ async def lab_work_propose(
     """Record proposed work and merge it into an existing authoritative/equivalent item when one exists."""
     return await call(
         lab().work_propose, project_id, worker_id, session_id, proposed_mode,
-        proposed_role, rationale, canonical_objective_id, target_id, authority_key_hint,
+        proposed_role, rationale, canonical_objective_id, hypothesis_branch_id, target_id, authority_key_hint,
         equivalence_key_hint, expected_scientific_value, dependency_refs,
     )
 
@@ -1824,7 +1835,8 @@ async def lab_work_create(
     canonical_subject_version: str | None = None, authority_status: str = "SUPPORTING",
     subject_id: str | None = None, recovery_policy: dict[str, Any] | None = None,
     dormant_until_dependencies: bool = False,
-    canonical_objective_id: str | None = None, dependency_scope: str = "WORKITEM_LOCAL",
+    canonical_objective_id: str | None = None, branch_id: str | None = None,
+    dependency_scope: str = "WORKITEM_LOCAL",
 ):
     """Create dependency-aware project work; authoritative gate work is idempotently reused."""
     return await call(
@@ -1835,7 +1847,8 @@ async def lab_work_create(
         authority_key=authority_key, gate_id=gate_id, canonical_subject_version=canonical_subject_version,
         authority_status=authority_status, subject_id=subject_id, recovery_policy=recovery_policy,
         dormant_until_dependencies=dormant_until_dependencies,
-        canonical_objective_id=canonical_objective_id, dependency_scope=dependency_scope,
+        canonical_objective_id=canonical_objective_id, branch_id=branch_id,
+        dependency_scope=dependency_scope,
     )
 
 
@@ -1868,12 +1881,12 @@ async def scientific_gate_work_ensure(
     gate_id: str, kind: str, title: str, description: str, scientific_role: str,
     worker_id: str, session_id: str, priority: float = 0, expected_value: float | None = None,
     estimated_cost: float | None = None, dependencies: list[dict] | None = None,
-    recovery_policy: dict[str, Any] | None = None,
+    recovery_policy: dict[str, Any] | None = None, branch_id: str | None = None,
 ):
     """Create or reuse the one active authoritative WorkItem for a gate."""
     return await call(
         lab().gate_work_ensure, gate_id, kind, title, description, scientific_role,
-        worker_id, session_id, priority, expected_value, estimated_cost, dependencies, recovery_policy,
+        worker_id, session_id, priority, expected_value, estimated_cost, dependencies, recovery_policy, branch_id,
     )
 
 

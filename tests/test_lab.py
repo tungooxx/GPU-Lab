@@ -97,6 +97,80 @@ def test_v355_objective_is_versioned_and_proposals_merge_into_existing_work():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_branch_identity_is_structured_for_work_and_proposals():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-v36-branch-link-{time.time_ns()}", "v3.6 branch linkage")["project_id"]
+    joined = lab.join(None, "v36-branch-worker", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    objective = lab.canonical_objective_create(
+        project_id, "SCIENTIFIC", "Residual mechanism", "Which mechanism explains residual instability?",
+    )
+    branch = lab.hypothesis_branch_create(
+        project_id, objective["id"], question_id="Q-residual", hypothesis_ids=["H-anchor"],
+        mechanistic_niche_id="anchor-state", scientific_distance="NEAR",
+    )
+    work = lab.create_work(
+        project_id, "ANALYSIS", "Inspect anchor state", "Bounded branch analysis", "RESULT_INSPECTOR",
+        worker_id, created_session_id=session_id, canonical_objective_id=objective["id"], branch_id=branch["id"],
+    )
+    proposal = lab.work_propose(
+        project_id, worker_id, session_id, "ANALYSIS", "RESULT_INSPECTOR", "Independent branch follow-up",
+        hypothesis_branch_id=branch["id"],
+    )
+    assert work["branch_id"] == branch["id"]
+    assert proposal["hypothesis_branch_id"] == branch["id"]
+    assert proposal["canonical_objective_id"] == objective["id"]
+    coverage = lab.branch_coverage_get(project_id)
+    assert coverage[0]["branch_id"] == branch["id"]
+    assert coverage[0]["active_work_item_ids"] == [work["id"]]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_branch_cannot_cross_objective_boundary():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-v36-branch-scope-{time.time_ns()}", "v3.6 branch scope")["project_id"]
+    joined = lab.join(None, "v36-scope-worker", "CODEX", project_id)
+    first = lab.canonical_objective_create(project_id, "SCIENTIFIC", "First", "First question")
+    second = lab.canonical_objective_create(project_id, "SCIENTIFIC", "Second", "Second question")
+    branch = lab.hypothesis_branch_create(project_id, first["id"])
+    with pytest.raises(GPUError, match="HYPOTHESIS_BRANCH_OBJECTIVE_MISMATCH"):
+        lab.create_work(
+            project_id, "ANALYSIS", "Wrong branch", "Must not cross objectives", "RESULT_INSPECTOR",
+            joined["worker"]["id"], created_session_id=joined["session_id"],
+            canonical_objective_id=second["id"], branch_id=branch["id"],
+        )
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_feature_gated_scheduler_claims_existing_work_or_records_healthy_idle():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store, feature_flags={"BRANCH_AWARE_ASSIGNMENT": True})
+    project_id = store.project_create(f"lab-v36-assign-{time.time_ns()}", "v3.6 assignment")["project_id"]
+    planner = lab.join(None, "v36-assignment-planner", "CODEX", project_id)
+    worker = lab.join(None, "v36-assignment-worker", "CHATGPT_WEB", project_id)
+    objective = lab.canonical_objective_create(project_id, "SCIENTIFIC", "Causal branch", "Which causal branch is active?")
+    branch = lab.hypothesis_branch_create(project_id, objective["id"], scientific_distance="FAR")
+    lab.hypothesis_portfolio_ensure(project_id, objective["id"])
+    gate = lab.gate_ensure(project_id, "RESULT_INSPECTION", "E-v36", "v1", planner["worker"]["id"], planner["session_id"])
+    work = lab.gate_work_ensure(
+        gate["id"], "REVIEW", "Inspect E-v36", "Canonical existing work", "RESULT_INSPECTOR",
+        planner["worker"]["id"], planner["session_id"], branch_id=branch["id"],
+    )
+
+    assigned = lab.portfolio_assign_existing(project_id, worker["worker"]["id"], worker["session_id"])
+    assert assigned["status"] == "ASSIGNED"
+    assert assigned["work_item"]["id"] == work["id"]
+    assert assigned["work_item"]["branch_id"] == branch["id"]
+    assert assigned["plan"]["version"] == 1
+
+    idle = lab.portfolio_assign_existing(project_id, planner["worker"]["id"], planner["session_id"])
+    assert idle["status"] == "IDLE"
+    assert idle["idle_reason"] == "NO_EXISTING_ACTIONABLE_CANONICAL_WORK"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_browser_runtime_marks_first_successful_connection_attached():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)
