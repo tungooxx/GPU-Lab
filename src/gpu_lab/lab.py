@@ -45,9 +45,11 @@ MESSAGE_TYPES = {
 class LabController:
     """Coordinate workers without becoming a second scientific truth store."""
 
-    def __init__(self, store: ResearchStore, lease_seconds: int = 300):
+    def __init__(self, store: ResearchStore, lease_seconds: int = 300,
+                 feature_flags: dict[str, bool] | None = None):
         self.store = store
         self.lease_seconds = lease_seconds
+        self.feature_flags = feature_flags or {}
         self._migrate()
 
     def _migrate(self) -> None:
@@ -815,6 +817,11 @@ class LabController:
                 raise GPUError("LAB_WORK_CREATOR_SESSION_REQUIRED", "created_by and created_session_id")
             self._worker(cur, created_by)
             self._session(cur, created_session_id, created_by, project_id)
+            if self.feature_flags.get("WORK_PROPOSAL_MODE") and authority_status == "AUTHORITATIVE" and not gate_id:
+                cur.execute("SELECT worker_type FROM research_workers WHERE id=%s", (created_by,))
+                creator = cur.fetchone()
+                if not creator or creator["worker_type"] not in {"WORK_PLANNER", "BRAIN", "SYSTEM"}:
+                    raise GPUError("LAB_WORK_PROPOSAL_REQUIRED", "normal workers must use lab_work_propose")
             if canonical_objective_id:
                 cur.execute(
                     "SELECT status FROM canonical_objectives WHERE id=%s AND project_id=%s FOR SHARE",

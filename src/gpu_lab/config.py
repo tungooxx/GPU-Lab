@@ -59,6 +59,15 @@ class Settings(BaseSettings):
     gpu_lab_worker_max_consecutive_continues: int = Field(default=3, ge=1, le=20)
     gpu_lab_browser_wake_poll_seconds: int = Field(default=5, ge=1, le=60)
     gpu_lab_lease_reconciliation_poll_seconds: int = Field(default=30, ge=5, le=300)
+    # v3.5.5 rollout is deliberately staged; defaults preserve existing live
+    # behavior until an operator enables each enforcement phase.
+    canonical_authority_v355: bool = False
+    atomic_work_dedupe: bool = False
+    versioned_worker_writes: bool = False
+    canonical_sync_context: bool = False
+    supersession_propagation: bool = False
+    dependency_reconciliation: bool = True
+    work_proposal_mode: bool = False
     gpu_lab_dashboard_monitor_enabled: bool = True
     gpu_lab_cockpit_password: str | None = None
     gpu_lab_cockpit_session_secret: str | None = None

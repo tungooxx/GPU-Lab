@@ -594,7 +594,15 @@ def lab() -> LabController:
     if lab_controller_service is None:
         with _singleton_lock:
             if lab_controller_service is None:
-                lab_controller_service = LabController(research())
+                lab_controller_service = LabController(research(), feature_flags={
+                    "CANONICAL_AUTHORITY_V355": settings.canonical_authority_v355,
+                    "ATOMIC_WORK_DEDUPE": settings.atomic_work_dedupe,
+                    "VERSIONED_WORKER_WRITES": settings.versioned_worker_writes,
+                    "CANONICAL_SYNC_CONTEXT": settings.canonical_sync_context,
+                    "SUPERSESSION_PROPAGATION": settings.supersession_propagation,
+                    "DEPENDENCY_RECONCILIATION": settings.dependency_reconciliation,
+                    "WORK_PROPOSAL_MODE": settings.work_proposal_mode,
+                })
     return lab_controller_service
 
 
