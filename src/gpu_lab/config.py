@@ -68,6 +68,13 @@ class Settings(BaseSettings):
     supersession_propagation: bool = False
     dependency_reconciliation: bool = True
     work_proposal_mode: bool = False
+    portfolio_scheduler_v36: bool = False
+    waiting_work_release: bool = False
+    branch_aware_assignment: bool = False
+    agenda_coverage: bool = False
+    planner_on_idle: bool = False
+    gpu_worker_detach: bool = False
+    speculative_work_policy: bool = False
     gpu_lab_dashboard_monitor_enabled: bool = True
     gpu_lab_cockpit_password: str | None = None
     gpu_lab_cockpit_session_secret: str | None = None

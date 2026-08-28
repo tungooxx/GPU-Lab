@@ -198,6 +198,23 @@ class LabController:
                     detected_at TIMESTAMPTZ NOT NULL, resolved_at TIMESTAMPTZ,
                     UNIQUE(project_id,conflict_key)
                 );
+                CREATE TABLE IF NOT EXISTS hypothesis_portfolios (
+                    id UUID PRIMARY KEY, project_id UUID NOT NULL REFERENCES research_projects(id),
+                    canonical_objective_id UUID NOT NULL REFERENCES canonical_objectives(id), objective_version INTEGER NOT NULL,
+                    research_agenda_item_id TEXT, active_branch_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    branch_budget INTEGER, scientific_concurrency_budget INTEGER, gpu_concurrency_budget INTEGER,
+                    training_concurrency_budget INTEGER, reasoning_concurrency_budget INTEGER,
+                    search_regime TEXT, status TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL,
+                    UNIQUE(project_id,canonical_objective_id,objective_version)
+                );
+                CREATE TABLE IF NOT EXISTS parallel_research_plans (
+                    id UUID PRIMARY KEY, project_id UUID NOT NULL REFERENCES research_projects(id), portfolio_id UUID REFERENCES hypothesis_portfolios(id),
+                    version INTEGER NOT NULL, status TEXT NOT NULL, assignments JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    rationale JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL,
+                    UNIQUE(project_id,portfolio_id,version)
+                );
+                ALTER TABLE research_workers ADD COLUMN IF NOT EXISTS availability_state TEXT NOT NULL DEFAULT 'AVAILABLE';
+                ALTER TABLE research_workers ADD COLUMN IF NOT EXISTS availability_updated_at TIMESTAMPTZ;
                 ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS canonical_objective_id UUID REFERENCES canonical_objectives(id);
                 ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS dependency_scope TEXT NOT NULL DEFAULT 'WORKITEM_LOCAL';
                 ALTER TABLE lab_work_dependencies ADD COLUMN IF NOT EXISTS dependency_scope TEXT NOT NULL DEFAULT 'WORKITEM_LOCAL';
@@ -1884,6 +1901,29 @@ class LabController:
             if not row:
                 raise GPUError("HYPOTHESIS_BRANCH_NOT_FOUND", branch_id)
             return self._record(row) or {}
+
+    def hypothesis_portfolio_ensure(self, project_id: str, canonical_objective_id: str,
+                                    search_regime: str = "EXPLORE", branch_budget: int | None = None,
+                                    scientific_concurrency_budget: int | None = None,
+                                    gpu_concurrency_budget: int | None = None,
+                                    training_concurrency_budget: int | None = None,
+                                    reasoning_concurrency_budget: int | None = None) -> dict:
+        now = self._now()
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM canonical_objectives WHERE id=%s AND project_id=%s FOR UPDATE", (canonical_objective_id, project_id))
+            objective = cur.fetchone()
+            if not objective:
+                raise GPUError("CANONICAL_OBJECTIVE_NOT_FOUND", canonical_objective_id)
+            cur.execute("SELECT * FROM hypothesis_portfolios WHERE project_id=%s AND canonical_objective_id=%s AND objective_version=%s", (project_id, canonical_objective_id, objective["version"]))
+            existing = cur.fetchone()
+            if existing:
+                return self._record(existing) or {}
+            cur.execute("SELECT id FROM hypothesis_branches WHERE canonical_objective_id=%s AND state IN ('OPEN','WAITING','BLOCKED') ORDER BY priority DESC,created_at", (canonical_objective_id,))
+            branches = [str(row["id"]) for row in cur.fetchall()]
+            ident = str(uuid.uuid4())
+            cur.execute("INSERT INTO hypothesis_portfolios(id,project_id,canonical_objective_id,objective_version,active_branch_ids,branch_budget,scientific_concurrency_budget,gpu_concurrency_budget,training_concurrency_budget,reasoning_concurrency_budget,search_regime,status,created_at,updated_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'ACTIVE',%s,%s)", (ident, project_id, canonical_objective_id, objective["version"], json.dumps(branches), branch_budget, scientific_concurrency_budget, gpu_concurrency_budget, training_concurrency_budget, reasoning_concurrency_budget, search_regime.upper(), now, now))
+            cur.execute("SELECT * FROM hypothesis_portfolios WHERE id=%s", (ident,))
+            return self._record(cur.fetchone()) or {}
 
     def branch_coverage_get(self, project_id: str) -> list[dict]:
         """Return scheduler-facing coverage, not a task queue that creates artificial work."""

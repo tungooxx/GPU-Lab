@@ -602,6 +602,13 @@ def lab() -> LabController:
                     "SUPERSESSION_PROPAGATION": settings.supersession_propagation,
                     "DEPENDENCY_RECONCILIATION": settings.dependency_reconciliation,
                     "WORK_PROPOSAL_MODE": settings.work_proposal_mode,
+                    "PORTFOLIO_SCHEDULER_V36": settings.portfolio_scheduler_v36,
+                    "WAITING_WORK_RELEASE": settings.waiting_work_release,
+                    "BRANCH_AWARE_ASSIGNMENT": settings.branch_aware_assignment,
+                    "AGENDA_COVERAGE": settings.agenda_coverage,
+                    "PLANNER_ON_IDLE": settings.planner_on_idle,
+                    "GPU_WORKER_DETACH": settings.gpu_worker_detach,
+                    "SPECULATIVE_WORK_POLICY": settings.speculative_work_policy,
                 })
     return lab_controller_service
 
@@ -1677,6 +1684,16 @@ async def canonical_objective_get(objective_id: str):
 async def hypothesis_branch_get(branch_id: str):
     """Read one explicit hypothesis branch."""
     return await call(lab().hypothesis_branch_get, branch_id)
+
+@mcp.tool()
+async def hypothesis_portfolio_ensure(project_id: str, canonical_objective_id: str,
+                                      search_regime: str = "EXPLORE", branch_budget: int | None = None,
+                                      scientific_concurrency_budget: int | None = None,
+                                      gpu_concurrency_budget: int | None = None,
+                                      training_concurrency_budget: int | None = None,
+                                      reasoning_concurrency_budget: int | None = None):
+    """Create or return a version-bound v3.6 hypothesis portfolio; no work is scheduled by this call."""
+    return await call(lab().hypothesis_portfolio_ensure, project_id, canonical_objective_id, search_regime, branch_budget, scientific_concurrency_budget, gpu_concurrency_budget, training_concurrency_budget, reasoning_concurrency_budget)
 
 
 @mcp.tool()
