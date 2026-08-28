@@ -32,7 +32,10 @@ class SSHClient:
 
     @staticmethod
     def _usable(connection: asyncssh.SSHClientConnection) -> bool:
-        return not connection.is_closing()
+        # AsyncSSH exposes ``is_closed()``, unlike asyncio transports' common
+        # ``is_closing()`` spelling. Keeping the check on the public AsyncSSH
+        # API avoids turning a cache hit into an internal error.
+        return not connection.is_closed()
 
     def _discard(self, key: tuple[str, int, str, str], connection: asyncssh.SSHClientConnection | None = None) -> None:
         cached = self._connections.get(key)

@@ -29,7 +29,7 @@ async def test_ssh_reuses_live_connection_for_same_instance(monkeypatch, tmp_pat
         def __init__(self):
             self.closed = False
 
-        def is_closing(self):
+        def is_closed(self):
             return self.closed
 
         def close(self):
