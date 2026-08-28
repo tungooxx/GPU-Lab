@@ -661,6 +661,15 @@ def start_lab_reconciliation_loop() -> None:
                 result = lab().recover_stale_leases()
                 if result["recovered"]:
                     logger.info("Reconciled orphaned Lab WorkItems: %s", result)
+                # Replay durable READY transitions after a controller restart or
+                # consumer failure.  Cockpit wake creation is already idempotent.
+                for event in lab().outbox_pending(100):
+                    if event["event_type"] != "WORK_ITEM_READY":
+                        lab().outbox_mark_delivered(event["id"])
+                        continue
+                    wake = cockpit().wake_ready_work(event["project_id"], [event["subject_id"]])
+                    lab().outbox_mark_delivered(event["id"])
+                    logger.info("Reconciled durable ready wake event=%s result=%s", event["id"], wake)
             except Exception:
                 logger.exception("Lab reconciliation sweep failed; it will retry")
             lab_reconciliation_loop_stop.wait(settings.gpu_lab_lease_reconciliation_poll_seconds)

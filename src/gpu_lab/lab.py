@@ -1827,6 +1827,12 @@ class LabController:
             cur.execute(sql, args)
             return [self._record(row) or {} for row in cur.fetchall()]
 
+    def outbox_pending(self, limit: int = 100) -> list[dict]:
+        """Return global pending operational events for restart-safe dispatcher recovery."""
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM lab_transactional_outbox WHERE delivered_at IS NULL ORDER BY created_at,id LIMIT %s", (min(max(1, limit), 500),))
+            return [self._record(row) or {} for row in cur.fetchall()]
+
     def outbox_mark_delivered(self, outbox_id: str) -> dict:
         """Idempotently acknowledge a successfully applied coordination projection."""
         now = self._now()
