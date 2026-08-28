@@ -1471,6 +1471,11 @@ class LabController:
             session = self._session(cur, session_id, worker_id, str(target["project_id"]))
             if str(session["current_project_id"]) != str(target["project_id"]):
                 raise GPUError("LAB_PROJECT_MISMATCH", work_item_id)
+            # `_session(... FOR UPDATE)` serializes competing schedulers for one
+            # runtime, but the second caller must not be allowed to replace the
+            # first caller's fresh assignment after it obtains that lock.
+            if session["current_work_item_id"] and str(session["current_work_item_id"]) != str(work_item_id):
+                raise GPUError("LAB_WORKER_ALREADY_ASSIGNED", str(session["current_work_item_id"]))
             cur.execute("SELECT * FROM lab_work_dependencies WHERE work_item_id=%s", (work_item_id,))
             dependencies = cur.fetchall()
             if dependencies:

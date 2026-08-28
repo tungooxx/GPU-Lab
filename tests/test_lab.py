@@ -488,6 +488,35 @@ def test_atomic_claim_and_dependency_reactivation_survive_store_restart():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_concurrent_schedulers_cannot_assign_two_work_items_to_one_session():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-v36-session-race-{time.time_ns()}", "Session assignment race")["project_id"]
+    joined = lab.join(None, f"v36-session-race-worker-{time.time_ns()}", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    first = lab.create_work(project_id, "REVIEW", "First", "First canonical work", "RESULT_INSPECTOR", worker_id, created_session_id=session_id)
+    second = lab.create_work(project_id, "REVIEW", "Second", "Second canonical work", "RESULT_INSPECTOR", worker_id, created_session_id=session_id)
+    barrier = threading.Barrier(2)
+
+    def claim(work_id):
+        barrier.wait()
+        controller = LabController(ResearchStore(TEST_DATABASE_URL))
+        try:
+            return controller.claim_work(work_id, worker_id, session_id)["id"]
+        except GPUError as error:
+            return error.error_type
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(claim, (first["id"], second["id"])))
+    assert sum(outcome in {first["id"], second["id"]} for outcome in outcomes) == 1
+    assert outcomes.count("LAB_WORKER_ALREADY_ASSIGNED") == 1
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT current_work_item_id FROM research_worker_sessions WHERE id=%s", (session_id,))
+        session = cur.fetchone()
+    assert str(session["current_work_item_id"]) in {first["id"], second["id"]}
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_unsatisfied_dependency_demotes_ready_work_and_blocks_claim():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)
