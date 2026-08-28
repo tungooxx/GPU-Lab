@@ -1651,6 +1651,18 @@ async def canonical_projection_shadow_v355(project_id: str):
 
 
 @mcp.tool()
+async def lab_transactional_outbox_list(project_id: str, pending_only: bool = True, limit: int = 100):
+    """Inspect durable v3.5.5 coordination events that still need projection or wake delivery."""
+    return await call(lab().outbox_list, project_id, pending_only, limit)
+
+
+@mcp.tool()
+async def lab_transactional_outbox_mark_delivered(outbox_id: str):
+    """Acknowledge one delivered coordination event; this is idempotent and never changes science state."""
+    return await call(lab().outbox_mark_delivered, outbox_id)
+
+
+@mcp.tool()
 async def canonical_objective_create(
     project_id: str, objective_type: str, title: str, scientific_question: str,
     current_goal: str = "", priority: float = 0,
@@ -1676,6 +1688,23 @@ async def lab_work_propose(
         lab().work_propose, project_id, worker_id, session_id, proposed_mode,
         proposed_role, rationale, canonical_objective_id, target_id, authority_key_hint,
         equivalence_key_hint, expected_scientific_value, dependency_refs,
+    )
+
+
+@mcp.tool()
+async def hypothesis_branch_create(
+    project_id: str, canonical_objective_id: str, state: str = "OPEN",
+    question_id: str | None = None, hypothesis_ids: list[str] | None = None,
+    mechanistic_niche_id: str | None = None, scientific_distance: str | None = None,
+    architecture_lineage_id: str | None = None, priority: float = 0,
+    branch_dependencies: list[dict[str, Any]] | None = None,
+    branch_blocking_scope: str = "BRANCH",
+):
+    """Create an explicit hypothesis branch; branch dependencies cannot silently become project-global."""
+    return await call(
+        lab().hypothesis_branch_create, project_id, canonical_objective_id, state,
+        question_id, hypothesis_ids, mechanistic_niche_id, scientific_distance,
+        architecture_lineage_id, priority, branch_dependencies, branch_blocking_scope,
     )
 
 

@@ -31,6 +31,7 @@ AUTHORITY_STATUSES = {"AUTHORITATIVE", "SUPPORTING", "RECOVERY_TEMPLATE", "OBSOL
 OBJECTIVE_STATUSES = {"ACTIVE", "BLOCKED", "RESOLVED", "SUPERSEDED", "PAUSED", "CANCELLED"}
 PROPOSAL_STATUSES = {"PROPOSED", "MERGED_INTO_EXISTING", "SATISFIED_BY_TERMINAL", "MATERIALIZED", "REJECTED_DUPLICATE", "REJECTED_LOW_VALUE", "REJECTED_STALE", "SUPERSEDED"}
 DEPENDENCY_SCOPES = {"WORKITEM_LOCAL", "BRANCH", "PORTFOLIO", "OBJECTIVE_GLOBAL"}
+BRANCH_STATES = {"OPEN", "WAITING", "BLOCKED", "SUPPORTED_WITHIN_SCOPE", "WEAKENED", "REFUTED", "RESOLVED", "SUPERSEDED", "ABANDONED"}
 GATE_STATUSES = {"PENDING", "PREFLIGHT_FAILED", "AWAITING_SEMANTIC_REVIEW", "PASS", "FAIL", "INVALID", "SUPERSEDED"}
 PREFLIGHT_STATUSES = {"PASS", "FAIL"}
 COORDINATION_VERSION = "lab-coordination-v3.2.2-gates-v1"
@@ -295,6 +296,34 @@ class LabController:
             cur.execute("INSERT INTO lab_work_proposals(id,project_id,proposed_by_worker_id,canonical_objective_id,target_id,proposed_mode,proposed_role,proposed_authority_key_hint,proposed_equivalence_key_hint,rationale,expected_scientific_value,dependency_refs,status,canonical_work_item_id,created_at,updated_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (ident, project_id, worker_id, canonical_objective_id, target_id, proposed_mode, proposed_role, authority_key_hint, equivalence_key_hint, rationale.strip(), expected_scientific_value, json.dumps(dependency_refs or []), status, existing_id, now, now))
             self._event(cur, project_id, "WORK_PROPOSAL_" + status, ident, {"canonical_work_item_id": existing_id})
             cur.execute("SELECT * FROM lab_work_proposals WHERE id=%s", (ident,))
+            return self._record(cur.fetchone()) or {}
+
+    def hypothesis_branch_create(
+        self, project_id: str, canonical_objective_id: str, state: str = "OPEN",
+        question_id: str | None = None, hypothesis_ids: list[str] | None = None,
+        mechanistic_niche_id: str | None = None, scientific_distance: str | None = None,
+        architecture_lineage_id: str | None = None, priority: float = 0,
+        branch_dependencies: list[dict] | None = None, branch_blocking_scope: str = "BRANCH",
+    ) -> dict:
+        """Create an explicit independently-progressable branch under an active objective."""
+        state = self._validate(state, BRANCH_STATES, "HYPOTHESIS_BRANCH_STATE")
+        scope = self._validate(branch_blocking_scope, {"BRANCH", "PORTFOLIO", "OBJECTIVE_GLOBAL"}, "HYPOTHESIS_BRANCH_SCOPE")
+        now, ident = self._now(), str(uuid.uuid4())
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT status FROM canonical_objectives WHERE id=%s AND project_id=%s FOR SHARE", (canonical_objective_id, project_id))
+            objective = cur.fetchone()
+            if not objective:
+                raise GPUError("CANONICAL_OBJECTIVE_NOT_FOUND", canonical_objective_id)
+            if objective["status"] != "ACTIVE":
+                raise GPUError("CANONICAL_OBJECTIVE_NOT_ACTIVE", objective["status"])
+            cur.execute(
+                "INSERT INTO hypothesis_branches(id,project_id,canonical_objective_id,question_id,hypothesis_ids,mechanistic_niche_id,scientific_distance,architecture_lineage_id,state,priority,branch_dependencies,branch_blocking_scope,created_at) "
+                "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (ident, project_id, canonical_objective_id, question_id, json.dumps(hypothesis_ids or []), mechanistic_niche_id,
+                 scientific_distance, architecture_lineage_id, state, priority, json.dumps(branch_dependencies or []), scope, now),
+            )
+            self._event(cur, project_id, "HYPOTHESIS_BRANCH_CREATED", ident, {"canonical_objective_id": canonical_objective_id, "state": state})
+            cur.execute("SELECT * FROM hypothesis_branches WHERE id=%s", (ident,))
             return self._record(cur.fetchone()) or {}
 
     @staticmethod
@@ -1754,6 +1783,28 @@ class LabController:
             cur.execute("SELECT * FROM lab_work_items WHERE project_id=%s AND status=ANY(%s) AND authority_status='AUTHORITATIVE' ORDER BY priority DESC,created_at", (project_id, list(ACTIVE_WORK_STATUSES)))
             canonical_work = [self._record(row) for row in cur.fetchall()]
         return {"projection_version": "v3.5.5-shadow", "objectives": objectives, "active_branches": branches, "canonical_work_items": canonical_work, "consistency": audit}
+
+    def outbox_list(self, project_id: str, pending_only: bool = True, limit: int = 100) -> list[dict]:
+        """Inspect durable coordination events without replaying them or changing science state."""
+        with self.store._connect() as conn, conn.cursor() as cur:
+            sql = "SELECT * FROM lab_transactional_outbox WHERE project_id=%s"
+            args: list[Any] = [project_id]
+            if pending_only:
+                sql += " AND delivered_at IS NULL"
+            sql += " ORDER BY created_at,id LIMIT %s"
+            args.append(min(max(1, limit), 500))
+            cur.execute(sql, args)
+            return [self._record(row) or {} for row in cur.fetchall()]
+
+    def outbox_mark_delivered(self, outbox_id: str) -> dict:
+        """Idempotently acknowledge a successfully applied coordination projection."""
+        now = self._now()
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("UPDATE lab_transactional_outbox SET delivered_at=COALESCE(delivered_at,%s) WHERE id=%s RETURNING *", (now, outbox_id))
+            row = cur.fetchone()
+            if not row:
+                raise GPUError("LAB_OUTBOX_EVENT_NOT_FOUND", outbox_id)
+            return self._record(row) or {}
 
     def _lab_budget_get(self, project_id: str) -> dict[str, Any]:
         with self.store._connect() as conn, conn.cursor() as cur:
