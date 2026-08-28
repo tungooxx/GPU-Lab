@@ -2339,7 +2339,7 @@ class LabController:
             return result
 
     def agenda_coverage_get(self, project_id: str) -> list[dict]:
-        """Read-only v3.6 agenda coverage; branch-local waits never become project-global here."""
+        """Read-only v3.6 agenda coverage, including unbranched active questions."""
         coverage = self.branch_coverage_get(project_id)
         by_objective: dict[str, list[dict]] = {}
         for branch in coverage:
@@ -2353,6 +2353,24 @@ class LabController:
                     return "COVERED_WAITING" if branch["waiting_dependency"] else "COVERED_ACTIVE"
                 return "UNCOVERED_ACTIONABLE" if branch["status"] == "OPEN" else "UNCOVERED_NOT_ACTIONABLE"
             result.append({"canonical_objective_id": objective_id, "branches": [{**branch, "coverage_state": state(branch)} for branch in branches], "actionable_uncovered_count": sum(state(branch) == "UNCOVERED_ACTIONABLE" for branch in branches)})
+        # ResearchAgenda is authoritative for questions.  Do not hide an OPEN
+        # AgendaItem just because a HypothesisBranch has not yet been proposed.
+        # Branch.question_id is the durable link when a branch already exists.
+        linked_questions = {str(branch.get("unresolved_question")) for branch in coverage if branch.get("unresolved_question")}
+        agenda_items = self.store.objects_list(project_id, "AgendaItem", {"OPEN", "ACTIVE"}, limit=None)
+        for agenda_item in agenda_items:
+            agenda_id = str(agenda_item["id"])
+            if agenda_id in linked_questions:
+                continue
+            result.append({
+                "canonical_objective_id": None,
+                "agenda_item_id": agenda_id,
+                "agenda_question": agenda_item.get("data", {}).get("question"),
+                "branches": [],
+                "actionable_uncovered_count": 1,
+                "coverage_state": "UNCOVERED_ACTIONABLE",
+                "planner_action": "CONSIDER_BRANCH_PROPOSAL",
+            })
         return result
 
     def work_planner_candidates(self, project_id: str, limit: int = 50) -> dict:

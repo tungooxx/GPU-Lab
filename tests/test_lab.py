@@ -431,6 +431,22 @@ def test_v36_shadow_and_audit_only_expose_workers_joined_to_the_project():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_agenda_coverage_exposes_unbranched_active_agenda_item():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-v36-agenda-uncovered-{time.time_ns()}", "v3.6 agenda coverage")["project_id"]
+    agenda_item = store.object_create(
+        project_id, "AgendaItem", {"question": "Which independent mechanism remains untested?"},
+        "AGENDA_ITEM_CREATED", "OPEN",
+    )
+    coverage = lab.agenda_coverage_get(project_id)
+    entry = next(item for item in coverage if item.get("agenda_item_id") == agenda_item["id"])
+    assert entry["coverage_state"] == "UNCOVERED_ACTIONABLE"
+    assert entry["planner_action"] == "CONSIDER_BRANCH_PROPOSAL"
+    assert entry["branches"] == []
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_v36_historical_replay_is_read_only_and_never_claims_counterfactual_science():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)
