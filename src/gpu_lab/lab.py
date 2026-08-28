@@ -1983,6 +1983,24 @@ class LabController:
             )
             return [self._record(row) for row in cur.fetchall()]
 
+    def _project_scheduler_workers(self, project_id: str) -> list[dict]:
+        """Project-scoped worker projection for audit and shadow scheduling.
+
+        Worker identities are global, but assignment capacity is not.  A worker
+        joined to another project must never appear as capacity in this one.
+        """
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT ON (w.id) w.id,w.display_name,w.worker_type,"
+                "CASE WHEN s.current_work_item_id IS NOT NULL THEN 'ASSIGNED' ELSE w.availability_state END AS availability_state,"
+                "w.availability_updated_at,w.idle_reason,w.idle_since,s.id AS session_id,s.status AS session_status "
+                "FROM research_workers w JOIN research_worker_sessions s ON s.worker_id=w.id "
+                "WHERE w.enabled=TRUE AND s.current_project_id=%s AND s.status NOT IN ('DISCONNECTED','EXPIRED') "
+                "ORDER BY w.id,s.last_heartbeat_at DESC",
+                (project_id,),
+            )
+            return [self._record(row) or {} for row in cur.fetchall()]
+
     def state_get(
         self,
         project_id: str,
@@ -2356,9 +2374,7 @@ class LabController:
         coverage = {item["branch_id"]: item for item in self.branch_coverage_get(project_id)}
         ready = [item for item in self.work_list(project_id, ["READY"], limit) if item.get("authority_status") == "AUTHORITATIVE"]
         global_blocks = self._objective_global_blocks(project_id)
-        with self.store._connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT id,display_name,worker_type,availability_state FROM research_workers WHERE enabled=TRUE ORDER BY created_at")
-            workers = [self._record(row) or {} for row in cur.fetchall()]
+        workers = self._project_scheduler_workers(project_id)
         assignments, used = [], set()
         for worker in workers:
             if worker["availability_state"] not in {"AVAILABLE", "IDLE"}:
@@ -2491,12 +2507,8 @@ class LabController:
         """Read-only v3.6 coordination audit; no scheduler mutation or planning."""
         coverage = self.branch_coverage_get(project_id)
         ready = [item for item in self.work_list(project_id, ["READY"], 500) if item.get("authority_status") == "AUTHORITATIVE"]
+        workers = self._project_scheduler_workers(project_id)
         with self.store._connect() as conn, conn.cursor() as cur:
-            cur.execute(
-                "SELECT id,display_name,worker_type,availability_state,availability_updated_at,idle_reason,idle_since "
-                "FROM research_workers WHERE enabled=TRUE ORDER BY display_name"
-            )
-            workers = [self._record(row) or {} for row in cur.fetchall()]
             cur.execute(
                 "SELECT w.id,w.branch_id,w.dependency_scope,d.target_type,d.target_id FROM lab_work_items w "
                 "LEFT JOIN lab_work_dependencies d ON d.work_item_id=w.id "

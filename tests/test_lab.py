@@ -393,6 +393,21 @@ def test_v36_production_audit_and_cockpit_portfolio_are_read_only():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_shadow_and_audit_only_expose_workers_joined_to_the_project():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    first_project = store.project_create(f"lab-v36-worker-scope-a-{time.time_ns()}", "first scope")["project_id"]
+    second_project = store.project_create(f"lab-v36-worker-scope-b-{time.time_ns()}", "second scope")["project_id"]
+    first = lab.join(None, f"v36-scope-first-{time.time_ns()}", "CODEX", first_project)
+    second = lab.join(None, f"v36-scope-second-{time.time_ns()}", "CODEX", second_project)
+    shadow = lab.portfolio_scheduler_shadow(first_project)
+    audit = lab.portfolio_production_audit(first_project)
+    assert [entry["worker_id"] for entry in shadow["assignments"]] == [first["worker"]["id"]]
+    assert [entry["id"] for entry in audit["workers"]["all"]] == [first["worker"]["id"]]
+    assert second["worker"]["id"] not in [entry["id"] for entry in audit["workers"]["all"]]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_v36_historical_replay_is_read_only_and_never_claims_counterfactual_science():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)
