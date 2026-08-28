@@ -1645,6 +1645,50 @@ async def canonical_authority_audit_v355(project_id: str):
 
 
 @mcp.tool()
+async def canonical_project_state_get_v355(project_id: str):
+    """Return the compact v3.5.5 canonical read model, excluding obsolete work by default."""
+    return await call(lab().v355_shadow_projection, project_id)
+
+
+@mcp.tool()
+async def canonical_objective_get(objective_id: str):
+    """Read one versioned canonical objective."""
+    return await call(lab().canonical_objective_get, objective_id)
+
+
+@mcp.tool()
+async def hypothesis_branch_get(branch_id: str):
+    """Read one explicit hypothesis branch."""
+    return await call(lab().hypothesis_branch_get, branch_id)
+
+
+@mcp.tool()
+async def hypothesis_branch_coverage_get(project_id: str):
+    """Return branch coverage for agenda-aware scheduling; it never materializes filler work."""
+    return await call(lab().branch_coverage_get, project_id)
+
+
+@mcp.tool()
+async def lab_work_authority_get(project_id: str, authority_key: str,
+                                 canonical_subject_version: str | None = None):
+    """Resolve the one current authoritative WorkItem for a semantic authority key."""
+    return await call(lab().work_authority_get, project_id, authority_key, canonical_subject_version)
+
+
+@mcp.tool()
+async def lab_work_equivalence_lookup(project_id: str, equivalence_key: str,
+                                      canonical_subject_version: str | None = None):
+    """Resolve active or terminal valid work that already satisfies an equivalent request."""
+    return await call(lab().work_equivalence_lookup, project_id, equivalence_key, canonical_subject_version)
+
+
+@mcp.tool()
+async def lab_dependency_status(project_id: str, dependency: dict[str, Any]):
+    """Evaluate one typed dependency without changing its WorkItem."""
+    return await call(lab().dependency_status, project_id, dependency)
+
+
+@mcp.tool()
 async def canonical_projection_shadow_v355(project_id: str):
     """Read-only v3.5.5 canonical projection for staged rollout and conflict review."""
     return await call(lab().v355_shadow_projection, project_id)

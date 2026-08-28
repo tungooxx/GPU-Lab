@@ -1806,6 +1806,81 @@ class LabController:
                 raise GPUError("LAB_OUTBOX_EVENT_NOT_FOUND", outbox_id)
             return self._record(row) or {}
 
+    def canonical_objective_get(self, objective_id: str) -> dict:
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM canonical_objectives WHERE id=%s", (objective_id,))
+            row = cur.fetchone()
+            if not row:
+                raise GPUError("CANONICAL_OBJECTIVE_NOT_FOUND", objective_id)
+            return self._record(row) or {}
+
+    def hypothesis_branch_get(self, branch_id: str) -> dict:
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM hypothesis_branches WHERE id=%s", (branch_id,))
+            row = cur.fetchone()
+            if not row:
+                raise GPUError("HYPOTHESIS_BRANCH_NOT_FOUND", branch_id)
+            return self._record(row) or {}
+
+    def branch_coverage_get(self, project_id: str) -> list[dict]:
+        """Return scheduler-facing coverage, not a task queue that creates artificial work."""
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM hypothesis_branches WHERE project_id=%s ORDER BY priority DESC,created_at", (project_id,))
+            branches = cur.fetchall()
+            result: list[dict] = []
+            for branch in branches:
+                cur.execute(
+                    "SELECT w.*,l.worker_id AS lease_worker_id FROM lab_work_items w "
+                    "LEFT JOIN lab_work_leases l ON l.id=w.lease_id AND l.released_at IS NULL "
+                    "WHERE w.branch_id=%s AND w.status=ANY(%s) ORDER BY w.priority DESC,w.created_at",
+                    (branch["id"], list(ACTIVE_WORK_STATUSES)),
+                )
+                work = cur.fetchall()
+                result.append({
+                    "branch_id": str(branch["id"]), "status": branch["state"], "canonical_objective_id": str(branch["canonical_objective_id"]),
+                    "active_work_count": len(work), "current_owner": str(work[0]["lease_worker_id"]) if work and work[0]["lease_worker_id"] else None,
+                    "waiting_dependency": any(item["status"] in {"WAITING_DEPENDENCY", "BLOCKED", "DORMANT"} for item in work),
+                    "current_gate": str(next((item["gate_id"] for item in work if item["gate_id"]), "")) or None,
+                    "unresolved_question": branch["question_id"], "scientific_niche": branch["mechanistic_niche_id"],
+                    "last_progress_at": max((item["updated_at"] for item in work), default=branch["created_at"]),
+                })
+            return result
+
+    def work_authority_get(self, project_id: str, authority_key: str,
+                           canonical_subject_version: str | None = None) -> dict:
+        with self.store._connect() as conn, conn.cursor() as cur:
+            sql = "SELECT * FROM lab_work_items WHERE project_id=%s AND authority_key=%s AND authority_status='AUTHORITATIVE'"
+            args: list[Any] = [project_id, authority_key]
+            if canonical_subject_version is not None:
+                sql += " AND canonical_subject_version=%s"
+                args.append(canonical_subject_version)
+            sql += " ORDER BY CASE WHEN status=ANY(%s) THEN 0 WHEN status='COMPLETED' THEN 1 ELSE 2 END,created_at LIMIT 1"
+            args.append(list(ACTIVE_WORK_STATUSES))
+            cur.execute(sql, args)
+            row = cur.fetchone()
+            if not row:
+                raise GPUError("LAB_WORK_AUTHORITY_NOT_FOUND", authority_key)
+            return self._record(row) or {}
+
+    def work_equivalence_lookup(self, project_id: str, equivalence_key: str,
+                                canonical_subject_version: str | None = None) -> dict:
+        with self.store._connect() as conn, conn.cursor() as cur:
+            sql = "SELECT * FROM lab_work_items WHERE project_id=%s AND equivalence_key=%s"
+            args: list[Any] = [project_id, equivalence_key]
+            if canonical_subject_version is not None:
+                sql += " AND canonical_subject_version=%s"
+                args.append(canonical_subject_version)
+            sql += " AND status NOT IN ('INVALIDATED','SUPERSEDED','CANCELLED','FAILED') ORDER BY CASE WHEN status=ANY(%s) THEN 0 WHEN status='COMPLETED' THEN 1 ELSE 2 END,created_at LIMIT 1"
+            args.append(list(ACTIVE_WORK_STATUSES))
+            cur.execute(sql, args)
+            row = cur.fetchone()
+            return {"result": "NOT_FOUND"} if not row else {"result": "REUSED_ACTIVE" if row["status"] in ACTIVE_WORK_STATUSES else "ALREADY_SATISFIED" if row["status"] == "COMPLETED" else "HISTORICAL", "work_item": self._record(row)}
+
+    def dependency_status(self, project_id: str, dependency: dict) -> dict:
+        with self.store._connect() as conn, conn.cursor() as cur:
+            satisfied, invalidated, detail = self._dependency_status(cur, project_id, dependency)
+            return {"satisfied": satisfied, "invalidated": invalidated, "detail": detail}
+
     def _lab_budget_get(self, project_id: str) -> dict[str, Any]:
         with self.store._connect() as conn, conn.cursor() as cur:
             return self._budget(cur, project_id)
