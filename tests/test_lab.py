@@ -188,6 +188,39 @@ def test_v36_refuting_branch_releases_live_lease_and_worker_ownership():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v355_gate_supersession_releases_live_lease_and_worker_ownership():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-v355-gate-retire-{time.time_ns()}", "gate retirement")["project_id"]
+    joined = lab.join(None, "v355-gate-retire-worker", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    old_gate = lab.gate_ensure(project_id, "RESULT_INSPECTION", "E-gate-retire", "v1", worker_id, session_id)
+    successor_gate = lab.gate_ensure(project_id, "RESULT_INSPECTION", "E-gate-retire", "v2", worker_id, session_id)
+    work = lab.gate_work_ensure(old_gate["id"], "REVIEW", "Inspect v1", "Old reviewed contract", "RESULT_INSPECTOR", worker_id, session_id)
+    claimed = lab.claim_work(work["id"], worker_id, session_id)
+    lab.start_work(work["id"], worker_id, session_id)
+
+    result = lab.supersede_gate_version(old_gate["id"], successor_gate["id"], worker_id, session_id, "A new reviewed version supersedes v1.")
+
+    assert result["status"] == "SUPERSEDED"
+    retired = lab.work_get(work["id"])
+    assert retired["status"] == "SUPERSEDED"
+    assert retired["lease_id"] is None
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT released_at,release_reason FROM lab_work_leases WHERE id=%s", (claimed["lease_id"],))
+        lease = cur.fetchone()
+        cur.execute("SELECT current_work_item_id,status FROM research_worker_sessions WHERE id=%s", (session_id,))
+        session = cur.fetchone()
+        cur.execute("SELECT availability_state FROM research_workers WHERE id=%s", (worker_id,))
+        worker = cur.fetchone()
+    assert lease["released_at"] is not None
+    assert lease["release_reason"] == "GATE_SUPERSEDED"
+    assert session["current_work_item_id"] is None
+    assert session["status"] == "ACTIVE"
+    assert worker["availability_state"] == "AVAILABLE"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_v36_feature_gated_scheduler_claims_existing_work_or_records_healthy_idle():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store, feature_flags={"BRANCH_AWARE_ASSIGNMENT": True})

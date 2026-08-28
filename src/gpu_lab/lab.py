@@ -1020,12 +1020,45 @@ class LabController:
                 "UPDATE scientific_gates SET status='SUPERSEDED',superseded_by=%s,invalidation_reason=%s,resolved_at=%s WHERE id=%s",
                 (successor_gate_id, rationale.strip()[:4000], now, old_gate_id),
             )
+            # Gate supersession must retire live operational ownership as well
+            # as authority. Otherwise an old-version lease can keep its worker
+            # BUSY after the replacement gate is already canonical.
             cur.execute(
-                "UPDATE lab_work_items SET status='SUPERSEDED',authority_status='SUPERSEDED',superseded_by=%s,"
-                "invalidated_reason=%s,invalidated_at=%s,updated_at=%s WHERE gate_id=%s "
-                "AND status=ANY(%s)",
-                (successor_gate_id, rationale.strip()[:4000], now, now, old_gate_id, list(ACTIVE_WORK_STATUSES)),
+                "SELECT * FROM lab_work_items WHERE gate_id=%s AND status=ANY(%s) FOR UPDATE",
+                (old_gate_id, list(ACTIVE_WORK_STATUSES)),
             )
+            retired_items = cur.fetchall()
+            released_worker_ids: set[str] = set()
+            for item in retired_items:
+                if item["assigned_worker_id"]:
+                    released_worker_ids.add(str(item["assigned_worker_id"]))
+                cur.execute(
+                    "UPDATE lab_work_leases SET released_at=%s,release_reason='GATE_SUPERSEDED',lease_version=lease_version+1 "
+                    "WHERE work_item_id=%s AND released_at IS NULL",
+                    (now, item["id"]),
+                )
+                cur.execute(
+                    "UPDATE lab_work_items SET status='SUPERSEDED',authority_status='SUPERSEDED',superseded_by=%s,"
+                    "invalidated_reason=%s,invalidated_at=%s,completed_at=%s,assigned_worker_id=NULL,"
+                    "assigned_session_id=NULL,lease_id=NULL,updated_at=%s,work_version=work_version+1 WHERE id=%s",
+                    (successor_gate_id, rationale.strip()[:4000], now, now, now, item["id"]),
+                )
+                cur.execute(
+                    "UPDATE research_worker_sessions SET current_work_item_id=NULL,active_role=NULL,status='ACTIVE',"
+                    "last_heartbeat_at=%s WHERE current_work_item_id=%s",
+                    (now, item["id"]),
+                )
+                self._event(cur, old["project_id"], "WORK_ITEM_SUPERSEDED", item["id"], {
+                    "successor_gate_id": successor_gate_id, "reason": rationale.strip()[:4000],
+                })
+            if released_worker_ids:
+                cur.execute(
+                    "UPDATE research_workers w SET availability_state='AVAILABLE',availability_updated_at=%s,"
+                    "idle_reason=NULL,idle_since=NULL WHERE w.id=ANY(%s) AND NOT EXISTS ("
+                    "SELECT 1 FROM research_worker_sessions s WHERE s.worker_id=w.id "
+                    "AND s.current_work_item_id IS NOT NULL AND s.status IN ('ACTIVE','BUSY','WAITING'))",
+                    (now, list(released_worker_ids)),
+                )
             self._event(cur, old["project_id"], "SCIENTIFIC_GATE_VERSION_SUPERSEDED", old_gate_id, {
                 "successor_gate_id": successor_gate_id,
                 "old_version": old["canonical_subject_version"],
