@@ -1193,6 +1193,8 @@ class LabController:
                 "kind": kind, "title": title, "status": status, "gate_id": gate_id,
                 "authority_key": authority_key, "authority_status": authority_status,
                 "canonical_objective_id": canonical_objective_id, "dependency_scope": dependency_scope,
+                "branch_id": branch_id, "equivalence_key": equivalence_key,
+                "resource_class": resource_class, "speculation_class": speculation_class,
                 "dormant_until_dependencies": dormant_until_dependencies,
             })
         self.resolve_dependencies(project_id)
@@ -2296,6 +2298,114 @@ class LabController:
             else:
                 assignments.append({"worker_id": worker["id"], "suggested_work_item_id": None, "reason": "IDLE_NO_EXISTING_ACTIONABLE_WORK"})
         return {"projection_version": "v3.6-shadow", "assignments": assignments, "unassigned_ready_work_item_ids": [item["id"] for item in ready if item["id"] not in used], "planner_action": "DO_NOT_CREATE_WORK" if not ready else "CLAIM_EXISTING_ONLY"}
+
+    def portfolio_historical_replay(self, project_id: str, limit: int = 1000) -> dict:
+        """Read-only replay of the operational information known at each event.
+
+        It reports opportunities, never counterfactual scientific outcomes. Older
+        records without v3.6 branch metadata remain unknown instead of being
+        reconstructed from today's database state.
+        """
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT event_type,subject_id,payload,created_at FROM research_events "
+                "WHERE project_id=%s ORDER BY created_at,id LIMIT %s",
+                (project_id, min(max(1, limit), 5_000)),
+            )
+            events = cur.fetchall()
+
+        work: dict[str, dict[str, Any]] = {}
+        workers: dict[str, str] = {}
+        schedule_points: list[dict[str, Any]] = []
+        missed_independent = duplicate_signals = unknown_branch_events = 0
+
+        def alternatives(branch_id: str | None) -> list[str]:
+            return [item_id for item_id, item in work.items()
+                    if item.get("status") == "READY" and item.get("authority_status") == "AUTHORITATIVE"
+                    and item.get("branch_id") and item.get("branch_id") != branch_id]
+
+        for event in events:
+            event_type = event["event_type"]
+            subject_id = str(event["subject_id"]) if event["subject_id"] else None
+            payload = event["payload"] or {}
+            point: dict[str, Any] | None = None
+            if event_type in {"WORKER_JOINED", "WORKER_SESSION_RECOVERED"}:
+                worker_id = str(payload.get("worker_id") or "")
+                if worker_id:
+                    workers[worker_id] = "AVAILABLE"
+            elif event_type == "WORK_ITEM_CREATED" and subject_id:
+                branch_id = payload.get("branch_id")
+                unknown_branch_events += int(not bool(branch_id))
+                work[subject_id] = {"status": payload.get("status", "READY"),
+                                    "branch_id": str(branch_id) if branch_id else None,
+                                    "authority_status": payload.get("authority_status"),
+                                    "equivalence_key": payload.get("equivalence_key")}
+                if payload.get("equivalence_key") and any(
+                    item.get("equivalence_key") == payload["equivalence_key"]
+                    and item.get("status") in ACTIVE_WORK_STATUSES
+                    for existing_id, item in work.items() if existing_id != subject_id
+                ):
+                    duplicate_signals += 1
+            elif event_type == "WORK_ITEM_READY" and subject_id:
+                work.setdefault(subject_id, {})["status"] = "READY"
+                point = {"kind": "READY_WORK", "work_item_id": subject_id}
+            elif event_type == "WORK_CLAIMED" and subject_id:
+                item = work.setdefault(subject_id, {})
+                item["status"] = "CLAIMED"
+                item["worker_id"] = str(payload.get("worker_id") or "")
+                if item["worker_id"]:
+                    workers[item["worker_id"]] = "BUSY"
+                point = {"kind": "WORK_CLAIMED", "work_item_id": subject_id, "worker_id": item.get("worker_id")}
+            elif event_type == "WORK_RELEASED" and subject_id:
+                item = work.setdefault(subject_id, {})
+                item["status"] = payload.get("next_status", "READY")
+                worker_id = str(payload.get("worker_id") or item.get("worker_id") or "")
+                if worker_id:
+                    workers[worker_id] = "AVAILABLE"
+                independent = alternatives(item.get("branch_id"))
+                if item["status"] == "WAITING_DEPENDENCY" and independent:
+                    missed_independent += 1
+                point = {"kind": "WORK_RELEASED", "work_item_id": subject_id, "worker_id": worker_id or None,
+                         "released_to": item["status"], "independent_ready_work_item_ids": independent}
+            elif event_type in {"WORK_ITEM_INVALIDATED", "WORK_ITEM_SUPERSEDED", "WORK_ITEM_EQUIVALENCE_SUPERSEDED"} and subject_id:
+                work.setdefault(subject_id, {})["status"] = "INVALIDATED" if event_type == "WORK_ITEM_INVALIDATED" else "SUPERSEDED"
+            elif event_type == "WORK_COMPLETED" and subject_id:
+                work.setdefault(subject_id, {})["status"] = "COMPLETED"
+                worker_id = str(payload.get("worker_id") or "")
+                if worker_id:
+                    workers[worker_id] = "AVAILABLE"
+            elif event_type == "WORK_ITEM_EXPERIMENT_ATTACHED" and subject_id:
+                work.setdefault(subject_id, {})["status"] = "RUNNING_DETACHED"
+                worker_id = str(payload.get("worker_id") or "")
+                if worker_id:
+                    workers[worker_id] = "AVAILABLE"
+            elif event_type == "HYPOTHESIS_BRANCH_CREATED" and subject_id:
+                point = {"kind": "BRANCH_CREATED", "branch_id": subject_id, "state": payload.get("state", "OPEN")}
+            elif event_type == "HYPOTHESIS_BRANCH_TRANSITIONED" and subject_id:
+                point = {"kind": "BRANCH_TRANSITION", "branch_id": subject_id, "state": payload.get("state", "UNKNOWN")}
+
+            if point is not None:
+                point.update({
+                    "at": event["created_at"], "event_type": event_type,
+                    "known_available_worker_ids": sorted(worker_id for worker_id, status in workers.items() if status == "AVAILABLE"),
+                    "known_ready_authoritative_work_item_ids": sorted(
+                        item_id for item_id, item in work.items()
+                        if item.get("status") == "READY" and item.get("authority_status") == "AUTHORITATIVE"
+                    ),
+                })
+                schedule_points.append(point)
+
+        return {
+            "replay_version": "v3.6-historical-read-only", "project_id": project_id,
+            "events_examined": len(events), "schedule_points": schedule_points,
+            "summary": {"waiting_releases_with_independent_ready_opportunity": missed_independent,
+                        "duplicate_equivalence_signals": duplicate_signals,
+                        "observed_available_workers_at_end": sorted(worker_id for worker_id, status in workers.items() if status == "AVAILABLE")},
+            "limitations": {"unknown_branch_event_count": unknown_branch_events,
+                            "counterfactual_claim": "No suggested assignment is treated as evidence that an unexecuted branch would have succeeded.",
+                            "historical_fidelity": "Only event payload present at each event is used; pre-v3.6 events without branch metadata remain unknown."},
+            "mutated": False,
+        }
 
     def portfolio_production_audit(self, project_id: str) -> dict:
         """Read-only v3.6 coordination audit; no scheduler mutation or planning."""

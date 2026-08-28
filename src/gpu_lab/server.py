@@ -1717,6 +1717,13 @@ async def research_portfolio_scheduler_shadow(project_id: str, limit: int = 50):
     """Read-only v3.6 branch-aware assignment suggestions using existing canonical READY work only."""
     return await call(lab().portfolio_scheduler_shadow, project_id, limit)
 
+
+@mcp.tool()
+async def research_portfolio_historical_replay(project_id: str, limit: int = 1000):
+    """Replay known scheduler state without mutating research or claiming counterfactual science."""
+    return await call(lab().portfolio_historical_replay, project_id, limit)
+
+
 @mcp.tool()
 async def research_portfolio_production_audit(project_id: str):
     """Read-only v3.6 audit of availability, branch coverage, waits, and coordination risks."""

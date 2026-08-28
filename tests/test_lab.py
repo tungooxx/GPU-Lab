@@ -283,6 +283,49 @@ def test_v36_production_audit_and_cockpit_portfolio_are_read_only():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_historical_replay_is_read_only_and_never_claims_counterfactual_science():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-v36-replay-{time.time_ns()}", "v3.6 replay")["project_id"]
+    joined = lab.join(None, f"v36-replay-worker-{time.time_ns()}", "CODEX", project_id)
+    objective = lab.canonical_objective_create(project_id, "SCIENTIFIC", "Replay", "Which work was actionable?")
+    branch = lab.hypothesis_branch_create(project_id, objective["id"])
+    before_events = len(store.events(project_id, 500))
+    replay = lab.portfolio_historical_replay(project_id)
+    after_events = len(store.events(project_id, 500))
+    assert replay["mutated"] is False
+    assert replay["events_examined"] >= before_events
+    assert replay["limitations"]["counterfactual_claim"].startswith("No suggested assignment")
+    assert after_events == before_events
+    assert replay["summary"]["observed_available_workers_at_end"] == [joined["worker"]["id"]]
+    assert branch["id"] in {point.get("branch_id") for point in replay["schedule_points"]}
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_historical_replay_detects_waiting_release_with_existing_independent_work():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-v36-replay-release-{time.time_ns()}", "v3.6 replay release")["project_id"]
+    joined = lab.join(None, f"v36-replay-release-{time.time_ns()}", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    objective = lab.canonical_objective_create(project_id, "SCIENTIFIC", "Replay release", "Which branch remains actionable?")
+    waiting_branch = lab.hypothesis_branch_create(project_id, objective["id"])
+    independent_branch = lab.hypothesis_branch_create(project_id, objective["id"])
+    waiting_gate = lab.gate_ensure(project_id, "RESULT_INSPECTION", "replay-wait", "v1", worker_id, session_id)
+    ready_gate = lab.gate_ensure(project_id, "RESULT_INSPECTION", "replay-ready", "v1", worker_id, session_id)
+    waiting_work = lab.gate_work_ensure(waiting_gate["id"], "REVIEW", "Wait", "Waiting branch", "RESULT_INSPECTOR", worker_id, session_id, branch_id=waiting_branch["id"])
+    ready_work = lab.gate_work_ensure(ready_gate["id"], "REVIEW", "Ready", "Independent branch", "RESULT_INSPECTOR", worker_id, session_id, branch_id=independent_branch["id"])
+    prerequisite = store.object_create(project_id, "ExperimentRun", {"label": "pending"}, "EXPERIMENT_STARTED", "running")
+    lab.claim_work(waiting_work["id"], worker_id, session_id)
+    lab.block_work(waiting_work["id"], worker_id, session_id, [{"target_type": "EXPERIMENT_RUN", "target_id": prerequisite["id"], "required_statuses": ["completed"]}])
+
+    replay = lab.portfolio_historical_replay(project_id)
+    released = [point for point in replay["schedule_points"] if point["kind"] == "WORK_RELEASED"]
+    assert replay["summary"]["waiting_releases_with_independent_ready_opportunity"] == 1
+    assert ready_work["id"] in released[-1]["independent_ready_work_item_ids"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_browser_runtime_marks_first_successful_connection_attached():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)
