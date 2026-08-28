@@ -7,6 +7,7 @@ import ipaddress
 import json
 import logging
 import re
+import subprocess
 import threading
 import time
 import uuid
@@ -700,8 +701,21 @@ def _runtime_code_version() -> dict[str, Any]:
         for name, loaded in _LOADED_SOURCE_SHAS.items()
     }
     drifted = [name for name, values in files.items() if values["loaded_sha256"] != values["disk_sha256"]]
-    return {"files": files, "code_drift": bool(drifted), "drifted_files": drifted,
+    return {"files": files, "source_checkout": _canonical_source_checkout(), "code_drift": bool(drifted), "drifted_files": drifted,
             "reload_policy": "restart_required_for_consistent_singleton_runtime"}
+
+
+def _canonical_source_checkout() -> dict[str, Any]:
+    """Read-only provenance for the host-mounted, version-controlled source."""
+    path = settings.gpu_lab_source_checkout
+    if not (path / ".git").exists():
+        return {"available": False, "path": str(path), "reason": "SOURCE_CHECKOUT_NOT_MOUNTED"}
+    try:
+        commit = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], check=True, text=True, capture_output=True, timeout=5).stdout.strip()
+        dirty = bool(subprocess.run(["git", "-C", str(path), "status", "--porcelain"], check=True, text=True, capture_output=True, timeout=5).stdout.strip())
+        return {"available": True, "path": str(path), "commit": commit, "dirty": dirty, "read_only": True}
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"available": False, "path": str(path), "reason": f"SOURCE_CHECKOUT_UNREADABLE:{exc}"}
 
 
 def _research_runtime_has_code_drift() -> bool:
