@@ -191,6 +191,13 @@ class LabController:
                     subject_id TEXT, payload JSONB NOT NULL DEFAULT '{}'::jsonb, idempotency_key TEXT NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL, delivered_at TIMESTAMPTZ, UNIQUE(project_id,idempotency_key)
                 );
+                CREATE TABLE IF NOT EXISTS lab_consistency_conflicts (
+                    id UUID PRIMARY KEY, project_id UUID NOT NULL REFERENCES research_projects(id),
+                    conflict_key TEXT NOT NULL, conflict_type TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'OPEN',
+                    object_ids JSONB NOT NULL DEFAULT '[]'::jsonb, details JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    detected_at TIMESTAMPTZ NOT NULL, resolved_at TIMESTAMPTZ,
+                    UNIQUE(project_id,conflict_key)
+                );
                 ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS canonical_objective_id UUID REFERENCES canonical_objectives(id);
                 ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS dependency_scope TEXT NOT NULL DEFAULT 'WORKITEM_LOCAL';
                 ALTER TABLE lab_work_dependencies ADD COLUMN IF NOT EXISTS dependency_scope TEXT NOT NULL DEFAULT 'WORKITEM_LOCAL';
@@ -1772,6 +1779,9 @@ class LabController:
                         waiting_satisfied.append(str(item["id"]))
             cur.execute("SELECT id,status,data FROM research_objects WHERE project_id=%s AND kind='Experiment'", (project_id,))
             experiments = cur.fetchall()
+            text_state_divergence = [str(item["id"]) for item in active if "supersed" in (item["title"] + " " + item["description"]).lower()]
+            cur.execute("SELECT * FROM lab_consistency_conflicts WHERE project_id=%s AND status='OPEN' ORDER BY detected_at", (project_id,))
+            conflicts = [self._record(row) for row in cur.fetchall()]
             return {
                 "project_id": project_id,
                 "active_work_count": len(active),
@@ -1782,6 +1792,8 @@ class LabController:
                 "active_work_without_subject_version": [str(item["id"]) for item in active if not item["canonical_subject_version"]],
                 "waiting_with_satisfied_dependencies": waiting_satisfied,
                 "experiments_without_explicit_version": [str(row["id"]) for row in experiments if not row["data"].get("version")],
+                "text_state_divergence": text_state_divergence,
+                "open_consistency_conflicts": conflicts,
             }
 
     def v355_shadow_projection(self, project_id: str) -> dict[str, Any]:
@@ -1892,6 +1904,11 @@ class LabController:
         with self.store._connect() as conn, conn.cursor() as cur:
             satisfied, invalidated, detail = self._dependency_status(cur, project_id, dependency)
             return {"satisfied": satisfied, "invalidated": invalidated, "detail": detail}
+
+    def consistency_conflicts_get(self, project_id: str, status: str = "OPEN") -> list[dict]:
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM lab_consistency_conflicts WHERE project_id=%s AND status=%s ORDER BY detected_at", (project_id, status.upper()))
+            return [self._record(row) or {} for row in cur.fetchall()]
 
     def _lab_budget_get(self, project_id: str) -> dict[str, Any]:
         with self.store._connect() as conn, conn.cursor() as cur:

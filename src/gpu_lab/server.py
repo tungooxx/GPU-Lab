@@ -1689,6 +1689,12 @@ async def lab_dependency_status(project_id: str, dependency: dict[str, Any]):
 
 
 @mcp.tool()
+async def lab_consistency_conflicts_get(project_id: str, status: str = "OPEN"):
+    """List explicitly recorded operational consistency conflicts; these are not scientific evidence."""
+    return await call(lab().consistency_conflicts_get, project_id, status)
+
+
+@mcp.tool()
 async def canonical_projection_shadow_v355(project_id: str):
     """Read-only v3.5.5 canonical projection for staged rollout and conflict review."""
     return await call(lab().v355_shadow_projection, project_id)
