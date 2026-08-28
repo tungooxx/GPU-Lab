@@ -848,7 +848,19 @@ class LabController:
                     equivalence_key = authority_key
             if existing_id:
                 self._event(cur, project_id, "WORK_ITEM_AUTHORITY_REUSED", existing_id, {"authority_key": authority_key, "gate_id": gate_id})
-                return self._work_record(cur, existing_id)
+                return {**self._work_record(cur, existing_id), "dedupe_result": "REUSED_ACTIVE"}
+            if authority_status == "AUTHORITATIVE" and authority_key and canonical_subject_version:
+                cur.execute(
+                    "SELECT id FROM lab_work_items WHERE project_id=%s AND authority_key=%s "
+                    "AND canonical_subject_version=%s AND authority_status='AUTHORITATIVE' "
+                    "AND status='COMPLETED' AND invalidated_at IS NULL ORDER BY completed_at DESC LIMIT 1 FOR UPDATE",
+                    (project_id, authority_key, canonical_subject_version),
+                )
+                terminal = cur.fetchone()
+                if terminal:
+                    existing_id = str(terminal["id"])
+                    self._event(cur, project_id, "WORK_ITEM_TERMINAL_REUSED", existing_id, {"authority_key": authority_key, "canonical_subject_version": canonical_subject_version})
+                    return {**self._work_record(cur, existing_id), "dedupe_result": "ALREADY_SATISFIED"}
             status = "DORMANT" if dormant_until_dependencies else ("WAITING_DEPENDENCY" if dependencies else "READY")
             try:
                 cur.execute(
@@ -885,7 +897,7 @@ class LabController:
                 "dormant_until_dependencies": dormant_until_dependencies,
             })
         self.resolve_dependencies(project_id)
-        return self.work_get(ident)
+        return {**self.work_get(ident), "dedupe_result": "CREATED"}
 
     def _work_record(self, cur, work_item_id: str) -> dict:
         cur.execute("SELECT * FROM lab_work_items WHERE id=%s", (work_item_id,))
