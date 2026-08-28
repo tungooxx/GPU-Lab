@@ -1813,6 +1813,24 @@ async def lab_work_propose(
 
 
 @mcp.tool()
+async def lab_work_proposal_materialize(
+    proposal_id: str, planner_worker_id: str, session_id: str, kind: str, title: str,
+    description: str, scientific_role: str, priority: float = 0,
+    expected_value: float | None = None, estimated_cost: float | None = None,
+    related_refs: dict[str, Any] | None = None, dependencies: list[dict] | None = None,
+    speculation_class: str = "NON_SPECULATIVE", speculation_condition: dict[str, Any] | None = None,
+    resource_class: str | None = None,
+):
+    """Materialize an approved proposal through a planner-authorized canonical path only."""
+    return await call(
+        lab().work_proposal_materialize, proposal_id, planner_worker_id, session_id,
+        kind, title, description, scientific_role, priority, expected_value, estimated_cost,
+        related_refs, dependencies, speculation_class=speculation_class,
+        speculation_condition=speculation_condition, resource_class=resource_class,
+    )
+
+
+@mcp.tool()
 async def hypothesis_branch_create(
     project_id: str, canonical_objective_id: str, state: str = "OPEN",
     question_id: str | None = None, hypothesis_ids: list[str] | None = None,

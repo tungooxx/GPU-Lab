@@ -361,6 +361,57 @@ class LabController:
             cur.execute("SELECT * FROM lab_work_proposals WHERE id=%s", (ident,))
             return self._record(cur.fetchone()) or {}
 
+    def work_proposal_materialize(
+        self, proposal_id: str, planner_worker_id: str, session_id: str,
+        kind: str, title: str, description: str, scientific_role: str,
+        priority: float = 0, expected_value: float | None = None,
+        estimated_cost: float | None = None, related_refs: dict[str, Any] | None = None,
+        dependencies: list[dict] | None = None, authority_key: str | None = None,
+        gate_id: str | None = None, canonical_subject_version: str | None = None,
+        authority_status: str = "SUPPORTING", subject_id: str | None = None,
+        recovery_policy: dict[str, Any] | None = None,
+        speculation_class: str = "NON_SPECULATIVE", speculation_condition: dict[str, Any] | None = None,
+        resource_class: str | None = None, dependency_scope: str = "WORKITEM_LOCAL",
+    ) -> dict:
+        """Central planner-only proposal materialization; workers cannot self-allocate work."""
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM lab_work_proposals WHERE id=%s FOR UPDATE", (proposal_id,))
+            proposal = cur.fetchone()
+            if not proposal:
+                raise GPUError("LAB_WORK_PROPOSAL_NOT_FOUND", proposal_id)
+            self._session(cur, session_id, planner_worker_id, str(proposal["project_id"]))
+            planner = self._worker(cur, planner_worker_id)
+            capabilities = planner["capabilities"] or {}
+            if not capabilities.get("can_materialize_work_plans"):
+                raise GPUError("LAB_WORK_PLANNER_AUTHORITY_REQUIRED", "worker capability can_materialize_work_plans=true")
+            if proposal["status"] != "PROPOSED":
+                return {"proposal": self._record(proposal), "materialization": "NOT_ACTIONABLE"}
+            proposal_data = self._record(proposal) or {}
+
+        work = self.create_work(
+            proposal_data["project_id"], kind, title, description, scientific_role,
+            planner_worker_id, priority, expected_value, estimated_cost, related_refs,
+            dependencies, proposal_data.get("proposed_equivalence_key_hint"), None, session_id,
+            authority_key or proposal_data.get("proposed_authority_key_hint"), gate_id,
+            canonical_subject_version, authority_status, subject_id, recovery_policy,
+            canonical_objective_id=proposal_data.get("canonical_objective_id"),
+            branch_id=proposal_data.get("hypothesis_branch_id"), speculation_class=speculation_class,
+            speculation_condition=speculation_condition, resource_class=resource_class,
+            dependency_scope=dependency_scope,
+        )
+        now = self._now()
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE lab_work_proposals SET status='MATERIALIZED',canonical_work_item_id=%s,updated_at=%s "
+                "WHERE id=%s AND status='PROPOSED' RETURNING *",
+                (work["id"], now, proposal_id),
+            )
+            updated = cur.fetchone()
+            if updated:
+                self._event(cur, proposal_data["project_id"], "WORK_PROPOSAL_MATERIALIZED", proposal_id, {"work_item_id": work["id"]})
+        return {"proposal": self._record(updated) if updated else proposal_data, "work_item": work,
+                "materialization": "CREATED_OR_REUSED"}
+
     def hypothesis_branch_create(
         self, project_id: str, canonical_objective_id: str, state: str = "OPEN",
         question_id: str | None = None, hypothesis_ids: list[str] | None = None,
