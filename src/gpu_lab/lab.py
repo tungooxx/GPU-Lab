@@ -1462,6 +1462,9 @@ class LabController:
         result: dict | None = None
         with self.store._connect() as conn, conn.cursor() as cur:
             self._worker(cur, worker_id)
+            # Serialize all claims for one worker identity before taking work or
+            # session row locks; this also avoids cross-session lock inversion.
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"lab-worker-claim:{worker_id}",))
             # Budget and portfolio policy use structured branch/resource/speculation
             # fields.  Claiming a partial row would silently bypass newer limits.
             cur.execute("SELECT * FROM lab_work_items WHERE id=%s FOR UPDATE", (work_item_id,))
@@ -1476,6 +1479,17 @@ class LabController:
             # first caller's fresh assignment after it obtains that lock.
             if session["current_work_item_id"] and str(session["current_work_item_id"]) != str(work_item_id):
                 raise GPUError("LAB_WORKER_ALREADY_ASSIGNED", str(session["current_work_item_id"]))
+            # Worker capacity belongs to the identity, not to a browser/session
+            # row. Without this guard, the same ChatGPT/Codex worker could be
+            # scheduled concurrently through two project sessions.
+            cur.execute(
+                "SELECT current_work_item_id FROM research_worker_sessions WHERE worker_id=%s AND id<>%s "
+                "AND current_work_item_id IS NOT NULL AND status IN ('ACTIVE','BUSY','WAITING')",
+                (worker_id, session_id),
+            )
+            other_assignment = cur.fetchone()
+            if other_assignment:
+                raise GPUError("LAB_WORKER_ALREADY_ASSIGNED", str(other_assignment["current_work_item_id"]))
             cur.execute("SELECT * FROM lab_work_dependencies WHERE work_item_id=%s", (work_item_id,))
             dependencies = cur.fetchall()
             if dependencies:

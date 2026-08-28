@@ -592,6 +592,22 @@ def test_v36_concurrent_schedulers_cannot_assign_two_work_items_to_one_session()
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_worker_identity_cannot_be_assigned_through_two_project_sessions():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    first_project = store.project_create(f"lab-v36-worker-identity-a-{time.time_ns()}", "first identity scope")["project_id"]
+    second_project = store.project_create(f"lab-v36-worker-identity-b-{time.time_ns()}", "second identity scope")["project_id"]
+    first = lab.join(None, f"v36-identity-worker-{time.time_ns()}", "CODEX", first_project)
+    second = lab.join(first["worker"]["id"], None, "CODEX", second_project)
+    first_work = lab.create_work(first_project, "REVIEW", "First", "First project work", "RESULT_INSPECTOR", first["worker"]["id"], created_session_id=first["session_id"])
+    second_work = lab.create_work(second_project, "REVIEW", "Second", "Second project work", "RESULT_INSPECTOR", second["worker"]["id"], created_session_id=second["session_id"])
+    lab.claim_work(first_work["id"], first["worker"]["id"], first["session_id"])
+    with pytest.raises(GPUError) as exc_info:
+        lab.claim_work(second_work["id"], second["worker"]["id"], second["session_id"])
+    assert exc_info.value.error_type == "LAB_WORKER_ALREADY_ASSIGNED"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_v36_controller_restart_reconstructs_waiting_branch_and_reclaims_after_dependency():
     store = ResearchStore(TEST_DATABASE_URL)
     flags = {"WAITING_WORK_RELEASE": True, "BRANCH_AWARE_ASSIGNMENT": True}
