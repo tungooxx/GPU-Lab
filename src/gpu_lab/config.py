@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     gpu_lab_max_log_lines: int = 1000
     gpu_lab_max_text_artifact_bytes: int = 1_048_576
     gpu_lab_ssh_timeout: int = 20
+    gpu_lab_ssh_connection_idle_seconds: int = Field(default=60, ge=1, le=900)
     gpu_lab_ssh_known_hosts: Path | None = None
     gpu_lab_ssh_allow_unverified_hosts: bool = False
     gpu_lab_allowed_hosts: str = "127.0.0.1:*,localhost:*"
