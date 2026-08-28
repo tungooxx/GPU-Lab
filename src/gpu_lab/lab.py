@@ -1198,6 +1198,7 @@ class LabController:
                     raise GPUError("LAB_WORK_NOT_CLAIMABLE", work_item_id)
                 cur.execute("INSERT INTO lab_work_leases(id,work_item_id,worker_id,worker_session_id,acquired_at,heartbeat_at,expires_at,lease_version) VALUES(%s,%s,%s,%s,%s,%s,%s,1)", (lease_id, work_item_id, worker_id, session_id, now, now, expiry))
                 cur.execute("UPDATE research_worker_sessions SET current_work_item_id=%s,active_role=%s,status='BUSY',last_heartbeat_at=%s WHERE id=%s", (work_item_id, role or item["scientific_role"], now, session_id))
+                cur.execute("UPDATE research_workers SET availability_state='ASSIGNED',availability_updated_at=%s WHERE id=%s", (now, worker_id))
                 self._event(cur, item["project_id"], "WORK_CLAIMED", work_item_id, {"worker_id": worker_id, "session_id": session_id, "lease_id": lease_id, "role": role or item["scientific_role"]})
                 result = self._record(item)
                 result["lease_id"] = lease_id
@@ -1252,6 +1253,7 @@ class LabController:
             if item["status"] not in {"CLAIMED", "RUNNING"}:
                 raise GPUError("LAB_WORK_NOT_STARTABLE", work_item_id)
             cur.execute("UPDATE lab_work_items SET status='RUNNING',updated_at=%s,work_version=work_version+1 WHERE id=%s", (now, work_item_id))
+            cur.execute("UPDATE research_workers SET availability_state='EXECUTING',availability_updated_at=%s WHERE id=%s", (now, worker_id))
             self._event(cur, item["project_id"], "WORK_STARTED", work_item_id, {"worker_id": worker_id, "session_id": session_id})
         return self.work_get(work_item_id)
 
@@ -1284,6 +1286,8 @@ class LabController:
             cur.execute("UPDATE lab_work_leases SET released_at=%s,release_reason=%s,lease_version=lease_version+1 WHERE id=%s AND released_at IS NULL", (now, reason, item["lease_id"]))
             cur.execute("UPDATE lab_work_items SET status=%s,assigned_worker_id=NULL,assigned_session_id=NULL,lease_id=NULL,blocked_reason=%s,updated_at=%s,work_version=work_version+1 WHERE id=%s", (next_status, blocked_reason, now, work_item_id))
             cur.execute("UPDATE research_worker_sessions SET current_work_item_id=NULL,active_role=NULL,status='ACTIVE',last_heartbeat_at=%s WHERE id=%s", (now, session_id))
+            if waiting_dependency and self.feature_flags.get("WAITING_WORK_RELEASE"):
+                cur.execute("UPDATE research_workers SET availability_state='AVAILABLE',availability_updated_at=%s WHERE id=%s", (now, worker_id))
             self._event(cur, item["project_id"], "WORK_RELEASED", work_item_id, {"worker_id": worker_id, "reason": reason, "next_status": next_status})
         if waiting_dependency and has_dependencies:
             self.resolve_dependencies(str(item["project_id"]))
@@ -1415,6 +1419,7 @@ class LabController:
             cur.execute("UPDATE lab_work_leases SET released_at=%s,release_reason='COMPLETED',lease_version=lease_version+1 WHERE id=%s AND released_at IS NULL", (now, item["lease_id"]))
             cur.execute("UPDATE lab_work_items SET status='COMPLETED',completed_at=%s,updated_at=%s,work_version=work_version+1 WHERE id=%s", (now, now, work_item_id))
             cur.execute("UPDATE research_worker_sessions SET current_work_item_id=NULL,active_role=NULL,status='ACTIVE',last_heartbeat_at=%s WHERE id=%s", (now, session_id))
+            cur.execute("UPDATE research_workers SET availability_state='AVAILABLE',availability_updated_at=%s WHERE id=%s", (now, worker_id))
             self._event(cur, item["project_id"], "WORK_COMPLETED", work_item_id, {"worker_id": worker_id, "summary": summary[:4000], "output_object_ids": output_object_ids or []})
         self.resolve_dependencies(str(item["project_id"]))
         return self.work_get(work_item_id)
