@@ -1639,6 +1639,18 @@ async def lab_work_list(project_id: str, statuses: list[str] | None = None, limi
 
 
 @mcp.tool()
+async def canonical_authority_audit_v355(project_id: str):
+    """Read-only v3.5.5 production consistency audit; creates and changes nothing."""
+    return await call(lab().v355_production_audit, project_id)
+
+
+@mcp.tool()
+async def canonical_projection_shadow_v355(project_id: str):
+    """Read-only v3.5.5 canonical projection for staged rollout and conflict review."""
+    return await call(lab().v355_shadow_projection, project_id)
+
+
+@mcp.tool()
 async def lab_work_create(
     project_id: str, kind: str, title: str, description: str, scientific_role: str,
     created_by: str, created_session_id: str, priority: float = 0, expected_value: float | None = None,

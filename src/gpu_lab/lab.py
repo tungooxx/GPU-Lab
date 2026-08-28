@@ -152,6 +152,43 @@ class LabController:
                     AND status IN ('READY','CLAIMED','RUNNING','RUNNING_DETACHED','RESULT_READY','WAITING_DEPENDENCY','BLOCKED','REPLAN_REQUIRED');
                 CREATE INDEX IF NOT EXISTS lab_work_items_gate_idx ON lab_work_items(gate_id,status,created_at);
                 CREATE INDEX IF NOT EXISTS scientific_gates_project_status_idx ON scientific_gates(project_id,status,created_at);
+                CREATE TABLE IF NOT EXISTS canonical_objectives (
+                    id UUID PRIMARY KEY, project_id UUID NOT NULL REFERENCES research_projects(id),
+                    version INTEGER NOT NULL, objective_type TEXT NOT NULL, title TEXT NOT NULL,
+                    scientific_question TEXT NOT NULL, status TEXT NOT NULL, priority DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    current_goal TEXT NOT NULL DEFAULT '', parent_objective_id UUID REFERENCES canonical_objectives(id),
+                    supersedes_objective_id UUID REFERENCES canonical_objectives(id),
+                    superseded_by_objective_id UUID REFERENCES canonical_objectives(id),
+                    created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL,
+                    UNIQUE(project_id, title, version)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS canonical_objectives_one_active_title
+                    ON canonical_objectives(project_id,title) WHERE status='ACTIVE';
+                CREATE TABLE IF NOT EXISTS hypothesis_branches (
+                    id UUID PRIMARY KEY, project_id UUID NOT NULL REFERENCES research_projects(id),
+                    canonical_objective_id UUID NOT NULL REFERENCES canonical_objectives(id),
+                    question_id TEXT, hypothesis_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    mechanistic_niche_id TEXT, scientific_distance TEXT, architecture_lineage_id TEXT,
+                    state TEXT NOT NULL, priority DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    branch_dependencies JSONB NOT NULL DEFAULT '[]'::jsonb, branch_blocking_scope TEXT NOT NULL DEFAULT 'BRANCH',
+                    created_at TIMESTAMPTZ NOT NULL, resolved_at TIMESTAMPTZ
+                );
+                CREATE TABLE IF NOT EXISTS lab_work_proposals (
+                    id UUID PRIMARY KEY, project_id UUID NOT NULL REFERENCES research_projects(id),
+                    proposed_by_worker_id UUID REFERENCES research_workers(id), canonical_objective_id UUID REFERENCES canonical_objectives(id),
+                    target_id TEXT, proposed_mode TEXT NOT NULL, proposed_role TEXT NOT NULL,
+                    proposed_authority_key_hint TEXT, proposed_equivalence_key_hint TEXT,
+                    rationale TEXT NOT NULL, expected_scientific_value DOUBLE PRECISION,
+                    dependency_refs JSONB NOT NULL DEFAULT '[]'::jsonb, status TEXT NOT NULL,
+                    canonical_work_item_id UUID REFERENCES lab_work_items(id), created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS lab_transactional_outbox (
+                    id UUID PRIMARY KEY, project_id UUID NOT NULL REFERENCES research_projects(id), event_type TEXT NOT NULL,
+                    subject_id TEXT, payload JSONB NOT NULL DEFAULT '{}'::jsonb, idempotency_key TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL, delivered_at TIMESTAMPTZ, UNIQUE(project_id,idempotency_key)
+                );
+                ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS canonical_objective_id UUID REFERENCES canonical_objectives(id);
+                ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS dependency_scope TEXT NOT NULL DEFAULT 'WORKITEM_LOCAL';
             """)
 
     @staticmethod
@@ -1487,6 +1524,51 @@ class LabController:
             "session_id": session_id, "old_work_reassigned": old_work_reassigned,
             "lease_state": lease_state, "lease_detail": lease_detail, "lab_state": state,
         }
+
+    def v355_production_audit(self, project_id: str) -> dict[str, Any]:
+        """Read-only v3.5.5 consistency audit; never changes lab or science state."""
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM lab_work_items WHERE project_id=%s ORDER BY created_at,id", (project_id,))
+            items = cur.fetchall()
+            active = [item for item in items if item["status"] in ACTIVE_WORK_STATUSES]
+            by_equivalence: dict[str, list[str]] = {}
+            by_authority: dict[tuple[str, str | None], list[str]] = {}
+            waiting_satisfied: list[str] = []
+            for item in active:
+                if item["equivalence_key"]:
+                    by_equivalence.setdefault(item["equivalence_key"], []).append(str(item["id"]))
+                if item["authority_key"]:
+                    by_authority.setdefault((item["authority_key"], item["canonical_subject_version"]), []).append(str(item["id"]))
+                if item["status"] == "WAITING_DEPENDENCY":
+                    cur.execute("SELECT * FROM lab_work_dependencies WHERE work_item_id=%s", (item["id"],))
+                    dependencies = cur.fetchall()
+                    if dependencies and all(self._dependency_status(cur, project_id, dep)[0] for dep in dependencies):
+                        waiting_satisfied.append(str(item["id"]))
+            cur.execute("SELECT id,status,data FROM research_objects WHERE project_id=%s AND kind='Experiment'", (project_id,))
+            experiments = cur.fetchall()
+            return {
+                "project_id": project_id,
+                "active_work_count": len(active),
+                "duplicate_active_equivalence": {key: ids for key, ids in by_equivalence.items() if len(ids) > 1},
+                "duplicate_active_authority": {"|".join(key): ids for key, ids in by_authority.items() if len(ids) > 1},
+                "active_work_without_objective": [str(item["id"]) for item in active if item["canonical_objective_id"] is None and not item["parent_work_item_id"] and not item["recovery_policy"]],
+                "active_work_without_authority": [str(item["id"]) for item in active if not item["authority_key"]],
+                "active_work_without_subject_version": [str(item["id"]) for item in active if not item["canonical_subject_version"]],
+                "waiting_with_satisfied_dependencies": waiting_satisfied,
+                "experiments_without_explicit_version": [str(row["id"]) for row in experiments if not row["data"].get("version")],
+            }
+
+    def v355_shadow_projection(self, project_id: str) -> dict[str, Any]:
+        """Read-only canonical projection for staged UI/scheduler rollout."""
+        audit = self.v355_production_audit(project_id)
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM canonical_objectives WHERE project_id=%s AND status='ACTIVE' ORDER BY priority DESC,updated_at DESC", (project_id,))
+            objectives = [self._record(row) for row in cur.fetchall()]
+            cur.execute("SELECT * FROM hypothesis_branches WHERE project_id=%s AND state IN ('OPEN','WAITING','BLOCKED') ORDER BY priority DESC,created_at", (project_id,))
+            branches = [self._record(row) for row in cur.fetchall()]
+            cur.execute("SELECT * FROM lab_work_items WHERE project_id=%s AND status=ANY(%s) AND authority_status='AUTHORITATIVE' ORDER BY priority DESC,created_at", (project_id, list(ACTIVE_WORK_STATUSES)))
+            canonical_work = [self._record(row) for row in cur.fetchall()]
+        return {"projection_version": "v3.5.5-shadow", "objectives": objectives, "active_branches": branches, "canonical_work_items": canonical_work, "consistency": audit}
 
     def _lab_budget_get(self, project_id: str) -> dict[str, Any]:
         with self.store._connect() as conn, conn.cursor() as cur:
