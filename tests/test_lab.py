@@ -248,6 +248,29 @@ def test_v36_feature_gated_scheduler_claims_existing_work_or_records_healthy_idl
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_planner_on_idle_requests_central_evaluation_without_creating_work():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store, feature_flags={"BRANCH_AWARE_ASSIGNMENT": True, "PLANNER_ON_IDLE": True})
+    project_id = store.project_create(f"lab-v36-planner-idle-{time.time_ns()}", "v3.6 planner on idle")["project_id"]
+    joined = lab.join(None, f"v36-planner-idle-worker-{time.time_ns()}", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    objective = lab.canonical_objective_create(project_id, "SCIENTIFIC", "Planner", "Is missing work scientifically justified?")
+    branch = lab.hypothesis_branch_create(project_id, objective["id"])
+    lab.hypothesis_portfolio_ensure(project_id, objective["id"])
+    before = lab.work_list(project_id, None, 100)
+
+    result = lab.portfolio_assign_existing(project_id, worker_id, session_id)
+
+    assert result["status"] == "IDLE"
+    assert result["idle_reason"] == "PLANNER_EVALUATION_REQUIRED"
+    assert result["planner_action"] == "REQUEST_CENTRAL_PLANNER_EVALUATION"
+    assert result["planner_candidates"]["planner_action"] == "CONSIDER_PROPOSAL"
+    assert result["planner_candidates"]["undercovered_branches"][0]["branch_id"] == branch["id"]
+    assert result["plan"]["rationale"]["new_work_created"] is False
+    assert lab.work_list(project_id, None, 100) == before
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_v36_objective_global_dependency_blocks_assignment_but_branch_local_wait_does_not():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store, feature_flags={"BRANCH_AWARE_ASSIGNMENT": True})

@@ -2670,8 +2670,13 @@ class LabController:
             return {"status": "ASSIGNED", "work_item": chosen, "plan": plan,
                     "reason": "EXISTING_READY_CANONICAL_WORK"}
 
+        planner_candidates = self.work_planner_candidates(project_id)
+        planner_needed = (
+            self.feature_flags.get("PLANNER_ON_IDLE")
+            and planner_candidates["planner_action"] == "CONSIDER_PROPOSAL"
+        )
         now = self._now()
-        idle_reason = "NO_EXISTING_ACTIONABLE_CANONICAL_WORK"
+        idle_reason = "PLANNER_EVALUATION_REQUIRED" if planner_needed else "NO_EXISTING_ACTIONABLE_CANONICAL_WORK"
         with self.store._connect() as conn, conn.cursor() as cur:
             self._session(cur, session_id, worker_id, project_id)
             cur.execute(
@@ -2681,10 +2686,12 @@ class LabController:
         plan = self._parallel_plan_record(
             project_id, None, [{"worker_id": worker_id, "session_id": session_id, "work_item_id": None}],
             {"reason": idle_reason, "new_work_created": False,
-             "planner_action": "PLANNER_EVALUATION_REQUIRED" if self.feature_flags.get("PLANNER_ON_IDLE") else "IDLE"},
+             "planner_action": "REQUEST_CENTRAL_PLANNER_EVALUATION" if planner_needed else "IDLE",
+             "undercovered_branch_ids": [entry["branch_id"] for entry in planner_candidates["undercovered_branches"]] if planner_needed else []},
         )
         return {"status": "IDLE", "idle_reason": idle_reason, "plan": plan,
-                "planner_action": "PLANNER_EVALUATION_REQUIRED" if self.feature_flags.get("PLANNER_ON_IDLE") else "IDLE"}
+                "planner_action": "REQUEST_CENTRAL_PLANNER_EVALUATION" if planner_needed else "IDLE",
+                "planner_candidates": planner_candidates if planner_needed else None}
 
     def canonical_execution_projection(self, project_id: str) -> dict:
         """Separate current canonical execution from physically real historical runs."""
