@@ -15,6 +15,7 @@ from typing import Any
 import psycopg
 
 from .errors import GPUError
+from .research_portfolio_v36_shadow import ResearchPortfolioV36Shadow
 from .research import ResearchStore
 
 RUNTIME_TYPES = {"CHATGPT_WEB", "OPENAI_API", "CLAUDE_API", "CODEX", "LOCAL_AGENT", "OTHER"}
@@ -2413,25 +2414,7 @@ class LabController:
         ready = [item for item in self.work_list(project_id, ["READY"], limit) if item.get("authority_status") == "AUTHORITATIVE"]
         global_blocks = self._objective_global_blocks(project_id)
         workers = self._project_scheduler_workers(project_id)
-        assignments, used = [], set()
-        for worker in workers:
-            if worker["availability_state"] not in {"AVAILABLE", "IDLE"}:
-                continue
-            if global_blocks:
-                assignments.append({"worker_id": worker["id"], "suggested_work_item_id": None,
-                                    "reason": "OBJECTIVE_GLOBAL_DEPENDENCY_BLOCK", "global_blocks": global_blocks})
-                continue
-            candidate = next((item for item in ready if item["id"] not in used), None)
-            if candidate:
-                used.add(candidate["id"])
-                branch = coverage.get(str(candidate.get("branch_id") or ""), {})
-                assignments.append({"worker_id": worker["id"], "suggested_work_item_id": candidate["id"], "branch_id": candidate.get("branch_id"), "reason": "EXISTING_READY_CANONICAL_WORK", "dependency_scope": candidate.get("dependency_scope"), "branch_coverage": branch})
-            else:
-                assignments.append({"worker_id": worker["id"], "suggested_work_item_id": None, "reason": "IDLE_NO_EXISTING_ACTIONABLE_WORK"})
-        return {"projection_version": "v3.6-shadow", "assignments": assignments,
-                "unassigned_ready_work_item_ids": [item["id"] for item in ready if item["id"] not in used],
-                "objective_global_blocks": global_blocks,
-                "planner_action": "OBJECTIVE_GLOBAL_BLOCK" if global_blocks else "DO_NOT_CREATE_WORK" if not ready else "CLAIM_EXISTING_ONLY"}
+        return ResearchPortfolioV36Shadow.project(workers, ready, coverage, global_blocks)
 
     def portfolio_historical_replay(self, project_id: str, limit: int = 1000) -> dict:
         """Read-only replay of the operational information known at each event.
