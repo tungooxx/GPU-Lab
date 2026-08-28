@@ -1706,9 +1706,20 @@ class LabController:
         state = self.state_get(project_id, session_id, since, reconcile=False)
         old_work_reassigned = bool(current_work_item_id and current_work_item_id != str(session["current_work_item_id"] or ""))
         canonical_context = self._canonical_worker_context(project_id, session_id, state, since)
+        if lease_state == "OWNED":
+            sync_status = "ASSIGNED"
+        elif lease_state == "LEASE_LOST":
+            old = self.work_get(current_work_item_id) if current_work_item_id else None
+            sync_status = "WORK_SUPERSEDED" if old and old["status"] == "SUPERSEDED" else "WORK_COMPLETED_ELSEWHERE" if old and old["status"] == "COMPLETED" else "LEASE_LOST"
+        elif canonical_context["work"] and canonical_context["work"]["status"] in {"WAITING_DEPENDENCY", "BLOCKED", "DORMANT"}:
+            sync_status = "WAITING"
+        else:
+            sync_status = "NO_WORK"
+        compact = self.feature_flags.get("CANONICAL_SYNC_CONTEXT", False)
         return {
             "session_id": session_id, "old_work_reassigned": old_work_reassigned,
-            "lease_state": lease_state, "lease_detail": lease_detail, "lab_state": state,
+            "sync_status": sync_status, "lease_state": lease_state, "lease_detail": lease_detail,
+            "lab_state": canonical_context if compact else state,
             "canonical_worker_context": canonical_context,
         }
 
