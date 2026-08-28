@@ -50,6 +50,7 @@ from .meta_research import MetaResearchService
 from .policy_lab import PolicyLabService
 from .qd import HypothesisDraft, HypothesisQDService
 from .research import ResearchStore
+from .research_portfolio_bench_v36 import ResearchPortfolioBenchV36
 from .research_operators import HttpResearchOperatorProvider, ResearchOperatorService
 from .service import GPUService
 from .strategy import DecisionOutcomeAssessment, NullModelDraft, ResearchStrategyService
@@ -223,6 +224,8 @@ _READ_ONLY_TOOLS = {
     "engineering_context_get",
     "engineering_result_get",
     "engineering_task_verify",
+    "research_portfolio_historical_replay",
+    "research_portfolio_bench_v36",
 }
 _DESTRUCTIVE_TOOLS = {
     "gpu_destroy",
@@ -1722,6 +1725,12 @@ async def research_portfolio_scheduler_shadow(project_id: str, limit: int = 50):
 async def research_portfolio_historical_replay(project_id: str, limit: int = 1000):
     """Replay known scheduler state without mutating research or claiming counterfactual science."""
     return await call(lab().portfolio_historical_replay, project_id, limit)
+
+
+@mcp.tool()
+async def research_portfolio_bench_v36():
+    """Run deterministic read-only v3.6 scheduler benchmark cases; never changes research state."""
+    return ResearchPortfolioBenchV36.run_all()
 
 
 @mcp.tool()
