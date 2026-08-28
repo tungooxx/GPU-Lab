@@ -1949,6 +1949,23 @@ class LabController:
                 })
             return result
 
+    def agenda_coverage_get(self, project_id: str) -> list[dict]:
+        """Read-only v3.6 agenda coverage; branch-local waits never become project-global here."""
+        coverage = self.branch_coverage_get(project_id)
+        by_objective: dict[str, list[dict]] = {}
+        for branch in coverage:
+            by_objective.setdefault(branch["canonical_objective_id"], []).append(branch)
+        result = []
+        for objective_id, branches in by_objective.items():
+            def state(branch: dict) -> str:
+                if branch["status"] in {"RESOLVED", "REFUTED", "ABANDONED", "SUPERSEDED"}:
+                    return "RESOLVED"
+                if branch["active_work_count"]:
+                    return "COVERED_WAITING" if branch["waiting_dependency"] else "COVERED_ACTIVE"
+                return "UNCOVERED_ACTIONABLE" if branch["status"] == "OPEN" else "UNCOVERED_NOT_ACTIONABLE"
+            result.append({"canonical_objective_id": objective_id, "branches": [{**branch, "coverage_state": state(branch)} for branch in branches], "actionable_uncovered_count": sum(state(branch) == "UNCOVERED_ACTIONABLE" for branch in branches)})
+        return result
+
     def work_planner_candidates(self, project_id: str, limit: int = 50) -> dict:
         """Agenda-aware planning input. It never creates work merely to occupy idle workers."""
         coverage = self.branch_coverage_get(project_id)

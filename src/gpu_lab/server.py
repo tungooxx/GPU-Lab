@@ -1701,6 +1701,11 @@ async def hypothesis_branch_coverage_get(project_id: str):
     """Return branch coverage for agenda-aware scheduling; it never materializes filler work."""
     return await call(lab().branch_coverage_get, project_id)
 
+@mcp.tool()
+async def research_agenda_coverage_get(project_id: str):
+    """Read v3.6 objective/branch coverage without scheduling or creating work."""
+    return await call(lab().agenda_coverage_get, project_id)
+
 
 @mcp.tool()
 async def lab_work_planner_candidates(project_id: str, limit: int = 50):
