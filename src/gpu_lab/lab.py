@@ -1637,6 +1637,16 @@ class LabController:
             cur.execute("UPDATE lab_work_leases SET released_at=%s,release_reason='EXPERIMENT_RUN_ATTACHED' WHERE id=%s AND released_at IS NULL", (now, item["lease_id"]))
             cur.execute("UPDATE lab_work_items SET status='RUNNING_DETACHED',related_refs=%s,assigned_worker_id=NULL,assigned_session_id=NULL,lease_id=NULL,blocked_reason=%s,updated_at=%s WHERE id=%s", (json.dumps(refs), "Canonical ExperimentRun is executing; this WorkItem cannot be claimed.", now, work_item_id))
             cur.execute("UPDATE research_worker_sessions SET current_work_item_id=NULL,active_role=NULL,status='ACTIVE',last_heartbeat_at=%s WHERE id=%s", (now, session_id))
+            # A detached ExperimentRun continues independently.  The worker that
+            # launched it is available for another bounded WorkItem unless one of
+            # its other live sessions still owns work.
+            cur.execute(
+                "UPDATE research_workers w SET availability_state='AVAILABLE',availability_updated_at=%s,"
+                "idle_reason=NULL,idle_since=NULL WHERE w.id=%s AND NOT EXISTS ("
+                "SELECT 1 FROM research_worker_sessions s WHERE s.worker_id=w.id "
+                "AND s.current_work_item_id IS NOT NULL AND s.status IN ('ACTIVE','BUSY','WAITING'))",
+                (now, worker_id),
+            )
             self._event(cur, item["project_id"], "WORK_ITEM_EXPERIMENT_ATTACHED", work_item_id, {"run_id": run_id, "worker_id": worker_id})
         return self.work_get(work_item_id)
 

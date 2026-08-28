@@ -754,6 +754,10 @@ def test_attached_execution_cannot_return_to_ready_after_worker_disconnect():
     attached = lab.attach_experiment_run(work["id"], worker_id, session_id, run["id"])
     assert attached["status"] == "RUNNING_DETACHED"
     assert attached["related_refs"]["experiment_run_id"] == run["id"]
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT availability_state FROM research_workers WHERE id=%s", (worker_id,))
+        worker = cur.fetchone()
+    assert worker["availability_state"] == "AVAILABLE"
     assert lab.work_list(project_id, ["READY"]) == []
 
     assert lab.experiment_run_terminal(run["id"], "completed") == {"result_ready": 1}
@@ -762,6 +766,26 @@ def test_attached_execution_cannot_return_to_ready_after_worker_disconnect():
     store.object_update(run["id"], {"inspection": {"mode": "fixture"}}, "RESULT_INSPECTED")
     assert lab.experiment_run_inspected(run["id"]) == {"completed": 1}
     assert lab.work_get(work["id"])["status"] == "COMPLETED"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_detached_gpu_run_releases_worker_for_existing_independent_work():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store, feature_flags={"BRANCH_AWARE_ASSIGNMENT": True})
+    project_id = store.project_create(f"lab-v36-detach-reassign-{time.time_ns()}", "v3.6 GPU detach")["project_id"]
+    joined = lab.join(None, f"v36-detach-worker-{time.time_ns()}", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    objective = lab.canonical_objective_create(project_id, "SCIENTIFIC", "Detach", "Can long execution release reasoning capacity?")
+    run_branch = lab.hypothesis_branch_create(project_id, objective["id"])
+    inspect_branch = lab.hypothesis_branch_create(project_id, objective["id"])
+    lab.hypothesis_portfolio_ensure(project_id, objective["id"])
+    run_work = lab.create_work(project_id, "TRAINING_RUN", "Launch", "Canonical long run.", "EXECUTION", worker_id, created_session_id=session_id, canonical_objective_id=objective["id"], branch_id=run_branch["id"])
+    gate = lab.gate_ensure(project_id, "RESULT_INSPECTION", "detach-independent", "v1", worker_id, session_id)
+    ready_work = lab.gate_work_ensure(gate["id"], "REVIEW", "Inspect", "Existing independent review.", "RESULT_INSPECTOR", worker_id, session_id, branch_id=inspect_branch["id"])
+    run = store.object_create(project_id, "ExperimentRun", {"label": "long"}, "EXPERIMENT_STARTED", "running")
+    lab.claim_work(run_work["id"], worker_id, session_id)
+    assert lab.attach_experiment_run(run_work["id"], worker_id, session_id, run["id"])["status"] == "RUNNING_DETACHED"
+    assert lab.portfolio_assign_existing(project_id, worker_id, session_id)["work_item"]["id"] == ready_work["id"]
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
