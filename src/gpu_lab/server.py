@@ -1686,6 +1686,12 @@ async def hypothesis_branch_coverage_get(project_id: str):
 
 
 @mcp.tool()
+async def lab_work_planner_candidates(project_id: str, limit: int = 50):
+    """Return agenda-aware planning candidates without automatically creating work for idle workers."""
+    return await call(lab().work_planner_candidates, project_id, limit)
+
+
+@mcp.tool()
 async def lab_work_authority_get(project_id: str, authority_key: str,
                                  canonical_subject_version: str | None = None):
     """Resolve the one current authoritative WorkItem for a semantic authority key."""

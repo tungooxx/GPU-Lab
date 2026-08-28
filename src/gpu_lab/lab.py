@@ -832,6 +832,10 @@ class LabController:
                     raise GPUError("CANONICAL_OBJECTIVE_NOT_FOUND", canonical_objective_id)
                 if objective["status"] != "ACTIVE":
                     raise GPUError("CANONICAL_OBJECTIVE_NOT_ACTIVE", objective["status"])
+            elif self.feature_flags.get("CANONICAL_AUTHORITY_V355"):
+                root_type = str((related_refs or {}).get("work_root_type", "")).upper()
+                if root_type not in {"ENGINEERING_PREREQUISITE", "META_RESEARCH_OBJECTIVE", "RECOVERY_OPERATION"}:
+                    raise GPUError("LAB_WORK_CANONICAL_OBJECTIVE_REQUIRED", "provide canonical_objective_id or explicit work_root_type")
             if gate_id:
                 cur.execute("SELECT * FROM scientific_gates WHERE id=%s AND project_id=%s FOR UPDATE", (gate_id, project_id))
                 gate = cur.fetchone()
@@ -1893,6 +1897,21 @@ class LabController:
                     "last_progress_at": max((item["updated_at"] for item in work), default=branch["created_at"]),
                 })
             return result
+
+    def work_planner_candidates(self, project_id: str, limit: int = 50) -> dict:
+        """Agenda-aware planning input. It never creates work merely to occupy idle workers."""
+        coverage = self.branch_coverage_get(project_id)
+        ready = self.work_list(project_id, ["READY"], limit)
+        active_branch_ids = {str(item["branch_id"]) for item in ready if item.get("branch_id")}
+        undercovered = [branch for branch in coverage if branch["status"] in {"OPEN", "WAITING"} and branch["active_work_count"] == 0]
+        return {
+            "project_id": project_id,
+            "ready_canonical_work": [item for item in ready if item.get("authority_status") == "AUTHORITATIVE"],
+            "branch_coverage": coverage,
+            "undercovered_branches": undercovered,
+            "planner_action": "CLAIM_EXISTING" if ready else "CONSIDER_PROPOSAL" if undercovered else "IDLE",
+            "materialization_requires": "approved WorkProposal or authorized planner/gate transition",
+        }
 
     def work_authority_get(self, project_id: str, authority_key: str,
                            canonical_subject_version: str | None = None) -> dict:
