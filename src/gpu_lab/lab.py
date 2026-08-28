@@ -85,9 +85,6 @@ class LabController:
                     created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL, completed_at TIMESTAMPTZ
                 );
                 DROP INDEX IF EXISTS lab_work_items_active_equivalence_unique;
-                CREATE UNIQUE INDEX lab_work_items_active_equivalence_unique
-                    ON lab_work_items(project_id,equivalence_key)
-                    WHERE equivalence_key IS NOT NULL AND status IN ('DORMANT','READY','CLAIMED','RUNNING','RUNNING_DETACHED','RESULT_READY','WAITING_DEPENDENCY','BLOCKED');
                 CREATE INDEX IF NOT EXISTS lab_work_items_project_status_priority_idx
                     ON lab_work_items(project_id,status,priority DESC,created_at);
                 CREATE TABLE IF NOT EXISTS lab_work_dependencies (
@@ -205,6 +202,17 @@ class LabController:
                 ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS dependency_scope TEXT NOT NULL DEFAULT 'WORKITEM_LOCAL';
                 ALTER TABLE lab_work_dependencies ADD COLUMN IF NOT EXISTS dependency_scope TEXT NOT NULL DEFAULT 'WORKITEM_LOCAL';
                 ALTER TABLE lab_work_leases ADD COLUMN IF NOT EXISTS lease_version INTEGER NOT NULL DEFAULT 1;
+                WITH ranked_equivalence AS (
+                    SELECT id, first_value(id) OVER (PARTITION BY project_id,equivalence_key ORDER BY created_at,id) AS canonical_id,
+                           row_number() OVER (PARTITION BY project_id,equivalence_key ORDER BY created_at,id) AS ordinal
+                    FROM lab_work_items WHERE equivalence_key IS NOT NULL
+                    AND status IN ('DORMANT','READY','CLAIMED','RUNNING','RUNNING_DETACHED','RESULT_READY','WAITING_DEPENDENCY','BLOCKED')
+                )
+                UPDATE lab_work_items AS duplicate SET status='SUPERSEDED',authority_status='SUPERSEDED',superseded_by=ranked_equivalence.canonical_id,
+                    invalidated_reason='v3.5.5 migration: duplicate active equivalence key',invalidated_at=NOW(),updated_at=NOW(),work_version=work_version+1
+                FROM ranked_equivalence WHERE duplicate.id=ranked_equivalence.id AND ranked_equivalence.ordinal>1;
+                CREATE UNIQUE INDEX IF NOT EXISTS lab_work_items_active_equivalence_unique ON lab_work_items(project_id,equivalence_key)
+                    WHERE equivalence_key IS NOT NULL AND status IN ('DORMANT','READY','CLAIMED','RUNNING','RUNNING_DETACHED','RESULT_READY','WAITING_DEPENDENCY','BLOCKED');
             """)
 
     @staticmethod
