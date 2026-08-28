@@ -144,6 +144,50 @@ def test_v36_branch_cannot_cross_objective_boundary():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_refuting_branch_releases_live_lease_and_worker_ownership():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-v36-branch-retire-{time.time_ns()}", "v3.6 branch retirement")["project_id"]
+    joined = lab.join(None, "v36-branch-retire-worker", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    objective = lab.canonical_objective_create(project_id, "SCIENTIFIC", "Refutation", "Which branch survives?")
+    branch = lab.hypothesis_branch_create(project_id, objective["id"])
+    portfolio = lab.hypothesis_portfolio_ensure(project_id, objective["id"])
+    assert portfolio["active_branch_ids"] == [branch["id"]]
+    work = lab.create_work(
+        project_id, "ANALYSIS", "Live branch analysis", "Must be released when branch is refuted.",
+        "RESULT_INSPECTOR", worker_id, created_session_id=session_id,
+        canonical_objective_id=objective["id"], branch_id=branch["id"],
+    )
+    claimed = lab.claim_work(work["id"], worker_id, session_id)
+    assert lab.start_work(work["id"], worker_id, session_id)["status"] == "RUNNING"
+
+    transitioned = lab.hypothesis_branch_transition(
+        branch["id"], worker_id, session_id, "REFUTED", "The discriminating prediction failed.",
+    )
+
+    assert transitioned["retired_descendants"] == 1
+    retired = lab.work_get(work["id"])
+    assert retired["status"] == "INVALIDATED"
+    assert retired["lease_id"] is None
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT released_at,release_reason FROM lab_work_leases WHERE id=%s", (claimed["lease_id"],))
+        lease = cur.fetchone()
+        cur.execute("SELECT current_work_item_id,status FROM research_worker_sessions WHERE id=%s", (session_id,))
+        session = cur.fetchone()
+        cur.execute("SELECT availability_state FROM research_workers WHERE id=%s", (worker_id,))
+        worker = cur.fetchone()
+    assert lease["released_at"] is not None
+    assert lease["release_reason"] == "BRANCH_RETIRED"
+    assert session["current_work_item_id"] is None
+    assert session["status"] == "ACTIVE"
+    assert worker["availability_state"] == "AVAILABLE"
+    refreshed_portfolio = lab.hypothesis_portfolio_ensure(project_id, objective["id"])
+    assert refreshed_portfolio["active_branch_ids"] == []
+    assert refreshed_portfolio["status"] == "RESOLVED"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_v36_feature_gated_scheduler_claims_existing_work_or_records_healthy_idle():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store, feature_flags={"BRANCH_AWARE_ASSIGNMENT": True})

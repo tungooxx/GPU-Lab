@@ -437,8 +437,36 @@ class LabController:
                  scientific_distance, architecture_lineage_id, state, priority, json.dumps(branch_dependencies or []), scope, now),
             )
             self._event(cur, project_id, "HYPOTHESIS_BRANCH_CREATED", ident, {"canonical_objective_id": canonical_objective_id, "state": state})
+            self._refresh_portfolio_branches(cur, project_id, canonical_objective_id, now)
             cur.execute("SELECT * FROM hypothesis_branches WHERE id=%s", (ident,))
             return self._record(cur.fetchone()) or {}
+
+    def _refresh_portfolio_branches(self, cur, project_id: str, canonical_objective_id: str,
+                                    now: datetime) -> None:
+        """Keep the persisted portfolio membership aligned with branch lifecycle.
+
+        This is a scheduling projection, not scientific interpretation.  It is
+        deliberately refreshed inside the same transaction that creates or
+        transitions a branch, so controller restart cannot resurrect a branch
+        that was already retired from the current objective version.
+        """
+        cur.execute("SELECT version FROM canonical_objectives WHERE id=%s AND project_id=%s", (canonical_objective_id, project_id))
+        objective = cur.fetchone()
+        if not objective:
+            return
+        cur.execute(
+            "SELECT id FROM hypothesis_branches WHERE canonical_objective_id=%s "
+            "AND state IN ('OPEN','WAITING','BLOCKED','WEAKENED','SUPPORTED_WITHIN_SCOPE') "
+            "ORDER BY priority DESC,created_at",
+            (canonical_objective_id,),
+        )
+        branch_ids = [str(row["id"]) for row in cur.fetchall()]
+        cur.execute(
+            "UPDATE hypothesis_portfolios SET active_branch_ids=%s,status=%s,updated_at=%s "
+            "WHERE project_id=%s AND canonical_objective_id=%s AND objective_version=%s",
+            (json.dumps(branch_ids), "ACTIVE" if branch_ids else "RESOLVED", now,
+             project_id, canonical_objective_id, objective["version"]),
+        )
 
     def hypothesis_branch_transition(self, branch_id: str, worker_id: str, session_id: str,
                                      state: str, rationale: str) -> dict:
@@ -457,9 +485,51 @@ class LabController:
             self._session(cur, session_id, worker_id, str(branch["project_id"]))
             cur.execute("UPDATE hypothesis_branches SET state=%s,resolved_at=CASE WHEN %s IN ('RESOLVED','REFUTED','ABANDONED','SUPERSEDED') THEN %s ELSE resolved_at END WHERE id=%s", (state, state, now, branch_id))
             retired = 0
-            if state in {"REFUTED", "ABANDONED", "SUPERSEDED"}:
-                cur.execute("UPDATE lab_work_items SET status='INVALIDATED',invalidated_reason=%s,invalidated_at=%s,updated_at=%s,work_version=work_version+1 WHERE branch_id=%s AND status=ANY(%s)", (f"Branch {state}: {rationale.strip()}", now, now, branch_id, list(ACTIVE_WORK_STATUSES)))
-                retired = cur.rowcount
+            if state in {"RESOLVED", "REFUTED", "ABANDONED", "SUPERSEDED"}:
+                # A terminal branch state retires *operational work ownership*, not
+                # merely its display status.  Leaving a lease/session behind here
+                # makes a worker look BUSY against invalidated work and can block
+                # the portfolio scheduler indefinitely after a branch refutation.
+                cur.execute(
+                    "SELECT * FROM lab_work_items WHERE branch_id=%s AND status=ANY(%s) FOR UPDATE",
+                    (branch_id, list(ACTIVE_WORK_STATUSES)),
+                )
+                retired_items = cur.fetchall()
+                released_worker_ids: set[str] = set()
+                for item in retired_items:
+                    if item["assigned_worker_id"]:
+                        released_worker_ids.add(str(item["assigned_worker_id"]))
+                    cur.execute(
+                        "UPDATE lab_work_leases SET released_at=%s,release_reason='BRANCH_RETIRED',lease_version=lease_version+1 "
+                        "WHERE work_item_id=%s AND released_at IS NULL",
+                        (now, item["id"]),
+                    )
+                    cur.execute(
+                        "UPDATE lab_work_items SET status='INVALIDATED',invalidated_reason=%s,invalidated_at=%s,"
+                        "completed_at=%s,assigned_worker_id=NULL,assigned_session_id=NULL,lease_id=NULL,"
+                        "updated_at=%s,work_version=work_version+1 WHERE id=%s",
+                        (f"Branch {state}: {rationale.strip()}", now, now, now, item["id"]),
+                    )
+                    cur.execute(
+                        "UPDATE research_worker_sessions SET current_work_item_id=NULL,active_role=NULL,status='ACTIVE',"
+                        "last_heartbeat_at=%s WHERE current_work_item_id=%s",
+                        (now, item["id"]),
+                    )
+                    self._event(cur, branch["project_id"], "WORK_ITEM_INVALIDATED", item["id"], {
+                        "reason": f"Branch {state}: {rationale.strip()}", "branch_id": branch_id,
+                    })
+                    retired += 1
+                # A worker can have more than one live session, so publish it as
+                # AVAILABLE only when no remaining session still owns work.
+                if released_worker_ids:
+                    cur.execute(
+                        "UPDATE research_workers w SET availability_state='AVAILABLE',availability_updated_at=%s,"
+                        "idle_reason=NULL,idle_since=NULL WHERE w.id=ANY(%s) AND NOT EXISTS ("
+                        "SELECT 1 FROM research_worker_sessions s WHERE s.worker_id=w.id "
+                        "AND s.current_work_item_id IS NOT NULL AND s.status IN ('ACTIVE','BUSY','WAITING'))",
+                        (now, list(released_worker_ids)),
+                    )
+            self._refresh_portfolio_branches(cur, str(branch["project_id"]), str(branch["canonical_objective_id"]), now)
             self._event(cur, branch["project_id"], "HYPOTHESIS_BRANCH_TRANSITIONED", branch_id, {"state": state, "retired_descendants": retired})
         return {"branch_id": branch_id, "state": state, "retired_descendants": retired}
 
@@ -2109,7 +2179,9 @@ class LabController:
             cur.execute("SELECT * FROM hypothesis_portfolios WHERE project_id=%s AND canonical_objective_id=%s AND objective_version=%s", (project_id, canonical_objective_id, objective["version"]))
             existing = cur.fetchone()
             if existing:
-                return self._record(existing) or {}
+                self._refresh_portfolio_branches(cur, project_id, canonical_objective_id, now)
+                cur.execute("SELECT * FROM hypothesis_portfolios WHERE id=%s", (existing["id"],))
+                return self._record(cur.fetchone()) or {}
             cur.execute("SELECT id FROM hypothesis_branches WHERE canonical_objective_id=%s AND state IN ('OPEN','WAITING','BLOCKED') ORDER BY priority DESC,created_at", (canonical_objective_id,))
             branches = [str(row["id"]) for row in cur.fetchall()]
             ident = str(uuid.uuid4())
