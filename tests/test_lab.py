@@ -447,6 +447,20 @@ def test_v36_agenda_coverage_exposes_unbranched_active_agenda_item():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_planner_on_idle_receives_unbranched_agenda_item_without_creating_work():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store, feature_flags={"BRANCH_AWARE_ASSIGNMENT": True, "PLANNER_ON_IDLE": True})
+    project_id = store.project_create(f"lab-v36-agenda-planner-{time.time_ns()}", "v3.6 agenda planner")["project_id"]
+    joined = lab.join(None, f"v36-agenda-planner-worker-{time.time_ns()}", "CODEX", project_id)
+    agenda_item = store.object_create(project_id, "AgendaItem", {"question": "Which strong null remains untested?"}, "AGENDA_ITEM_CREATED", "OPEN")
+    result = lab.portfolio_assign_existing(project_id, joined["worker"]["id"], joined["session_id"])
+    assert result["idle_reason"] == "PLANNER_EVALUATION_REQUIRED"
+    assert result["planner_candidates"]["unbranched_agenda_items"][0]["agenda_item_id"] == agenda_item["id"]
+    assert result["plan"]["rationale"]["unbranched_agenda_item_ids"] == [agenda_item["id"]]
+    assert lab.work_list(project_id, None, 100) == []
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_v36_historical_replay_is_read_only_and_never_claims_counterfactual_science():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)

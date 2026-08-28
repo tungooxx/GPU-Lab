@@ -2376,17 +2376,23 @@ class LabController:
     def work_planner_candidates(self, project_id: str, limit: int = 50) -> dict:
         """Agenda-aware planning input. It never creates work merely to occupy idle workers."""
         coverage = self.branch_coverage_get(project_id)
+        agenda_coverage = self.agenda_coverage_get(project_id)
         ready = self.work_list(project_id, ["READY"], limit)
         global_blocks = self._objective_global_blocks(project_id)
         active_branch_ids = {str(item["branch_id"]) for item in ready if item.get("branch_id")}
         undercovered = [branch for branch in coverage if branch["status"] in {"OPEN", "WAITING"} and branch["active_work_count"] == 0]
+        unbranched_agenda_items = [
+            item for item in agenda_coverage
+            if item.get("agenda_item_id") and item.get("coverage_state") == "UNCOVERED_ACTIONABLE"
+        ]
         return {
             "project_id": project_id,
             "ready_canonical_work": [item for item in ready if item.get("authority_status") == "AUTHORITATIVE"],
             "branch_coverage": coverage,
             "undercovered_branches": undercovered,
+            "unbranched_agenda_items": unbranched_agenda_items,
             "objective_global_blocks": global_blocks,
-            "planner_action": "IDLE_OBJECTIVE_GLOBAL_BLOCK" if global_blocks else "CLAIM_EXISTING" if ready else "CONSIDER_PROPOSAL" if undercovered else "IDLE",
+            "planner_action": "IDLE_OBJECTIVE_GLOBAL_BLOCK" if global_blocks else "CLAIM_EXISTING" if ready else "CONSIDER_PROPOSAL" if (undercovered or unbranched_agenda_items) else "IDLE",
             "materialization_requires": "approved WorkProposal or authorized planner/gate transition",
         }
 
@@ -2719,7 +2725,8 @@ class LabController:
             project_id, None, [{"worker_id": worker_id, "session_id": session_id, "work_item_id": None}],
             {"reason": idle_reason, "new_work_created": False,
              "planner_action": "REQUEST_CENTRAL_PLANNER_EVALUATION" if planner_needed else "IDLE",
-             "undercovered_branch_ids": [entry["branch_id"] for entry in planner_candidates["undercovered_branches"]] if planner_needed else []},
+             "undercovered_branch_ids": [entry["branch_id"] for entry in planner_candidates["undercovered_branches"]] if planner_needed else [],
+             "unbranched_agenda_item_ids": [entry["agenda_item_id"] for entry in planner_candidates["unbranched_agenda_items"]] if planner_needed else []},
         )
         return {"status": "IDLE", "idle_reason": idle_reason, "plan": plan,
                 "planner_action": "REQUEST_CENTRAL_PLANNER_EVALUATION" if planner_needed else "IDLE",
