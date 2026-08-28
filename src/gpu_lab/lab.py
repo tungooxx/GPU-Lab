@@ -30,6 +30,7 @@ ACTIVE_WORK_STATUSES = {
 AUTHORITY_STATUSES = {"AUTHORITATIVE", "SUPPORTING", "RECOVERY_TEMPLATE", "OBSOLETE", "SUPERSEDED"}
 OBJECTIVE_STATUSES = {"ACTIVE", "BLOCKED", "RESOLVED", "SUPERSEDED", "PAUSED", "CANCELLED"}
 PROPOSAL_STATUSES = {"PROPOSED", "MERGED_INTO_EXISTING", "SATISFIED_BY_TERMINAL", "MATERIALIZED", "REJECTED_DUPLICATE", "REJECTED_LOW_VALUE", "REJECTED_STALE", "SUPERSEDED"}
+DEPENDENCY_SCOPES = {"WORKITEM_LOCAL", "BRANCH", "PORTFOLIO", "OBJECTIVE_GLOBAL"}
 GATE_STATUSES = {"PENDING", "PREFLIGHT_FAILED", "AWAITING_SEMANTIC_REVIEW", "PASS", "FAIL", "INVALID", "SUPERSEDED"}
 PREFLIGHT_STATUSES = {"PASS", "FAIL"}
 COORDINATION_VERSION = "lab-coordination-v3.2.2-gates-v1"
@@ -191,6 +192,8 @@ class LabController:
                 );
                 ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS canonical_objective_id UUID REFERENCES canonical_objectives(id);
                 ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS dependency_scope TEXT NOT NULL DEFAULT 'WORKITEM_LOCAL';
+                ALTER TABLE lab_work_dependencies ADD COLUMN IF NOT EXISTS dependency_scope TEXT NOT NULL DEFAULT 'WORKITEM_LOCAL';
+                ALTER TABLE lab_work_leases ADD COLUMN IF NOT EXISTS lease_version INTEGER NOT NULL DEFAULT 1;
             """)
 
     @staticmethod
@@ -212,6 +215,15 @@ class LabController:
 
     def _event(self, cur, project_id: str, event_type: str, subject_id: str | None, payload: dict) -> None:
         self.store._event(cur, project_id, event_type, subject_id, payload)
+
+    def _outbox(self, cur, project_id: str, event_type: str, subject_id: str | None,
+                idempotency_key: str, payload: dict) -> None:
+        """Durably queue a projection/wake event in the same transaction as its state change."""
+        cur.execute(
+            "INSERT INTO lab_transactional_outbox(id,project_id,event_type,subject_id,payload,idempotency_key,created_at) "
+            "VALUES(%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(project_id,idempotency_key) DO NOTHING",
+            (str(uuid.uuid4()), project_id, event_type, subject_id, json.dumps(payload), idempotency_key, self._now()),
+        )
 
     @staticmethod
     def authority_key(project_id: str, scientific_object_id: str, canonical_subject_version: str, gate_key: str) -> str:
@@ -755,10 +767,7 @@ class LabController:
         now, ident = self._now(), str(uuid.uuid4())
         dependencies = dependencies or []
         authority_status = self._validate(authority_status, AUTHORITY_STATUSES, "LAB_WORK_AUTHORITY_STATUS")
-        dependency_scope = self._validate(
-            dependency_scope, {"WORKITEM_LOCAL", "BRANCH", "PORTFOLIO", "OBJECTIVE_GLOBAL"},
-            "LAB_WORK_DEPENDENCY_SCOPE",
-        )
+        dependency_scope = self._validate(dependency_scope, DEPENDENCY_SCOPES, "LAB_WORK_DEPENDENCY_SCOPE")
         if dormant_until_dependencies and not dependencies:
             raise GPUError("LAB_DORMANT_WORK_DEPENDENCY_REQUIRED", "A dormant conditional branch needs dependencies")
         existing_id: str | None = None
@@ -855,7 +864,7 @@ class LabController:
         if not item:
             raise GPUError("LAB_WORK_NOT_FOUND", work_item_id)
         cur.execute(
-            "SELECT target_type,target_id,required_statuses,invalidating_statuses,description "
+            "SELECT target_type,target_id,required_statuses,invalidating_statuses,description,dependency_scope "
             "FROM lab_work_dependencies WHERE work_item_id=%s ORDER BY created_at",
             (work_item_id,),
         )
@@ -969,8 +978,16 @@ class LabController:
                 )
             if exists_only is not True and "allow_exists_only" in dependency and not isinstance(exists_only, bool):
                 raise GPUError("LAB_DEPENDENCY_EXISTS_ONLY_INVALID", target_id)
-            cur.execute("INSERT INTO lab_work_dependencies(id,work_item_id,target_type,target_id,required_statuses,invalidating_statuses,description,created_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",
-                        (str(uuid.uuid4()), work_item_id, target_type, target_id, json.dumps(required_statuses), json.dumps(dependency.get("invalidating_statuses", [])), str(dependency.get("description", "")), now))
+            scope = self._validate(
+                str(dependency.get("dependency_scope", "WORKITEM_LOCAL")), DEPENDENCY_SCOPES,
+                "LAB_DEPENDENCY_SCOPE",
+            )
+            cur.execute(
+                "INSERT INTO lab_work_dependencies(id,work_item_id,target_type,target_id,required_statuses,invalidating_statuses,description,dependency_scope,created_at) "
+                "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (str(uuid.uuid4()), work_item_id, target_type, target_id, json.dumps(required_statuses),
+                 json.dumps(dependency.get("invalidating_statuses", [])), str(dependency.get("description", "")), scope, now),
+            )
 
     def resolve_dependencies(self, project_id: str) -> dict[str, int]:
         """Reconcile dependency-gated work without leaving unsafe READY items claimable."""
@@ -997,18 +1014,19 @@ class LabController:
                 outcomes = [self._dependency_status(cur, project_id, dependency) for dependency in dependencies]
                 invalidations = [detail for _, invalidated, detail in outcomes if invalidated]
                 if invalidations and item["status"] in ACTIVE_WORK_STATUSES:
-                    cur.execute("UPDATE lab_work_items SET status='INVALIDATED',invalidated_reason=%s,updated_at=%s,completed_at=%s WHERE id=%s", ("; ".join(invalidations), now, now, item["id"]))
+                    cur.execute("UPDATE lab_work_items SET status='INVALIDATED',invalidated_reason=%s,updated_at=%s,completed_at=%s,work_version=work_version+1 WHERE id=%s RETURNING work_version", ("; ".join(invalidations), now, now, item["id"]))
+                    version = cur.fetchone()["work_version"]
                     self._event(cur, project_id, "WORK_ITEM_INVALIDATED", item["id"], {"reason": invalidations})
+                    self._outbox(cur, project_id, "WORK_ITEM_INVALIDATED", str(item["id"]), f"work-invalidated:{item['id']}:{version}", {"reason": invalidations, "work_version": version})
                     changed["invalidated"] += 1
                     continue
                 unsatisfied = [detail for satisfied, _, detail in outcomes if not satisfied]
                 if unsatisfied and item["status"] == "READY":
                     reason = "; ".join(unsatisfied)
-                    cur.execute(
-                        "UPDATE lab_work_items SET status='WAITING_DEPENDENCY',blocked_reason=%s,updated_at=%s WHERE id=%s",
-                        (reason, now, item["id"]),
-                    )
+                    cur.execute("UPDATE lab_work_items SET status='WAITING_DEPENDENCY',blocked_reason=%s,updated_at=%s,work_version=work_version+1 WHERE id=%s RETURNING work_version", (reason, now, item["id"]))
+                    version = cur.fetchone()["work_version"]
                     self._event(cur, project_id, "WORK_ITEM_WAITING_DEPENDENCY", item["id"], {"reason": reason})
+                    self._outbox(cur, project_id, "WORK_ITEM_WAITING_DEPENDENCY", str(item["id"]), f"work-waiting:{item['id']}:{version}", {"reason": reason, "work_version": version})
                     changed["waiting"] += 1
                     continue
                 if all(satisfied for satisfied, _, _ in outcomes) and item["status"] in {"DORMANT", "WAITING_DEPENDENCY", "BLOCKED"}:
@@ -1026,19 +1044,23 @@ class LabController:
                             )
                             cur.execute(
                                 "UPDATE lab_work_items SET status='SUPERSEDED',authority_status='SUPERSEDED',"
-                                "superseded_by=%s,invalidated_reason=%s,invalidated_at=%s,updated_at=%s "
-                                "WHERE id=%s",
+                                "superseded_by=%s,invalidated_reason=%s,invalidated_at=%s,updated_at=%s,"
+                                "work_version=work_version+1 WHERE id=%s RETURNING work_version",
                                 (equivalent["id"], reason, now, now, item["id"]),
                             )
+                            version = cur.fetchone()["work_version"]
                             self._event(cur, project_id, "WORK_ITEM_EQUIVALENCE_SUPERSEDED", item["id"], {
                                 "canonical_work_item_id": str(equivalent["id"]),
                                 "equivalence_key": item["equivalence_key"], "reason": reason,
                             })
+                            self._outbox(cur, project_id, "WORK_ITEM_SUPERSEDED", str(item["id"]), f"work-superseded:{item['id']}:{version}", {"successor_id": str(equivalent["id"]), "work_version": version})
                             changed["invalidated"] += 1
                             continue
-                    cur.execute("UPDATE lab_work_items SET status='READY',blocked_reason=NULL,updated_at=%s WHERE id=%s", (now, item["id"]))
+                    cur.execute("UPDATE lab_work_items SET status='READY',blocked_reason=NULL,updated_at=%s,work_version=work_version+1 WHERE id=%s RETURNING work_version", (now, item["id"]))
+                    version = cur.fetchone()["work_version"]
                     self._event(cur, project_id, "WORK_DEPENDENCY_RESOLVED", item["id"], {})
                     self._event(cur, project_id, "WORK_ITEM_READY", item["id"], {})
+                    self._outbox(cur, project_id, "WORK_ITEM_READY", str(item["id"]), f"work-ready:{item['id']}:{version}", {"work_version": version})
                     changed["ready"] += 1
         return changed
 
@@ -1068,7 +1090,7 @@ class LabController:
                 if invalidations:
                     reason = "; ".join(invalidations)
                     cur.execute(
-                        "UPDATE lab_work_items SET status='INVALIDATED',invalidated_reason=%s,updated_at=%s,completed_at=%s WHERE id=%s AND status='READY'",
+                        "UPDATE lab_work_items SET status='INVALIDATED',invalidated_reason=%s,updated_at=%s,completed_at=%s,work_version=work_version+1 WHERE id=%s AND status='READY'",
                         (reason, now, now, work_item_id),
                     )
                     self._event(cur, target["project_id"], "WORK_ITEM_INVALIDATED", work_item_id, {"reason": invalidations})
@@ -1076,18 +1098,18 @@ class LabController:
                 elif unsatisfied:
                     reason = "; ".join(unsatisfied)
                     cur.execute(
-                        "UPDATE lab_work_items SET status='WAITING_DEPENDENCY',blocked_reason=%s,updated_at=%s WHERE id=%s AND status='READY'",
+                        "UPDATE lab_work_items SET status='WAITING_DEPENDENCY',blocked_reason=%s,updated_at=%s,work_version=work_version+1 WHERE id=%s AND status='READY'",
                         (reason, now, work_item_id),
                     )
                     self._event(cur, target["project_id"], "WORK_ITEM_WAITING_DEPENDENCY", work_item_id, {"reason": reason})
                     dependency_error = ("LAB_WORK_DEPENDENCY_UNSATISFIED", reason)
             if dependency_error is None:
                 self._enforce_claim_budget(cur, str(target["project_id"]), target, session_id)
-                cur.execute("UPDATE lab_work_items SET status='CLAIMED',assigned_worker_id=%s,assigned_session_id=%s,lease_id=%s,updated_at=%s WHERE id=%s AND status='READY' RETURNING *", (worker_id, session_id, lease_id, now, work_item_id))
+                cur.execute("UPDATE lab_work_items SET status='CLAIMED',assigned_worker_id=%s,assigned_session_id=%s,lease_id=%s,updated_at=%s,work_version=work_version+1 WHERE id=%s AND status='READY' RETURNING *", (worker_id, session_id, lease_id, now, work_item_id))
                 item = cur.fetchone()
                 if not item:
                     raise GPUError("LAB_WORK_NOT_CLAIMABLE", work_item_id)
-                cur.execute("INSERT INTO lab_work_leases(id,work_item_id,worker_id,worker_session_id,acquired_at,heartbeat_at,expires_at) VALUES(%s,%s,%s,%s,%s,%s,%s)", (lease_id, work_item_id, worker_id, session_id, now, now, expiry))
+                cur.execute("INSERT INTO lab_work_leases(id,work_item_id,worker_id,worker_session_id,acquired_at,heartbeat_at,expires_at,lease_version) VALUES(%s,%s,%s,%s,%s,%s,%s,1)", (lease_id, work_item_id, worker_id, session_id, now, now, expiry))
                 cur.execute("UPDATE research_worker_sessions SET current_work_item_id=%s,active_role=%s,status='BUSY',last_heartbeat_at=%s WHERE id=%s", (work_item_id, role or item["scientific_role"], now, session_id))
                 self._event(cur, item["project_id"], "WORK_CLAIMED", work_item_id, {"worker_id": worker_id, "session_id": session_id, "lease_id": lease_id, "role": role or item["scientific_role"]})
                 result = self._record(item)
@@ -1607,10 +1629,65 @@ class LabController:
         self.resolve_dependencies(project_id)
         state = self.state_get(project_id, session_id, since, reconcile=False)
         old_work_reassigned = bool(current_work_item_id and current_work_item_id != str(session["current_work_item_id"] or ""))
+        canonical_context = self._canonical_worker_context(project_id, session_id, state, since)
         return {
             "session_id": session_id, "old_work_reassigned": old_work_reassigned,
             "lease_state": lease_state, "lease_detail": lease_detail, "lab_state": state,
+            "canonical_worker_context": canonical_context,
         }
+
+    def _canonical_worker_context(self, project_id: str, session_id: str, state: dict,
+                                  since: str | None = None) -> dict[str, Any]:
+        """Compact coordinator projection; only IDs, versions, and actionable state are returned."""
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT worker_id,current_work_item_id,status FROM research_worker_sessions WHERE id=%s AND current_project_id=%s", (session_id, project_id))
+            session = cur.fetchone()
+            if not session:
+                raise GPUError("LAB_SESSION_NOT_FOUND", session_id)
+            item = None
+            lease = None
+            if session["current_work_item_id"]:
+                cur.execute("SELECT * FROM lab_work_items WHERE id=%s AND project_id=%s", (session["current_work_item_id"], project_id))
+                item = cur.fetchone()
+                if item:
+                    cur.execute("SELECT id,worker_id,expires_at,lease_version FROM lab_work_leases WHERE id=%s AND released_at IS NULL", (item["lease_id"],))
+                    lease = cur.fetchone()
+            objective = None
+            objective_id = item["canonical_objective_id"] if item else None
+            if objective_id:
+                cur.execute("SELECT id,version,title,current_goal,status FROM canonical_objectives WHERE id=%s", (objective_id,))
+                objective = cur.fetchone()
+            if not objective:
+                cur.execute("SELECT id,version,title,current_goal,status FROM canonical_objectives WHERE project_id=%s AND status='ACTIVE' ORDER BY priority DESC,updated_at DESC LIMIT 1", (project_id,))
+                objective = cur.fetchone()
+            unresolved: list[dict[str, Any]] = []
+            if item:
+                cur.execute("SELECT * FROM lab_work_dependencies WHERE work_item_id=%s ORDER BY created_at", (item["id"],))
+                for dependency in cur.fetchall():
+                    satisfied, invalidated, detail = self._dependency_status(cur, project_id, dependency)
+                    if not satisfied:
+                        unresolved.append({"target_type": dependency["target_type"], "target_id": dependency["target_id"], "scope": dependency["dependency_scope"], "invalidated": invalidated, "detail": detail})
+            events = state.get("recent_events", [])
+            if since:
+                events = [event for event in events if event["created_at"].isoformat() > since]
+            return {
+                "context_version": "v3.5.5",
+                "generated_at": self._now(),
+                "worker": {"worker_id": str(session["worker_id"]), "session_id": session_id, "status": session["status"]},
+                "project": {"project_id": project_id, "project_state_version": state["research_state_version"]},
+                "canonical_objective": self._record(objective),
+                "work": None if not item else {
+                    "work_item_id": str(item["id"]), "work_item_version": item["work_version"],
+                    "authority_key": item["authority_key"], "subject_id": item["subject_id"],
+                    "subject_version": item["canonical_subject_version"], "status": item["status"],
+                    "role": item["scientific_role"], "mode": item["kind"],
+                },
+                "lease": None if not lease else {"lease_id": str(lease["id"]), "version": lease["lease_version"], "owner": str(lease["worker_id"]), "expires_at": lease["expires_at"]},
+                "dependencies": {"unresolved": unresolved, "newly_resolved": []},
+                "invalidations": [event for event in events if "INVALIDATED" in event["event_type"] or "SUPERSEDED" in event["event_type"]],
+                "relevant_changes_since_last_sync": events,
+                "critical_messages": state.get("unread_messages", []),
+            }
 
     def v355_production_audit(self, project_id: str) -> dict[str, Any]:
         """Read-only v3.5.5 consistency audit; never changes lab or science state."""
