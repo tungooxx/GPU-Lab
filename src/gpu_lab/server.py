@@ -1713,6 +1713,11 @@ async def lab_work_planner_candidates(project_id: str, limit: int = 50):
     return await call(lab().work_planner_candidates, project_id, limit)
 
 @mcp.tool()
+async def research_portfolio_scheduler_shadow(project_id: str, limit: int = 50):
+    """Read-only v3.6 branch-aware assignment suggestions using existing canonical READY work only."""
+    return await call(lab().portfolio_scheduler_shadow, project_id, limit)
+
+@mcp.tool()
 async def canonical_execution_projection_get(project_id: str):
     """Show current canonical runs separately from historical/non-canonical physical runs."""
     return await call(lab().canonical_execution_projection, project_id)

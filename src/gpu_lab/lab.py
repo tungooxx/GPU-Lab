@@ -1981,6 +1981,26 @@ class LabController:
             "materialization_requires": "approved WorkProposal or authorized planner/gate transition",
         }
 
+    def portfolio_scheduler_shadow(self, project_id: str, limit: int = 50) -> dict:
+        """Read-only v3.6 scheduling recommendation; existing READY canonical work always wins."""
+        coverage = {item["branch_id"]: item for item in self.branch_coverage_get(project_id)}
+        ready = [item for item in self.work_list(project_id, ["READY"], limit) if item.get("authority_status") == "AUTHORITATIVE"]
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id,display_name,worker_type,availability_state FROM research_workers WHERE enabled=TRUE ORDER BY created_at")
+            workers = [self._record(row) or {} for row in cur.fetchall()]
+        assignments, used = [], set()
+        for worker in workers:
+            if worker["availability_state"] not in {"AVAILABLE", "IDLE"}:
+                continue
+            candidate = next((item for item in ready if item["id"] not in used), None)
+            if candidate:
+                used.add(candidate["id"])
+                branch = coverage.get(str(candidate.get("branch_id") or ""), {})
+                assignments.append({"worker_id": worker["id"], "suggested_work_item_id": candidate["id"], "branch_id": candidate.get("branch_id"), "reason": "EXISTING_READY_CANONICAL_WORK", "dependency_scope": candidate.get("dependency_scope"), "branch_coverage": branch})
+            else:
+                assignments.append({"worker_id": worker["id"], "suggested_work_item_id": None, "reason": "IDLE_NO_EXISTING_ACTIONABLE_WORK"})
+        return {"projection_version": "v3.6-shadow", "assignments": assignments, "unassigned_ready_work_item_ids": [item["id"] for item in ready if item["id"] not in used], "planner_action": "DO_NOT_CREATE_WORK" if not ready else "CLAIM_EXISTING_ONLY"}
+
     def canonical_execution_projection(self, project_id: str) -> dict:
         """Separate current canonical execution from physically real historical runs."""
         with self.store._connect() as conn, conn.cursor() as cur:
