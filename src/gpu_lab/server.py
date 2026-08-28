@@ -1690,6 +1690,11 @@ async def lab_work_planner_candidates(project_id: str, limit: int = 50):
     """Return agenda-aware planning candidates without automatically creating work for idle workers."""
     return await call(lab().work_planner_candidates, project_id, limit)
 
+@mcp.tool()
+async def canonical_execution_projection_get(project_id: str):
+    """Show current canonical runs separately from historical/non-canonical physical runs."""
+    return await call(lab().canonical_execution_projection, project_id)
+
 
 @mcp.tool()
 async def lab_work_authority_get(project_id: str, authority_key: str,

@@ -1913,6 +1913,16 @@ class LabController:
             "materialization_requires": "approved WorkProposal or authorized planner/gate transition",
         }
 
+    def canonical_execution_projection(self, project_id: str) -> dict:
+        """Separate current canonical execution from physically real historical runs."""
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM lab_work_items WHERE project_id=%s AND related_refs ? 'experiment_run_id' ORDER BY updated_at DESC", (project_id,))
+            current, historical = [], []
+            for item in cur.fetchall():
+                entry = {"work_item_id": str(item["id"]), "run_id": item["related_refs"].get("experiment_run_id"), "subject_id": item["subject_id"], "subject_version": item["canonical_subject_version"], "physical_work_status": item["status"], "canonical": item["status"] not in {"SUPERSEDED", "INVALIDATED"} and item["authority_status"] == "AUTHORITATIVE", "superseded_by": str(item["superseded_by"]) if item["superseded_by"] else None}
+                (current if entry["canonical"] else historical).append(entry)
+            return {"current_canonical_runs": current, "historical_or_noncanonical_runs": historical}
+
     def work_authority_get(self, project_id: str, authority_key: str,
                            canonical_subject_version: str | None = None) -> dict:
         with self.store._connect() as conn, conn.cursor() as cur:
