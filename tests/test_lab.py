@@ -736,6 +736,21 @@ def test_branch_coverage_respects_persisted_branch_dependencies():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_branch_coverage_accepts_legacy_type_status_dependencies():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-legacy-branch-dependency-{time.time_ns()}", "legacy branch dependency coverage")["project_id"]
+    objective = lab.canonical_objective_create(project_id, "SCIENTIFIC", "Sleeve", "Does sleeve input validate?")
+    branch = lab.hypothesis_branch_create(
+        project_id, objective["id"], question_id="VALIDATED_SLEEVE_INPUT",
+        branch_dependencies=[{"type": "VALIDATED_SLEEVE_INPUT", "status": "BLOCKED", "detail": "No validated sleeve."}],
+    )
+    coverage = next(item for item in lab.branch_coverage_get(project_id) if item["branch_id"] == branch["id"])
+    assert coverage["next_actionability"] == "WAITING_BRANCH_DEPENDENCY"
+    assert coverage["unresolved_branch_dependencies"][0]["reason"].endswith("BLOCKED")
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_v36_controller_restart_reconstructs_waiting_branch_and_reclaims_after_dependency():
     store = ResearchStore(TEST_DATABASE_URL)
     flags = {"WAITING_WORK_RELEASE": True, "BRANCH_AWARE_ASSIGNMENT": True}

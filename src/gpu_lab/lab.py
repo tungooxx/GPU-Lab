@@ -1357,6 +1357,20 @@ class LabController:
         required = dependency["required_statuses"] or []
         return (not required or status in required), False, f"dependency {target_id} is {status}"
 
+    def _branch_dependency_status(self, cur, project_id: str, dependency: dict) -> tuple[bool, bool, str]:
+        """Evaluate typed dependencies and legacy branch metadata safely."""
+        if dependency.get("target_type") and dependency.get("target_id"):
+            return self._dependency_status(
+                cur, project_id, {"required_statuses": [], "invalidating_statuses": [], **dependency}
+            )
+        legacy_status = str(dependency.get("status", "")).upper()
+        legacy_type = str(dependency.get("type", "LEGACY_BRANCH_DEPENDENCY"))
+        if legacy_status in {"SATISFIED", "COMPLETED", "PASS"}:
+            return True, False, f"legacy branch dependency {legacy_type} is {legacy_status}"
+        if legacy_status in {"INVALID", "INVALIDATED", "SUPERSEDED"}:
+            return False, True, f"legacy branch dependency {legacy_type} is {legacy_status}"
+        return False, False, f"legacy branch dependency {legacy_type} is {legacy_status or 'UNRESOLVED'}"
+
     @staticmethod
     def _linked_experiment_run_ids(related_refs: dict[str, Any]) -> set[str]:
         """Extract explicit run links without guessing from arbitrary text."""
@@ -2345,12 +2359,9 @@ class LabController:
                     (branch["id"],),
                 )
                 unresolved_dependencies = [self._record(item) or {} for item in cur.fetchall()]
-                branch_dependencies = [
-                    {"required_statuses": [], "invalidating_statuses": [], **dependency}
-                    for dependency in (branch["branch_dependencies"] or [])
-                ]
+                branch_dependencies = list(branch["branch_dependencies"] or [])
                 branch_dependency_outcomes = [
-                    self._dependency_status(cur, project_id, dependency)
+                    self._branch_dependency_status(cur, project_id, dependency)
                     for dependency in branch_dependencies
                 ]
                 unresolved_branch_dependencies = [
