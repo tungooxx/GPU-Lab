@@ -39,6 +39,7 @@ RESOURCE_CLASSES = {"REASONING", "ENGINEERING", "GPU", "TRAINING", "LITERATURE",
 GATE_STATUSES = {"PENDING", "PREFLIGHT_FAILED", "AWAITING_SEMANTIC_REVIEW", "PASS", "FAIL", "INVALID", "SUPERSEDED"}
 PREFLIGHT_STATUSES = {"PASS", "FAIL"}
 COORDINATION_VERSION = "lab-coordination-v3.2.2-gates-v1"
+PLANNER_LEASE_SECONDS = 300
 MESSAGE_TYPES = {
     "REQUEST_REVIEW", "REQUEST_DATA", "REQUEST_IMPLEMENTATION", "SHARE_FINDING",
     "CHALLENGE_INTERPRETATION", "HANDOFF", "BLOCKER", "CROSS_PROJECT_RELEVANCE",
@@ -75,6 +76,13 @@ class LabController:
                 );
                 CREATE INDEX IF NOT EXISTS research_worker_sessions_project_active_idx
                     ON research_worker_sessions(current_project_id,last_heartbeat_at DESC);
+                CREATE TABLE IF NOT EXISTS lab_project_planner_leases (
+                    project_id UUID PRIMARY KEY REFERENCES research_projects(id),
+                    worker_id UUID NOT NULL REFERENCES research_workers(id),
+                    session_id UUID NOT NULL REFERENCES research_worker_sessions(id),
+                    acquired_at TIMESTAMPTZ NOT NULL, heartbeat_at TIMESTAMPTZ NOT NULL,
+                    expires_at TIMESTAMPTZ NOT NULL, lease_version INTEGER NOT NULL DEFAULT 1
+                );
                 CREATE TABLE IF NOT EXISTS lab_work_items (
                     id UUID PRIMARY KEY, project_id UUID NOT NULL REFERENCES research_projects(id),
                     kind TEXT NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL,
@@ -364,6 +372,38 @@ class LabController:
             cur.execute("SELECT * FROM lab_work_proposals WHERE id=%s", (ident,))
             return self._record(cur.fetchone()) or {}
 
+    def _planner_lease_elect(self, cur, project_id: str, worker_id: str, session_id: str) -> dict:
+        """Acquire the one expiring planner lease for a project."""
+        now = self._now()
+        expiry = now + timedelta(seconds=PLANNER_LEASE_SECONDS)
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"planner:{project_id}",))
+        cur.execute("SELECT * FROM lab_project_planner_leases WHERE project_id=%s FOR UPDATE", (project_id,))
+        current = cur.fetchone()
+        if current and current["expires_at"] > now:
+            if str(current["worker_id"]) == str(worker_id) and str(current["session_id"]) == str(session_id):
+                cur.execute(
+                    "UPDATE lab_project_planner_leases SET heartbeat_at=%s,expires_at=%s,lease_version=lease_version+1 "
+                    "WHERE project_id=%s RETURNING *", (now, expiry, project_id),
+                )
+                return self._record(cur.fetchone()) or {}
+            raise GPUError("LAB_PROJECT_PLANNER_LEASE_HELD", str(current["worker_id"]))
+        if current:
+            cur.execute(
+                "UPDATE lab_project_planner_leases SET worker_id=%s,session_id=%s,acquired_at=%s,heartbeat_at=%s,"
+                "expires_at=%s,lease_version=lease_version+1 WHERE project_id=%s RETURNING *",
+                (worker_id, session_id, now, now, expiry, project_id),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO lab_project_planner_leases(project_id,worker_id,session_id,acquired_at,heartbeat_at,expires_at) "
+                "VALUES(%s,%s,%s,%s,%s,%s) RETURNING *", (project_id, worker_id, session_id, now, now, expiry),
+            )
+        lease = self._record(cur.fetchone()) or {}
+        self._event(cur, project_id, "PROJECT_PLANNER_ELECTED", None, {
+            "worker_id": worker_id, "session_id": session_id, "expires_at": expiry.isoformat(),
+        })
+        return lease
+
     def work_proposal_materialize(
         self, proposal_id: str, planner_worker_id: str, session_id: str,
         kind: str, title: str, description: str, scientific_role: str,
@@ -383,10 +423,7 @@ class LabController:
             if not proposal:
                 raise GPUError("LAB_WORK_PROPOSAL_NOT_FOUND", proposal_id)
             self._session(cur, session_id, planner_worker_id, str(proposal["project_id"]))
-            planner = self._worker(cur, planner_worker_id)
-            capabilities = planner["capabilities"] or {}
-            if not capabilities.get("can_materialize_work_plans"):
-                raise GPUError("LAB_WORK_PLANNER_AUTHORITY_REQUIRED", "worker capability can_materialize_work_plans=true")
+            self._planner_lease_elect(cur, str(proposal["project_id"]), planner_worker_id, session_id)
             if proposal["status"] != "PROPOSED":
                 return {"proposal": self._record(proposal), "materialization": "NOT_ACTIONABLE"}
             proposal_data = self._record(proposal) or {}
