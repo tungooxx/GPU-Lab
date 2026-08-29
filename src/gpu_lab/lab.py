@@ -15,8 +15,8 @@ from typing import Any
 import psycopg
 
 from .errors import GPUError
-from .research_portfolio_v36_shadow import ResearchPortfolioV36Shadow
 from .research import ResearchStore
+from .research_portfolio_v36_shadow import ResearchPortfolioV36Shadow
 
 RUNTIME_TYPES = {"CHATGPT_WEB", "OPENAI_API", "CLAUDE_API", "CODEX", "LOCAL_AGENT", "OTHER"}
 SESSION_STATUSES = {"ACTIVE", "BUSY", "WAITING", "IDLE", "DISCONNECTED", "EXPIRED"}
@@ -557,6 +557,31 @@ class LabController:
         if not session or session["status"] in {"DISCONNECTED", "EXPIRED"}:
             raise GPUError("LAB_SESSION_NOT_ACTIVE", session_id)
         return session
+
+    def _clear_stale_session_ownership(self, cur, worker_id: str, now: datetime) -> list[str]:
+        """Remove session pointers which no longer represent a live lease.
+
+        ``current_work_item_id`` is a projection for fast coordinator reads,
+        not an authority source. A pointer may survive a crash or an orphan
+        reconciliation, so it may block neither a fresh session nor a new
+        claim unless its WorkItem and lease still belong to that exact session.
+        """
+        cur.execute(
+            "UPDATE research_worker_sessions s SET current_work_item_id=NULL,active_role=NULL,"
+            "status=CASE WHEN s.status='BUSY' THEN 'ACTIVE' ELSE s.status END,"
+            "last_heartbeat_at=%s "
+            "WHERE s.worker_id=%s AND s.current_work_item_id IS NOT NULL "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM lab_work_items wi JOIN lab_work_leases l ON l.id=wi.lease_id "
+            "WHERE wi.id=s.current_work_item_id "
+            "AND wi.status NOT IN ('COMPLETED','SUPERSEDED','FAILED','CANCELLED','INVALIDATED','DORMANT') "
+            "AND wi.assigned_worker_id=s.worker_id AND wi.assigned_session_id=s.id "
+            "AND l.worker_id=s.worker_id AND l.worker_session_id=s.id "
+            "AND l.released_at IS NULL AND l.expires_at>=%s"
+            ") RETURNING s.id",
+            (now, worker_id, now),
+        )
+        return [str(row["id"]) for row in cur.fetchall()]
 
     def budget_set(self, project_id: str, worker_id: str, session_id: str,
                    limits: dict[str, Any]) -> dict:
@@ -1473,6 +1498,10 @@ class LabController:
             if not target:
                 raise GPUError("LAB_WORK_NOT_FOUND", work_item_id)
             session = self._session(cur, session_id, worker_id, str(target["project_id"]))
+            self._clear_stale_session_ownership(cur, worker_id, now)
+            # The reconciliation can clear this session's stale projection;
+            # reload the locked row before applying the ownership guard.
+            session = self._session(cur, session_id, worker_id, str(target["project_id"]))
             if str(session["current_project_id"]) != str(target["project_id"]):
                 raise GPUError("LAB_PROJECT_MISMATCH", work_item_id)
             # `_session(... FOR UPDATE)` serializes competing schedulers for one
@@ -2069,6 +2098,15 @@ class LabController:
             if not session:
                 raise GPUError("LAB_SESSION_NOT_FOUND", session_id)
             now = self._now()
+            self._clear_stale_session_ownership(cur, str(session["worker_id"]), now)
+            cur.execute(
+                "SELECT worker_id,current_work_item_id,status FROM research_worker_sessions "
+                "WHERE id=%s AND current_project_id=%s FOR UPDATE",
+                (session_id, project_id),
+            )
+            session = cur.fetchone()
+            if not session:
+                raise GPUError("LAB_SESSION_NOT_FOUND", session_id)
             if current_work_item_id:
                 cur.execute("SELECT id,status,assigned_session_id,work_version,subject_id FROM lab_work_items WHERE id=%s AND project_id=%s", (current_work_item_id, project_id))
                 item = cur.fetchone()

@@ -638,6 +638,86 @@ def test_v36_worker_identity_cannot_be_assigned_through_two_project_sessions():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_stale_completed_session_pointer_is_cleared_before_a_new_claim_after_restart():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-stale-completed-{time.time_ns()}", "stale completed ownership")['project_id']
+    joined = lab.join(None, f"stale-completed-{time.time_ns()}", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    completed = lab.create_work(project_id, "REVIEW", "Complete old", "terminal old work", "RESULT_INSPECTOR", worker_id, created_session_id=session_id)
+    lab.claim_work(completed["id"], worker_id, session_id)
+    lab.complete_work(completed["id"], worker_id, session_id)
+    replacement = lab.create_work(project_id, "REVIEW", "Claim new", "new ready work", "RESULT_INSPECTOR", worker_id, created_session_id=session_id)
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE research_worker_sessions SET current_work_item_id=%s,status='BUSY' WHERE id=%s", (completed["id"], session_id))
+
+    claimed = LabController(ResearchStore(TEST_DATABASE_URL)).claim_work(replacement["id"], worker_id, session_id)
+    assert claimed["id"] == replacement["id"]
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT current_work_item_id FROM research_worker_sessions WHERE id=%s", (session_id,))
+        assert str(cur.fetchone()["current_work_item_id"]) == replacement["id"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_released_orphaned_session_pointer_cannot_block_a_fresh_session_for_same_worker():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-orphaned-session-{time.time_ns()}", "orphaned session ownership")['project_id']
+    old = lab.join(None, f"orphaned-worker-{time.time_ns()}", "CODEX", project_id)
+    fresh = lab.join(old["worker"]["id"], None, "CODEX", project_id)
+    worker_id = old["worker"]["id"]
+    old_work = lab.create_work(project_id, "REVIEW", "Old lease", "orphaned old lease", "RESULT_INSPECTOR", worker_id, created_session_id=old["session_id"])
+    lab.claim_work(old_work["id"], worker_id, old["session_id"])
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE lab_work_leases SET released_at=NOW(),release_reason='ORPHANED_SESSION' WHERE work_item_id=%s", (old_work["id"],))
+        cur.execute("UPDATE research_worker_sessions SET current_work_item_id=%s,status='BUSY' WHERE id=%s", (old_work["id"], old["session_id"]))
+    new_work = lab.create_work(project_id, "REVIEW", "Fresh lease", "fresh ready work", "RESULT_INSPECTOR", worker_id, created_session_id=fresh["session_id"])
+
+    assert lab.claim_work(new_work["id"], worker_id, fresh["session_id"])["id"] == new_work["id"]
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT current_work_item_id FROM research_worker_sessions WHERE id=%s", (old["session_id"],))
+        assert cur.fetchone()["current_work_item_id"] is None
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_sync_cleans_lost_terminal_ownership_projection():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-sync-stale-{time.time_ns()}", "sync stale ownership")['project_id']
+    joined = lab.join(None, f"sync-stale-{time.time_ns()}", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    old_work = lab.create_work(project_id, "REVIEW", "Complete sync old", "terminal sync work", "RESULT_INSPECTOR", worker_id, created_session_id=session_id)
+    lab.claim_work(old_work["id"], worker_id, session_id)
+    lab.complete_work(old_work["id"], worker_id, session_id)
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE research_worker_sessions SET current_work_item_id=%s,status='BUSY' WHERE id=%s", (old_work["id"], session_id))
+
+    synced = lab.sync(session_id, project_id, current_work_item_id=old_work["id"])
+    assert synced["lease_state"] == "LEASE_LOST"
+    assert synced["sync_status"] == "WORK_COMPLETED_ELSEWHERE"
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT current_work_item_id FROM research_worker_sessions WHERE id=%s", (session_id,))
+        assert cur.fetchone()["current_work_item_id"] is None
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_live_lease_ownership_still_blocks_competing_session_claims():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-live-owner-{time.time_ns()}", "live owner remains exclusive")['project_id']
+    owner = lab.join(None, f"live-owner-{time.time_ns()}", "CODEX", project_id)
+    competitor = lab.join(owner["worker"]["id"], None, "CODEX", project_id)
+    worker_id = owner["worker"]["id"]
+    owned = lab.create_work(project_id, "REVIEW", "Live owned", "must retain ownership", "RESULT_INSPECTOR", worker_id, created_session_id=owner["session_id"])
+    contender = lab.create_work(project_id, "REVIEW", "Competing", "must not claim", "RESULT_INSPECTOR", worker_id, created_session_id=competitor["session_id"])
+    lab.claim_work(owned["id"], worker_id, owner["session_id"])
+
+    with pytest.raises(GPUError) as exc_info:
+        lab.claim_work(contender["id"], worker_id, competitor["session_id"])
+    assert exc_info.value.error_type == "LAB_WORKER_ALREADY_ASSIGNED"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_v36_controller_restart_reconstructs_waiting_branch_and_reclaims_after_dependency():
     store = ResearchStore(TEST_DATABASE_URL)
     flags = {"WAITING_WORK_RELEASE": True, "BRANCH_AWARE_ASSIGNMENT": True}
