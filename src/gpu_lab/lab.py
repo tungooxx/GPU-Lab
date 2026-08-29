@@ -1452,6 +1452,26 @@ class LabController:
             cur.execute(sql, args)
             return [self._record(row) for row in cur.fetchall()]
 
+    @staticmethod
+    def _scheduler_actionable_work(item: dict) -> bool:
+        """Return whether a READY item is safe for portfolio assignment.
+
+        ``AUTHORITATIVE`` remains mandatory for execution authority. It is not
+        required to assign outcome-independent design, analysis, or review
+        work. Treating every ``SUPPORTING`` item as invisible made a
+        materialized PRE_SCIENCE_DESIGN_FREEZE discoverable by equivalence
+        lookup but impossible for the scheduler to assign.
+        """
+        if item.get("status") != "READY" or item.get("superseded_by") or item.get("invalidated_at"):
+            return False
+        if item.get("authority_status") == "AUTHORITATIVE":
+            return True
+        return (
+            item.get("authority_status") == "SUPPORTING"
+            and item.get("resource_class") in {"REASONING", "REVIEW"}
+            and item.get("kind") not in {"RUN_EXPERIMENT", "TRAINING_RUN"}
+        )
+
     def gate_list(self, project_id: str, statuses: list[str] | None = None, limit: int = 100) -> list[dict]:
         with self.store._connect() as conn, conn.cursor() as cur:
             sql, args = "SELECT * FROM scientific_gates WHERE project_id=%s", [project_id]
@@ -2672,9 +2692,9 @@ class LabController:
             return [self._record(row) or {} for row in cur.fetchall()]
 
     def portfolio_scheduler_shadow(self, project_id: str, limit: int = 50) -> dict:
-        """Read-only v3.6 scheduling recommendation; existing READY canonical work always wins."""
+        """Read-only v3.6 scheduling recommendation using existing safe READY work."""
         coverage = {item["branch_id"]: item for item in self.branch_coverage_get(project_id)}
-        ready = [item for item in self.work_list(project_id, ["READY"], limit) if item.get("authority_status") == "AUTHORITATIVE"]
+        ready = [item for item in self.work_list(project_id, ["READY"], limit) if self._scheduler_actionable_work(item)]
         global_blocks = self._objective_global_blocks(project_id)
         workers = self._project_scheduler_workers(project_id)
         return ResearchPortfolioV36Shadow.project(workers, ready, coverage, global_blocks)
@@ -2790,7 +2810,7 @@ class LabController:
     def portfolio_production_audit(self, project_id: str) -> dict:
         """Read-only v3.6 coordination audit; no scheduler mutation or planning."""
         coverage = self.branch_coverage_get(project_id)
-        ready = [item for item in self.work_list(project_id, ["READY"], 500) if item.get("authority_status") == "AUTHORITATIVE"]
+        ready = [item for item in self.work_list(project_id, ["READY"], 500) if self._scheduler_actionable_work(item)]
         workers = self._project_scheduler_workers(project_id)
         with self.store._connect() as conn, conn.cursor() as cur:
             cur.execute(
@@ -2871,7 +2891,7 @@ class LabController:
         """Feature-gated v3.6 allocation for one available worker.
 
         This stage intentionally never materializes work: it can only atomically
-        claim an existing authoritative READY WorkItem, or persist an explicit
+        claim an existing safe READY WorkItem, or persist an explicit
         idle reason.  `claim_work` remains the concurrency guard, so concurrent
         scheduler processes cannot assign the same item twice.
         """
@@ -2902,7 +2922,7 @@ class LabController:
         coverage = {entry["branch_id"]: entry for entry in self.branch_coverage_get(project_id)}
         ready = [
             item for item in self.work_list(project_id, ["READY"], limit)
-            if item.get("authority_status") == "AUTHORITATIVE"
+            if self._scheduler_actionable_work(item)
             # Deterministic reallocation never adds a second worker to an
             # already-covered branch. A separately authorized correction or
             # review can still be explicitly claimed outside this allocator.

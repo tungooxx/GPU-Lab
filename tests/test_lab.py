@@ -411,7 +411,7 @@ def test_v36_production_audit_and_cockpit_portfolio_are_read_only():
     audit = lab.portfolio_production_audit(project_id)
     state = cockpit.state_get(project_id)
     assert audit["mutated"] is False
-    assert audit["existing_ready_canonical_work"] == []  # supporting work is never scheduler authority
+    assert [item["id"] for item in audit["existing_ready_canonical_work"]] == [work["id"]]
     assert state["portfolio_scheduler"]["branch_coverage"][0]["branch_id"] == branch["id"]
     assert lab.work_get(work["id"])["work_version"] == before["work_version"]
 
@@ -429,6 +429,30 @@ def test_v36_shadow_and_audit_only_expose_workers_joined_to_the_project():
     assert [entry["worker_id"] for entry in shadow["assignments"]] == [first["worker"]["id"]]
     assert [entry["id"] for entry in audit["workers"]["all"]] == [first["worker"]["id"]]
     assert second["worker"]["id"] not in [entry["id"] for entry in audit["workers"]["all"]]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_scheduler_surfaces_safe_supporting_work_but_not_supporting_execution():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store, feature_flags={"BRANCH_AWARE_ASSIGNMENT": True})
+    project_id = store.project_create(f"lab-v36-supporting-schedule-{time.time_ns()}", "supporting schedule")["project_id"]
+    joined = lab.join(None, f"v36-supporting-worker-{time.time_ns()}", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    safe = lab.create_work(
+        project_id, "PRE_SCIENCE_DESIGN_FREEZE", "Freeze recurrence", "Outcome-blind design freeze.",
+        "SCIENTIFIC_DESIGNER", worker_id, created_session_id=session_id,
+        authority_key="supporting-freeze", authority_status="SUPPORTING", resource_class="REASONING",
+    )
+    execution = lab.create_work(
+        project_id, "RUN_EXPERIMENT", "Do not schedule", "Execution still needs authority.",
+        "EXPERIMENT_OWNER", worker_id, created_session_id=session_id,
+        authority_key="supporting-execution", authority_status="SUPPORTING", resource_class="GPU",
+    )
+
+    shadow = lab.portfolio_scheduler_shadow(project_id)
+    assert safe["id"] in shadow["unassigned_ready_work_item_ids"]
+    assert execution["id"] not in shadow["unassigned_ready_work_item_ids"]
+    assert lab.portfolio_assign_existing(project_id, worker_id, session_id)["work_item"]["id"] == safe["id"]
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
