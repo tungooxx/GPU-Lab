@@ -660,6 +660,29 @@ def test_stale_completed_session_pointer_is_cleared_before_a_new_claim_after_res
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_missing_session_work_pointer_cannot_block_a_ready_claim():
+    """A deleted/nonexistent WorkItem pointer is never a hidden reservation."""
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-missing-pointer-{time.time_ns()}", "missing ownership pointer")['project_id']
+    joined = lab.join(None, f"missing-pointer-worker-{time.time_ns()}", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    ready = lab.create_work(project_id, "REVIEW", "Ready work", "must remain claimable", "RESULT_INSPECTOR", worker_id, created_session_id=session_id)
+    missing_work_id = str(uuid.uuid4())
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE research_worker_sessions SET current_work_item_id=%s,status='BUSY' WHERE id=%s",
+            (missing_work_id, session_id),
+        )
+
+    claimed = LabController(ResearchStore(TEST_DATABASE_URL)).claim_work(ready["id"], worker_id, session_id)
+    assert claimed["id"] == ready["id"]
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT current_work_item_id FROM research_worker_sessions WHERE id=%s", (session_id,))
+        assert str(cur.fetchone()["current_work_item_id"]) == ready["id"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_released_orphaned_session_pointer_cannot_block_a_fresh_session_for_same_worker():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)
