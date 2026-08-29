@@ -713,19 +713,23 @@ class ResearchBrain:
             **temporal,
         )
         latest_discovery_round = max(completed_rounds, key=lambda item: item["created_at"], default=None)
+        stale_terminal_discovery = None
         if latest_discovery_round:
-            # A completed archive is still not safe to rank after decisive
-            # state changed.  The DDE snapshot excludes DDE bookkeeping itself.
+            # A completed archive remains immutable provenance. Later state can
+            # make it unsuitable as a current ranking input, but must not turn
+            # historical completion into an operational deadlock. Only an
+            # ACTIVE, nonterminal round above blocks a fresh decision.
             from .discovery_v33 import DistributedDiscoveryService
 
             staleness = DistributedDiscoveryService(self.store, migrate=False).stale_check(
                 str(latest_discovery_round["id"]), mark_stale=persist,
             )
             if staleness["stale"]:
-                raise GPUError(
-                    "DISCOVERY_ROUND_STALE",
-                    "The completed discovery archive predates current scientific state; do not select from it blindly.",
-                )
+                stale_terminal_discovery = {
+                    "round_id": str(latest_discovery_round["id"]),
+                    "reason": "Terminal discovery archive is historical and excluded from current ranking.",
+                }
+                latest_discovery_round = None
         portfolio = (
             self._portfolio_refresh(project_id)
             if persist
@@ -837,6 +841,7 @@ class ResearchBrain:
                 "distributed_discovery_round_id": str(latest_discovery_round["id"]) if latest_discovery_round else None,
                 "distributed_discovery_archive_id": latest_discovery_round["data"].get("archive_id") if latest_discovery_round else None,
                 "distributed_discovery_coverage_id": latest_discovery_round["data"].get("coverage_id") if latest_discovery_round else None,
+                "stale_terminal_discovery": stale_terminal_discovery,
             },
             "evidence_considered": self._evidence_ids(state),
             "hypotheses_affected": [str(item["id"]) for item in hypotheses],
