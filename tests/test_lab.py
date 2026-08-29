@@ -718,6 +718,24 @@ def test_live_lease_ownership_still_blocks_competing_session_claims():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_branch_coverage_respects_persisted_branch_dependencies():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-branch-dependency-{time.time_ns()}", "branch dependency coverage")["project_id"]
+    joined = lab.join(None, f"branch-dependency-{time.time_ns()}", "CODEX", project_id)
+    objective = lab.canonical_objective_create(project_id, "SCIENTIFIC", "Sleeve", "Does sleeve input validate?")
+    input_run = store.object_create(project_id, "ExperimentRun", {"label": "validated sleeve input"}, "EXPERIMENT_STARTED", "running")
+    branch = lab.hypothesis_branch_create(
+        project_id, objective["id"], question_id="VALIDATED_SLEEVE_INPUT",
+        branch_dependencies=[{"target_type": "EXPERIMENT_RUN", "target_id": input_run["id"], "required_statuses": ["completed"]}],
+    )
+    coverage = next(item for item in lab.branch_coverage_get(project_id) if item["branch_id"] == branch["id"])
+    assert coverage["next_actionability"] == "WAITING_BRANCH_DEPENDENCY"
+    assert coverage["waiting_dependency"] is True
+    assert coverage["unresolved_branch_dependencies"][0]["dependency"]["target_id"] == input_run["id"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_v36_controller_restart_reconstructs_waiting_branch_and_reclaims_after_dependency():
     store = ResearchStore(TEST_DATABASE_URL)
     flags = {"WAITING_WORK_RELEASE": True, "BRANCH_AWARE_ASSIGNMENT": True}

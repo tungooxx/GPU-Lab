@@ -2345,9 +2345,27 @@ class LabController:
                     (branch["id"],),
                 )
                 unresolved_dependencies = [self._record(item) or {} for item in cur.fetchall()]
+                branch_dependencies = [
+                    {"required_statuses": [], "invalidating_statuses": [], **dependency}
+                    for dependency in (branch["branch_dependencies"] or [])
+                ]
+                branch_dependency_outcomes = [
+                    self._dependency_status(cur, project_id, dependency)
+                    for dependency in branch_dependencies
+                ]
+                unresolved_branch_dependencies = [
+                    {"dependency": dependency, "reason": detail, "invalidated": invalidated}
+                    for dependency, (satisfied, invalidated, detail) in zip(
+                        branch_dependencies, branch_dependency_outcomes, strict=True
+                    )
+                    if not satisfied
+                ]
                 terminal = branch["state"] in {"RESOLVED", "REFUTED", "ABANDONED", "SUPERSEDED"}
                 if terminal:
                     next_actionability, saturation = "RESOLVED", "RESOLVED"
+                elif unresolved_branch_dependencies:
+                    next_actionability = "WAITING_BRANCH_DEPENDENCY"
+                    saturation = "BLOCKED_GLOBAL" if branch["branch_blocking_scope"] == "OBJECTIVE_GLOBAL" else "BLOCKED_LOCAL"
                 elif waiting and not any(item["status"] == "READY" for item in active):
                     next_actionability, saturation = "WAITING_DEPENDENCY", "BLOCKED_LOCAL"
                 elif any(item["status"] == "READY" for item in active):
@@ -2368,7 +2386,8 @@ class LabController:
                     "completed_work_item_ids": [str(item["id"]) for item in completed],
                     "active_worker_count": len({str(item["lease_worker_id"]) for item in executing if item["lease_worker_id"]}),
                     "current_owner": str(executing[0]["lease_worker_id"]) if executing and executing[0]["lease_worker_id"] else None,
-                    "waiting_dependency": bool(waiting), "unresolved_dependencies": unresolved_dependencies,
+                    "waiting_dependency": bool(waiting or unresolved_branch_dependencies), "unresolved_dependencies": unresolved_dependencies,
+                    "unresolved_branch_dependencies": unresolved_branch_dependencies,
                     "current_gate_ids": [str(item["gate_id"]) for item in active if item["gate_id"]],
                     "unresolved_question": branch["question_id"], "scientific_niche": branch["mechanistic_niche_id"],
                     "next_actionability": next_actionability, "branch_saturation_state": saturation,
