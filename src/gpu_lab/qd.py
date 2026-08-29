@@ -229,16 +229,42 @@ class HypothesisQDService:
         table, missing = [], []
         for record in important:
             response = responses.get(record["id"], {})
-            addressed = response.get("candidate_addresses") is True
+            # ``candidate_already_addresses_it`` is the public contract. Keep
+            # the earlier internal spelling as a compatibility alias.
+            addressed = (
+                response.get("candidate_already_addresses_it") is True
+                or response.get("candidate_addresses") is True
+            )
+            implication = str(response.get("implication_for_candidate") or "").strip()
+            explicit_lineage = bool(response) and (bool(implication) or addressed)
             table.append({
                 "experiment_or_record": record["id"], "result": record["summary"],
                 "failed_assumption": record["failed_assumption"],
-                "implication_for_candidate": response.get("implication_for_candidate"),
+                "implication_for_candidate": implication or None,
+                "explicit_lineage": explicit_lineage,
                 "candidate_already_addresses_it": addressed,
             })
-            if not addressed and not response.get("implication_for_candidate"):
+            if not explicit_lineage:
                 missing.append(record["id"])
-        failed_prerequisites = [item["failed_assumption"] for item in important if item.get("failed_assumption")]
+        response_by_id = {entry["experiment_or_record"]: entry for entry in table}
+
+        def still_required(assumption: str, record_id: str) -> bool:
+            """Only demand declaration for a failed assumption the new design retains."""
+            if response_by_id.get(record_id, {}).get("candidate_already_addresses_it"):
+                return False
+            haystack = " ".join(str(candidate.get(key) or "") for key in (
+                "mechanism", "mechanistic_hypothesis", "prediction", "predictions",
+            )).lower()
+            normalized = str(assumption).strip().lower()
+            if normalized and normalized in haystack:
+                return True
+            tokens = {token for token in normalized.replace("-", " ").split() if len(token) >= 4}
+            return len(tokens) >= 2 and len(tokens & set(haystack.replace("-", " ").split())) >= 2
+
+        failed_prerequisites = [
+            item["failed_assumption"] for item in important
+            if item.get("failed_assumption") and still_required(item["failed_assumption"], item["id"])
+        ]
         declared = {str(item).strip().lower() for item in candidate.get("falsified_prerequisites", [])}
         undeclared = [item for item in failed_prerequisites if str(item).strip().lower() not in declared]
         design_fields_missing = [key for key in ("enabling_method", "mechanistic_hypothesis") if str(candidate.get(key, "")).strip().lower() in _PLACEHOLDER_VALUES]
