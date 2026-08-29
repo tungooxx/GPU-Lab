@@ -595,6 +595,12 @@ class LegacyRepairStore:
         item["status"] = status
         return item
 
+    def objects_list(self, project_id, kind, limit=None):
+        return [
+            item for item in self.objects.values()
+            if item["project_id"] == project_id and item["kind"] == kind
+        ]
+
 
 def test_legacy_run_provenance_repair_reconstructs_inspection_decision_once():
     store = LegacyRepairStore()
@@ -607,6 +613,46 @@ def test_legacy_run_provenance_repair_reconstructs_inspection_decision_once():
     assert repaired["decision"]["data"]["selected_action"]["action_type"] == "ARTIFACT_ANALYSIS"
     assert store.objects["run"]["data"]["decision_id"] == "reconstructed-decision"
     assert replay["idempotent_replay"] is True
+
+
+class ExistingDecisionNegativeStore(LegacyRepairStore):
+    def __init__(self):
+        super().__init__()
+        self.objects["hypothesis"]["status"] = "REFUTED"
+        self.objects["agenda"]["status"] = "RESOLVED"
+        self.objects["decision"] = {
+            "id": "decision", "project_id": "project", "kind": "ResearchDecision", "status": "APPROVED",
+            "data": {
+                "agenda_item_id": "agenda", "execution_experiment_id": "experiment",
+                "hindsight_assessment": "Resolved negative result.",
+            },
+        }
+        self.objects["run"]["data"]["decision_id"] = "decision"
+        self.objects["negative"] = {
+            "id": "negative", "project_id": "project", "kind": "NegativeResult", "status": "ACTIVE",
+            "data": {"experiment_id": "experiment"},
+        }
+
+
+def test_legacy_existing_decision_terminal_negative_backfill_is_refusal_safe_and_idempotent():
+    store = ExistingDecisionNegativeStore()
+    brain = ResearchBrain(store)
+    repaired = brain.legacy_run_provenance_repair("run", "agenda", "Close historic negative inspection")
+    replay = brain.legacy_run_provenance_repair("run", "agenda", "Close historic negative inspection")
+    assert repaired["run"]["status"] == "RESULT_INSPECTED"
+    assert repaired["run"]["data"]["inspection"]["negative_result_id"] == "negative"
+    assert repaired["run"]["data"]["inspection"]["scientific_evidence_created"] is False
+    assert replay["idempotent_replay"] is True
+    for mutate, error in [
+        (lambda value: value.objects["decision"]["data"].update({"agenda_item_id": "wrong"}), "LEGACY_EXISTING_DECISION_MISMATCH"),
+        (lambda value: value.objects["hypothesis"].update({"status": "ACTIVE"}), "LEGACY_TERMINAL_NEGATIVE_REQUIRED"),
+        (lambda value: value.objects.pop("negative"), "LEGACY_MATCHING_NEGATIVE_REQUIRED"),
+    ]:
+        refusal = ExistingDecisionNegativeStore()
+        mutate(refusal)
+        with pytest.raises(GPUError) as error_value:
+            ResearchBrain(refusal).legacy_run_provenance_repair("run", "agenda", "Close historic negative inspection")
+        assert error_value.value.error_type == error
 
 
 class LegacyAbandonStore(LegacyRepairStore):

@@ -994,7 +994,7 @@ class ResearchBrain:
     ) -> dict:
         """Attach inspect-only reconstructed provenance to one pre-binding run."""
         run = self._expect(run_id, "ExperimentRun")
-        if run["status"] not in {"completed", "RESULT_NOT_INSPECTED", "failed", "cancelled", "unknown"}:
+        if run["status"] not in {"completed", "RESULT_NOT_INSPECTED", "RESULT_INSPECTED", "failed", "cancelled", "unknown"}:
             raise GPUError("LEGACY_RUN_NOT_INSPECTABLE", run["status"])
         agenda_item = self._expect(agenda_item_id, "AgendaItem")
         experiment = self._expect(str(run["data"].get("experiment_id")), "Experiment")
@@ -1010,6 +1010,61 @@ class ResearchBrain:
                 legacy = existing["data"].get("legacy_provenance", {})
                 if legacy.get("run_id") == run_id and legacy.get("reconstructed") is True:
                     return {"run": run, "decision": existing, "idempotent_replay": True}
+                closure = run["data"].get("legacy_inspection_closure", {})
+                if closure.get("decision_id") == str(existing_id):
+                    if run["status"] != "RESULT_INSPECTED":
+                        raise GPUError("LEGACY_INSPECTION_CLOSURE_STATUS_INVALID", run["status"])
+                    return {"run": run, "decision": existing, "idempotent_replay": True}
+                if run["status"] == "RESULT_INSPECTED":
+                    raise GPUError("LEGACY_RUN_ALREADY_INSPECTED", run_id)
+                decision_data = existing["data"]
+                selected = decision_data.get("selected_action", {})
+                payload = selected.get("payload", {}) if isinstance(selected, dict) else {}
+                decision_experiment_id = (
+                    decision_data.get("execution_experiment_id")
+                    or decision_data.get("frozen_experiment_id")
+                    or payload.get("experiment_id")
+                )
+                if (
+                    str(existing["project_id"]) != project_id
+                    or str(decision_data.get("agenda_item_id")) != agenda_item_id
+                    or str(decision_experiment_id) != str(experiment["id"])
+                ):
+                    raise GPUError("LEGACY_EXISTING_DECISION_MISMATCH", run_id)
+                if hypothesis["status"] not in {"REFUTED", "WEAKENED"}:
+                    raise GPUError("LEGACY_TERMINAL_NEGATIVE_REQUIRED", hypothesis["status"])
+                if agenda_item["status"] != "RESOLVED":
+                    raise GPUError("LEGACY_AGENDA_NOT_RESOLVED", agenda_item["status"])
+                if not str(decision_data.get("hindsight_assessment", "")).strip():
+                    raise GPUError("LEGACY_DECISION_CLOSED_CYCLE_REQUIRED", str(existing_id))
+                negatives = self.store.objects_list(project_id, "NegativeResult", limit=None)
+                matching_negative = next(
+                    (
+                        item for item in negatives
+                        if str(item["data"].get("experiment_id")) == str(experiment["id"])
+                    ),
+                    None,
+                )
+                if matching_negative is None:
+                    raise GPUError("LEGACY_MATCHING_NEGATIVE_REQUIRED", str(experiment["id"]))
+                inspection = {
+                    "mode": "EXISTING_DECISION_TERMINAL_NEGATIVE_BACKFILL",
+                    "decision_id": str(existing_id),
+                    "experiment_id": str(experiment["id"]),
+                    "hypothesis_id": hypothesis_id,
+                    "agenda_item_id": agenda_item_id,
+                    "negative_result_id": str(matching_negative["id"]),
+                    "rationale": rationale.strip(),
+                    "scientific_evidence_created": False,
+                    "scientific_conclusion_changed": False,
+                }
+                repaired_run = self.store.object_update(
+                    run_id,
+                    {"inspection": inspection, "legacy_inspection_closure": inspection},
+                    "RESULT_INSPECTED",
+                    "EXPERIMENT_RUN_EXISTING_DECISION_NEGATIVE_INSPECTION_BACKFILLED",
+                )
+                return {"run": repaired_run, "decision": existing, "idempotent_replay": False}
                 raise GPUError("LEGACY_RUN_ALREADY_HAS_DECISION", run_id)
             abandonment = run["data"].get("legacy_abandonment", {})
             if abandonment.get("verified_missing_backing_job") is not True:
