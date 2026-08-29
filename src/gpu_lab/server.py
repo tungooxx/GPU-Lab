@@ -2849,6 +2849,9 @@ async def research_decision_create(
     working_directory: str = ".",
     env: dict[str, str] | None = None,
     python_env: str | None = None,
+    lab_work_item_id: str | None = None,
+    lab_worker_id: str | None = None,
+    lab_session_id: str | None = None,
 ):
     """Create a compact execution handoff containing the required decision_id.
 
@@ -2865,7 +2868,42 @@ async def research_decision_create(
             },
             "runtime": _runtime_code_version(),
         }
-    step = await call(brain().experiment_execution_decision_create, project_id, experiment_id)
+    authority = None
+    supplied = (lab_work_item_id, lab_worker_id, lab_session_id)
+    authoritative_gates = []
+    # Production Research OS always has the canonical database configured.
+    # Preserve dependency-light unit/legacy callers only when no Lab authority
+    # was supplied and there is no database from which an authoritative gate
+    # could be resolved.  A supplied authority without canonical storage still
+    # fails closed.
+    if settings.gpu_lab_research_database_url:
+        gate_rows = await call(lab().gate_list, project_id, ["PASS"], 500)
+        if "error" in gate_rows:
+            return gate_rows
+        authoritative_gates = [
+            gate for gate in gate_rows
+            if str(gate.get("scientific_object_id")) == str(experiment_id) and gate.get("authoritative_work_item_id")
+        ]
+    elif any(value is not None for value in supplied):
+        return {"error": {"type": "RESEARCH_DATABASE_NOT_CONFIGURED", "message": "Canonical Lab authority requires GPU_LAB_RESEARCH_DATABASE_URL"}}
+    if authoritative_gates or any(value is not None for value in supplied):
+        if len(authoritative_gates) != 1:
+            return {"error": {"type": "FROZEN_EXECUTION_AUTHORITY_AMBIGUOUS", "message": "Expected exactly one current PASS authoritative gate"}}
+        if not all(supplied):
+            return {"error": {"type": "LAB_EXECUTION_AUTHORITY_REQUIRED", "message": "Provide lab_work_item_id, lab_worker_id, and lab_session_id together"}}
+        if str(authoritative_gates[0]["authoritative_work_item_id"]) != str(lab_work_item_id):
+            return {"error": {"type": "LAB_EXECUTION_AUTHORITY_MISMATCH", "message": "Supplied WorkItem is not the gate authority"}}
+        authority = await call(
+            lab().frozen_execution_authority_validate,
+            project_id, experiment_id, lab_work_item_id, lab_worker_id, lab_session_id, None,
+        )
+        if "error" in authority:
+            return authority
+    step = (
+        await call(brain().experiment_execution_decision_create, project_id, experiment_id, authority)
+        if authority is not None
+        else await call(brain().experiment_execution_decision_create, project_id, experiment_id)
+    )
     if "error" in step:
         return step
     fingerprint = _execution_action_fingerprint(
@@ -4400,6 +4438,9 @@ async def research_experiment_execute(
     executor = "vast" if instance_id else "local"
     if executor == "local" and not settings.gpu_lab_enable_local_runner:
         return {"error": {"type": "LOCAL_RUNNER_DISABLED"}}
+    supplied_lab_authority = (lab_work_item_id, lab_worker_id, lab_session_id)
+    if any(value is not None for value in supplied_lab_authority) and not all(supplied_lab_authority):
+        return {"error": {"type": "LAB_ATTACHMENT_ARGUMENTS_REQUIRED", "message": "lab_work_item_id, lab_worker_id, and lab_session_id must be provided together."}}
     if engineering_task_id:
         readiness = await call(
             engineering().assert_ready_for_experiment,
@@ -4444,12 +4485,31 @@ async def research_experiment_execute(
     action_fingerprint = _execution_action_fingerprint(
         experiment_id, command, working_directory, env, python_env
     )
+    authorization = await call(
+        brain().authorize_execution, experiment_id, decision_id, action_fingerprint,
+    )
+    if "error" in authorization:
+        return authorization
+    authority = authorization.get("execution_authority")
+    one_shot = False
+    if authority is not None:
+        if not all(supplied_lab_authority):
+            return {"error": {"type": "LAB_EXECUTION_AUTHORITY_REQUIRED", "message": "Authority-bound Decision requires the owning Lab WorkItem context"}}
+        current_authority = await call(
+            lab().frozen_execution_authority_validate,
+            str(experiment["project_id"]), experiment_id, lab_work_item_id, lab_worker_id, lab_session_id, idempotency_key,
+        )
+        if "error" in current_authority:
+            return current_authority
+        for field in ("gate_id", "work_item_id", "canonical_subject_version", "experiment_id", "hypothesis_id"):
+            if str(current_authority.get(field)) != str(authority.get(field)):
+                return {"error": {"type": "FROZEN_EXECUTION_AUTHORITY_CHANGED", "message": f"Execution authority field {field} changed after Decision creation"}}
+        one_shot = bool(current_authority.get("one_shot"))
     job_prefix = "remote" if instance_id else "local"
     job_id = job_prefix + "_" + hashlib.sha256(
         f"{experiment_id}:{idempotency_key}".encode()
     ).hexdigest()[:24]
-    reservation = await call(
-        research().run_reserve,
+    reservation_args = (
         experiment_id,
         idempotency_key,
         job_id,
@@ -4465,24 +4525,26 @@ async def research_experiment_execute(
             "python_env": python_env,
         },
     )
+    # Keep the legacy run_reserve call shape unchanged unless current frozen
+    # authority actually requires Experiment-level one-shot enforcement.
+    reservation = await call(
+        research().run_reserve, *reservation_args, True
+    ) if one_shot else await call(research().run_reserve, *reservation_args)
     if "error" in reservation:
         return reservation
-    authorization = await call(
-        brain().authorize_execution,
-        experiment_id,
-        decision_id,
-        action_fingerprint,
-    )
-    if "error" in authorization:
-        return {
-            "experiment_id": reservation["experiment_id"],
-            "run_id": reservation["run_id"],
-            "job_id": reservation["job_id"],
-            "idempotency_key": reservation["idempotency_key"],
-            "status": "RESERVED",
-            "authorization_error": authorization["error"],
-            "retry_safe": True,
-        }
+    attachment = None
+    if authority is not None:
+        attachment = await call(
+            lab().attach_experiment_run,
+            lab_work_item_id, lab_worker_id, lab_session_id, reservation["run_id"], current_authority,
+        )
+        if "error" in attachment:
+            return {
+                **reservation,
+                "status": "RESERVED",
+                "authority_attachment_error": attachment["error"],
+                "retry_safe": True,
+            }
     if instance_id:
         remote_env = dict(env or {})
         remote_command = command
@@ -4555,18 +4617,7 @@ async def research_experiment_execute(
             "mapping_error": mapping["error"],
             "retry_safe": True,
         }
-    attachment = None
-    if any(value is not None for value in (lab_work_item_id, lab_worker_id, lab_session_id)):
-        if not all((lab_work_item_id, lab_worker_id, lab_session_id)):
-            return {
-                **mapping,
-                "job": job,
-                "retry_safe": True,
-                "lab_attachment_error": {
-                    "type": "LAB_ATTACHMENT_ARGUMENTS_REQUIRED",
-                    "message": "lab_work_item_id, lab_worker_id, and lab_session_id must be provided together.",
-                },
-            }
+    if authority is None and all((lab_work_item_id, lab_worker_id, lab_session_id)):
         attachment = await call(
             lab().attach_experiment_run,
             lab_work_item_id,

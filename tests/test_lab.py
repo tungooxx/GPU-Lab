@@ -1,3 +1,4 @@
+from pathlib import Path
 import os
 import threading
 import time
@@ -1079,3 +1080,255 @@ def test_project_scope_and_message_acknowledgement_require_active_session():
     assert lab.message_list(one, recipient["worker"]["id"], unread_only=True) == []
     with pytest.raises(GPUError, match="LAB_MESSAGE_RECIPIENT_NOT_IN_PROJECT"):
         lab.message_send(one, sender["worker"]["id"], sender["session_id"], "REQUEST_REVIEW", "Bad", "No cross-project recipient", to_worker_id=outsider["worker"]["id"])
+
+
+def _execution_authority_records():
+    project, experiment_id, work, worker, session = "p", "e", "w", "u", "s"
+    item = {
+        "id": work, "project_id": project, "status": "RUNNING", "assigned_worker_id": worker,
+        "assigned_session_id": session, "authority_status": "AUTHORITATIVE", "subject_id": experiment_id,
+        "gate_id": "g", "canonical_subject_version": "sv", "authority_key": "ak",
+        "recovery_policy": {"one_shot": True}, "superseded_by": None, "invalidated_at": None,
+    }
+    gate = {
+        "id": "g", "project_id": project, "status": "PASS", "scientific_object_id": experiment_id,
+        "authoritative_work_item_id": work, "canonical_subject_version": "sv",
+        "superseded_by": None, "invalidation_reason": None,
+    }
+    experiment = {
+        "id": experiment_id, "project_id": project, "kind": "Experiment", "status": "ACTIVE",
+        "data": {"frozen": True, "hypothesis_id": "h"},
+    }
+    hypothesis = {"id": "h", "project_id": project, "kind": "Hypothesis", "status": "ACTIVE", "data": {}}
+    return project, experiment_id, work, worker, session, item, gate, experiment, hypothesis
+
+
+def test_frozen_execution_authority_records_require_exact_current_owner_and_gate():
+    args = _execution_authority_records()
+    result = LabController._validate_frozen_execution_authority_records(
+        *args[:5], *args[5:], [(True, False, "ok")], True, [], None
+    )
+    assert result["validated"] is True
+    assert result["one_shot"] is True
+    assert result["gate_id"] == "g"
+
+
+@pytest.mark.parametrize("mutation,error_type", [
+    (("item", "status", "WAITING_DEPENDENCY"), "LAB_EXECUTION_WORK_NOT_OWNED"),
+    (("item", "assigned_worker_id", "other"), "LAB_WORK_OWNERSHIP_MISMATCH"),
+    (("item", "authority_status", "SUPPORTING"), "LAB_EXECUTION_AUTHORITY_INVALID"),
+    (("gate", "status", "FAIL"), "SCIENTIFIC_GATE_NOT_EXECUTABLE"),
+    (("gate", "authoritative_work_item_id", "other"), "SCIENTIFIC_GATE_AUTHORITY_MISMATCH"),
+    (("experiment", "status", "COMPLETED"), "EXPERIMENT_NOT_EXECUTABLE"),
+])
+def test_frozen_execution_authority_records_fail_closed(mutation, error_type):
+    project, experiment_id, work, worker, session, item, gate, experiment, hypothesis = _execution_authority_records()
+    target = {"item": item, "gate": gate, "experiment": experiment}[mutation[0]]
+    target[mutation[1]] = mutation[2]
+    with pytest.raises(GPUError) as error:
+        LabController._validate_frozen_execution_authority_records(
+            project, experiment_id, work, worker, session, item, gate, experiment, hypothesis,
+            [(True, False, "ok")], True, [], None,
+        )
+    assert error.value.error_type == error_type
+
+
+def test_one_shot_authority_allows_only_exact_retry_attempt_uuid():
+    args = _execution_authority_records()
+    attempt = [{"idempotency_key": "attempt-1", "run_id": "r", "status": "RESERVED"}]
+    with pytest.raises(GPUError) as error:
+        LabController._validate_frozen_execution_authority_records(
+            *args[:5], *args[5:], [(True, False, "ok")], True, attempt, "attempt-2"
+        )
+    assert error.value.error_type == "EXPERIMENT_ONE_SHOT_ALREADY_RESERVED"
+    replay = LabController._validate_frozen_execution_authority_records(
+        *args[:5], *args[5:], [(True, False, "ok")], True, attempt, "attempt-1"
+    )
+    assert replay["execution_attempt_uuid"] == "attempt-1"
+
+
+def _detached_execution_authority_records():
+    project, experiment_id, work, worker, session, item, gate, experiment, hypothesis = _execution_authority_records()
+    item.update({
+        "status": "RUNNING_DETACHED",
+        "assigned_worker_id": None,
+        "assigned_session_id": None,
+        "lease_id": None,
+        "related_refs": {
+            "experiment_run_id": "r",
+            "execution_owner_worker_id": worker,
+            "execution_owner_session_id": session,
+            "execution_attempt_uuid": "attempt-1",
+            "execution_request_fingerprint": "fp-1",
+        },
+    })
+    attempt = [{"idempotency_key": "attempt-1", "run_id": "r", "request_fingerprint": "fp-1", "status": "RESERVED"}]
+    return project, experiment_id, work, worker, session, item, gate, experiment, hypothesis, attempt
+
+
+def test_detached_exact_retry_preserves_same_owner_same_reserved_attempt_only():
+    *records, attempt = _detached_execution_authority_records()
+    result = LabController._validate_frozen_execution_authority_records(
+        *records, [(True, False, "ok")], False, attempt, "attempt-1", True
+    )
+    assert result["validated"] is True
+    assert result["detached_retry"] is True
+    assert result["execution_attempt_uuid"] == "attempt-1"
+
+
+@pytest.mark.parametrize("field,value,error_type", [
+    ("uuid", "attempt-2", "EXPERIMENT_ONE_SHOT_ALREADY_RESERVED"),
+    ("worker", "other", "LAB_WORK_OWNERSHIP_MISMATCH"),
+    ("session", "other", "LAB_WORK_OWNERSHIP_MISMATCH"),
+    ("run", "other-run", "EXPERIMENT_DETACHED_RETRY_NOT_RESERVED"),
+    ("fingerprint", "other-fp", "EXPERIMENT_DETACHED_RETRY_NOT_RESERVED"),
+    ("status", "SUBMITTED", "EXPERIMENT_DETACHED_RETRY_NOT_RESERVED"),
+])
+def test_detached_retry_fails_closed_on_identity_or_attempt_drift(field, value, error_type):
+    project, experiment_id, work, worker, session, item, gate, experiment, hypothesis, attempt = _detached_execution_authority_records()
+    execution_uuid = "attempt-1"
+    if field == "uuid":
+        execution_uuid = value
+    elif field == "worker":
+        worker = value
+    elif field == "session":
+        session = value
+    elif field == "run":
+        attempt[0]["run_id"] = value
+    elif field == "fingerprint":
+        attempt[0]["request_fingerprint"] = value
+    elif field == "status":
+        attempt[0]["status"] = value
+    with pytest.raises(GPUError) as error:
+        LabController._validate_frozen_execution_authority_records(
+            project, experiment_id, work, worker, session, item, gate, experiment, hypothesis,
+            [(True, False, "ok")], False, attempt, execution_uuid, True,
+        )
+    assert error.value.error_type == error_type
+
+
+def _db_frozen_execution_fixture(label: str):
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store, lease_seconds=60)
+    project_id = store.project_create(f"tr6-frozen-authority-{label}-{time.time_ns()}", "Frozen authority DB canary")["project_id"]
+    joined = lab.join(None, f"tr6-authority-{label}-{time.time_ns()}", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    hypothesis = store.object_create(
+        project_id, "Hypothesis", {"label": label}, "HYPOTHESIS_CREATED", "ACTIVE"
+    )
+    experiment = store.object_create(
+        project_id, "Experiment",
+        {"frozen": True, "hypothesis_id": hypothesis["id"], "plan": {"label": label}},
+        "EXPERIMENT_PREREGISTERED", "ACTIVE",
+    )
+    subject_version = f"experiment:{experiment['id']}|fixture:{label}"
+    gate = lab.gate_ensure(
+        project_id, "ONE_SHOT_EXECUTION", experiment["id"], subject_version,
+        worker_id, session_id, semantic_review_required=False,
+    )
+    work = lab.gate_work_ensure(
+        gate["id"], "MECHANISM_TEST", "Execute frozen DB canary", "One-shot exact authority canary",
+        "EXPERIMENT_OWNER", worker_id, session_id,
+        recovery_policy={"one_shot": True, "requires_no_existing_run": True},
+    )
+    lab.preflight_run(gate["id"], worker_id, session_id, {"fixture_ready": True})
+    lab.gate_resolve(gate["id"], worker_id, session_id, "PASS", rationale="DB canary only")
+    lab.claim_work(work["id"], worker_id, session_id)
+    lab.start_work(work["id"], worker_id, session_id)
+    return store, lab, project_id, joined, experiment, work
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_frozen_authority_detached_exact_reserved_retry_is_db_safe():
+    store, lab, project_id, joined, experiment, work = _db_frozen_execution_fixture("detached-retry")
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    attempt_uuid, fingerprint = "attempt-exact-1", "fingerprint-exact-1"
+
+    authority = lab.frozen_execution_authority_validate(
+        project_id, experiment["id"], work["id"], worker_id, session_id, attempt_uuid
+    )
+    reserved = store.run_reserve(
+        experiment["id"], attempt_uuid, "local_retryfixture01", fingerprint,
+        {"executor": "local", "decision_id": "fixture-decision"}, True,
+    )
+    attached = lab.attach_experiment_run(
+        work["id"], worker_id, session_id, reserved["run_id"], authority
+    )
+    assert attached["status"] == "RUNNING_DETACHED"
+    assert attached["related_refs"]["execution_owner_worker_id"] == worker_id
+    assert attached["related_refs"]["execution_owner_session_id"] == session_id
+    assert attached["related_refs"]["execution_attempt_uuid"] == attempt_uuid
+    assert attached["related_refs"]["execution_request_fingerprint"] == fingerprint
+
+    # Exercise a real LocalRunner pre-process submission failure after the WorkItem
+    # has detached.  No process/job directory may be created, and exact retry
+    # authority must remain recoverable for the canonical RESERVED attempt.
+    import asyncio as _asyncio
+    from gpu_lab.config import Settings as _Settings
+    from gpu_lab.local_runner import LocalRunner as _LocalRunner
+    runner = _LocalRunner(
+        _Settings(gpu_lab_enable_local_runner=True, gpu_lab_local_workspace="/workspace/local-vlm"), None
+    )
+    with pytest.raises(GPUError) as submit_error:
+        _asyncio.run(
+            runner.submit(
+                "printf should-not-run", "__tr6_missing_workdir__", "retry-fixture",
+                job_id=reserved["job_id"],
+            )
+        )
+    assert submit_error.value.error_type == "INVALID_LOCAL_PATH"
+    assert not (Path("/workspace/local-vlm/.gpu-lab/jobs") / reserved["job_id"]).exists()
+
+    retry_authority = lab.frozen_execution_authority_validate(
+        project_id, experiment["id"], work["id"], worker_id, session_id, attempt_uuid
+    )
+    assert retry_authority["detached_retry"] is True
+    same = store.run_reserve(
+        experiment["id"], attempt_uuid, "local_retryfixture01", fingerprint,
+        {"executor": "local", "decision_id": "fixture-decision"}, True,
+    )
+    assert same["run_id"] == reserved["run_id"]
+
+    with pytest.raises(GPUError) as fresh_error:
+        lab.frozen_execution_authority_validate(
+            project_id, experiment["id"], work["id"], worker_id, session_id, "attempt-fresh-2"
+        )
+    assert fresh_error.value.error_type == "EXPERIMENT_ONE_SHOT_ALREADY_RESERVED"
+
+    outsider = lab.join(None, f"tr6-outsider-{time.time_ns()}", "CODEX", project_id)
+    with pytest.raises(GPUError) as owner_error:
+        lab.frozen_execution_authority_validate(
+            project_id, experiment["id"], work["id"], outsider["worker"]["id"], outsider["session_id"], attempt_uuid
+        )
+    assert owner_error.value.error_type == "LAB_WORK_OWNERSHIP_MISMATCH"
+
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT count(*) AS n FROM research_execution_attempts WHERE experiment_id=%s", (experiment["id"],))
+        assert cur.fetchone()["n"] == 1
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_one_shot_run_reserve_racing_fresh_uuids_creates_one_canonical_attempt():
+    store, _, _, _, experiment, _ = _db_frozen_execution_fixture("uuid-race")
+    barrier = threading.Barrier(2)
+
+    def reserve(attempt_uuid: str):
+        barrier.wait()
+        contender = ResearchStore(TEST_DATABASE_URL)
+        try:
+            result = contender.run_reserve(
+                experiment["id"], attempt_uuid, f"job-{attempt_uuid}", f"fp-{attempt_uuid}",
+                {"executor": "local", "decision_id": "fixture-decision"}, True,
+            )
+            return ("OK", result["run_id"], result["idempotency_key"])
+        except GPUError as error:
+            return (error.error_type, None, attempt_uuid)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(reserve, ("race-a", "race-b")))
+
+    assert sum(result[0] == "OK" for result in results) == 1
+    assert sum(result[0] == "EXPERIMENT_ONE_SHOT_ALREADY_RESERVED" for result in results) == 1
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT count(*) AS n FROM research_execution_attempts WHERE experiment_id=%s", (experiment["id"],))
+        assert cur.fetchone()["n"] == 1

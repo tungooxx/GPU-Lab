@@ -1304,6 +1304,142 @@ class LabController:
         with self.store._connect() as conn, conn.cursor() as cur:
             return self._work_record(cur, work_item_id)
 
+    @staticmethod
+    def _validate_frozen_execution_authority_records(
+        project_id: str, experiment_id: str, work_item_id: str, worker_id: str, session_id: str,
+        item: dict[str, Any], gate: dict[str, Any], experiment: dict[str, Any], hypothesis: dict[str, Any],
+        dependency_outcomes: list[tuple[bool, bool, str]], lease_active: bool,
+        attempts: list[dict[str, Any]], execution_attempt_uuid: str | None = None,
+        detached_retry: bool = False,
+    ) -> dict[str, Any]:
+        """Validate current execution authority without consulting discovery ranking."""
+        if str(item.get("project_id")) != str(project_id) or str(experiment.get("project_id")) != str(project_id):
+            raise GPUError("LAB_PROJECT_MISMATCH", work_item_id)
+        if str(hypothesis.get("project_id")) != str(project_id):
+            raise GPUError("RESEARCH_PROJECT_MISMATCH", "Experiment and hypothesis differ")
+        refs = item.get("related_refs") or {}
+        if detached_retry:
+            if item.get("status") != "RUNNING_DETACHED":
+                raise GPUError("LAB_EXECUTION_RETRY_NOT_DETACHED", f"WorkItem is {item.get('status')}")
+            if item.get("assigned_worker_id") is not None or item.get("assigned_session_id") is not None or item.get("lease_id") is not None:
+                raise GPUError("LAB_EXECUTION_RETRY_STATE_INVALID", "Detached WorkItem still carries live ownership")
+            if str(refs.get("execution_owner_worker_id")) != str(worker_id) or str(refs.get("execution_owner_session_id")) != str(session_id):
+                raise GPUError("LAB_WORK_OWNERSHIP_MISMATCH", work_item_id)
+            if not execution_attempt_uuid or str(refs.get("execution_attempt_uuid")) != str(execution_attempt_uuid):
+                raise GPUError("EXPERIMENT_ONE_SHOT_ALREADY_RESERVED", experiment_id)
+            if len(attempts) != 1:
+                raise GPUError("EXPERIMENT_ONE_SHOT_ALREADY_RESERVED", experiment_id)
+            attempt = attempts[0]
+            if (
+                str(attempt.get("idempotency_key")) != str(execution_attempt_uuid)
+                or str(attempt.get("run_id")) != str(refs.get("experiment_run_id"))
+                or str(attempt.get("request_fingerprint")) != str(refs.get("execution_request_fingerprint"))
+                or str(attempt.get("status")) != "RESERVED"
+            ):
+                raise GPUError("EXPERIMENT_DETACHED_RETRY_NOT_RESERVED", experiment_id)
+        else:
+            if item.get("status") not in {"CLAIMED", "RUNNING"}:
+                raise GPUError("LAB_EXECUTION_WORK_NOT_OWNED", f"WorkItem is {item.get('status')}")
+            if str(item.get("assigned_worker_id")) != str(worker_id) or str(item.get("assigned_session_id")) != str(session_id):
+                raise GPUError("LAB_WORK_OWNERSHIP_MISMATCH", work_item_id)
+        if item.get("authority_status") != "AUTHORITATIVE" or item.get("superseded_by") or item.get("invalidated_at"):
+            raise GPUError("LAB_EXECUTION_AUTHORITY_INVALID", "WorkItem is not current authoritative work")
+        if str(item.get("subject_id")) != str(experiment_id):
+            raise GPUError("LAB_EXECUTION_AUTHORITY_MISMATCH", "WorkItem subject differs from Experiment")
+        if not item.get("gate_id") or not item.get("canonical_subject_version"):
+            raise GPUError("LAB_EXECUTION_AUTHORITY_INCOMPLETE", "WorkItem lacks gate/subject binding")
+        if any(invalidated for _, invalidated, _ in dependency_outcomes):
+            raise GPUError("LAB_WORK_DEPENDENCY_INVALIDATED", "; ".join(d for _, i, d in dependency_outcomes if i))
+        if any(not satisfied for satisfied, _, _ in dependency_outcomes):
+            raise GPUError("LAB_WORK_DEPENDENCY_UNSATISFIED", "; ".join(d for s, _, d in dependency_outcomes if not s))
+        if not detached_retry and not lease_active:
+            raise GPUError("LAB_LEASE_NOT_ACTIVE", work_item_id)
+        if gate.get("status") != "PASS" or gate.get("superseded_by") or gate.get("invalidation_reason"):
+            raise GPUError("SCIENTIFIC_GATE_NOT_EXECUTABLE", str(gate.get("status")))
+        if str(gate.get("project_id")) != str(project_id) or str(gate.get("scientific_object_id")) != str(experiment_id):
+            raise GPUError("SCIENTIFIC_GATE_AUTHORITY_MISMATCH", str(gate.get("id")))
+        if str(gate.get("authoritative_work_item_id")) != str(work_item_id):
+            raise GPUError("SCIENTIFIC_GATE_AUTHORITY_MISMATCH", "Gate points to another WorkItem")
+        if str(gate.get("canonical_subject_version")) != str(item.get("canonical_subject_version")):
+            raise GPUError("SCIENTIFIC_GATE_SUBJECT_MISMATCH", str(gate.get("id")))
+        if str(item.get("gate_id")) != str(gate.get("id")):
+            raise GPUError("SCIENTIFIC_GATE_AUTHORITY_MISMATCH", "WorkItem points to another gate")
+        if experiment.get("kind") != "Experiment" or experiment.get("status") != "ACTIVE" or experiment.get("data", {}).get("frozen") is not True:
+            raise GPUError("EXPERIMENT_NOT_EXECUTABLE", str(experiment.get("status")))
+        hypothesis_id = str(experiment.get("data", {}).get("hypothesis_id") or "")
+        if not hypothesis_id or hypothesis.get("kind") != "Hypothesis" or str(hypothesis.get("id")) != hypothesis_id:
+            raise GPUError("EXPERIMENT_PLAN_INCOMPLETE", "Experiment/Hypothesis binding is invalid")
+        recovery = item.get("recovery_policy") or {}
+        one_shot = bool(recovery.get("one_shot") or recovery.get("requires_no_existing_run"))
+        if one_shot and attempts:
+            keys = {str(row.get("idempotency_key")) for row in attempts}
+            if not execution_attempt_uuid or keys != {str(execution_attempt_uuid)} or len(attempts) != 1:
+                raise GPUError("EXPERIMENT_ONE_SHOT_ALREADY_RESERVED", experiment_id)
+        return {
+            "validated": True,
+            "project_id": str(project_id),
+            "experiment_id": str(experiment_id),
+            "hypothesis_id": hypothesis_id,
+            "gate_id": str(gate["id"]),
+            "work_item_id": str(work_item_id),
+            "canonical_subject_version": str(item["canonical_subject_version"]),
+            "authority_key": item.get("authority_key"),
+            "one_shot": one_shot,
+            "execution_attempt_uuid": str(execution_attempt_uuid) if execution_attempt_uuid else None,
+            "detached_retry": detached_retry,
+        }
+
+    def frozen_execution_authority_validate(
+        self, project_id: str, experiment_id: str, work_item_id: str, worker_id: str, session_id: str,
+        execution_attempt_uuid: str | None = None,
+    ) -> dict[str, Any]:
+        """Validate a current gated frozen-experiment execution owner, fail closed."""
+        now = self._now()
+        with self.store._connect() as conn, conn.cursor() as cur:
+            self._worker(cur, worker_id)
+            session = self._session(cur, session_id, worker_id, project_id)
+            cur.execute("SELECT * FROM lab_work_items WHERE id=%s AND project_id=%s FOR UPDATE", (work_item_id, project_id))
+            item = cur.fetchone()
+            if not item:
+                raise GPUError("LAB_WORK_NOT_FOUND", work_item_id)
+            detached_retry = item.get("status") == "RUNNING_DETACHED"
+            if not detached_retry and str(session.get("current_work_item_id")) != str(work_item_id):
+                raise GPUError("LAB_WORK_OWNERSHIP_MISMATCH", work_item_id)
+            cur.execute("SELECT * FROM lab_work_dependencies WHERE work_item_id=%s", (work_item_id,))
+            dependencies = cur.fetchall()
+            outcomes = [self._dependency_status(cur, project_id, dep) for dep in dependencies]
+            cur.execute("SELECT * FROM scientific_gates WHERE id=%s AND project_id=%s FOR SHARE", (item.get("gate_id"), project_id))
+            gate = cur.fetchone()
+            if not gate:
+                raise GPUError("SCIENTIFIC_GATE_NOT_FOUND", str(item.get("gate_id")))
+            cur.execute("SELECT * FROM research_objects WHERE id=%s AND project_id=%s", (experiment_id, project_id))
+            experiment = cur.fetchone()
+            if not experiment:
+                raise GPUError("RESEARCH_OBJECT_NOT_FOUND", experiment_id)
+            hypothesis_id = str((experiment.get("data") or {}).get("hypothesis_id") or "")
+            cur.execute("SELECT * FROM research_objects WHERE id=%s AND project_id=%s", (hypothesis_id, project_id))
+            hypothesis = cur.fetchone()
+            if not hypothesis:
+                raise GPUError("RESEARCH_OBJECT_NOT_FOUND", hypothesis_id)
+            cur.execute(
+                "SELECT id FROM lab_work_leases WHERE id=%s AND work_item_id=%s AND worker_id=%s "
+                "AND worker_session_id=%s AND released_at IS NULL AND expires_at>=%s",
+                (item.get("lease_id"), work_item_id, worker_id, session_id, now),
+            )
+            lease_active = cur.fetchone() is not None
+            cur.execute(
+                "SELECT run_id,job_id,idempotency_key,request_fingerprint,status FROM research_execution_attempts "
+                "WHERE experiment_id=%s ORDER BY created_at,run_id",
+                (experiment_id,),
+            )
+            attempts = cur.fetchall()
+            return self._validate_frozen_execution_authority_records(
+                project_id, experiment_id, work_item_id, worker_id, session_id,
+                self._record(item) or {}, self._record(gate) or {}, dict(experiment),
+                dict(hypothesis), outcomes, lease_active,
+                [dict(row) for row in attempts], execution_attempt_uuid, detached_retry,
+            )
+
     def work_list(self, project_id: str, statuses: list[str] | None = None, limit: int = 100) -> list[dict]:
         with self.store._connect() as conn, conn.cursor() as cur:
             sql, args = "SELECT * FROM lab_work_items WHERE project_id=%s", [project_id]
@@ -1667,7 +1803,8 @@ class LabController:
         return self.release_work(work_item_id, worker_id, session_id, reason, dependencies)
 
     def attach_experiment_run(
-        self, work_item_id: str, worker_id: str, session_id: str, run_id: str
+        self, work_item_id: str, worker_id: str, session_id: str, run_id: str,
+        expected_execution_authority: dict[str, Any] | None = None,
     ) -> dict:
         """Detach an owned execution WorkItem onto its canonical ExperimentRun.
 
@@ -1681,19 +1818,77 @@ class LabController:
             if not item:
                 raise GPUError("LAB_WORK_NOT_FOUND", work_item_id)
             self._session(cur, session_id, worker_id, str(item["project_id"]))
-            if str(item["assigned_worker_id"]) != str(worker_id) or str(item["assigned_session_id"]) != str(session_id):
-                raise GPUError("LAB_WORK_NOT_OWNED", work_item_id)
-            if item["status"] not in {"CLAIMED", "RUNNING"}:
-                raise GPUError("LAB_WORK_NOT_ATTACHABLE", item["status"])
+            refs = item.get("related_refs") or {}
+            detached_retry = item["status"] == "RUNNING_DETACHED"
+            if detached_retry:
+                if expected_execution_authority is None or expected_execution_authority.get("detached_retry") is not True:
+                    raise GPUError("LAB_WORK_NOT_ATTACHABLE", item["status"])
+                if str(refs.get("execution_owner_worker_id")) != str(worker_id) or str(refs.get("execution_owner_session_id")) != str(session_id):
+                    raise GPUError("LAB_WORK_NOT_OWNED", work_item_id)
+                if str(refs.get("experiment_run_id")) != str(run_id):
+                    raise GPUError("FROZEN_EXECUTION_AUTHORITY_CHANGED", "Detached retry points to another run")
+                if str(refs.get("execution_attempt_uuid")) != str(expected_execution_authority.get("execution_attempt_uuid")):
+                    raise GPUError("FROZEN_EXECUTION_AUTHORITY_CHANGED", "Detached retry points to another attempt")
+            else:
+                if str(item["assigned_worker_id"]) != str(worker_id) or str(item["assigned_session_id"]) != str(session_id):
+                    raise GPUError("LAB_WORK_NOT_OWNED", work_item_id)
+                if item["status"] not in {"CLAIMED", "RUNNING"}:
+                    raise GPUError("LAB_WORK_NOT_ATTACHABLE", item["status"])
             cur.execute("SELECT status,data FROM research_objects WHERE id=%s AND project_id=%s AND kind='ExperimentRun'", (run_id, item["project_id"]))
             run = cur.fetchone()
             if not run:
                 raise GPUError("EXPERIMENT_RUN_NOT_FOUND", run_id)
             if not self.store.experiment_run_is_operationally_active(run):
                 raise GPUError("EXPERIMENT_RUN_NOT_ACTIVE", run_id)
-            refs = {**(item["related_refs"] or {}), "experiment_run_id": run_id}
+            if expected_execution_authority is not None:
+                if expected_execution_authority.get("validated") is not True:
+                    raise GPUError("FROZEN_EXECUTION_AUTHORITY_INVALID", "Attachment authority was not validated")
+                if item.get("authority_status") != "AUTHORITATIVE" or item.get("superseded_by") or item.get("invalidated_at"):
+                    raise GPUError("LAB_EXECUTION_AUTHORITY_INVALID", "WorkItem changed before run attachment")
+                for field, observed in (
+                    ("work_item_id", item.get("id")),
+                    ("gate_id", item.get("gate_id")),
+                    ("canonical_subject_version", item.get("canonical_subject_version")),
+                    ("experiment_id", item.get("subject_id")),
+                ):
+                    if str(expected_execution_authority.get(field)) != str(observed):
+                        raise GPUError("FROZEN_EXECUTION_AUTHORITY_CHANGED", f"Authority field {field} changed before attachment")
+                if str((run.get("data") or {}).get("experiment_id")) != str(item.get("subject_id")):
+                    raise GPUError("LAB_EXECUTION_AUTHORITY_MISMATCH", "Reserved run belongs to another Experiment")
+                cur.execute("SELECT * FROM lab_work_dependencies WHERE work_item_id=%s", (work_item_id,))
+                outcomes = [self._dependency_status(cur, str(item["project_id"]), dep) for dep in cur.fetchall()]
+                if any(invalidated for _, invalidated, _ in outcomes):
+                    raise GPUError("LAB_WORK_DEPENDENCY_INVALIDATED", "; ".join(d for _, i, d in outcomes if i))
+                if any(not satisfied for satisfied, _, _ in outcomes):
+                    raise GPUError("LAB_WORK_DEPENDENCY_UNSATISFIED", "; ".join(d for s, _, d in outcomes if not s))
+                cur.execute("SELECT * FROM scientific_gates WHERE id=%s AND project_id=%s FOR SHARE", (item.get("gate_id"), item["project_id"]))
+                current_gate = cur.fetchone()
+                if (
+                    not current_gate
+                    or current_gate.get("status") != "PASS"
+                    or current_gate.get("superseded_by")
+                    or current_gate.get("invalidation_reason")
+                    or str(current_gate.get("authoritative_work_item_id")) != str(work_item_id)
+                    or str(current_gate.get("canonical_subject_version")) != str(item.get("canonical_subject_version"))
+                ):
+                    raise GPUError("SCIENTIFIC_GATE_NOT_EXECUTABLE", str(item.get("gate_id")))
+            if detached_retry:
+                # Exact recovery is idempotent: keep the WorkItem detached and do
+                # not recreate a lease or ownership.  The server may now retry
+                # submission of this same RESERVED canonical attempt only.
+                return self._record(item) or {}
+            refs = {
+                **(item["related_refs"] or {}),
+                "experiment_run_id": str(run_id),
+                "execution_owner_worker_id": str(worker_id),
+                "execution_owner_session_id": str(session_id),
+                "execution_attempt_uuid": (expected_execution_authority or {}).get("execution_attempt_uuid"),
+                "execution_request_fingerprint": (run.get("data") or {}).get("request_fingerprint"),
+                "execution_authority_gate_id": str(item.get("gate_id")) if item.get("gate_id") is not None else None,
+                "execution_authority_subject_version": str(item.get("canonical_subject_version")) if item.get("canonical_subject_version") is not None else None,
+            }
             cur.execute("UPDATE lab_work_leases SET released_at=%s,release_reason='EXPERIMENT_RUN_ATTACHED' WHERE id=%s AND released_at IS NULL", (now, item["lease_id"]))
-            cur.execute("UPDATE lab_work_items SET status='RUNNING_DETACHED',related_refs=%s,assigned_worker_id=NULL,assigned_session_id=NULL,lease_id=NULL,blocked_reason=%s,updated_at=%s WHERE id=%s", (json.dumps(refs), "Canonical ExperimentRun is executing; this WorkItem cannot be claimed.", now, work_item_id))
+            cur.execute("UPDATE lab_work_items SET status='RUNNING_DETACHED',related_refs=%s,assigned_worker_id=NULL,assigned_session_id=NULL,lease_id=NULL,blocked_reason=%s,updated_at=%s WHERE id=%s", (json.dumps(refs), "Canonical ExperimentRun is executing or reserved for exact retry; this WorkItem cannot be claimed.", now, work_item_id))
             cur.execute("UPDATE research_worker_sessions SET current_work_item_id=NULL,active_role=NULL,status='ACTIVE',last_heartbeat_at=%s WHERE id=%s", (now, session_id))
             # A detached ExperimentRun continues independently.  The worker that
             # launched it is available for another bounded WorkItem unless one of

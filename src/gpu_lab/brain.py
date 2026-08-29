@@ -713,23 +713,21 @@ class ResearchBrain:
             **temporal,
         )
         latest_discovery_round = max(completed_rounds, key=lambda item: item["created_at"], default=None)
-        stale_terminal_discovery = None
         if latest_discovery_round:
-            # A completed archive remains immutable provenance. Later state can
-            # make it unsuitable as a current ranking input, but must not turn
-            # historical completion into an operational deadlock. Only an
-            # ACTIVE, nonterminal round above blocks a fresh decision.
+            # Ordinary NEW ranking remains fail-closed when the latest completed
+            # discovery archive predates current scientific state. Already-gated
+            # frozen execution uses a separate exact authority path and must not
+            # weaken this ranking guard.
             from .discovery_v33 import DistributedDiscoveryService
 
             staleness = DistributedDiscoveryService(self.store, migrate=False).stale_check(
                 str(latest_discovery_round["id"]), mark_stale=persist,
             )
             if staleness["stale"]:
-                stale_terminal_discovery = {
-                    "round_id": str(latest_discovery_round["id"]),
-                    "reason": "Terminal discovery archive is historical and excluded from current ranking.",
-                }
-                latest_discovery_round = None
+                raise GPUError(
+                    "DISCOVERY_ROUND_STALE",
+                    "The completed discovery archive predates current scientific state; do not select from it blindly.",
+                )
         portfolio = (
             self._portfolio_refresh(project_id)
             if persist
@@ -841,7 +839,6 @@ class ResearchBrain:
                 "distributed_discovery_round_id": str(latest_discovery_round["id"]) if latest_discovery_round else None,
                 "distributed_discovery_archive_id": latest_discovery_round["data"].get("archive_id") if latest_discovery_round else None,
                 "distributed_discovery_coverage_id": latest_discovery_round["data"].get("coverage_id") if latest_discovery_round else None,
-                "stale_terminal_discovery": stale_terminal_discovery,
             },
             "evidence_considered": self._evidence_ids(state),
             "hypotheses_affected": [str(item["id"]) for item in hypotheses],
@@ -1154,7 +1151,7 @@ class ResearchBrain:
         )
 
     def experiment_execution_decision_create(
-        self, project_id: str, experiment_id: str
+        self, project_id: str, experiment_id: str, execution_authority: dict[str, Any] | None = None
     ) -> dict:
         """Create an executable decision from one frozen experiment plan.
 
@@ -1188,9 +1185,39 @@ class ResearchBrain:
         if str(hypothesis["project_id"]) != str(project_id):
             raise GPUError("RESEARCH_PROJECT_MISMATCH", "Experiment and hypothesis differ")
 
-        # This is intentionally a dry run: it retains all discovery/staleness
-        # guards but must never write an unrelated generic ResearchDecision.
-        gate = self.brain_step(project_id, persist=False)
+        # Legacy/ungated executions retain the ordinary agenda-level discovery
+        # guards.  A current authoritative Lab/Gate path may instead provide a
+        # server-validated frozen-execution authority context.  This prevents a
+        # selected frozen Experiment from self-invalidating solely because its
+        # own Hypothesis/Experiment records made the historical selecting archive
+        # stale.  The context is not user authority: only the server/Lab control
+        # plane may construct it after current gate/work/owner validation.
+        if execution_authority is None:
+            gate = self.brain_step(project_id, persist=False)
+            agenda_item_id = str(gate["agenda_item"]["id"])
+            research_state = gate.get("scientific_state", {})
+            authority_snapshot = None
+            rationale = (
+                "Selected the exact frozen preregistered experiment plan after "
+                "the current Brain/discovery gates passed."
+            )
+        else:
+            if execution_authority.get("validated") is not True:
+                raise GPUError("FROZEN_EXECUTION_AUTHORITY_INVALID", "Authority context was not validated")
+            if str(execution_authority.get("project_id")) != str(project_id):
+                raise GPUError("RESEARCH_PROJECT_MISMATCH", "Execution authority and project differ")
+            if str(execution_authority.get("experiment_id")) != str(experiment_id):
+                raise GPUError("FROZEN_EXECUTION_AUTHORITY_MISMATCH", "Authority context covers another Experiment")
+            if str(execution_authority.get("hypothesis_id")) != hypothesis_id:
+                raise GPUError("FROZEN_EXECUTION_AUTHORITY_MISMATCH", "Authority context covers another Hypothesis")
+            agenda = execution_authority.get("agenda_item_id")
+            agenda_item_id = str(agenda) if agenda else None
+            research_state = {}
+            authority_snapshot = self._json_safe(execution_authority)
+            rationale = (
+                "Selected the exact frozen preregistered experiment plan under a "
+                "current server-validated ScientificGate/Lab WorkItem execution authority."
+            )
         action_type = str(plan.get("action_type", "FROZEN_DIAGNOSTIC")).upper()
         if action_type not in EXECUTABLE_ACTIONS:
             raise GPUError("EXPERIMENT_ACTION_NOT_EXECUTABLE", action_type)
@@ -1222,19 +1249,20 @@ class ResearchBrain:
         decision_data = {
             "request_id": str(uuid.uuid4()),
             "brain_step_id": str(uuid.uuid4()),
-            "agenda_item_id": str(gate["agenda_item"]["id"]),
+            "agenda_item_id": agenda_item_id,
             "question": question.strip(),
             "hypotheses_affected": [hypothesis_id],
             "selected_action": selected,
             "state_snapshot": {
-                "research_state": gate.get("scientific_state", {}),
+                "research_state": research_state,
                 "execution_experiment_id": experiment_id,
+                "execution_authority": authority_snapshot,
             },
             "brain_policy_version": BRAIN_POLICY_VERSION,
             "strategy_policy_version": STRATEGY_POLICY_VERSION,
             "scoring_policy_version": SCORING_POLICY_VERSION,
             "decision_role": "SCIENTIFIC_ACTION",
-            "rationale": "Selected the exact frozen preregistered experiment plan after the current Brain/discovery gates passed.",
+            "rationale": rationale,
             "result_that_changes_belief": [prediction.strip()],
             "pass_means": plan.get("interpretation_if_pass"),
             "fail_means": plan.get("interpretation_if_fail"),
@@ -1281,6 +1309,7 @@ class ResearchBrain:
             "action_type": selected.get("action_type"),
             "requires_human_approval": False,
             "approved": True,
+            "execution_authority": decision["data"].get("state_snapshot", {}).get("execution_authority"),
         }
 
     def result_assess(

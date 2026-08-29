@@ -4262,6 +4262,7 @@ class ResearchStore:
         job_id: str,
         request_fingerprint: str,
         execution: dict[str, Any],
+        one_shot: bool = False,
     ) -> dict:
         """Atomically reserve canonical run/job identity before process submission."""
         if not idempotency_key or len(idempotency_key) > 200:
@@ -4277,6 +4278,19 @@ class ResearchStore:
                 raise GPUError("RESEARCH_OBJECT_NOT_FOUND", experiment_id)
             if experiment["kind"] != "Experiment" or not experiment["data"].get("frozen"):
                 raise GPUError("EXPERIMENT_NOT_PREREGISTERED", experiment_id)
+            if one_shot:
+                cur.execute(
+                    "SELECT run_id,job_id,idempotency_key,request_fingerprint,status "
+                    "FROM research_execution_attempts WHERE experiment_id=%s ORDER BY created_at,run_id",
+                    (experiment_id,),
+                )
+                prior_attempts = cur.fetchall()
+                conflicting = [row for row in prior_attempts if str(row["idempotency_key"]) != str(idempotency_key)]
+                if conflicting or len(prior_attempts) > 1:
+                    raise GPUError(
+                        "EXPERIMENT_ONE_SHOT_ALREADY_RESERVED",
+                        "A one-shot Experiment already has a different canonical execution attempt",
+                    )
             cur.execute(
                 "SELECT run_id,job_id,request_fingerprint,status FROM research_execution_attempts "
                 "WHERE experiment_id=%s AND idempotency_key=%s",

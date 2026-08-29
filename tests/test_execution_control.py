@@ -244,6 +244,10 @@ async def test_execution_decision_bind_exposes_exact_request_fingerprint(monkeyp
 async def test_decision_create_returns_compact_execution_handoff(monkeypatch):
     brain = DecisionCreatingBrain()
     monkeypatch.setattr(server, "brain", lambda: brain)
+    # This is a dependency-light handoff unit test.  It intentionally exercises
+    # the legacy no-Lab-authority path, rather than resolving the Docker-only
+    # canonical Lab database from the Windows test process.
+    monkeypatch.setattr(server.settings, "gpu_lab_research_database_url", "")
 
     result = await server.research_decision_create(
         "project-id", "experiment-id", "python run.py", "/workspace", {"MODE": "test"}, "torch-env"

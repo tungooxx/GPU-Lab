@@ -431,6 +431,64 @@ def test_experiment_execution_decision_uses_frozen_question_and_prediction():
     assert result["decision"]["data"]["question"] == selected["question_addressed"]
 
 
+
+
+def test_frozen_execution_authority_bypasses_only_agenda_ranking_gate():
+    store = FrozenExperimentDecisionStore()
+    brain = ResearchBrain(store)
+
+    def must_not_rank(*_args, **_kwargs):
+        raise AssertionError("authoritative frozen execution must not rerun agenda ranking")
+
+    brain.brain_step = must_not_rank
+    authority = {
+        "validated": True,
+        "project_id": "project",
+        "experiment_id": "experiment",
+        "hypothesis_id": "hypothesis",
+        "gate_id": "gate",
+        "work_item_id": "work",
+        "canonical_subject_version": "subject-v1",
+    }
+    result = brain.experiment_execution_decision_create("project", "experiment", authority)
+
+    data = result["decision"]["data"]
+    assert data["agenda_item_id"] is None
+    assert data["state_snapshot"]["execution_authority"]["gate_id"] == "gate"
+    assert data["selected_action"]["payload"]["experiment_id"] == "experiment"
+    assert data["selected_action"]["predicted_outcomes"] == [
+        "The preregistered A0C metric improves over the matched control."
+    ]
+
+
+@pytest.mark.parametrize(
+    "update,error_type",
+    [
+        ({"validated": False}, "FROZEN_EXECUTION_AUTHORITY_INVALID"),
+        ({"project_id": "other"}, "RESEARCH_PROJECT_MISMATCH"),
+        ({"experiment_id": "other"}, "FROZEN_EXECUTION_AUTHORITY_MISMATCH"),
+        ({"hypothesis_id": "other"}, "FROZEN_EXECUTION_AUTHORITY_MISMATCH"),
+    ],
+)
+def test_frozen_execution_authority_rejects_unvalidated_or_mismatched_context(update, error_type):
+    store = FrozenExperimentDecisionStore()
+    brain = ResearchBrain(store)
+    authority = {
+        "validated": True,
+        "project_id": "project",
+        "experiment_id": "experiment",
+        "hypothesis_id": "hypothesis",
+        "gate_id": "gate",
+        "work_item_id": "work",
+        "canonical_subject_version": "subject-v1",
+        **update,
+    }
+    with pytest.raises(GPUError) as error:
+        brain.experiment_execution_decision_create("project", "experiment", authority)
+    assert error.value.error_type == error_type
+    assert store.persisted is None
+
+
 def test_experiment_execution_decision_preserves_discovery_gate():
     store = FrozenExperimentDecisionStore()
     brain = ResearchBrain(store)
@@ -444,6 +502,42 @@ def test_experiment_execution_decision_preserves_discovery_gate():
 
     assert error.value.error_type == "DISCOVERY_ROUND_INCOMPLETE"
     assert store.persisted is None
+
+
+def test_experiment_execution_decision_preserves_stale_discovery_gate_without_authority():
+    store = FrozenExperimentDecisionStore()
+    brain = ResearchBrain(store)
+
+    def stale(*_args, **_kwargs):
+        raise GPUError("DISCOVERY_ROUND_STALE", "Completed discovery predates current state")
+
+    brain.brain_step = stale
+    with pytest.raises(GPUError) as error:
+        brain.experiment_execution_decision_create("project", "experiment")
+
+    assert error.value.error_type == "DISCOVERY_ROUND_STALE"
+    assert store.persisted is None
+
+
+def test_frozen_execution_authority_is_separate_from_stale_new_ranking_gate():
+    store = FrozenExperimentDecisionStore()
+    brain = ResearchBrain(store)
+
+    def stale(*_args, **_kwargs):
+        raise GPUError("DISCOVERY_ROUND_STALE", "Completed discovery predates current state")
+
+    brain.brain_step = stale
+    authority = {
+        "validated": True,
+        "project_id": "project",
+        "experiment_id": "experiment",
+        "hypothesis_id": "hypothesis",
+        "gate_id": "gate",
+        "work_item_id": "work",
+        "canonical_subject_version": "subject-v1",
+    }
+    result = brain.experiment_execution_decision_create("project", "experiment", authority)
+    assert result["decision"]["data"]["state_snapshot"]["execution_authority"]["gate_id"] == "gate"
 
 
 class LegacyRepairStore:
