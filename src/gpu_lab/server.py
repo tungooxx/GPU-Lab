@@ -747,8 +747,14 @@ def _canonical_source_checkout() -> dict[str, Any]:
         return {"available": False, "path": str(path), "reason": "SOURCE_CHECKOUT_NOT_MOUNTED"}
     try:
         commit = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], check=True, text=True, capture_output=True, timeout=5).stdout.strip()
-        dirty = bool(subprocess.run(["git", "-C", str(path), "status", "--porcelain"], check=True, text=True, capture_output=True, timeout=5).stdout.strip())
-        return {"available": True, "path": str(path), "commit": commit, "dirty": dirty, "read_only": True}
+        tracked_dirty = bool(subprocess.run(["git", "-C", str(path), "diff", "--quiet"], check=False, timeout=5).returncode)
+        untracked = subprocess.run(["git", "-C", str(path), "ls-files", "--others", "--exclude-standard"], check=True, text=True, capture_output=True, timeout=5).stdout.splitlines()
+        return {
+            "available": True, "path": str(path), "commit": commit,
+            "dirty": tracked_dirty, "tracked_dirty": tracked_dirty,
+            "untracked_file_count": len(untracked), "runtime_mount_read_only": True,
+            "maintenance_note": "The container mount is intentionally read-only; authorized maintainers update the host checkout and restart the service.",
+        }
     except (OSError, subprocess.SubprocessError) as exc:
         return {"available": False, "path": str(path), "reason": f"SOURCE_CHECKOUT_UNREADABLE:{exc}"}
 
