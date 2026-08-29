@@ -187,6 +187,9 @@ _READ_ONLY_TOOLS = {
     "claim_get_evidence",
     "claim_compare",
     "hypothesis_related",
+    "discovery_context_build",
+    "hypothesis_lineage_audit",
+    "discovery_adversarial_check",
     "hypothesis_niche_list",
     "hypothesis_qd_screen",
     "experiment_branch_get",
@@ -316,6 +319,11 @@ class DiscoveryCandidateInput(BaseModel):
     expected_failure_modes: list[str] | None = Field(
         default=None, description="Optional anticipated failure modes."
     )
+    enabling_method: str | None = Field(default=None, description="Implementation/control method distinct from the proposed mechanism.")
+    mechanistic_hypothesis: str | None = Field(default=None, description="Causal claim distinct from the enabling method.")
+    lineage_responses: list[dict[str, Any]] | None = Field(default=None, description="Per-record cross-lineage synthesis responses.")
+    falsified_prerequisites: list[str] | None = Field(default=None, description="Previously falsified assumptions this candidate still depends on.")
+    original_created_at: str | None = Field(default=None, description="Original candidate creation time for later-evidence refresh.")
 
 
 class EngineeringDiffReviewInput(BaseModel):
@@ -1485,8 +1493,18 @@ async def discovery_candidate_submit(
     no ``candidate.discriminating_prediction`` field; each item in
     ``predictions`` is a discriminating prediction.
     """
+    round_ = await call(distributed_discovery().round_get, discovery_round_id)
+    if isinstance(round_, dict) and "error" in round_:
+        return round_
+    candidate_data = candidate.model_dump(exclude_none=True)
+    audit = await call(qd().hypothesis_lineage_audit, round_["project_id"], candidate_data)
+    if isinstance(audit, dict) and "error" in audit:
+        return audit
+    if not audit["passed"]:
+        return {"error": {"type": "DISCOVERY_LINEAGE_INCOMPLETE", "message": "Complete cross-lineage synthesis before submitting a discovery candidate.", "audit": audit}}
+    candidate_data["lineage_audit"] = audit
     return await call(distributed_discovery().submit_candidate, discovery_round_id, candidate_batch_id,
-                      worker_id, session_id, candidate.model_dump(exclude_none=True))
+                      worker_id, session_id, candidate_data)
 
 
 @mcp.tool()
@@ -3101,9 +3119,24 @@ async def hypothesis_create(
     kill_condition: str,
     parent_ids: list[str] | None = None,
     scientific_difference: str | None = None,
+    enabling_method: str | None = None,
+    mechanistic_hypothesis: str | None = None,
+    lineage_responses: list[dict[str, Any]] | None = None,
+    falsified_prerequisites: list[str] | None = None,
 ):
     """Create a falsifiable hypothesis after screening related active and failed mechanisms."""
     parents = parent_ids or []
+    lineage_candidate = {
+        "mechanism": mechanism, "prediction": prediction, "parent_ids": parents,
+        "enabling_method": enabling_method, "mechanistic_hypothesis": mechanistic_hypothesis,
+        "lineage_responses": lineage_responses or [],
+        "falsified_prerequisites": falsified_prerequisites or [],
+    }
+    lineage_audit = await call(qd().hypothesis_lineage_audit, project_id, lineage_candidate)
+    if isinstance(lineage_audit, dict) and lineage_audit.get("error"):
+        return lineage_audit
+    if not lineage_audit["passed"]:
+        return {"error": {"type": "DISCOVERY_LINEAGE_INCOMPLETE", "message": "Complete lineage synthesis before hypothesis creation.", "audit": lineage_audit}}
     for parent_id in parents:
         parent = research().object_get(parent_id)
         if str(parent["project_id"]) != project_id or parent["kind"] != "Hypothesis":
@@ -3137,6 +3170,9 @@ async def hypothesis_create(
             "parent_ids": parents,
             "scientific_difference": scientific_difference,
             "related_hypothesis_ids": [str(item["id"]) for item in related],
+            "enabling_method": enabling_method,
+            "mechanistic_hypothesis": mechanistic_hypothesis,
+            "lineage_audit": lineage_audit,
         },
         "HYPOTHESIS_CREATED",
     )
@@ -3152,6 +3188,24 @@ async def hypothesis_create(
 async def hypothesis_related(project_id: str, mechanism: str, limit: int = 10):
     """Retrieve related active and failed mechanisms before proposing a new descendant."""
     return await call(research().related_hypotheses, project_id, mechanism, min(max(limit, 1), 50))
+
+
+@mcp.tool()
+async def discovery_context_build(project_id: str, candidate: dict[str, Any]):
+    """Retrieve project-wide scientific lineage before hypothesis or discovery action."""
+    return await call(qd().discovery_context_build, project_id, candidate)
+
+
+@mcp.tool()
+async def hypothesis_lineage_audit(project_id: str, candidate: dict[str, Any]):
+    """Require cross-lineage synthesis, later-evidence refresh, and dead-assumption accounting."""
+    return await call(qd().hypothesis_lineage_audit, project_id, candidate)
+
+
+@mcp.tool()
+async def discovery_adversarial_check(project_id: str, candidate: dict[str, Any]):
+    """Surface the strongest counterevidence and redundancy risks before promotion."""
+    return await call(qd().discovery_adversarial_check, project_id, candidate)
 
 
 @mcp.tool()

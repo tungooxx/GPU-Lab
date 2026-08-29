@@ -330,6 +330,11 @@ class ResearchOperatorService:
                 ),
                 "expected_scope": proposal.expected_scope,
                 "scientific_difference": proposal.scientific_difference,
+                # Generated proposals still traverse the same lineage gate as
+                # manual/QD proposals. The operator's mechanism is the causal
+                # claim; its proposed intervention is retained separately.
+                "mechanistic_hypothesis": proposal.mechanism,
+                "enabling_method": proposal.cheapest_kill_test,
                 "supporting_evidence": proposal.supporting_evidence,
                 "against_evidence": proposal.against_evidence,
                 "alternative_explanations": proposal.alternative_explanations,

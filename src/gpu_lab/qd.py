@@ -1,10 +1,19 @@
 import math
+import json
+import re
 from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from .errors import GPUError
 from .research import ResearchStore
+
+
+_LINEAGE_KINDS = {
+    "Hypothesis", "NegativeResult", "Claim", "MetaLesson", "ExperimentRun",
+    "Experiment", "ResearchDecision", "EvidenceUnit", "EngineeringResult",
+}
+_PLACEHOLDER_VALUES = {"", "noop", "todo", "test", "tbd", "none", "null", "dummy", "n/a"}
 
 
 class HypothesisDraft(BaseModel):
@@ -29,6 +38,11 @@ class HypothesisDraft(BaseModel):
     alternative_explanations: list[str] = Field(default_factory=list, max_length=30)
     expected_scope: str | dict[str, Any] | None = None
     novelty_risk: str | None = Field(default=None, max_length=5000)
+    enabling_method: str | None = Field(default=None, max_length=10_000)
+    mechanistic_hypothesis: str | None = Field(default=None, max_length=20_000)
+    original_created_at: str | None = Field(default=None, max_length=100)
+    lineage_responses: list[dict[str, Any]] = Field(default_factory=list, max_length=200)
+    falsified_prerequisites: list[str] = Field(default_factory=list, max_length=100)
     operator_provenance: dict[str, Any] | None = None
     embedding: list[float] | None = Field(default=None, max_length=4096)
 
@@ -131,6 +145,126 @@ class HypothesisQDService:
     def niche_list(self, project_id: str) -> list[dict[str, Any]]:
         return self.store.objects_list(project_id, "HypothesisNiche", limit=None)
 
+    @staticmethod
+    def _words(value: Any) -> set[str]:
+        return {
+            word for word in re.findall(r"[a-z0-9][a-z0-9_-]{2,}", str(value).lower())
+            if word not in {"that", "with", "from", "this", "will", "when", "where", "into", "then"}
+        }
+
+    @staticmethod
+    def _epistemic_classification(item: dict[str, Any]) -> str:
+        data, kind, status = item.get("data", {}), item.get("kind"), str(item.get("status", "")).upper()
+        text = " ".join(str(data.get(key, "")) for key in ("scientific_role", "scientific_verification", "execution_verification", "failure_mode", "summary")) .upper()
+        if any(token in text for token in ("TECHNICAL_INVALID", "NOT_SCIENTIFIC", "SYSTEM_SMOKE", "CONTRACT_TEST")):
+            return "TECHNICAL_INVALID"
+        if "CONSTRUCT" in text or "IMPLEMENTATION" in text:
+            return "CONSTRUCTIBILITY_ONLY"
+        if kind == "NegativeResult" and ("NOOP" in text or "INVALID" in text):
+            return "NOOP/INVALID"
+        if kind == "NegativeResult":
+            return "SCIENTIFIC_VALID"
+        if kind in {"ExperimentRun", "Experiment", "EvidenceUnit"}:
+            return "CAUSAL_RESULT" if any(token in text for token in ("CAUSAL", "INTERVENTION", "DECISIVE")) else "REPRESENTATION_RESULT"
+        if status in {"REFUTED", "WEAKENED"}:
+            return "SCIENTIFIC_VALID"
+        return "TECHNICAL_ONLY" if "TECHNICAL" in text else "SCIENTIFIC_VALID"
+
+    def discovery_context_build(self, project_id: str, candidate: dict[str, Any]) -> dict[str, Any]:
+        """Retrieve related lineage across canonical records, not merely supplied parents."""
+        mechanism = str(candidate.get("mechanism") or candidate.get("mechanistic_hypothesis") or "")
+        if mechanism.strip().lower() in _PLACEHOLDER_VALUES:
+            raise GPUError("DISCOVERY_PLACEHOLDER_WRITE_REJECTED", "mechanism must not be a placeholder")
+        candidate_words = self._words(" ".join(str(candidate.get(key, "")) for key in (
+            "mechanism", "mechanistic_hypothesis", "enabling_method", "prediction", "assumptions", "variables", "scope"
+        )))
+        parent_ids = {str(item) for item in candidate.get("parent_ids", [])}
+        if hasattr(self.store, "_connect"):
+            with self.store._connect() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id,project_id,kind,status,data,created_at FROM research_objects "
+                    "WHERE project_id=%s AND kind=ANY(%s) ORDER BY created_at",
+                    (project_id, list(_LINEAGE_KINDS)),
+                )
+                records = [dict(row) for row in cur.fetchall()]
+        else:  # Lightweight stores used by deterministic policy/unit tests.
+            records = [
+                item for kind in _LINEAGE_KINDS
+                for item in self.store.objects_list(project_id, kind, limit=None)
+            ]
+        related = []
+        for record in records:
+            data = record.get("data") or {}
+            record_words = self._words(" ".join(str(data.get(key, "")) for key in (
+                "mechanism", "proposal", "prediction", "failed_assumption", "summary", "question", "title", "description", "assumptions", "variables"
+            )))
+            overlap = len(candidate_words & record_words)
+            linked = str(record["id"]) in parent_ids or bool(parent_ids & {str(item) for item in data.get("parent_ids", [])})
+            if linked or overlap >= 2:
+                related.append({
+                    "id": str(record["id"]), "kind": record["kind"], "status": record["status"],
+                    "created_at": record["created_at"].isoformat() if hasattr(record.get("created_at"), "isoformat") else (str(record["created_at"]) if record.get("created_at") else None),
+                    "overlap_terms": sorted(candidate_words & record_words), "explicit_lineage": linked,
+                    "epistemic_classification": self._epistemic_classification(record),
+                    "failed_assumption": data.get("failed_assumption") or data.get("failure_mode"),
+                    "summary": data.get("summary") or data.get("mechanism") or data.get("proposal") or data.get("question"),
+                })
+        created_after = candidate.get("original_created_at")
+        original = [item for item in related if not created_after or (item["created_at"] or "") <= created_after]
+        later = [item for item in related if created_after and (item["created_at"] or "") > created_after]
+        return {
+            "candidate_mechanism": mechanism, "related_records": related,
+            "original_discovery_basis": original,
+            "current_evidence_that_should_modify_the_design": later or related,
+            "retrieval_scope": {"searched_kinds": sorted(_LINEAGE_KINDS), "parent_ids": sorted(parent_ids)},
+        }
+
+    def hypothesis_lineage_audit(self, project_id: str, candidate: dict[str, Any]) -> dict[str, Any]:
+        context = self.discovery_context_build(project_id, candidate)
+        responses = {str(item.get("record_id")): item for item in candidate.get("lineage_responses", []) if isinstance(item, dict)}
+        important = [
+            record for record in context["related_records"]
+            if record["epistemic_classification"] in {"SCIENTIFIC_VALID", "REPRESENTATION_RESULT", "CAUSAL_RESULT"}
+        ]
+        table, missing = [], []
+        for record in important:
+            response = responses.get(record["id"], {})
+            addressed = response.get("candidate_addresses") is True
+            table.append({
+                "experiment_or_record": record["id"], "result": record["summary"],
+                "failed_assumption": record["failed_assumption"],
+                "implication_for_candidate": response.get("implication_for_candidate"),
+                "candidate_already_addresses_it": addressed,
+            })
+            if not addressed and not response.get("implication_for_candidate"):
+                missing.append(record["id"])
+        failed_prerequisites = [item["failed_assumption"] for item in important if item.get("failed_assumption")]
+        declared = {str(item).strip().lower() for item in candidate.get("falsified_prerequisites", [])}
+        undeclared = [item for item in failed_prerequisites if str(item).strip().lower() not in declared]
+        design_fields_missing = [key for key in ("enabling_method", "mechanistic_hypothesis") if str(candidate.get(key, "")).strip().lower() in _PLACEHOLDER_VALUES]
+        blockers = []
+        if missing:
+            blockers.append("DISCOVERY_LINEAGE_INCOMPLETE")
+        if undeclared:
+            blockers.append("DISCOVERY_DEAD_ASSUMPTION_UNDECLARED")
+        if design_fields_missing:
+            blockers.append("DISCOVERY_METHOD_MECHANISM_UNDISTINGUISHED")
+        return {
+            **context, "cross_lineage_synthesis": table,
+            "falsified_prerequisites_still_relevant": undeclared,
+            "design_fields_missing": design_fields_missing, "blockers": blockers,
+            "passed": not blockers,
+        }
+
+    def discovery_adversarial_check(self, project_id: str, candidate: dict[str, Any]) -> dict[str, Any]:
+        audit = self.hypothesis_lineage_audit(project_id, candidate)
+        strongest = next((item for item in audit["related_records"] if item.get("failed_assumption")), None)
+        return {
+            "passed": audit["passed"], "audit": audit,
+            "strongest_existing_counterevidence": strongest,
+            "questions": ["What existing result most strongly argues against this idea?", "What prior experiment makes it redundant?", "What assumptions have already failed?", "What evidence is merely technical?"],
+        }
+
     def screen(self, project_id: str, draft_data: dict[str, Any]) -> dict[str, Any]:
         draft = self._draft(draft_data)
         niche = self._expect(draft.niche_id, project_id, "HypothesisNiche")
@@ -207,6 +341,12 @@ class HypothesisQDService:
         }
 
     def create(self, project_id: str, draft_data: dict[str, Any]) -> dict[str, Any]:
+        audit = self.hypothesis_lineage_audit(project_id, draft_data)
+        hard_blockers = [item for item in audit["blockers"] if item != "DISCOVERY_METHOD_MECHANISM_UNDISTINGUISHED"]
+        # Lightweight in-memory stores exercise QD matching only; canonical
+        # PostgreSQL paths enforce the durable cross-lineage gate.
+        if hard_blockers and hasattr(self.store, "_connect"):
+            raise GPUError("DISCOVERY_LINEAGE_INCOMPLETE", json.dumps({"blockers": audit["blockers"], "record_ids": [row["experiment_or_record"] for row in audit["cross_lineage_synthesis"]]}))
         screened = self.screen(project_id, draft_data)
         if not screened["accepted"]:
             raise GPUError(
@@ -230,6 +370,7 @@ class HypothesisQDService:
                 "ancestor_ids": ancestors,
                 "similar_active_hypothesis_ids": screened["similar_active_hypothesis_ids"],
                 "similar_dead_hypothesis_ids": screened["similar_dead_hypothesis_ids"],
+                "lineage_audit": audit,
             },
             edges,
         )
