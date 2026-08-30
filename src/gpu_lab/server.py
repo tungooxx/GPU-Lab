@@ -2121,6 +2121,20 @@ async def scientific_gate_work_ensure(
 ):
     """Create or reuse the one active authoritative WorkItem for a gate."""
     return await call(
+        lab().gate_authority_work_ensure, gate_id, kind, title, description, scientific_role,
+        worker_id, session_id, priority, expected_value, estimated_cost, dependencies, recovery_policy, branch_id,
+    )
+
+
+@mcp.tool()
+async def scientific_gate_review_work_ensure(
+    gate_id: str, kind: str, title: str, description: str, scientific_role: str,
+    worker_id: str, session_id: str, priority: float = 0, expected_value: float | None = None,
+    estimated_cost: float | None = None, dependencies: list[dict] | None = None,
+    recovery_policy: dict[str, Any] | None = None, branch_id: str | None = None,
+):
+    """Create/reuse a non-authoritative independent-review slot for a gate."""
+    return await call(
         lab().gate_work_ensure, gate_id, kind, title, description, scientific_role,
         worker_id, session_id, priority, expected_value, estimated_cost, dependencies, recovery_policy, branch_id,
     )

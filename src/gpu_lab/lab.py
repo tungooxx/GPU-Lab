@@ -1101,10 +1101,60 @@ class LabController:
         return self.create_work(
             gate["project_id"], kind, title, description, scientific_role,
             worker_id, priority, expected_value, estimated_cost, refs, dependencies,
-            gate["authority_key"], None, session_id, gate["authority_key"], gate_id,
+            f"{gate['authority_key']}:review", None, session_id, gate["authority_key"], gate_id,
             gate["canonical_subject_version"], "SUPPORTING", gate["scientific_object_id"], recovery_policy,
             canonical_objective_id=None, branch_id=branch_id,
             authority_class="INDEPENDENT_REVIEW", promotion_state="NOT_APPLICABLE",
+        )
+
+    def gate_authority_work_ensure(
+        self, gate_id: str, kind: str, title: str, description: str, scientific_role: str,
+        worker_id: str, session_id: str, priority: float = 0, expected_value: float | None = None,
+        estimated_cost: float | None = None, dependencies: list[dict] | None = None,
+        recovery_policy: dict[str, Any] | None = None, branch_id: str | None = None,
+    ) -> dict:
+        """Create/reuse the one authoritative work slot for a scientific gate.
+
+        Review work uses :meth:`gate_work_ensure` and is deliberately
+        SUPPORTING/INDEPENDENT_REVIEW.  This separate method is the only
+        gate-bound creation path that may populate
+        ``authoritative_work_item_id``.
+        """
+        gate = self.gate_get(gate_id)
+        if gate["status"] in {"SUPERSEDED", "INVALID", "REPAIR_REQUIRED", "FAIL"}:
+            raise GPUError("SCIENTIFIC_GATE_NOT_ACTIONABLE", gate["status"])
+        # Repair the short-lived v3.6.5 projection bug where the review slot
+        # reused the gate authority's equivalence key.  That collision would
+        # otherwise prevent creation of the real authority work item.  This
+        # changes only operational dedupe metadata; the review remains intact.
+        now = self._now()
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM lab_work_items WHERE gate_id=%s AND authority_class='INDEPENDENT_REVIEW' "
+                "AND equivalence_key=%s AND status=ANY(%s) FOR UPDATE",
+                (gate_id, gate["authority_key"], list(ACTIVE_WORK_STATUSES)),
+            )
+            for review in cur.fetchall():
+                review_key = f"{gate['authority_key']}:review:{review['id']}"
+                cur.execute(
+                    "UPDATE lab_work_items SET equivalence_key=%s,updated_at=%s,work_version=work_version+1 WHERE id=%s",
+                    (review_key, now, review["id"]),
+                )
+                self._event(cur, gate["project_id"], "GATE_REVIEW_EQUIVALENCE_REPAIRED", review["id"], {
+                    "old_equivalence_key": gate["authority_key"], "new_equivalence_key": review_key,
+                    "reason": "Review slots may not occupy execution authority equivalence keys.",
+                })
+        refs = {
+            "scientific_object_id": gate["scientific_object_id"], "gate_id": gate_id,
+            "authority_slot": "GATE_EXECUTION_AUTHORITY",
+        }
+        return self.create_work(
+            gate["project_id"], kind, title, description, scientific_role,
+            worker_id, priority, expected_value, estimated_cost, refs, dependencies,
+            gate["authority_key"], None, session_id, gate["authority_key"], gate_id,
+            gate["canonical_subject_version"], "AUTHORITATIVE", gate["scientific_object_id"], recovery_policy,
+            canonical_objective_id=None, branch_id=branch_id,
+            authority_class="AUTHORITATIVE", promotion_state="ELIGIBLE",
         )
 
     @staticmethod

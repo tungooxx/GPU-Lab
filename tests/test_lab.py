@@ -1475,6 +1475,30 @@ def test_reviewer_harness_is_frozen_preparatory_not_authority():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_gate_authority_slot_never_projects_an_independent_review_as_execution_authority():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-gate-authority-slot-{time.time_ns()}", "Gate authority") ["project_id"]
+    joined = lab.join(None, "gate-authority-worker", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    gate = lab.gate_ensure(project_id, "EXECUTION", "experiment-final", "release-sha", worker_id, session_id)
+    review = lab.gate_work_ensure(
+        gate["id"], "REVIEW", "Independent review", "Review only.", "ADVERSARIAL_REVIEWER", worker_id, session_id,
+    )
+    assert review["authority_class"] == "INDEPENDENT_REVIEW"
+    assert lab.gate_get(gate["id"])["authoritative_work_item_id"] is None
+    authority = lab.gate_authority_work_ensure(
+        gate["id"], "RUN_EXPERIMENT", "Canonical execution", "Exact executable authority.", "EXECUTION", worker_id, session_id,
+    )
+    assert authority["authority_class"] == "AUTHORITATIVE"
+    assert authority["authority_status"] == "AUTHORITATIVE"
+    assert lab.gate_get(gate["id"])["authoritative_work_item_id"] == authority["id"]
+    assert lab.gate_authority_work_ensure(
+        gate["id"], "RUN_EXPERIMENT", "Repeated", "Must reuse authority.", "EXECUTION", worker_id, session_id,
+    )["id"] == authority["id"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_review_pass_transition_is_atomic_and_cannot_bypass_hard_approval():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)
