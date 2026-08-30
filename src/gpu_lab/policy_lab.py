@@ -36,6 +36,7 @@ class ResearchPolicyData(BaseModel):
     literature_policy: dict[str, Any] = Field(default_factory=dict)
     generalization_policy: dict[str, Any] = Field(default_factory=dict)
     meta_review_policy: dict[str, Any] = Field(default_factory=dict)
+    correction_policy: dict[str, Any] = Field(default_factory=dict)
     core_epistemic_invariants: list[str] = Field(default_factory=lambda: list(CORE_EPISTEMIC_INVARIANTS))
     provider_adapters: dict[str, Any] = Field(default_factory=dict)
     known_failure_modes: list[str] = Field(default_factory=list)
@@ -131,6 +132,14 @@ class PolicyLabService:
             evidence_policy={"independence_required": True},
             literature_policy={"external_content_untrusted": True},
             meta_review_policy={"bounded": True},
+            correction_policy={
+                "version": "v3.6.6",
+                "design_attack_before_major_execution": True,
+                "implementation_fidelity_is_not_design_correction": True,
+                "result_interpretation_is_separate": True,
+                "generic_code_review_default": "SUPPRESS",
+                "deterministic_engineering_default": True,
+            },
             applicability={"scope": "PROJECT"},
             notes="Canonical v2.5 baseline; deterministic v2.2 code remains the implementation source.",
         ).model_dump(mode="json")
