@@ -104,6 +104,21 @@ class GPUService:
             raise GPUError("INVALID_PATH", "Path must be inside the configured remote workspace")
         return str(candidate)
 
+    def experiment_submission_preflight(self, instance_id: str, repo_path: str) -> dict:
+        """Validate remote dispatch prerequisites without creating a job.
+
+        Canonical Research OS execution reserves its run identity before calling
+        :meth:`experiment_submit`.  Keep path and instance validation ahead of
+        that reservation so a simple routing mistake cannot leave a ghost
+        ``RESERVED`` run with no remote process.
+        """
+        item = self._instance(instance_id)
+        return {
+            "instance_id": item.id,
+            "repo_path": self._remote_path(repo_path),
+            "remote_root": self.settings.gpu_lab_remote_root,
+        }
+
     async def gpu_list(self) -> list[dict]:
         visible_by_account: dict[str, set[str]] = {}
         providers = self._configured_providers()

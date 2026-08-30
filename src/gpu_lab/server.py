@@ -4851,6 +4851,21 @@ async def research_experiment_execute(
     )
     if "error" in authorization:
         return authorization
+    # Do not reserve a canonical run until the selected remote executor can
+    # accept its immutable workspace.  Previously this check lived only in
+    # ``experiment_submit`` after reservation, which produced a RESERVED run
+    # and a fabricated remote job id for an invalid local-only cwd.
+    if instance_id:
+        remote_preflight = await call(
+            svc().experiment_submission_preflight, instance_id, working_directory,
+        )
+        if "error" in remote_preflight:
+            return {
+                "error": remote_preflight["error"],
+                "status": "NOT_RESERVED",
+                "retry_safe": True,
+                "recovery_action": "CORRECT_REMOTE_EXECUTION_PATH",
+            }
     authority = authorization.get("execution_authority")
     one_shot = False
     if authority is not None:

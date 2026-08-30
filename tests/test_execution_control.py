@@ -102,6 +102,9 @@ class RemoteRunner:
         self.submit_args = args
         return {"job_id": args[-1], "status": "running", "instance": {"id": args[0]}}
 
+    def experiment_submission_preflight(self, instance_id, repo_path):
+        return {"instance_id": instance_id, "repo_path": repo_path}
+
     async def experiment_status(self, job_id):
         return {"job_id": job_id, "status": "completed", "exit_code": 0, "logs_tail": ["ok"]}
 
@@ -354,6 +357,34 @@ async def test_execute_uses_canonical_remote_submission_and_absolute_python(monk
     assert runner.submit_args[0] == "vast_1"
     assert runner.submit_args[-1] == "local_reserved_job"
     assert "VIRTUAL_ENV=" in runner.submit_args[2]
+
+
+@pytest.mark.asyncio
+async def test_execute_rejects_invalid_remote_path_before_run_reservation(monkeypatch):
+    research = FakeResearch(_mapping("RESERVED"))
+    reservations = []
+    research.run_reserve = lambda *args: reservations.append(args) or research.mapping
+
+    class InvalidRemotePath(RemoteRunner):
+        def experiment_submission_preflight(self, _instance_id, _repo_path):
+            from gpu_lab.errors import GPUError
+            raise GPUError("INVALID_PATH", "Path must be inside the configured remote workspace")
+
+    runner = InvalidRemotePath()
+    monkeypatch.setattr(server, "research", lambda: research)
+    monkeypatch.setattr(server, "brain", lambda: AuthorizingBrain())
+    monkeypatch.setattr(server, "svc", lambda: runner)
+
+    result = await server.research_experiment_execute(
+        "experiment-id", "decision-id", "python train.py", "/workspace/local-vlm/forbidden",
+        execution_attempt_uuid="attempt-id", instance_id="vast_1",
+    )
+
+    assert result["error"]["type"] == "INVALID_PATH"
+    assert result["status"] == "NOT_RESERVED"
+    assert result["recovery_action"] == "CORRECT_REMOTE_EXECUTION_PATH"
+    assert reservations == []
+    assert runner.submit_args is None
 
 
 @pytest.mark.asyncio
