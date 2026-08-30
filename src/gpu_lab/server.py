@@ -2136,6 +2136,24 @@ async def scientific_review_pass_transition(
 
 
 @mcp.tool()
+async def scientific_review_material_repair_transition(
+    review_work_item_id: str, gate_id: str, worker_id: str, session_id: str,
+    repair_successor_spec: dict[str, Any], review_result: dict[str, Any], rationale: str = "",
+):
+    """Atomically record MATERIAL_REPAIR_REQUIRED and open/reuse its bounded repair successor."""
+    result = await call(
+        lab().review_material_repair_transition,
+        review_work_item_id, gate_id, worker_id, session_id,
+        repair_successor_spec, review_result, rationale,
+    )
+    if "error" not in result and result.get("repair_work_item", {}).get("status") == "READY":
+        wake = await call(cockpit().wake_ready_work, result["repair_work_item"]["project_id"])
+        if "error" not in wake:
+            result["worker_wake"] = wake
+    return result
+
+
+@mcp.tool()
 async def scientific_subject_supersede(
     project_id: str, old_subject_id: str, new_subject_id: str, rationale: str,
     worker_id: str, session_id: str, successor_gate_id: str | None = None,

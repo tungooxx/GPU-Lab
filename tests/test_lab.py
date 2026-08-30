@@ -1293,6 +1293,62 @@ def test_v365_atomic_pass_transition_requires_and_records_immutable_verdict():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v365_material_repair_transition_is_atomic_and_rebases_speculation():
+    """MRR must create repair work, not accidentally release authority."""
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store, feature_flags={"VERDICT_AWARE_DEPENDENCIES_V365": True})
+    project_id = store.project_create(f"lab-v365-mrr-transition-{time.time_ns()}", "Atomic MRR") ["project_id"]
+    joined = lab.join(None, "v365-mrr-reviewer", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    gate = lab.gate_ensure(project_id, "SEMANTIC", "mrr-subject", "v1", worker_id, session_id)
+    review = lab.gate_work_ensure(
+        gate["id"], "REVIEW", "MRR semantic review", "Review exact subject.",
+        "ADVERSARIAL_REVIEWER", worker_id, session_id,
+    )
+    lab.preflight_run(gate["id"], worker_id, session_id, {"frozen_semantics": True})
+    speculative = lab.create_work(
+        project_id, "IMPLEMENT", "Reusable adapter scaffold", "Non-authoritative plumbing.", "ENGINEER",
+        worker_id, created_session_id=session_id, authority_class="SPECULATIVE", promotion_state="BLOCKED",
+        speculation_class="SAFE_SPECULATIVE",
+    )
+    lab.speculative_binding_create(
+        speculative["id"], "mrr-subject", "v1", "sha256:semantic-v1", True, [], "PARTIAL_REBASE",
+        "LOW",
+    )
+    # Reproduce the formerly unsafe released-adapter shape.  MRR must retire it.
+    authority = lab.create_work(
+        project_id, "IMPLEMENT", "Unsafe authoritative adapter", "Must be superseded by MRR.", "ENGINEER",
+        worker_id, created_session_id=session_id, authority_key=f"{gate['authority_key']}:adapter",
+        gate_id=gate["id"], canonical_subject_version="v1", authority_status="AUTHORITATIVE",
+        authority_class="AUTHORITATIVE", promotion_state="ELIGIBLE", subject_id="mrr-subject",
+    )
+    claimed = lab.claim_work(review["id"], worker_id, session_id)
+    transition = lab.review_material_repair_transition(
+        claimed["id"], gate["id"], worker_id, session_id,
+        {
+            "kind": "REPAIR", "title": "Narrow semantic repair v2", "description": "Repair MRR finding.",
+            "scientific_role": "SCIENTIST", "equivalence_key": f"v365-mrr-repair-{time.time_ns()}",
+            "new_parent_version": "v2",
+        },
+        {
+            "target_subject_id": "mrr-subject", "target_subject_version": "v1", "review_type": "SEMANTIC",
+            "verdict": "MATERIAL_REPAIR_REQUIRED", "findings": [{"issue": "algebraic collapse"}],
+            "reviewed_hashes": {"spec": "sha256:semantic-v1"},
+        },
+        rationale="Static oneshot collapses to static repeat.",
+    )
+    assert transition["turn_status"] == "CONTINUE"
+    assert transition["gate"]["status"] == "REPAIR_REQUIRED"
+    assert transition["repair_work_item"]["status"] == "READY"
+    assert lab.work_get(review["id"])["status"] == "COMPLETED"
+    assert lab.work_get(authority["id"])["status"] == "SUPERSEDED"
+    assert lab.work_get(speculative["id"])["promotion_state"] == "REBASE_REQUIRED"
+    permissions = lab.work_permissions_get(speculative["id"])
+    assert permissions["may_promote_authority"] is False
+    assert permissions["may_execute_science"] is False
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_review_pass_transition_is_atomic_and_cannot_bypass_hard_approval():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)

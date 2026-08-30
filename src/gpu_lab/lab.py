@@ -40,7 +40,7 @@ DEPENDENCY_SCOPES = {"WORKITEM_LOCAL", "BRANCH", "PORTFOLIO", "OBJECTIVE_GLOBAL"
 BRANCH_STATES = {"OPEN", "WAITING", "BLOCKED", "SUPPORTED_WITHIN_SCOPE", "WEAKENED", "REFUTED", "RESOLVED", "SUPERSEDED", "ABANDONED"}
 SPECULATION_CLASSES = {"NON_SPECULATIVE", "SAFE_SPECULATIVE", "CONDITIONAL_SPECULATIVE", "EXPENSIVE_SPECULATIVE"}
 RESOURCE_CLASSES = {"REASONING", "ENGINEERING", "GPU", "TRAINING", "LITERATURE", "REVIEW", "SYNTHESIS"}
-GATE_STATUSES = {"PENDING", "PREFLIGHT_FAILED", "AWAITING_SEMANTIC_REVIEW", "PASS", "FAIL", "INVALID", "SUPERSEDED"}
+GATE_STATUSES = {"PENDING", "PREFLIGHT_FAILED", "AWAITING_SEMANTIC_REVIEW", "REPAIR_REQUIRED", "PASS", "FAIL", "INVALID", "SUPERSEDED"}
 PREFLIGHT_STATUSES = {"PASS", "FAIL"}
 COORDINATION_VERSION = "lab-coordination-v3.2.2-gates-v1"
 PLANNER_LEASE_SECONDS = 300
@@ -1018,7 +1018,7 @@ class LabController:
     ) -> dict:
         """Create or reuse the sole active independent-review slot for a gate."""
         gate = self.gate_get(gate_id)
-        if gate["status"] in {"SUPERSEDED", "INVALID", "PASS", "FAIL"}:
+        if gate["status"] in {"SUPERSEDED", "INVALID", "REPAIR_REQUIRED", "PASS", "FAIL"}:
             raise GPUError("SCIENTIFIC_GATE_NOT_ACTIONABLE", gate["status"])
         # Review slots are singleton per gate/version.  They are deliberately
         # supporting work, so authority-key arbitration alone cannot reuse
@@ -1071,7 +1071,7 @@ class LabController:
             if not gate:
                 raise GPUError("SCIENTIFIC_GATE_NOT_FOUND", gate_id)
             self._session(cur, session_id, worker_id, str(gate["project_id"]))
-            if gate["status"] in {"SUPERSEDED", "INVALID", "PASS", "FAIL"}:
+            if gate["status"] in {"SUPERSEDED", "INVALID", "REPAIR_REQUIRED", "PASS", "FAIL"}:
                 raise GPUError("SCIENTIFIC_GATE_NOT_PREFLIGHTABLE", gate["status"])
             subject = {
                 "scientific_object_id": gate["scientific_object_id"],
@@ -1142,7 +1142,7 @@ class LabController:
             if not gate:
                 raise GPUError("SCIENTIFIC_GATE_NOT_FOUND", gate_id)
             self._session(cur, session_id, worker_id, str(gate["project_id"]))
-            if gate["status"] in {"SUPERSEDED", "INVALID"}:
+            if gate["status"] in {"SUPERSEDED", "INVALID", "REPAIR_REQUIRED"}:
                 raise GPUError("SCIENTIFIC_GATE_NOT_RESOLVABLE", gate["status"])
             if gate["status"] in {"PASS", "FAIL"}:
                 if gate["status"] != semantic_status:
@@ -2724,6 +2724,82 @@ class LabController:
             else "COMPLETED"
         )
         return result
+
+    def review_material_repair_transition(
+        self, review_work_item_id: str, gate_id: str, worker_id: str, session_id: str,
+        repair_successor_spec: dict[str, Any], review_result: dict[str, Any], rationale: str = "",
+    ) -> dict[str, Any]:
+        """Atomically close an MRR review and open a non-promoted repair card."""
+        if not isinstance(repair_successor_spec, dict) or not isinstance(review_result, dict):
+            raise GPUError("LAB_REPAIR_TRANSITION_FIELDS_INVALID", "repair_successor_spec and review_result must be objects")
+        required = ("kind", "title", "description", "scientific_role", "equivalence_key", "new_parent_version")
+        if any(not str(repair_successor_spec.get(field, "")).strip() for field in required):
+            raise GPUError("LAB_REPAIR_SUCCESSOR_SPEC_REQUIRED", ", ".join(required))
+        now = self._now()
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM lab_work_items WHERE id=%s FOR UPDATE", (review_work_item_id,))
+            review = cur.fetchone()
+            if not review:
+                raise GPUError("LAB_WORK_NOT_FOUND", review_work_item_id)
+            self._session(cur, session_id, worker_id, str(review["project_id"]))
+            if str(review["assigned_worker_id"] or "") != str(worker_id) or str(review["assigned_session_id"] or "") != str(session_id):
+                raise GPUError("LAB_WORK_NOT_OWNED", review_work_item_id)
+            if str(review["gate_id"] or "") != str(gate_id):
+                raise GPUError("SCIENTIFIC_GATE_REVIEW_MISMATCH", review_work_item_id)
+            if self.feature_flags.get("VERDICT_AWARE_DEPENDENCIES_V365") and review["authority_class"] != "INDEPENDENT_REVIEW":
+                raise GPUError("SCIENTIFIC_GATE_REVIEWER_CLASS_REQUIRED", review_work_item_id)
+            cur.execute("SELECT * FROM scientific_gates WHERE id=%s AND project_id=%s FOR UPDATE", (gate_id, review["project_id"]))
+            gate = cur.fetchone()
+            if not gate or gate["status"] not in {"PENDING", "AWAITING_SEMANTIC_REVIEW"}:
+                raise GPUError("SCIENTIFIC_GATE_NOT_RESOLVABLE", str(gate["status"]) if gate else gate_id)
+            target_id = str(review_result.get("target_subject_id") or "")
+            target_version = str(review_result.get("target_subject_version") or "")
+            review_type = str(review_result.get("review_type") or "").strip()
+            verdict = self._validate(str(review_result.get("verdict") or ""), REVIEW_VERDICTS, "REVIEW_VERDICT")
+            findings, hashes = review_result.get("findings") or [], review_result.get("reviewed_hashes") or {}
+            if not target_id or not target_version or not review_type or not isinstance(findings, list) or not isinstance(hashes, dict):
+                raise GPUError("LAB_REVIEW_RESULT_BINDING_REQUIRED", "bound review result fields")
+            if target_id != str(gate["scientific_object_id"]) or target_version != str(gate["canonical_subject_version"]):
+                raise GPUError("SCIENTIFIC_GATE_REVIEW_RESULT_BINDING_MISMATCH", review_work_item_id)
+            if verdict != "MATERIAL_REPAIR_REQUIRED":
+                raise GPUError("SCIENTIFIC_GATE_REPAIR_VERDICT_REQUIRED", verdict)
+            cur.execute("SELECT * FROM lab_review_results WHERE project_id=%s AND review_work_item_id=%s AND review_type=%s FOR UPDATE", (review["project_id"], review_work_item_id, review_type))
+            stored = cur.fetchone()
+            if stored:
+                if str(stored["verdict"]) != verdict or str(stored["target_subject_id"]) != target_id or str(stored["target_subject_version"]) != target_version:
+                    raise GPUError("LAB_REVIEW_RESULT_IMMUTABLE", review_work_item_id)
+                result_id = str(stored["id"])
+            else:
+                result_id = str(uuid.uuid4())
+                cur.execute("INSERT INTO lab_review_results(id,project_id,review_work_item_id,target_subject_id,target_subject_version,review_type,verdict,findings,materiality,reviewed_hashes,lineage_snapshot_id,created_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (result_id, review["project_id"], review_work_item_id, target_id, target_version, review_type, verdict, json.dumps(findings), review_result.get("materiality"), json.dumps(hashes), review_result.get("lineage_snapshot_id"), now))
+                self._event(cur, review["project_id"], "REVIEW_RESULT_RECORDED", result_id, {"review_work_item_id": review_work_item_id, "review_type": review_type, "verdict": verdict, "target_subject_id": target_id, "target_subject_version": target_version})
+            # Old promoted-candidate paths cannot remain runnable after MRR.
+            cur.execute("SELECT id FROM lab_work_items WHERE gate_id=%s AND id<>%s AND authority_class='AUTHORITATIVE' AND status=ANY(%s) FOR UPDATE", (gate_id, review_work_item_id, list(ACTIVE_WORK_STATUSES)))
+            superseded_ids = [str(row["id"]) for row in cur.fetchall()]
+            for work_id in superseded_ids:
+                cur.execute("UPDATE lab_work_leases SET released_at=%s,release_reason='SEMANTIC_REPAIR_REQUIRED',lease_version=lease_version+1 WHERE work_item_id=%s AND released_at IS NULL", (now, work_id))
+                cur.execute("UPDATE lab_work_items SET status='SUPERSEDED',authority_status='SUPERSEDED',promotion_state='SUPERSEDED',assigned_worker_id=NULL,assigned_session_id=NULL,lease_id=NULL,invalidated_at=%s,invalidated_reason=%s,updated_at=%s,work_version=work_version+1 WHERE id=%s", (now, "Semantic review requires material repair", now, work_id))
+            cur.execute("UPDATE lab_work_items w SET promotion_state='REBASE_REQUIRED',blocked_reason=%s,updated_at=%s,work_version=work_version+1 FROM lab_speculative_bindings b WHERE b.work_item_id=w.id AND b.project_id=%s AND b.parent_subject_id=%s AND b.parent_subject_version=%s AND w.status=ANY(%s)", ("Upstream semantic review requires rebase assessment.", now, review["project_id"], gate["scientific_object_id"], gate["canonical_subject_version"], list(ACTIVE_WORK_STATUSES)))
+            rebased_count = cur.rowcount
+            key = str(repair_successor_spec["equivalence_key"])
+            cur.execute("SELECT * FROM lab_work_items WHERE project_id=%s AND equivalence_key=%s AND status=ANY(%s) ORDER BY created_at LIMIT 1 FOR UPDATE", (review["project_id"], key, list(EQUIVALENCE_ACTIVE_WORK_STATUSES | {"COMPLETED"})))
+            repair = cur.fetchone()
+            reused = repair is not None
+            if not repair:
+                repair_id = str(uuid.uuid4())
+                refs = {**dict(repair_successor_spec.get("related_refs") or {}), "predecessor_review_work_item_id": review_work_item_id, "review_result_id": result_id, "repair_required": True}
+                cur.execute("INSERT INTO lab_work_items(id,project_id,kind,title,description,scientific_role,status,priority,expected_value,estimated_cost,created_by,parent_work_item_id,related_refs,equivalence_key,canonical_subject_version,authority_status,subject_id,recovery_policy,speculation_class,speculation_condition,resource_class,dependency_scope,authority_class,promotion_state,created_at,updated_at) VALUES(%s,%s,%s,%s,%s,%s,'READY',%s,%s,%s,%s,%s,%s,%s,%s,'SUPPORTING',%s,%s,'NON_SPECULATIVE','{}'::jsonb,%s,'WORKITEM_LOCAL','RECOVERY','NOT_APPLICABLE',%s,%s)", (repair_id, review["project_id"], str(repair_successor_spec["kind"]), str(repair_successor_spec["title"]), str(repair_successor_spec["description"]), str(repair_successor_spec["scientific_role"]), float(repair_successor_spec.get("priority", 0)), repair_successor_spec.get("expected_value"), repair_successor_spec.get("estimated_cost"), worker_id, review_work_item_id, json.dumps(refs), key, str(repair_successor_spec["new_parent_version"]), gate["scientific_object_id"], json.dumps(repair_successor_spec.get("recovery_policy") or {}), str(repair_successor_spec.get("resource_class", "REASONING")), now, now))
+                self._replace_dependencies(cur, repair_id, repair_successor_spec.get("dependencies") or [], now)
+                cur.execute("SELECT * FROM lab_work_items WHERE id=%s", (repair_id,))
+                repair = cur.fetchone()
+                self._event(cur, review["project_id"], "WORK_ITEM_REPAIR_MATERIALIZED", repair_id, {"gate_id": gate_id, "review_result_id": result_id, "equivalence_key": key})
+            cur.execute("UPDATE lab_work_leases SET released_at=%s,release_reason='REVIEW_MATERIAL_REPAIR_REQUIRED',lease_version=lease_version+1 WHERE id=%s AND released_at IS NULL", (now, review["lease_id"]))
+            cur.execute("UPDATE lab_work_items SET status='COMPLETED',completed_at=%s,updated_at=%s,work_version=work_version+1 WHERE id=%s", (now, now, review_work_item_id))
+            cur.execute("UPDATE scientific_gates SET status='REPAIR_REQUIRED',semantic_review_work_item_id=%s,semantic_review_result_id=%s,resolved_at=%s WHERE id=%s", (review_work_item_id, result_id, now, gate_id))
+            cur.execute("UPDATE research_worker_sessions SET current_work_item_id=NULL,active_role=NULL,status='ACTIVE',last_heartbeat_at=%s WHERE id=%s", (now, session_id))
+            cur.execute("UPDATE research_workers SET availability_state='AVAILABLE',availability_updated_at=%s,idle_reason=NULL,idle_since=NULL WHERE id=%s", (now, worker_id))
+            self._event(cur, review["project_id"], "SCIENTIFIC_GATE_REPAIR_REQUIRED_ATOMIC", gate_id, {"review_work_item_id": review_work_item_id, "review_result_id": result_id, "repair_work_item_id": str(repair["id"]), "superseded_work_item_ids": superseded_ids, "speculative_rebase_required_count": rebased_count, "rationale": rationale[:4000]})
+        return {"gate": self.gate_get(gate_id), "review_result_id": result_id, "repair_work_item": self.work_get(str(repair["id"])), "repair_reused": reused, "superseded_work_item_ids": superseded_ids, "speculative_rebase_required_count": rebased_count, "dependency_changes": self.resolve_dependencies(str(review["project_id"])), "turn_status": "CONTINUE"}
 
     def recover_stale_leases(self, project_id: str | None = None) -> dict[str, int]:
         """Reconcile orphaned work without cancelling external execution.
