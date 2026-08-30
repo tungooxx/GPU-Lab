@@ -46,6 +46,10 @@ DEPENDENCY_SCOPES = {"WORKITEM_LOCAL", "BRANCH", "PORTFOLIO", "OBJECTIVE_GLOBAL"
 BRANCH_STATES = {"OPEN", "WAITING", "BLOCKED", "SUPPORTED_WITHIN_SCOPE", "WEAKENED", "REFUTED", "RESOLVED", "SUPERSEDED", "ABANDONED"}
 SPECULATION_CLASSES = {"NON_SPECULATIVE", "SAFE_SPECULATIVE", "CONDITIONAL_SPECULATIVE", "EXPENSIVE_SPECULATIVE"}
 RESOURCE_CLASSES = {"REASONING", "ENGINEERING", "GPU", "TRAINING", "LITERATURE", "REVIEW", "SYNTHESIS"}
+EVIDENCE_NEED_EXCEPTIONS = {
+    "INDEPENDENT_REPLICATION", "INDEPENDENT_REVIEW", "CORRECTION_VERIFICATION",
+    "NEW_ANALYSIS_QUESTION", "NEW_ARTIFACT_VERSION", "DIFFERENT_EVIDENCE_FAMILY", "GENERALIZATION_SCOPE",
+}
 GATE_STATUSES = {"PENDING", "PREFLIGHT_FAILED", "AWAITING_SEMANTIC_REVIEW", "REPAIR_REQUIRED", "PASS", "FAIL", "INVALID", "SUPERSEDED"}
 GATE_REVOCATION_REASONS = {"MALFORMED_SUBJECT_VERSION", "DUPLICATE_EXECUTION_AUTHORITY", "INVALID_PROVENANCE_BINDING"}
 PREFLIGHT_STATUSES = {"PASS", "FAIL"}
@@ -286,6 +290,18 @@ class LabController:
                     result TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL,
                     UNIQUE(binding_id,new_parent_version)
                 );
+                CREATE TABLE IF NOT EXISTS lab_evidence_needs (
+                    id UUID PRIMARY KEY, project_id UUID NOT NULL REFERENCES research_projects(id),
+                    need_key TEXT NOT NULL, exception_key TEXT NOT NULL DEFAULT '',
+                    empirical_origin TEXT NOT NULL, artifact_version TEXT NOT NULL,
+                    scientific_question TEXT NOT NULL, inspection_role TEXT NOT NULL,
+                    evidence_family_intent TEXT NOT NULL, analysis_version TEXT NOT NULL,
+                    exception_type TEXT, work_item_id UUID NOT NULL REFERENCES lab_work_items(id),
+                    created_at TIMESTAMPTZ NOT NULL,
+                    UNIQUE(project_id,need_key,exception_key)
+                );
+                CREATE INDEX IF NOT EXISTS lab_evidence_needs_project_need_idx
+                    ON lab_evidence_needs(project_id,need_key);
                 DO $$ BEGIN
                     ALTER TABLE lab_work_items ADD CONSTRAINT lab_work_items_branch_fk
                         FOREIGN KEY(branch_id) REFERENCES hypothesis_branches(id) NOT VALID;
@@ -660,6 +676,30 @@ class LabController:
     @staticmethod
     def _canonical_json_hash(value: Any) -> str:
         return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+
+    @classmethod
+    def _evidence_need_normalize(cls, evidence_need: dict[str, Any]) -> dict[str, str | None]:
+        """Return a stable EvidenceNeed identity, including explicit exceptions."""
+        if not isinstance(evidence_need, dict):
+            raise GPUError("LAB_EVIDENCE_NEED_INVALID", "evidence_need must be an object")
+        fields = (
+            "empirical_origin", "artifact_version", "scientific_question", "inspection_role",
+            "evidence_family_intent", "analysis_version",
+        )
+        normalized = {field: str(evidence_need.get(field) or "").strip() for field in fields}
+        if any(not value for value in normalized.values()):
+            raise GPUError("LAB_EVIDENCE_NEED_FIELDS_REQUIRED", ", ".join(fields))
+        exception_type = str(evidence_need.get("exception_type") or "").strip().upper() or None
+        exception_key = str(evidence_need.get("exception_key") or "").strip()
+        if exception_type:
+            if exception_type not in EVIDENCE_NEED_EXCEPTIONS:
+                raise GPUError("LAB_EVIDENCE_NEED_EXCEPTION_INVALID", exception_type)
+            if not exception_key:
+                raise GPUError("LAB_EVIDENCE_NEED_EXCEPTION_KEY_REQUIRED", exception_type)
+        elif exception_key:
+            raise GPUError("LAB_EVIDENCE_NEED_EXCEPTION_TYPE_REQUIRED", exception_key)
+        need_key = cls._canonical_json_hash(normalized)
+        return {**normalized, "need_key": need_key, "exception_type": exception_type, "exception_key": exception_key}
 
     def _worker(self, cur, worker_id: str) -> dict:
         cur.execute("SELECT * FROM research_workers WHERE id=%s AND enabled=TRUE", (worker_id,))
@@ -1526,9 +1566,11 @@ class LabController:
                     affinity_reason: str | None = None,
                     required_capabilities: list[str] | None = None,
                     authority_class: str | None = None,
-                    promotion_state: str | None = None) -> dict:
+                    promotion_state: str | None = None,
+                    evidence_need: dict[str, Any] | None = None) -> dict:
         now, ident = self._now(), str(uuid.uuid4())
         dependencies = dependencies or []
+        normalized_evidence_need = self._evidence_need_normalize(evidence_need) if evidence_need is not None else None
         authority_status = self._validate(authority_status, AUTHORITY_STATUSES, "LAB_WORK_AUTHORITY_STATUS")
         authority_class = self._validate(
             authority_class or ("AUTHORITATIVE" if authority_status == "AUTHORITATIVE" else "SUPPORTING"),
@@ -1574,6 +1616,25 @@ class LabController:
                 raise GPUError("LAB_WORK_CREATOR_SESSION_REQUIRED", "created_by and created_session_id")
             self._worker(cur, created_by)
             self._session(cur, created_session_id, created_by, project_id)
+            if normalized_evidence_need:
+                cur.execute(
+                    "SELECT n.*,w.status FROM lab_evidence_needs n JOIN lab_work_items w ON w.id=n.work_item_id "
+                    "WHERE n.project_id=%s AND n.need_key=%s AND n.exception_key=%s FOR UPDATE",
+                    (project_id, normalized_evidence_need["need_key"], normalized_evidence_need["exception_key"]),
+                )
+                existing_need = cur.fetchone()
+                if existing_need and existing_need["status"] in ACTIVE_WORK_STATUSES:
+                    existing_id = str(existing_need["work_item_id"])
+                    self._event(cur, project_id, "EVIDENCE_NEED_WORK_REUSED", existing_id, {
+                        "need_key": normalized_evidence_need["need_key"], "reason": "ACTIVE_EVIDENCE_NEED",
+                    })
+                    return {**self._work_record(cur, existing_id), "dedupe_result": "REUSED_ACTIVE"}
+                if existing_need and existing_need["status"] == "COMPLETED":
+                    existing_id = str(existing_need["work_item_id"])
+                    self._event(cur, project_id, "EVIDENCE_NEED_ALREADY_SATISFIED", existing_id, {
+                        "need_key": normalized_evidence_need["need_key"], "reason": "VALID_TERMINAL_INSPECTION",
+                    })
+                    return {**self._work_record(cur, existing_id), "dedupe_result": "ALREADY_SATISFIED"}
             if preferred_worker_id:
                 self._worker(cur, preferred_worker_id)
                 if not affinity_reason or not affinity_reason.strip():
@@ -1688,6 +1749,23 @@ class LabController:
                     raise GPUError("LAB_EQUIVALENT_WORK_ACTIVE", equivalence_key or title) from exc
                 raise
             self._replace_dependencies(cur, ident, dependencies, now)
+            if normalized_evidence_need:
+                cur.execute(
+                    "INSERT INTO lab_evidence_needs(id,project_id,need_key,exception_key,empirical_origin,artifact_version,scientific_question,inspection_role,evidence_family_intent,analysis_version,exception_type,work_item_id,created_at) "
+                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                    "ON CONFLICT(project_id,need_key,exception_key) DO UPDATE SET work_item_id=EXCLUDED.work_item_id,created_at=EXCLUDED.created_at "
+                    "WHERE (SELECT status FROM lab_work_items WHERE id=lab_evidence_needs.work_item_id) NOT IN ('COMPLETED','READY','CLAIMED','RUNNING','RUNNING_DETACHED','RESULT_READY','WAITING_DEPENDENCY','BLOCKED','REPLAN_REQUIRED','DORMANT')",
+                    (str(uuid.uuid4()), project_id, normalized_evidence_need["need_key"], normalized_evidence_need["exception_key"],
+                     normalized_evidence_need["empirical_origin"], normalized_evidence_need["artifact_version"],
+                     normalized_evidence_need["scientific_question"], normalized_evidence_need["inspection_role"],
+                     normalized_evidence_need["evidence_family_intent"], normalized_evidence_need["analysis_version"],
+                     normalized_evidence_need["exception_type"], ident, now),
+                )
+                self._event(cur, project_id, "EVIDENCE_NEED_BOUND", ident, {
+                    "need_key": normalized_evidence_need["need_key"],
+                    "exception_type": normalized_evidence_need["exception_type"],
+                    "exception_key": normalized_evidence_need["exception_key"],
+                })
             if gate_id and authority_status == "AUTHORITATIVE":
                 cur.execute("UPDATE scientific_gates SET authoritative_work_item_id=%s WHERE id=%s", (ident, gate_id))
             self._event(cur, project_id, "WORK_ITEM_CREATED", ident, {
@@ -4050,6 +4128,23 @@ class LabController:
                 entry = {"work_item_id": str(item["id"]), "run_id": item["related_refs"].get("experiment_run_id"), "subject_id": item["subject_id"], "subject_version": item["canonical_subject_version"], "physical_work_status": item["status"], "canonical": item["status"] not in {"SUPERSEDED", "INVALIDATED"} and item["authority_status"] == "AUTHORITATIVE", "superseded_by": str(item["superseded_by"]) if item["superseded_by"] else None}
                 (current if entry["canonical"] else historical).append(entry)
             return {"current_canonical_runs": current, "historical_or_noncanonical_runs": historical}
+
+    def evidence_need_lookup(self, project_id: str, evidence_need: dict[str, Any]) -> dict[str, Any]:
+        """Read the canonical duplicate/terminal state for one EvidenceNeed."""
+        normalized = self._evidence_need_normalize(evidence_need)
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT n.*,w.status,w.id AS canonical_work_item_id FROM lab_evidence_needs n "
+                "JOIN lab_work_items w ON w.id=n.work_item_id "
+                "WHERE n.project_id=%s AND n.need_key=%s AND n.exception_key=%s",
+                (project_id, normalized["need_key"], normalized["exception_key"]),
+            )
+            row = cur.fetchone()
+            if not row:
+                return {"result": "NOT_FOUND", "need_key": normalized["need_key"]}
+            item = self._record(row) or {}
+            result = "REUSED_ACTIVE" if item["status"] in ACTIVE_WORK_STATUSES else "ALREADY_SATISFIED" if item["status"] == "COMPLETED" else "RETRY_ALLOWED"
+            return {"result": result, "need_key": normalized["need_key"], "evidence_need": item}
 
     def work_authority_get(self, project_id: str, authority_key: str,
                            canonical_subject_version: str | None = None) -> dict:

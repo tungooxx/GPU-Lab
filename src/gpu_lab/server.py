@@ -1984,6 +1984,7 @@ async def lab_work_create(
     preferred_worker_id: str | None = None, affinity_reason: str | None = None,
     required_capabilities: list[str] | None = None,
     authority_class: str | None = None, promotion_state: str | None = None,
+    evidence_need: dict[str, Any] | None = None,
 ):
     """Create dependency-aware work; optional worker affinity is never exclusive."""
     return await call(
@@ -2001,7 +2002,14 @@ async def lab_work_create(
         preferred_worker_id=preferred_worker_id, affinity_reason=affinity_reason,
         required_capabilities=required_capabilities,
         authority_class=authority_class, promotion_state=promotion_state,
+        evidence_need=evidence_need,
     )
+
+
+@mcp.tool()
+async def evidence_need_lookup(project_id: str, evidence_need: dict[str, Any]):
+    """Check whether an inspection/evidence need is active, already satisfied, or retryable."""
+    return await call(lab().evidence_need_lookup, project_id, evidence_need)
 
 
 @mcp.tool()

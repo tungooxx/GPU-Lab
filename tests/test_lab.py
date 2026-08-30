@@ -1399,6 +1399,43 @@ def test_terminal_malformed_pass_gate_can_be_auditably_revoked():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_evidence_need_suppresses_reinspection_but_allows_explicit_independent_review():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-evidence-need-{time.time_ns()}", "Evidence dedupe")["project_id"]
+    joined = lab.join(None, "evidence-worker", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    need = {
+        "empirical_origin": "artifact-A", "artifact_version": "v1", "scientific_question": "Q1",
+        "inspection_role": "RESULT_INSPECTION", "evidence_family_intent": "MECHANISM", "analysis_version": "a1",
+    }
+    first = lab.create_work(
+        project_id, "REVIEW", "Inspect artifact A", "One valid inspection.", "RESULT_INSPECTOR", worker_id,
+        created_session_id=session_id, evidence_need=need,
+    )
+    duplicate = lab.create_work(
+        project_id, "REVIEW", "Repeat inspection", "Must be deduplicated.", "RESULT_INSPECTOR", worker_id,
+        created_session_id=session_id, evidence_need=need,
+    )
+    assert duplicate["id"] == first["id"]
+    assert duplicate["dedupe_result"] == "REUSED_ACTIVE"
+    claimed = lab.claim_work(first["id"], worker_id, session_id)
+    lab.complete_work(claimed["id"], worker_id, session_id, summary="Validly inspected")
+    assert lab.evidence_need_lookup(project_id, need)["result"] == "ALREADY_SATISFIED"
+    repeated = lab.create_work(
+        project_id, "REVIEW", "Repeat terminal inspection", "Must remain suppressed.", "RESULT_INSPECTOR", worker_id,
+        created_session_id=session_id, evidence_need=need,
+    )
+    assert repeated["dedupe_result"] == "ALREADY_SATISFIED"
+    independent = lab.create_work(
+        project_id, "REVIEW", "Independent review", "Explicit independent review is distinct.", "ADVERSARIAL_REVIEWER", worker_id,
+        created_session_id=session_id,
+        evidence_need={**need, "exception_type": "INDEPENDENT_REVIEW", "exception_key": "review-slot-2"},
+    )
+    assert independent["id"] != first["id"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_review_pass_transition_is_atomic_and_cannot_bypass_hard_approval():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)
