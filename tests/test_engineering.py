@@ -243,6 +243,31 @@ def test_final_release_review_binds_rc_and_seals_confirmation():
     assert wrong_experiment.value.error_type == "CONFIRMATION_EXPERIMENT_MISMATCH"
 
 
+def test_delta_manifest_false_drift_must_match_immutable_release_hashes():
+    store = Store()
+    service = EngineeringService(store)
+    base = store.object_create("project", "PreScienceReleaseCandidate", {
+        "experiment_id": "experiment-1", "canonical_subject_version": "v1", "scientific_spec_id": "spec-1",
+        "scientific_hashes": {"scientific_semantic_hash": "same"},
+    }, "FIXTURE", "APPROVED")
+    candidate = store.object_create("project", "PreScienceReleaseCandidate", {
+        "experiment_id": "experiment-1", "canonical_subject_version": "v1", "scientific_spec_id": "spec-1",
+        "scientific_hashes": {"scientific_semantic_hash": "same"},
+    }, "FIXTURE", "PREPARED")
+    manifest = service.delta_manifest_create(
+        "project", base["id"], candidate["id"], ["launcher.sh"], [], [], [], {"launcher.sh": "old"},
+        {"launcher.sh": "new"}, "same", "same", "FALSE", ["cleanup"], ["launcher-test"], [],
+        ["launcher-test"], "Repair shell cleanup.",
+    )
+    assert manifest["data"]["scientific_variable_drift"] == "FALSE"
+    with pytest.raises(GPUError) as forged:
+        service.delta_manifest_create(
+            "project", base["id"], candidate["id"], [], [], [], [], {}, {}, "forged", "forged", "FALSE",
+            [], [], [], ["test"], "Attempt to forge a no-drift classification.",
+        )
+    assert forged.value.error_type == "DELTA_MANIFEST_RELEASE_HASH_MISMATCH"
+
+
 def test_result_cannot_be_recorded_twice_after_completion():
     service = EngineeringService(Store())
     task = _task(service)

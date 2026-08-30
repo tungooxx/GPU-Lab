@@ -346,8 +346,17 @@ class EngineeringService:
             raise GPUError("DELTA_MANIFEST_FIELDS_REQUIRED", "rationale and required_verification")
         if not isinstance(previous_hashes, dict) or not isinstance(current_hashes, dict):
             raise GPUError("DELTA_MANIFEST_HASHES_INVALID", "previous_hashes and current_hashes must be objects")
+        base_semantic_hash = (base.get("data", {}).get("scientific_hashes") or {}).get("scientific_semantic_hash")
+        candidate_semantic_hash = (candidate.get("data", {}).get("scientific_hashes") or {}).get("scientific_semantic_hash")
+        if not base_semantic_hash or not candidate_semantic_hash:
+            raise GPUError("DELTA_MANIFEST_RELEASE_SEMANTIC_HASH_REQUIRED", "both release candidates must bind scientific_semantic_hash")
+        if (scientific_semantic_hash_before != base_semantic_hash
+                or scientific_semantic_hash_after != candidate_semantic_hash):
+            raise GPUError("DELTA_MANIFEST_RELEASE_HASH_MISMATCH", "provided semantic hashes must match their immutable release candidates")
         if drift == "FALSE" and scientific_semantic_hash_before != scientific_semantic_hash_after:
             raise GPUError("SCIENTIFIC_VARIABLE_DRIFT_CONTRADICTION", "FALSE requires matching semantic hashes")
+        if drift == "FALSE" and str(base.get("data", {}).get("scientific_spec_id") or "") != str(candidate.get("data", {}).get("scientific_spec_id") or ""):
+            raise GPUError("SCIENTIFIC_VARIABLE_DRIFT_CONTRADICTION", "FALSE requires the same ScientificSpecVersion")
         payload = {
             "base_release_candidate_id": base_release_candidate_id,
             "candidate_release_candidate_id": candidate_release_candidate_id,
