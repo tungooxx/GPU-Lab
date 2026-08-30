@@ -1,5 +1,6 @@
 import os
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
@@ -110,6 +111,51 @@ def test_snapshot_baseline_requires_exactly_one_selected_active_niche():
             {"selected_niche_baselines": [{"id": "a"}, {"id": "b"}]}
         )
     assert ambiguous.value.error_type == "DISCOVERY_BASELINE_AMBIGUOUS"
+
+
+def test_recovery_wave_idempotence_normalizes_uuid_identity():
+    """Persisted JSON IDs are text; database adapters may return UUID objects."""
+    parent_id = uuid.uuid4()
+    archive_id = uuid.uuid4()
+    existing_id = uuid.uuid4()
+    parent = {
+        "id": parent_id,
+        "project_id": "project",
+        "kind": "DiscoveryRound",
+        "data": {
+            "archive_id": str(archive_id), "generation_wave": 1,
+            "generation_budget": {"max_generation_waves": 2},
+            "required_distance_coverage": {"NEAR": 1, "MID": 1},
+            "frozen_state_hash": "frozen",
+        },
+    }
+    archive = {
+        "id": archive_id,
+        "kind": "CrossWorkerQDArchive",
+        "data": {"coverage": {"filled_distance_slots": {"NEAR": 1, "MID": 0}}},
+    }
+    existing = {
+        "id": existing_id,
+        "kind": "DiscoveryRound",
+        # Deliberately model a driver-returned UUID instead of a JSON string.
+        "data": {"recovery_of_round_id": parent_id},
+    }
+
+    class Store:
+        @staticmethod
+        def object_get(identifier):
+            return parent if str(identifier) == str(parent_id) else archive
+
+        @staticmethod
+        def objects_list(_project_id, _kind, limit=None):
+            return [existing]
+
+    service = DistributedDiscoveryService.__new__(DistributedDiscoveryService)
+    service.store = Store()
+    service._event = lambda *_args, **_kwargs: None
+
+    recovered = service.recovery_wave_create(str(parent_id), "RECOVER_DISCOVERY_WAVE")
+    assert str(recovered["id"]) == str(existing_id)
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
