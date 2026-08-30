@@ -202,6 +202,11 @@ def test_scientific_spec_is_canonical_and_escalation_is_project_scoped():
     with pytest.raises(GPUError) as foreign_project:
         service.review_escalation_reason_create("other-project", first["id"], "MATERIAL_NEW_SCIENTIFIC_EVIDENCE", "New evidence")
     assert foreign_project.value.error_type == "RESEARCH_PROJECT_MISMATCH"
+    with pytest.raises(GPUError) as stale_frontier:
+        service.semantic_review_record(
+            first["id"], "reviewer", "PASS", "Would otherwise be valid.", "2026-08-29T00:00:00Z"
+        )
+    assert stale_frontier.value.error_type == "SEMANTIC_REVIEW_FRONTIER_CHANGED"
 
 
 def test_final_release_review_binds_rc_and_seals_confirmation():
