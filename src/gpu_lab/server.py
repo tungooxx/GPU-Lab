@@ -2270,6 +2270,29 @@ async def engineering_result_get(result_id: str):
 
 
 @mcp.tool()
+async def pre_science_release_candidate_create(
+    project_id: str, canonical_subject_version: str, experiment_id: str,
+    research_decision_id: str, engineering_result_id: str,
+    deterministic_preflight_id: str, runtime_fingerprint: str,
+    scientific_hashes: dict[str, str], successor_work: dict[str, str],
+    semantic_review_required: bool = True,
+):
+    """Bind one immutable pre-science release candidate; this never authorizes execution."""
+    return await call(
+        engineering().pre_science_release_candidate_create,
+        project_id, canonical_subject_version, experiment_id, research_decision_id,
+        engineering_result_id, deterministic_preflight_id, runtime_fingerprint,
+        scientific_hashes, successor_work, semantic_review_required,
+    )
+
+
+@mcp.tool()
+async def pre_science_release_candidate_get(candidate_id: str):
+    """Read an immutable pre-science release bundle and its bound records."""
+    return await call(engineering().pre_science_release_candidate_get, candidate_id)
+
+
+@mcp.tool()
 async def engineering_task_verify(task_id: str):
     """Check implementation readiness; this never assesses a hypothesis."""
     return await call(engineering().task_verify, task_id)

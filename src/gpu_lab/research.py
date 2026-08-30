@@ -83,6 +83,9 @@ RESEARCH_OBJECT_KINDS = (
     "StrategyTransferHindsight",
     "EngineeringTask",
     "EngineeringResult",
+    # A pre-execution release bundle.  It binds operational readiness without
+    # being scientific evidence or an execution authorization.
+    "PreScienceReleaseCandidate",
     "ResearchPolicy",
     "PolicyHypothesis",
     "ResearchPolicyPatch",

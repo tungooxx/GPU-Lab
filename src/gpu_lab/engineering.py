@@ -409,6 +409,92 @@ class EngineeringService:
             raise GPUError("ENGINEERING_RESULT_REQUIRED", result_id)
         return item
 
+    def pre_science_release_candidate_create(
+        self, project_id: str, canonical_subject_version: str, experiment_id: str,
+        research_decision_id: str, engineering_result_id: str,
+        deterministic_preflight_id: str, runtime_fingerprint: str,
+        scientific_hashes: dict[str, str], successor_work: dict[str, Any],
+        semantic_review_required: bool = True,
+    ) -> dict:
+        """Create one immutable bundle for a pre-science release.
+
+        This is deliberately not an execution authorization.  It makes the
+        exact design/decision, verified implementation, deterministic
+        preflight, runtime binding, and known successor inspectable as one
+        release candidate before the separately sealed confirmation path.
+        """
+        if not canonical_subject_version.strip() or not runtime_fingerprint.strip():
+            raise GPUError("PRE_SCIENCE_RELEASE_IDENTITY_REQUIRED", "canonical_subject_version and runtime_fingerprint")
+        if not isinstance(semantic_review_required, bool):
+            raise GPUError("PRE_SCIENCE_RELEASE_REVIEW_POLICY_INVALID", "semantic_review_required")
+        if not isinstance(scientific_hashes, dict) or not scientific_hashes:
+            raise GPUError("PRE_SCIENCE_RELEASE_HASHES_REQUIRED", "scientific_hashes")
+        hashes = {str(key): str(value) for key, value in scientific_hashes.items()}
+        if any(not key.strip() or not value.strip() for key, value in hashes.items()):
+            raise GPUError("PRE_SCIENCE_RELEASE_HASH_INVALID", "scientific_hashes must have nonempty names and values")
+        if not isinstance(successor_work, dict):
+            raise GPUError("PRE_SCIENCE_RELEASE_SUCCESSOR_REQUIRED", "successor_work")
+        successor_required = ("kind", "title", "description", "scientific_role")
+        if any(not str(successor_work.get(field, "")).strip() for field in successor_required):
+            raise GPUError("PRE_SCIENCE_RELEASE_SUCCESSOR_REQUIRED", ", ".join(successor_required))
+
+        experiment = self._validate_parent(project_id, experiment_id, "Experiment", "experiment")
+        decision = self._validate_parent(project_id, research_decision_id, "ResearchDecision", "research_decision")
+        result = self._validate_parent(project_id, engineering_result_id, "EngineeringResult", "engineering_result")
+        if str((decision or {}).get("data", {}).get("experiment_id") or "") != str(experiment_id):
+            raise GPUError("PRE_SCIENCE_RELEASE_DECISION_MISMATCH", experiment_id)
+        if str((result or {}).get("data", {}).get("engineering_task_id") or "") == "":
+            raise GPUError("PRE_SCIENCE_RELEASE_ENGINEERING_RESULT_INVALID", engineering_result_id)
+        if (result or {}).get("data", {}).get("implementation_verification") not in {
+            "VERIFIED_TARGETED", "VERIFIED_INTEGRATION", "VERIFIED_REAL_EXECUTION",
+        }:
+            raise GPUError("PRE_SCIENCE_RELEASE_ENGINEERING_NOT_VERIFIED", engineering_result_id)
+
+        # Preflight IDs are durable rows in the Research OS schema.  Verify the
+        # exact successful row instead of accepting a client-provided PASS.
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT project_id,scientific_object_id,canonical_subject_version,status,result_hash "
+                "FROM lab_deterministic_preflights WHERE id=%s",
+                (deterministic_preflight_id,),
+            )
+            preflight = cur.fetchone()
+        if not preflight or str(preflight["project_id"]) != str(project_id):
+            raise GPUError("PRE_SCIENCE_RELEASE_PREFLIGHT_NOT_FOUND", deterministic_preflight_id)
+        if preflight["status"] != "PASS":
+            raise GPUError("PRE_SCIENCE_RELEASE_PREFLIGHT_NOT_PASS", deterministic_preflight_id)
+        if str(preflight["scientific_object_id"]) != str(experiment_id) or str(preflight["canonical_subject_version"]) != canonical_subject_version:
+            raise GPUError("PRE_SCIENCE_RELEASE_PREFLIGHT_MISMATCH", deterministic_preflight_id)
+
+        payload = {
+            "canonical_subject_version": canonical_subject_version,
+            "experiment_id": experiment_id,
+            "research_decision_id": research_decision_id,
+            "engineering_result_id": engineering_result_id,
+            "deterministic_preflight_id": deterministic_preflight_id,
+            "deterministic_preflight_result_hash": str(preflight["result_hash"]),
+            "runtime_fingerprint": runtime_fingerprint,
+            "scientific_hashes": dict(sorted(hashes.items())),
+            "successor_work": {field: successor_work[field] for field in successor_required},
+            "semantic_review_required": semantic_review_required,
+            "execution_authorized": False,
+            "scientific_result": "NOT_ASSESSED",
+        }
+        existing = self.store.objects_list(project_id, "PreScienceReleaseCandidate", limit=None)
+        for candidate in existing:
+            if candidate.get("data") == payload:
+                return {**candidate, "idempotent": True}
+        return self.store.object_create(
+            project_id, "PreScienceReleaseCandidate", payload,
+            "PRE_SCIENCE_RELEASE_CANDIDATE_CREATED", "PREPARED",
+        )
+
+    def pre_science_release_candidate_get(self, candidate_id: str) -> dict:
+        candidate = self.store.object_get(candidate_id)
+        if candidate["kind"] != "PreScienceReleaseCandidate":
+            raise GPUError("PRE_SCIENCE_RELEASE_CANDIDATE_REQUIRED", candidate_id)
+        return candidate
+
     def task_verify(self, task_id: str) -> dict:
         task = self.task_get(task_id)
         result_id = task["data"].get("latest_result_id")
