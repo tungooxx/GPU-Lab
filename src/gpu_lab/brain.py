@@ -1281,6 +1281,30 @@ class ResearchBrain:
         if str(hypothesis["project_id"]) != str(project_id):
             raise GPUError("RESEARCH_PROJECT_MISMATCH", "Experiment and hypothesis differ")
 
+        # v3.6.6 is an authority check, not a generic review requirement.  A
+        # plan that explicitly declares a major ScientificDesign cannot spend
+        # paid compute before the matching idea-level attack synthesis accepts
+        # that frozen design for test.  Legacy/minor plans without this binding
+        # retain their established gates unchanged.
+        design_id = plan.get("scientific_design_id")
+        if plan.get("requires_design_attack") is True and not design_id:
+            raise GPUError("SCIENTIFIC_DESIGN_ATTACK_REQUIRED", "Frozen major design has no scientific_design_id")
+        design_synthesis = None
+        if design_id:
+            design = self._expect(str(design_id), "ScientificDesign")
+            if str(design["project_id"]) != str(project_id):
+                raise GPUError("RESEARCH_PROJECT_MISMATCH", "Experiment and scientific design differ")
+            synthesis_id = design["data"].get("design_attack_synthesis_id")
+            if design["status"] != "ACCEPTED_FOR_TEST" or not synthesis_id:
+                raise GPUError("SCIENTIFIC_DESIGN_ATTACK_NOT_ACCEPTED", str(design_id))
+            design_synthesis = self._expect(str(synthesis_id), "DesignAttackSynthesis")
+            if str(design_synthesis["project_id"]) != str(project_id):
+                raise GPUError("RESEARCH_PROJECT_MISMATCH", "Design synthesis and project differ")
+            if str(design_synthesis["data"].get("design_id")) != str(design_id):
+                raise GPUError("SCIENTIFIC_DESIGN_ATTACK_MISMATCH", str(synthesis_id))
+            if design_synthesis["status"] != "ACCEPTED_FOR_TEST":
+                raise GPUError("SCIENTIFIC_DESIGN_ATTACK_NOT_ACCEPTED", str(synthesis_id))
+
         # Legacy/ungated executions retain the ordinary agenda-level discovery
         # guards.  A current authoritative Lab/Gate path may instead provide a
         # server-validated frozen-execution authority context.  This prevents a
@@ -1353,6 +1377,7 @@ class ResearchBrain:
                 "research_state": research_state,
                 "execution_experiment_id": experiment_id,
                 "execution_authority": authority_snapshot,
+                "scientific_design_attack_synthesis_id": str(design_synthesis["id"]) if design_synthesis else None,
             },
             "brain_policy_version": BRAIN_POLICY_VERSION,
             "strategy_policy_version": STRATEGY_POLICY_VERSION,

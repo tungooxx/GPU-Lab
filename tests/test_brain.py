@@ -431,6 +431,35 @@ def test_experiment_execution_decision_uses_frozen_question_and_prediction():
     assert result["decision"]["data"]["question"] == selected["question_addressed"]
 
 
+def test_major_frozen_design_cannot_execute_without_design_attack_binding():
+    store = FrozenExperimentDecisionStore()
+    store.objects["experiment"]["data"]["plan"]["requires_design_attack"] = True
+    brain = ResearchBrain(store)
+    with pytest.raises(GPUError) as error:
+        brain.experiment_execution_decision_create("project", "experiment")
+    assert error.value.error_type == "SCIENTIFIC_DESIGN_ATTACK_REQUIRED"
+    assert store.persisted is None
+
+
+def test_accepted_design_attack_allows_major_design_to_reach_existing_gates():
+    store = FrozenExperimentDecisionStore()
+    store.objects["experiment"]["data"]["plan"].update({
+        "requires_design_attack": True, "scientific_design_id": "design",
+    })
+    store.objects["design"] = {
+        "id": "design", "project_id": "project", "kind": "ScientificDesign",
+        "status": "ACCEPTED_FOR_TEST", "data": {"design_attack_synthesis_id": "synthesis"},
+    }
+    store.objects["synthesis"] = {
+        "id": "synthesis", "project_id": "project", "kind": "DesignAttackSynthesis",
+        "status": "ACCEPTED_FOR_TEST", "data": {"design_id": "design"},
+    }
+    brain = ResearchBrain(store)
+    brain.brain_step = lambda _project_id, persist=False: {"agenda_item": {"id": "agenda"}, "scientific_state": {}}
+    result = brain.experiment_execution_decision_create("project", "experiment")
+    assert result["decision"]["data"]["state_snapshot"]["scientific_design_attack_synthesis_id"] == "synthesis"
+
+
 
 
 def test_frozen_execution_authority_bypasses_only_agenda_ranking_gate():
