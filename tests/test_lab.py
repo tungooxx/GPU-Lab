@@ -1157,6 +1157,7 @@ def test_review_pass_transition_is_atomic_and_cannot_bypass_hard_approval():
         rationale="Final release review passed.",
     )
     assert transitioned["gate"]["status"] == "PASS"
+    assert transitioned["turn_status"] == "CONTINUE"
     assert lab.work_get(review["id"])["status"] == "COMPLETED"
     assert transitioned["successor"]["status"] == "READY"
     assert transitioned["successor"]["related_refs"]["deterministic_successor"] is True

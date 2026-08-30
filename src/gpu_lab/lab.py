@@ -2275,6 +2275,12 @@ class LabController:
                       "successor": self._record(successor) or {}, "successor_reused": reused}
         result["dependency_changes"] = self.resolve_dependencies(str(review["project_id"]))
         result["gate"] = self.gate_get(gate_id)
+        result["successor"] = self.work_get(str(result["successor"]["id"]))
+        result["turn_status"] = (
+            "CONTINUE" if result["successor"]["status"] == "READY"
+            else "WAITING_DEPENDENCY" if result["successor"]["status"] in {"WAITING_DEPENDENCY", "DORMANT", "BLOCKED"}
+            else "COMPLETED"
+        )
         return result
 
     def recover_stale_leases(self, project_id: str | None = None) -> dict[str, int]:
