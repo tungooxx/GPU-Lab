@@ -1458,6 +1458,12 @@ async def lab_state_get(project_id: str, session_id: str | None = None):
 
 
 @mcp.tool()
+async def lab_policy_invariants_reconcile(project_id: str):
+    """Reconcile stale authority, false-idle, and technical-result projection contradictions."""
+    return await call(lab().policy_invariants_reconcile, project_id)
+
+
+@mcp.tool()
 async def lab_budget_set(project_id: str, worker_id: str, session_id: str, limits: dict[str, Any]):
     """Set project-level worker and compute concurrency limits for Lab Control."""
     return await call(lab().budget_set, project_id, worker_id, session_id, limits)

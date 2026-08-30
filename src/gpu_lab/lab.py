@@ -2536,6 +2536,95 @@ class LabController:
             )
             return [self._record(row) or {} for row in cur.fetchall()]
 
+    def policy_invariants_reconcile(self, project_id: str) -> dict[str, int]:
+        """Repair mechanically provable v3.6.4 control-plane contradictions.
+
+        This central reconciler deliberately performs no scientific inference:
+        it only retires obsolete authority projections, prevents technical
+        terminal runs from masquerading as inspectable results, and returns an
+        idle worker to the available pool when canonical READY work exists.
+        """
+        now = self._now()
+        superseded = technical_blocked = false_idle = 0
+        active = list(ACTIVE_WORK_STATUSES | {"DORMANT"})
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT w.*,g.status AS gate_status,g.canonical_subject_version AS gate_version,"
+                "g.superseded_by AS gate_superseded_by,g.invalidation_reason AS gate_invalidation_reason "
+                "FROM lab_work_items w JOIN scientific_gates g ON g.id=w.gate_id "
+                "WHERE w.project_id=%s AND w.status=ANY(%s) AND ("
+                "g.status IN ('SUPERSEDED','INVALID') OR g.superseded_by IS NOT NULL "
+                "OR g.invalidation_reason IS NOT NULL OR w.canonical_subject_version IS DISTINCT FROM g.canonical_subject_version) "
+                "FOR UPDATE OF w",
+                (project_id, active),
+            )
+            for item in cur.fetchall():
+                cur.execute(
+                    "UPDATE lab_work_leases SET released_at=%s,release_reason='OBSOLETE_SUBJECT_VERSION',lease_version=lease_version+1 "
+                    "WHERE work_item_id=%s AND released_at IS NULL",
+                    (now, item["id"]),
+                )
+                cur.execute(
+                    "UPDATE lab_work_items SET status='SUPERSEDED',authority_status='SUPERSEDED',assigned_worker_id=NULL,"
+                    "assigned_session_id=NULL,lease_id=NULL,invalidated_at=%s,invalidated_reason=%s,completed_at=%s,"
+                    "updated_at=%s,work_version=work_version+1 WHERE id=%s",
+                    (now, "Canonical gate/version is obsolete.", now, now, item["id"]),
+                )
+                cur.execute(
+                    "UPDATE research_worker_sessions SET current_work_item_id=NULL,active_role=NULL,status='ACTIVE',last_heartbeat_at=%s "
+                    "WHERE current_work_item_id=%s",
+                    (now, item["id"]),
+                )
+                self._event(cur, project_id, "OBSOLETE_READY_WORK", item["id"], {
+                    "gate_id": str(item["gate_id"]), "work_version": item["canonical_subject_version"],
+                    "gate_version": item["gate_version"], "gate_status": item["gate_status"],
+                })
+                superseded += 1
+
+            cur.execute(
+                "SELECT w.id,w.related_refs,r.id AS run_id,r.status AS run_status FROM lab_work_items w "
+                "JOIN research_objects r ON r.id::text=(w.related_refs->>'experiment_run_id') "
+                "WHERE w.project_id=%s AND w.status='RESULT_READY' AND r.kind='ExperimentRun' "
+                "AND r.status IN ('TECHNICAL_CANCELLED','TECHNICAL_ORPHANED') FOR UPDATE OF w",
+                (project_id,),
+            )
+            for item in cur.fetchall():
+                cur.execute(
+                    "UPDATE lab_work_items SET status='BLOCKED',blocked_reason=%s,updated_at=%s,work_version=work_version+1 WHERE id=%s",
+                    (f"ExperimentRun {item['run_status']} is technical only; reconciliation required.", now, item["id"]),
+                )
+                self._event(cur, project_id, "TECHNICAL_RESULT_STATE_RECONCILED", item["id"], {
+                    "run_id": str(item["run_id"]), "run_status": item["run_status"], "scientific_result": "NOT_ASSESSED",
+                })
+                technical_blocked += 1
+
+            cur.execute(
+                "SELECT w.id FROM lab_work_items w WHERE w.project_id=%s AND w.status='READY' LIMIT 1",
+                (project_id,),
+            )
+            ready = cur.fetchone()
+            if ready:
+                cur.execute(
+                    "SELECT id FROM research_workers WHERE availability_state='IDLE' AND enabled=TRUE AND EXISTS ("
+                    "SELECT 1 FROM research_worker_sessions s WHERE s.worker_id=research_workers.id "
+                    "AND s.current_project_id=%s AND s.status='ACTIVE' AND s.current_work_item_id IS NULL) FOR UPDATE",
+                    (project_id,),
+                )
+                for worker in cur.fetchall():
+                    cur.execute(
+                        "UPDATE research_workers SET availability_state='AVAILABLE',availability_updated_at=%s,"
+                        "idle_reason=NULL,idle_since=NULL WHERE id=%s",
+                        (now, worker["id"]),
+                    )
+                    self._event(cur, project_id, "FALSE_IDLE_TRANSITION", ready["id"], {
+                        "worker_id": str(worker["id"]), "ready_work_item_id": str(ready["id"]),
+                    })
+                    false_idle += 1
+        if superseded:
+            self.resolve_dependencies(project_id)
+        return {"obsolete_work_superseded": superseded, "technical_result_blocked": technical_blocked,
+                "false_idle_recovered": false_idle}
+
     def state_get(
         self,
         project_id: str,
@@ -2547,6 +2636,7 @@ class LabController:
         if reconcile:
             self.recover_stale_leases(project_id)
             self.resolve_dependencies(project_id)
+            self.policy_invariants_reconcile(project_id)
         state = self.store.lab_state_summary(project_id)
         events = self.store.events_summary(project_id, 30)
         if since:
@@ -2581,6 +2671,7 @@ class LabController:
              current_work_item_id: str | None = None,
              expected_work_version: int | None = None) -> dict:
         self.recover_stale_leases(project_id)
+        self.policy_invariants_reconcile(project_id)
         lease_state = "IDLE"
         lease_detail: dict[str, Any] = {}
         with self.store._connect() as conn, conn.cursor() as cur:
