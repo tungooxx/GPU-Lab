@@ -15,6 +15,14 @@ from gpu_lab.research import ResearchStore
 TEST_DATABASE_URL = os.getenv("GPU_LAB_TEST_DATABASE_URL")
 
 
+def test_host_maintenance_capabilities_are_claim_gated():
+    item = {"related_refs": {"required_capabilities": ["host_source_write", "service_restart"]}}
+    assert not LabController._worker_can_claim_item({"capabilities": {"host_source_write": True}}, item)
+    assert LabController._worker_can_claim_item(
+        {"capabilities": {"host_source_write": True, "service_restart": True}}, item
+    )
+
+
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_two_workers_claim_distinct_work_and_messages_are_not_evidence():
     store = ResearchStore(TEST_DATABASE_URL)

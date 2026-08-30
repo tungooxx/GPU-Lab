@@ -1900,7 +1900,7 @@ async def lab_work_proposal_materialize(
     expected_value: float | None = None, estimated_cost: float | None = None,
     related_refs: dict[str, Any] | None = None, dependencies: list[dict] | None = None,
     speculation_class: str = "NON_SPECULATIVE", speculation_condition: dict[str, Any] | None = None,
-    resource_class: str | None = None,
+    resource_class: str | None = None, required_capabilities: list[str] | None = None,
 ):
     """Materialize an approved proposal through a planner-authorized canonical path only."""
     return await call(
@@ -1908,6 +1908,7 @@ async def lab_work_proposal_materialize(
         kind, title, description, scientific_role, priority, expected_value, estimated_cost,
         related_refs, dependencies, speculation_class=speculation_class,
         speculation_condition=speculation_condition, resource_class=resource_class,
+        required_capabilities=required_capabilities,
     )
 
 
@@ -1950,6 +1951,7 @@ async def lab_work_create(
     resource_class: str | None = None,
     dependency_scope: str = "WORKITEM_LOCAL",
     preferred_worker_id: str | None = None, affinity_reason: str | None = None,
+    required_capabilities: list[str] | None = None,
 ):
     """Create dependency-aware work; optional worker affinity is never exclusive."""
     return await call(
@@ -1965,6 +1967,7 @@ async def lab_work_create(
         resource_class=resource_class,
         dependency_scope=dependency_scope,
         preferred_worker_id=preferred_worker_id, affinity_reason=affinity_reason,
+        required_capabilities=required_capabilities,
     )
 
 

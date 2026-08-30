@@ -447,6 +447,7 @@ class LabController:
         recovery_policy: dict[str, Any] | None = None,
         speculation_class: str = "NON_SPECULATIVE", speculation_condition: dict[str, Any] | None = None,
         resource_class: str | None = None, dependency_scope: str = "WORKITEM_LOCAL",
+        required_capabilities: list[str] | None = None,
     ) -> dict:
         """Central planner-only proposal materialization; workers cannot self-allocate work."""
         with self.store._connect() as conn, conn.cursor() as cur:
@@ -469,7 +470,7 @@ class LabController:
             canonical_objective_id=proposal_data.get("canonical_objective_id"),
             branch_id=proposal_data.get("hypothesis_branch_id"), speculation_class=speculation_class,
             speculation_condition=speculation_condition, resource_class=resource_class,
-            dependency_scope=dependency_scope,
+            dependency_scope=dependency_scope, required_capabilities=required_capabilities,
         )
         now = self._now()
         with self.store._connect() as conn, conn.cursor() as cur:
@@ -615,6 +616,28 @@ class LabController:
         if not worker:
             raise GPUError("LAB_WORKER_NOT_FOUND", worker_id)
         return worker
+
+    @staticmethod
+    def _capability_names(capabilities: Any) -> set[str]:
+        """Normalize the durable worker-capability map without trusting prose."""
+        if not isinstance(capabilities, dict):
+            return set()
+        return {
+            str(name) for name, enabled in capabilities.items()
+            if isinstance(name, str) and name.strip() and enabled is True
+        }
+
+    @staticmethod
+    def _required_capability_names(item: dict) -> set[str]:
+        refs = item.get("related_refs") or {}
+        raw = refs.get("required_capabilities", []) if isinstance(refs, dict) else []
+        if not isinstance(raw, list) or any(not isinstance(value, str) or not value.strip() for value in raw):
+            raise GPUError("LAB_WORK_REQUIRED_CAPABILITIES_INVALID", "related_refs.required_capabilities must be a list of strings")
+        return {value.strip() for value in raw}
+
+    @classmethod
+    def _worker_can_claim_item(cls, worker: dict, item: dict) -> bool:
+        return cls._required_capability_names(item).issubset(cls._capability_names(worker.get("capabilities")))
 
     def _session(self, cur, session_id: str, worker_id: str, project_id: str) -> dict:
         cur.execute(
@@ -1250,7 +1273,8 @@ class LabController:
                     resource_class: str | None = None,
                     dependency_scope: str = "WORKITEM_LOCAL",
                     preferred_worker_id: str | None = None,
-                    affinity_reason: str | None = None) -> dict:
+                    affinity_reason: str | None = None,
+                    required_capabilities: list[str] | None = None) -> dict:
         now, ident = self._now(), str(uuid.uuid4())
         dependencies = dependencies or []
         authority_status = self._validate(authority_status, AUTHORITY_STATUSES, "LAB_WORK_AUTHORITY_STATUS")
@@ -1261,6 +1285,14 @@ class LabController:
         speculation_condition = speculation_condition or {}
         if not isinstance(speculation_condition, dict):
             raise GPUError("LAB_WORK_SPECULATION_CONDITION_INVALID", "speculation_condition must be an object")
+        if required_capabilities is not None:
+            if not isinstance(required_capabilities, list) or any(not isinstance(item, str) or not item.strip() for item in required_capabilities):
+                raise GPUError("LAB_WORK_REQUIRED_CAPABILITIES_INVALID", "required_capabilities must be a list of nonempty strings")
+            related_refs = dict(related_refs or {})
+            existing_required = related_refs.get("required_capabilities")
+            if existing_required is not None and set(existing_required) != set(required_capabilities):
+                raise GPUError("LAB_WORK_REQUIRED_CAPABILITIES_CONFLICT", "related_refs.required_capabilities")
+            related_refs["required_capabilities"] = sorted(set(required_capabilities))
         if speculation_class == "CONDITIONAL_SPECULATIVE":
             if not branch_id or not speculation_condition.get("condition") or not speculation_condition.get("invalidation_trigger"):
                 raise GPUError("LAB_WORK_SPECULATION_CONDITION_REQUIRED", "conditional speculative work requires branch_id, condition, and invalidation_trigger")
@@ -1794,7 +1826,7 @@ class LabController:
         dependency_error: tuple[str, str] | None = None
         result: dict | None = None
         with self.store._connect() as conn, conn.cursor() as cur:
-            self._worker(cur, worker_id)
+            worker = self._worker(cur, worker_id)
             # Serialize all claims for one worker identity before taking work or
             # session row locks; this also avoids cross-session lock inversion.
             cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"lab-worker-claim:{worker_id}",))
@@ -1804,6 +1836,10 @@ class LabController:
             target = cur.fetchone()
             if not target:
                 raise GPUError("LAB_WORK_NOT_FOUND", work_item_id)
+            required_capabilities = self._required_capability_names(target)
+            missing_capabilities = sorted(required_capabilities - self._capability_names(worker.get("capabilities")))
+            if missing_capabilities:
+                raise GPUError("LAB_WORKER_CAPABILITY_REQUIRED", ", ".join(missing_capabilities))
             session = self._session(cur, session_id, worker_id, str(target["project_id"]))
             self._clear_stale_session_ownership(cur, worker_id, now)
             # The reconciliation can clear this session's stale projection;
@@ -3282,6 +3318,7 @@ class LabController:
         ready = [
             item for item in self.work_list(project_id, ["READY"], limit)
             if self._scheduler_actionable_work(item)
+            and self._worker_can_claim_item(worker, item)
             # Deterministic reallocation never adds a second worker to an
             # already-covered branch. A separately authorized correction or
             # review can still be explicitly claimed outside this allocator.
