@@ -222,6 +222,12 @@ class EngineeringService:
             raise GPUError("SEMANTIC_REVIEW_VERDICT_INVALID", verdict)
         if not reviewer_id.strip() or not rationale.strip() or not latest_relevant_scientific_event_at:
             raise GPUError("SEMANTIC_REVIEW_FIELDS_REQUIRED", "reviewer_id, rationale, latest_relevant_scientific_event_at")
+        live_frontier = self.store.lab_state_summary(str(spec["project_id"])).get("latest_scientific_event_at")
+        if latest_relevant_scientific_event_at != live_frontier:
+            raise GPUError("SEMANTIC_REVIEW_FRONTIER_CHANGED", json.dumps({
+                "reviewed_latest_scientific_event_at": latest_relevant_scientific_event_at,
+                "actual_latest_scientific_event_at": live_frontier,
+            }))
         prior = [
             item for item in self.store.objects_list(str(spec["project_id"]), "ScientificSemanticReview", limit=None)
             if str(item.get("data", {}).get("scientific_spec_id")) == str(scientific_spec_id)
