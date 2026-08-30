@@ -22,10 +22,11 @@ unknown. Existing history is not rewritten.
 Verification on 2026-08-31:
 
 - Windows suite: `396 passed, 97 skipped`.
-- Fresh PostgreSQL v3.6.6 integration: `3 passed`.
+- Fresh PostgreSQL v3.6.6 integration: `4 passed`.
 - Covered invariants: peer isolation, fidelity != design correction, one
-  material challenge overrides apparent majority, discriminator creation, and
-  interpretation attack not admitting evidence.
+  material challenge overrides apparent majority, independent duplicate
+  challenge origins collapse only during synthesis, discriminator creation,
+  and interpretation attack not admitting evidence.
 
 Remaining rollout work is intentionally feature-flagged: planner policy and UI
 can consume these typed records after production shadow-audit review. Existing
