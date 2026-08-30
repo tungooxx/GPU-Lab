@@ -2001,6 +2001,35 @@ async def lab_work_permissions_get(work_item_id: str):
 
 
 @mcp.tool()
+async def speculative_binding_create(
+    work_item_id: str, parent_subject_id: str, parent_subject_version: str,
+    parent_semantic_fingerprint: str, reusable_if_parent_changes: bool,
+    invalidation_conditions: list[dict[str, Any]], rebase_policy: str,
+    max_cost_class: str, protected_data_access: bool = False,
+):
+    """Bind speculative/preparatory work to an exact parent; it has no authority effect."""
+    return await call(
+        lab().speculative_binding_create, work_item_id, parent_subject_id,
+        parent_subject_version, parent_semantic_fingerprint, reusable_if_parent_changes,
+        invalidation_conditions, rebase_policy, max_cost_class, protected_data_access,
+    )
+
+
+@mcp.tool()
+async def speculative_rebase_assess(
+    binding_id: str, new_parent_version: str, changed_semantic_fields: list[str],
+    affected_modules: list[str], unaffected_modules: list[str], reusable_artifacts: list[str],
+    invalidated_artifacts: list[str], required_repairs: list[str], result: str,
+):
+    """Classify parent-version impact as reusable, rebase-required, or invalidated."""
+    return await call(
+        lab().speculative_rebase_assess, binding_id, new_parent_version, changed_semantic_fields,
+        affected_modules, unaffected_modules, reusable_artifacts, invalidated_artifacts,
+        required_repairs, result,
+    )
+
+
+@mcp.tool()
 async def scientific_gate_ensure(
     project_id: str, gate_key: str, scientific_object_id: str, canonical_subject_version: str,
     worker_id: str, session_id: str, semantic_review_required: bool = True,

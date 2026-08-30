@@ -254,6 +254,30 @@ class LabController:
                 );
                 CREATE INDEX IF NOT EXISTS lab_review_results_subject_idx
                     ON lab_review_results(project_id,target_subject_id,target_subject_version,review_type,created_at DESC);
+                CREATE TABLE IF NOT EXISTS lab_speculative_bindings (
+                    id UUID PRIMARY KEY, project_id UUID NOT NULL REFERENCES research_projects(id),
+                    work_item_id UUID NOT NULL UNIQUE REFERENCES lab_work_items(id),
+                    parent_subject_id TEXT NOT NULL, parent_subject_version TEXT NOT NULL,
+                    parent_semantic_fingerprint TEXT NOT NULL, speculation_class TEXT NOT NULL,
+                    reusable_if_parent_changes BOOLEAN NOT NULL DEFAULT FALSE,
+                    invalidation_conditions JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    rebase_policy TEXT NOT NULL, max_cost_class TEXT NOT NULL,
+                    protected_data_access BOOLEAN NOT NULL DEFAULT FALSE,
+                    authority_effect TEXT NOT NULL DEFAULT 'NONE', created_at TIMESTAMPTZ NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS lab_speculative_rebase_assessments (
+                    id UUID PRIMARY KEY, project_id UUID NOT NULL REFERENCES research_projects(id),
+                    binding_id UUID NOT NULL REFERENCES lab_speculative_bindings(id),
+                    old_parent_version TEXT NOT NULL, new_parent_version TEXT NOT NULL,
+                    changed_semantic_fields JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    affected_modules JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    unaffected_modules JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    reusable_artifacts JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    invalidated_artifacts JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    required_repairs JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    result TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL,
+                    UNIQUE(binding_id,new_parent_version)
+                );
                 DO $$ BEGIN
                     ALTER TABLE lab_work_items ADD CONSTRAINT lab_work_items_branch_fk
                         FOREIGN KEY(branch_id) REFERENCES hypothesis_branches(id) NOT VALID;
@@ -2225,6 +2249,79 @@ class LabController:
                 "blocking_conditions": blocking, "satisfied_conditions": [detail for ok, _, detail in outcomes if ok],
                 "permission_snapshot_version": f"{item['work_version']}:{promotion_state}:{authority_class}",
             }
+
+    def speculative_binding_create(
+        self, work_item_id: str, parent_subject_id: str, parent_subject_version: str,
+        parent_semantic_fingerprint: str, reusable_if_parent_changes: bool,
+        invalidation_conditions: list[dict[str, Any]], rebase_policy: str,
+        max_cost_class: str, protected_data_access: bool = False,
+    ) -> dict:
+        """Bind non-authoritative labor to an exact semantic parent/version."""
+        if not parent_subject_id or not parent_subject_version or not parent_semantic_fingerprint:
+            raise GPUError("LAB_SPECULATIVE_BINDING_PARENT_REQUIRED", "parent subject, version, and fingerprint")
+        if not isinstance(invalidation_conditions, list) or not isinstance(protected_data_access, bool):
+            raise GPUError("LAB_SPECULATIVE_BINDING_FIELDS_INVALID", "invalidation_conditions/protected_data_access")
+        now, ident = self._now(), str(uuid.uuid4())
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM lab_work_items WHERE id=%s FOR UPDATE", (work_item_id,))
+            work = cur.fetchone()
+            if not work:
+                raise GPUError("LAB_WORK_NOT_FOUND", work_item_id)
+            if work["authority_class"] not in {"SPECULATIVE", "PREPARATORY"}:
+                raise GPUError("LAB_SPECULATIVE_BINDING_CLASS_REQUIRED", str(work["authority_class"]))
+            if work["authority_status"] == "AUTHORITATIVE" or work["promotion_state"] == "PROMOTED":
+                raise GPUError("LAB_SPECULATIVE_AUTHORITY_EFFECT_FORBIDDEN", work_item_id)
+            if protected_data_access:
+                raise GPUError("LAB_SPECULATIVE_CONFIRMATION_ACCESS_FORBIDDEN", work_item_id)
+            cur.execute(
+                "INSERT INTO lab_speculative_bindings(id,project_id,work_item_id,parent_subject_id,parent_subject_version,parent_semantic_fingerprint,speculation_class,reusable_if_parent_changes,invalidation_conditions,rebase_policy,max_cost_class,protected_data_access,authority_effect,created_at) "
+                "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,FALSE,'NONE',%s) "
+                "ON CONFLICT(work_item_id) DO UPDATE SET parent_subject_id=EXCLUDED.parent_subject_id,parent_subject_version=EXCLUDED.parent_subject_version,parent_semantic_fingerprint=EXCLUDED.parent_semantic_fingerprint,reusable_if_parent_changes=EXCLUDED.reusable_if_parent_changes,invalidation_conditions=EXCLUDED.invalidation_conditions,rebase_policy=EXCLUDED.rebase_policy,max_cost_class=EXCLUDED.max_cost_class "
+                "RETURNING *",
+                (ident, work["project_id"], work_item_id, parent_subject_id, parent_subject_version,
+                 parent_semantic_fingerprint, work["speculation_class"], reusable_if_parent_changes,
+                 json.dumps(invalidation_conditions), rebase_policy.strip()[:200], max_cost_class.strip()[:80], now),
+            )
+            binding = cur.fetchone()
+            self._event(cur, work["project_id"], "SPECULATIVE_BINDING_CREATED", work_item_id, {
+                "binding_id": str(binding["id"]), "parent_subject_id": parent_subject_id,
+                "parent_subject_version": parent_subject_version, "authority_effect": "NONE",
+            })
+        return self._record(binding) or {}
+
+    def speculative_rebase_assess(
+        self, binding_id: str, new_parent_version: str, changed_semantic_fields: list[str],
+        affected_modules: list[str], unaffected_modules: list[str], reusable_artifacts: list[str],
+        invalidated_artifacts: list[str], required_repairs: list[str], result: str,
+    ) -> dict:
+        """Record an engineering rebase decision without manufacturing authority."""
+        result = self._validate(result, {"REUSABLE_AS_IS", "PARTIAL_REBASE", "FULL_REBASE", "INVALIDATED"}, "SPECULATIVE_REBASE_RESULT")
+        values = (changed_semantic_fields, affected_modules, unaffected_modules, reusable_artifacts, invalidated_artifacts, required_repairs)
+        if not new_parent_version or any(not isinstance(value, list) or any(not isinstance(item, str) for item in value) for value in values):
+            raise GPUError("LAB_SPECULATIVE_REBASE_FIELDS_INVALID", "versions and artifact lists")
+        now, ident = self._now(), str(uuid.uuid4())
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT b.*,w.status,w.project_id FROM lab_speculative_bindings b JOIN lab_work_items w ON w.id=b.work_item_id WHERE b.id=%s FOR UPDATE", (binding_id,))
+            binding = cur.fetchone()
+            if not binding:
+                raise GPUError("LAB_SPECULATIVE_BINDING_NOT_FOUND", binding_id)
+            next_promotion = "BLOCKED" if result == "REUSABLE_AS_IS" else "REBASE_REQUIRED" if result in {"PARTIAL_REBASE", "FULL_REBASE"} else "INVALIDATED"
+            next_status = "INVALIDATED" if result == "INVALIDATED" else binding["status"]
+            cur.execute(
+                "INSERT INTO lab_speculative_rebase_assessments(id,project_id,binding_id,old_parent_version,new_parent_version,changed_semantic_fields,affected_modules,unaffected_modules,reusable_artifacts,invalidated_artifacts,required_repairs,result,created_at) "
+                "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT(binding_id,new_parent_version) DO UPDATE SET changed_semantic_fields=EXCLUDED.changed_semantic_fields,affected_modules=EXCLUDED.affected_modules,unaffected_modules=EXCLUDED.unaffected_modules,reusable_artifacts=EXCLUDED.reusable_artifacts,invalidated_artifacts=EXCLUDED.invalidated_artifacts,required_repairs=EXCLUDED.required_repairs,result=EXCLUDED.result "
+                "RETURNING *",
+                (ident, binding["project_id"], binding_id, binding["parent_subject_version"], new_parent_version,
+                 *(json.dumps(value) for value in values), result, now),
+            )
+            assessment = cur.fetchone()
+            cur.execute("UPDATE lab_work_items SET promotion_state=%s,status=%s,updated_at=%s,work_version=work_version+1 WHERE id=%s", (next_promotion, next_status, now, binding["work_item_id"]))
+            self._event(cur, binding["project_id"], "SPECULATIVE_REBASE_ASSESSED", binding["work_item_id"], {
+                "binding_id": binding_id, "result": result, "new_parent_version": new_parent_version,
+                "promotion_state": next_promotion,
+            })
+        return self._record(assessment) or {}
 
     def experiment_run_terminal(self, run_id: str, run_status: str) -> dict[str, int]:
         """Project terminal runs without treating technical failure as evidence.
