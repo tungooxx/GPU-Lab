@@ -1833,12 +1833,18 @@ def test_one_shot_can_replace_only_proven_unsubmitted_technical_cancellation():
         project, "ResearchDecision", {
             "hypotheses_affected": [hypothesis["id"]],
             "selected_action": {"action_type": "FROZEN_DIAGNOSTIC", "question_addressed": "Does recovery preserve one-shot semantics?"},
-            "execution_binding": {"experiment_id": str(experiment["id"]), "request_fingerprint": "bad-path"},
+            "execution_binding": {"experiment_id": str(experiment["id"]), "request_fingerprint": "placeholder"},
         }, "DECISION_CREATED", "SELECTED",
     )
+    old_execution = {
+        "executor": "vast", "decision_id": str(decision["id"]), "command": "bash run.sh",
+        "working_directory": "/workspace/GPU-Lab/repos/invalid", "environment": {"MODE": "dev"}, "python_env": None,
+    }
+    old_fingerprint = ResearchBrain._action_fingerprint_from_run_data({"experiment_id": experiment["id"], **old_execution})
+    store.object_update(decision["id"], {"execution_binding": {"experiment_id": str(experiment["id"]), "request_fingerprint": old_fingerprint}}, "SELECTED", "TEST_BINDING")
+    job_prefix = f"remote_unsubmitted_{uuid.uuid4().hex}"
     first = store.run_reserve(
-        experiment["id"], "attempt-invalid-path", "remote_unsubmitted_01", "bad-path",
-        {"executor": "vast", "decision_id": str(decision["id"])}, True,
+        experiment["id"], "attempt-invalid-path", job_prefix + "a", "bad-path", old_execution, True,
     )
     store.legacy_reserved_run_abandon(
         first["run_id"], first["job_id"], "Invalid remote working directory; no job submitted.",
@@ -1850,14 +1856,14 @@ def test_one_shot_can_replace_only_proven_unsubmitted_technical_cancellation():
     )
     assert rebound["data"]["execution_binding"]["request_fingerprint"] == "corrected-path"
     second = store.run_reserve(
-        experiment["id"], "attempt-corrected-path", "remote_unsubmitted_02", "corrected-path",
+        experiment["id"], "attempt-corrected-path", job_prefix + "b", "corrected-path",
         {"executor": "vast", "decision_id": str(decision["id"])}, True,
     )
     assert second["run_id"] != first["run_id"]
 
     with pytest.raises(GPUError) as rejected:
         store.run_reserve(
-            experiment["id"], "attempt-third", "remote_unsubmitted_03", "third-path",
+            experiment["id"], "attempt-third", job_prefix + "c", "third-path",
             {"executor": "vast", "decision_id": str(decision["id"])}, True,
         )
     assert rejected.value.error_type == "EXPERIMENT_ONE_SHOT_ALREADY_RESERVED"

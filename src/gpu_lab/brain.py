@@ -1,3 +1,5 @@
+import hashlib
+import json
 import math
 import uuid
 from datetime import UTC, datetime
@@ -1203,8 +1205,8 @@ class ResearchBrain:
                         "SELECT id,status,data FROM research_objects "
                         "WHERE project_id=%s AND kind='ExperimentRun' "
                         "AND data->>'experiment_id'=%s AND data->>'decision_id'=%s "
-                        "AND data->>'request_fingerprint'=%s ORDER BY created_at DESC FOR UPDATE",
-                        (experiment["project_id"], experiment_id, decision_id, prior.get("request_fingerprint")),
+                        "ORDER BY created_at DESC FOR UPDATE",
+                        (experiment["project_id"], experiment_id, decision_id),
                     )
                     prior_runs = cur.fetchall()
                 recoverable = []
@@ -1213,6 +1215,7 @@ class ResearchBrain:
                     provenance = abandonment.get("provenance") or {}
                     if (
                         run.get("status") == "cancelled"
+                        and self._action_fingerprint_from_run_data(run.get("data") or {}) == prior.get("request_fingerprint")
                         and abandonment.get("verified_missing_backing_job") is True
                         and provenance.get("technical_non_scientific") is True
                     ):
@@ -2245,3 +2248,22 @@ class ResearchBrain:
                 "findings": scientific_findings,
             },
         ]
+    @staticmethod
+    def _action_fingerprint_from_run_data(run_data: dict[str, Any]) -> str:
+        """Recreate the Decision binding fingerprint from an execution record.
+
+        ``research_execution_attempts.request_fingerprint`` deliberately also
+        includes executor routing (instance id and Decision id).  It is not
+        the same object as the Decision's action binding, which covers only
+        command, cwd, environment, and interpreter.
+        """
+        action = {
+            "experiment_id": run_data.get("experiment_id"),
+            "command": run_data.get("command"),
+            "working_directory": run_data.get("working_directory"),
+            "env": run_data.get("environment") or {},
+            "python_env": run_data.get("python_env"),
+        }
+        return hashlib.sha256(
+            json.dumps(action, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
