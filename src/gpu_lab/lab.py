@@ -1593,6 +1593,12 @@ class LabController:
             promotion_state or ("ELIGIBLE" if authority_class == "AUTHORITATIVE" else "NOT_APPLICABLE"),
             PROMOTION_STATES, "LAB_WORK_PROMOTION_STATE",
         )
+        if promotion_state == "PROMOTED":
+            # Promotion is a version-fenced transaction which checks typed
+            # dependencies and a current PASS gate.  Creation must never be a
+            # side door around it; legacy-corruption regressions use direct DB
+            # fixtures so the auditor still sees historical bad states.
+            raise GPUError("LAB_PROMOTION_ATOMIC_TRANSITION_REQUIRED", "use authority_promote")
         if authority_class in {"SPECULATIVE", "PREPARATORY"} and promotion_state in {"ELIGIBLE", "PROMOTED"}:
             raise GPUError("LAB_SPECULATIVE_PROMOTION_FORBIDDEN", "Speculative/preparatory work requires explicit rebase and promotion")
         dependency_scope = self._validate(dependency_scope, DEPENDENCY_SCOPES, "LAB_WORK_DEPENDENCY_SCOPE")
