@@ -279,6 +279,19 @@ class GenericToolResult(BaseModel):
     result: Any
 
 
+class DiscoveryLineageResponseInput(BaseModel):
+    """One explicit response to one record returned by the lineage audit."""
+
+    record_id: str = Field(description="Exact Research OS record ID from discovery_context_build.")
+    implication_for_candidate: str = Field(description="What this prior result implies for the candidate.")
+    candidate_already_addresses_it: bool = Field(
+        description="Whether the candidate's design already addresses that implication."
+    )
+    how_addressed: str | None = Field(
+        default=None, description="Concrete design change that addresses the implication."
+    )
+
+
 class DiscoveryCandidateInput(BaseModel):
     """Public MCP contract for a proposal-time discovery candidate.
 
@@ -321,7 +334,9 @@ class DiscoveryCandidateInput(BaseModel):
     )
     enabling_method: str | None = Field(default=None, description="Implementation/control method distinct from the proposed mechanism.")
     mechanistic_hypothesis: str | None = Field(default=None, description="Causal claim distinct from the enabling method.")
-    lineage_responses: list[dict[str, Any]] | None = Field(default=None, description="Per-record cross-lineage synthesis responses.")
+    lineage_responses: list[DiscoveryLineageResponseInput] | None = Field(
+        default=None, description="Per-record cross-lineage synthesis responses."
+    )
     falsified_prerequisites: list[str] | None = Field(default=None, description="Previously falsified assumptions this candidate still depends on.")
     original_created_at: str | None = Field(default=None, description="Original candidate creation time for later-evidence refresh.")
 

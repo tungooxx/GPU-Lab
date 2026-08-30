@@ -103,6 +103,9 @@ def test_discovery_candidate_contract_exposes_prediction_shape():
     }
     assert {"mechanism", "predictions", "falsifier"} <= set(candidate["required"])
     assert "discriminating_prediction" not in candidate["properties"]
+    assert {"enabling_method", "mechanistic_hypothesis", "lineage_responses", "falsified_prerequisites"} <= set(candidate["properties"])
+    response = schema["$defs"]["DiscoveryLineageResponseInput"]
+    assert {"record_id", "implication_for_candidate", "candidate_already_addresses_it"} <= set(response["required"])
 
 
 def test_hypothesis_qd_screen_exposes_the_backend_hypothesis_draft_contract():
