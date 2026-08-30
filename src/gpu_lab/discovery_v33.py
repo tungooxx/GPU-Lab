@@ -1018,6 +1018,30 @@ class DistributedDiscoveryService:
                     "realized_deficits": deficits, "frozen_state_hash": data.get("frozen_state_hash"),
                     "automatic": automatic,
                 })
+            else:
+                # Recovery waves created before this contract lacked durable
+                # source lineage.  Normalize in place: no snapshot, baseline,
+                # candidate, or scientific claim is rewritten.
+                existing_data = dict(result.get("data") or {})
+                source_round_ids = list(existing_data.get("source_round_ids") or data.get("source_round_ids") or [])
+                source_round_ids.append(str(round_id))
+                source_round_ids = list(dict.fromkeys(str(item) for item in source_round_ids))
+                normalized_data = {
+                    **existing_data,
+                    "source_round_ids": source_round_ids,
+                    "peer_visibility": "HIDDEN",
+                    "phase": "INDEPENDENT_GENERATION",
+                    "coverage_recover": "COVERAGE_CONTINUED",
+                }
+                if normalized_data != existing_data:
+                    cur.execute(
+                        "UPDATE research_objects SET data=%s WHERE id=%s",
+                        (self._json(normalized_data), result["id"]),
+                    )
+                    self.store._event(cur, parent["project_id"], "DISCOVERY_RECOVERY_WAVE_NORMALIZED", result["id"], {
+                        "parent_round_id": str(round_id), "source_round_ids": source_round_ids,
+                    })
+                    result = {**result, "data": normalized_data}
             if str(data.get("recovery_round_id") or "") != str(result["id"]):
                 cur.execute(
                     "UPDATE research_objects SET data=%s WHERE id=%s",

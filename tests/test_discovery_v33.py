@@ -281,6 +281,56 @@ def test_coverage_recovery_preserves_source_round_lineage_and_hidden_isolation()
     assert created[0]["peer_visibility"] == "HIDDEN"
 
 
+def test_coverage_recovery_normalizes_an_existing_legacy_wave():
+    parent_id = uuid.uuid4()
+    recovery_id = uuid.uuid4()
+    parent = {
+        "id": parent_id, "project_id": "project", "kind": "DiscoveryRound",
+        "data": {
+            "archive_id": "archive", "generation_wave": 1,
+            "generation_budget": {"max_generation_waves": 2},
+            "required_distance_coverage": {"MID": 1},
+        },
+    }
+    archive = {"id": "archive", "kind": "CrossWorkerQDArchive", "data": {
+        "coverage": {"filled_distance_slots": {"MID": 0}},
+    }}
+    legacy = {"id": recovery_id, "kind": "DiscoveryRound", "data": {
+        "recovery_of_round_id": str(parent_id), "peer_visibility": "VISIBLE_FOR_SYNTHESIS",
+    }}
+    updates: list[tuple] = []
+
+    class Cursor:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def execute(self, *args, **_kwargs): updates.append(args)
+
+    class Connection:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        @staticmethod
+        def cursor(): return Cursor()
+
+    class Store:
+        @staticmethod
+        def _connect(): return Connection()
+        @staticmethod
+        def object_get(identifier): return parent if str(identifier) == str(parent_id) else archive
+        @staticmethod
+        def objects_list(*_args, **_kwargs): return [legacy]
+        @staticmethod
+        def _event(*_args, **_kwargs): return None
+
+    service = DistributedDiscoveryService.__new__(DistributedDiscoveryService)
+    service.store = Store()
+    service._event = lambda *_args, **_kwargs: None
+    recovered = service.coverage_recover(str(parent_id), "RECOVER_DISCOVERY_WAVE")
+    assert recovered["data"]["source_round_ids"] == [str(parent_id)]
+    assert recovered["data"]["peer_visibility"] == "HIDDEN"
+    assert recovered["data"]["coverage_recover"] == "COVERAGE_CONTINUED"
+    assert any("UPDATE research_objects SET data" in statement[0] for statement in updates)
+
+
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_round_isolates_batches_then_archives_distinct_candidates():
     store = ResearchStore(TEST_DATABASE_URL)
