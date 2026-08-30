@@ -73,3 +73,54 @@ def test_lineage_audit_accepts_reviewed_record_id_aliases():
         ],
     }
     assert service.hypothesis_lineage_audit("project", candidate)["passed"] is True
+
+
+class DecisionRootStore:
+    def __init__(self, with_root=True, rootless=False):
+        self.records = []
+        if with_root:
+            self.records.append({
+                "id": "hypothesis-root", "project_id": "project", "kind": "Hypothesis", "status": "REFUTED",
+                "data": {"mechanism": "triangular parity dislocation closes after observed mismatch"},
+            })
+        decision_data = {"question": "triangular parity dislocation closes after observed mismatch"}
+        if not rootless:
+            decision_data["hypotheses_affected"] = ["hypothesis-root"]
+        self.records.append({
+            "id": "decision-derived", "project_id": "project", "kind": "ResearchDecision", "status": "COMPLETED",
+            "data": decision_data,
+        })
+
+    def objects_list(self, project_id, kind, limit=None):
+        return [item for item in self.records if item["project_id"] == project_id and item["kind"] == kind]
+
+
+def _parity_candidate(responses=None):
+    return {
+        "mechanism": "triangular parity dislocation closes after observed mismatch",
+        "enabling_method": "synchronized direct versus synthetic quote comparison",
+        "mechanistic_hypothesis": "temporary executable parity gaps close after fully observed quote mismatch",
+        "lineage_responses": responses or [],
+    }
+
+
+def test_derived_research_decision_is_satisfied_by_explicit_scientific_root():
+    service = HypothesisQDService(DecisionRootStore())
+    audit = service.hypothesis_lineage_audit("project", _parity_candidate([
+        {"record_id": "hypothesis-root", "implication_for_candidate": "Do not reuse the refuted formulation.", "candidate_already_addresses_it": True}
+    ]))
+    assert audit["passed"] is True
+    assert [item["experiment_or_record"] for item in audit["cross_lineage_synthesis"]] == ["hypothesis-root"]
+
+
+def test_omitted_material_scientific_root_still_blocks():
+    audit = HypothesisQDService(DecisionRootStore()).hypothesis_lineage_audit("project", _parity_candidate())
+    assert audit["passed"] is False
+    assert "DISCOVERY_LINEAGE_INCOMPLETE" in audit["blockers"]
+    assert [item["experiment_or_record"] for item in audit["cross_lineage_synthesis"]] == ["hypothesis-root"]
+
+
+def test_rootless_research_decision_remains_mandatory():
+    audit = HypothesisQDService(DecisionRootStore(with_root=False, rootless=True)).hypothesis_lineage_audit("project", _parity_candidate())
+    assert audit["passed"] is False
+    assert [item["experiment_or_record"] for item in audit["cross_lineage_synthesis"]] == ["decision-derived"]

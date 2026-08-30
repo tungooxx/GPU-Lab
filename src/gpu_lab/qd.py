@@ -13,6 +13,7 @@ _LINEAGE_KINDS = {
     "Hypothesis", "NegativeResult", "Claim", "MetaLesson", "ExperimentRun",
     "Experiment", "ResearchDecision", "EvidenceUnit", "EngineeringResult",
 }
+_SCIENTIFIC_ROOT_KINDS = {"Hypothesis", "NegativeResult"}
 _PLACEHOLDER_VALUES = {"", "noop", "todo", "test", "tbd", "none", "null", "dummy", "n/a"}
 
 
@@ -170,6 +171,69 @@ class HypothesisQDService:
             return "SCIENTIFIC_VALID"
         return "TECHNICAL_ONLY" if "TECHNICAL" in text else "SCIENTIFIC_VALID"
 
+    @staticmethod
+    def _decision_scientific_root_ids(
+        record: dict[str, Any], records_by_id: dict[str, dict[str, Any]]
+    ) -> list[str]:
+        """Resolve a Decision's explicit provenance into durable roots.
+
+        State snapshots are intentionally not traversed: they can contain
+        unrelated project history. A rootless Decision remains independently
+        material and must not disappear from the lineage audit.
+        """
+        if record.get("kind") != "ResearchDecision":
+            return []
+        data = record.get("data") or {}
+
+        def ids(value: Any) -> list[str]:
+            if value is None:
+                return []
+            if isinstance(value, (list, tuple, set)):
+                return [str(item) for item in value if item]
+            return [str(value)] if value else []
+
+        refs: list[str] = []
+        for key in (
+            "hypothesis_id", "hypothesis_ids", "hypotheses_affected",
+            "experiment_id", "execution_experiment_id", "frozen_experiment_id",
+        ):
+            refs.extend(ids(data.get(key)))
+        for container_key in ("selected_action", "execution_binding", "outcome"):
+            container = data.get(container_key)
+            if not isinstance(container, dict):
+                continue
+            payloads = [container]
+            if isinstance(container.get("payload"), dict):
+                payloads.append(container["payload"])
+            for payload in payloads:
+                for key in (
+                    "hypothesis_id", "hypothesis_ids", "hypotheses_affected",
+                    "hypotheses_discriminated", "experiment_id", "run_id",
+                ):
+                    refs.extend(ids(payload.get(key)))
+
+        roots: set[str] = set()
+        queue = list(dict.fromkeys(refs))
+        seen: set[str] = set()
+        while queue:
+            ref = queue.pop(0)
+            if ref in seen:
+                continue
+            seen.add(ref)
+            target = records_by_id.get(ref)
+            if not target:
+                continue
+            kind = target.get("kind")
+            target_data = target.get("data") or {}
+            if kind in _SCIENTIFIC_ROOT_KINDS:
+                roots.add(ref)
+            elif kind == "Experiment":
+                queue.extend(ids(target_data.get("hypothesis_id")))
+                queue.extend(ids(target_data.get("hypothesis_ids")))
+            elif kind == "ExperimentRun":
+                queue.extend(ids(target_data.get("experiment_id")))
+        return sorted(roots)
+
     def discovery_context_build(self, project_id: str, candidate: dict[str, Any]) -> dict[str, Any]:
         """Retrieve related lineage across canonical records, not merely supplied parents."""
         mechanism = str(candidate.get("mechanism") or candidate.get("mechanistic_hypothesis") or "")
@@ -192,23 +256,52 @@ class HypothesisQDService:
                 item for kind in _LINEAGE_KINDS
                 for item in self.store.objects_list(project_id, kind, limit=None)
             ]
-        related = []
+        records_by_id = {str(record["id"]): record for record in records}
+        related_by_id: dict[str, dict[str, Any]] = {}
+
+        def add_related(
+            record: dict[str, Any], *, explicit_lineage: bool,
+            overlap_terms: set[str] | None = None,
+        ) -> None:
+            data = record.get("data") or {}
+            identity = str(record["id"])
+            existing = related_by_id.get(identity)
+            payload = {
+                "id": identity, "kind": record["kind"], "status": record["status"],
+                "created_at": record["created_at"].isoformat() if hasattr(record.get("created_at"), "isoformat") else (str(record["created_at"]) if record.get("created_at") else None),
+                "overlap_terms": sorted(overlap_terms or set()),
+                "explicit_lineage": explicit_lineage,
+                "epistemic_classification": self._epistemic_classification(record),
+                "failed_assumption": data.get("failed_assumption") or data.get("failure_mode"),
+                "summary": data.get("summary") or data.get("mechanism") or data.get("proposal") or data.get("question"),
+            }
+            if existing:
+                payload["explicit_lineage"] = bool(existing.get("explicit_lineage")) or explicit_lineage
+                payload["overlap_terms"] = sorted(
+                    set(existing.get("overlap_terms", [])) | set(payload["overlap_terms"])
+                )
+            related_by_id[identity] = payload
+
         for record in records:
             data = record.get("data") or {}
             record_words = self._words(" ".join(str(data.get(key, "")) for key in (
                 "mechanism", "proposal", "prediction", "failed_assumption", "summary", "question", "title", "description", "assumptions", "variables"
             )))
-            overlap = len(candidate_words & record_words)
+            overlap_terms = candidate_words & record_words
             linked = str(record["id"]) in parent_ids or bool(parent_ids & {str(item) for item in data.get("parent_ids", [])})
-            if linked or overlap >= 2:
-                related.append({
-                    "id": str(record["id"]), "kind": record["kind"], "status": record["status"],
-                    "created_at": record["created_at"].isoformat() if hasattr(record.get("created_at"), "isoformat") else (str(record["created_at"]) if record.get("created_at") else None),
-                    "overlap_terms": sorted(candidate_words & record_words), "explicit_lineage": linked,
-                    "epistemic_classification": self._epistemic_classification(record),
-                    "failed_assumption": data.get("failed_assumption") or data.get("failure_mode"),
-                    "summary": data.get("summary") or data.get("mechanism") or data.get("proposal") or data.get("question"),
-                })
+            if not (linked or len(overlap_terms) >= 2):
+                continue
+            if record.get("kind") == "ResearchDecision":
+                roots = self._decision_scientific_root_ids(record, records_by_id)
+                if roots:
+                    for root_id in roots:
+                        # This is explicit Decision provenance, not a lexical
+                        # guess. The later audit still demands a candidate
+                        # response for the root itself.
+                        add_related(records_by_id[root_id], explicit_lineage=True)
+                    continue
+            add_related(record, explicit_lineage=linked, overlap_terms=overlap_terms)
+        related = list(related_by_id.values())
         created_after = candidate.get("original_created_at")
         original = [item for item in related if not created_after or (item["created_at"] or "") <= created_after]
         later = [item for item in related if created_after and (item["created_at"] or "") > created_after]
