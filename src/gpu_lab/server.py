@@ -2038,7 +2038,12 @@ async def scientific_review_pass_transition(
     successor_spec: dict[str, Any], rationale: str = "",
 ):
     """Atomically close a passing review, pass its gate, and create/reuse its predetermined successor."""
-    return await call(lab().review_pass_transition, review_work_item_id, gate_id, worker_id, session_id, successor_spec, rationale)
+    result = await call(lab().review_pass_transition, review_work_item_id, gate_id, worker_id, session_id, successor_spec, rationale)
+    if "error" not in result and result.get("successor", {}).get("status") == "READY":
+        wake = await call(cockpit().wake_ready_work, result["successor"]["project_id"])
+        if "error" not in wake:
+            result["worker_wake"] = wake
+    return result
 
 
 @mcp.tool()

@@ -2061,10 +2061,16 @@ class LabController:
         return self.work_get(work_item_id)
 
     def experiment_run_terminal(self, run_id: str, run_status: str) -> dict[str, int]:
-        """Move attached execution WorkItems to result-ready after canonical sync."""
+        """Project terminal runs without treating technical failure as evidence.
+
+        RESULT_READY is reserved for a canonical experimental outcome that may
+        be scientifically inspected.  A cancelled/orphaned technical run has
+        no such outcome and must instead remain visibly blocked pending its
+        engineering reconciliation.
+        """
         if run_status not in {"completed", "failed", "cancelled", "TECHNICAL_CANCELLED", "TECHNICAL_ORPHANED"}:
-            return {"result_ready": 0}
-        now, changed = self._now(), 0
+            return {"result_ready": 0, "technical_blocked": 0}
+        now, changed, technical_blocked = self._now(), 0, 0
         with self.store._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT * FROM lab_work_items WHERE (related_refs->>'experiment_run_id'=%s "
@@ -2074,10 +2080,21 @@ class LabController:
             )
             for item in cur.fetchall():
                 cur.execute("UPDATE lab_work_leases SET released_at=%s,release_reason='EXPERIMENT_TERMINAL' WHERE work_item_id=%s AND released_at IS NULL", (now, item["id"]))
-                cur.execute("UPDATE lab_work_items SET status='RESULT_READY',assigned_worker_id=NULL,assigned_session_id=NULL,lease_id=NULL,blocked_reason=%s,updated_at=%s WHERE id=%s", (f"Canonical ExperimentRun {run_status}; inspect before any follow-up execution.", now, item["id"]))
-                self._event(cur, item["project_id"], "WORK_ITEM_RESULT_READY", item["id"], {"run_id": run_id, "run_status": run_status})
-                changed += 1
-        return {"result_ready": changed}
+                if run_status in {"TECHNICAL_CANCELLED", "TECHNICAL_ORPHANED"}:
+                    cur.execute(
+                        "UPDATE lab_work_items SET status='BLOCKED',assigned_worker_id=NULL,assigned_session_id=NULL,lease_id=NULL,"
+                        "blocked_reason=%s,updated_at=%s WHERE id=%s",
+                        (f"Canonical ExperimentRun {run_status}; technical reconciliation is required and no scientific result is available.", now, item["id"]),
+                    )
+                    self._event(cur, item["project_id"], "WORK_ITEM_TECHNICAL_RUN_BLOCKED", item["id"], {
+                        "run_id": run_id, "run_status": run_status, "scientific_result": "NOT_ASSESSED",
+                    })
+                    technical_blocked += 1
+                else:
+                    cur.execute("UPDATE lab_work_items SET status='RESULT_READY',assigned_worker_id=NULL,assigned_session_id=NULL,lease_id=NULL,blocked_reason=%s,updated_at=%s WHERE id=%s", (f"Canonical ExperimentRun {run_status}; inspect before any follow-up execution.", now, item["id"]))
+                    self._event(cur, item["project_id"], "WORK_ITEM_RESULT_READY", item["id"], {"run_id": run_id, "run_status": run_status})
+                    changed += 1
+        return {"result_ready": changed, "technical_blocked": technical_blocked}
 
     def experiment_run_inspected(self, run_id: str) -> dict[str, int]:
         """Close detached execution work once its canonical result is inspected."""

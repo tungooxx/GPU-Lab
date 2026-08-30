@@ -1027,12 +1027,29 @@ def test_attached_execution_cannot_return_to_ready_after_worker_disconnect():
     assert worker["availability_state"] == "AVAILABLE"
     assert lab.work_list(project_id, ["READY"]) == []
 
-    assert lab.experiment_run_terminal(run["id"], "completed") == {"result_ready": 1}
+    assert lab.experiment_run_terminal(run["id"], "completed") == {"result_ready": 1, "technical_blocked": 0}
     assert lab.work_get(work["id"])["status"] == "RESULT_READY"
     assert lab.work_list(project_id, ["READY"]) == []
     store.object_update(run["id"], {"inspection": {"mode": "fixture"}}, "RESULT_INSPECTED")
     assert lab.experiment_run_inspected(run["id"]) == {"completed": 1}
     assert lab.work_get(work["id"])["status"] == "COMPLETED"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_technical_terminal_run_never_becomes_result_ready():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-technical-terminal-{time.time_ns()}", "Technical terminal projection")["project_id"]
+    joined = lab.join(None, "technical-terminal-worker", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    run = store.object_create(project_id, "ExperimentRun", {"label": "technical"}, "EXPERIMENT_STARTED", "running")
+    work = lab.create_work(project_id, "TRAINING_RUN", "Run", "No result if transport fails.", "EXECUTION", worker_id, created_session_id=session_id)
+    lab.claim_work(work["id"], worker_id, session_id)
+    lab.attach_experiment_run(work["id"], worker_id, session_id, run["id"])
+    assert lab.experiment_run_terminal(run["id"], "TECHNICAL_CANCELLED") == {"result_ready": 0, "technical_blocked": 1}
+    blocked = lab.work_get(work["id"])
+    assert blocked["status"] == "BLOCKED"
+    assert "no scientific result" in blocked["blocked_reason"]
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
