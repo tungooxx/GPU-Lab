@@ -23,7 +23,7 @@ DDE_VERSION = "distributed-discovery-engine-v3.3"
 ROUND_PHASES = {
     "CREATED", "STATE_FROZEN", "INDEPENDENT_GENERATION", "GENERATION_FROZEN",
     "CHARACTERIZATION", "DEAD_MEMORY_SCREEN", "QD_ARCHIVE", "LITERATURE_PASS",
-    "SYNTHESIS", "COMPLETED", "INVALID", "STALE",
+    "SYNTHESIS", "COMPLETED", "COVERAGE_CONTINUED", "INVALID", "STALE",
 }
 GENERATION_OPERATORS = {
     "LOCAL_CAUSAL_REPAIR", "CAUSAL_INVERSION", "REPRESENTATION_RESET",
@@ -829,7 +829,7 @@ class DistributedDiscoveryService:
                 "Scientific state changed after independent generation; preserve this round for history and start a fresh one.",
             )
         round_ = self._round(round_id)
-        if round_["data"].get("phase") not in {"GENERATION_FROZEN", "CHARACTERIZATION", "DEAD_MEMORY_SCREEN", "QD_ARCHIVE", "LITERATURE_PASS", "SYNTHESIS", "COMPLETED"}:
+        if round_["data"].get("phase") not in {"GENERATION_FROZEN", "CHARACTERIZATION", "DEAD_MEMORY_SCREEN", "QD_ARCHIVE", "LITERATURE_PASS", "SYNTHESIS", "COMPLETED", "COVERAGE_CONTINUED"}:
             raise GPUError("DISCOVERY_SYNTHESIS_BEFORE_FREEZE", round_id)
         now = self._now()
         with self.store._connect() as conn, conn.cursor() as cur:
@@ -846,7 +846,21 @@ class DistributedDiscoveryService:
             cur.execute("SELECT count(*) FILTER (WHERE status='JOINED') AS pending FROM discovery_round_memberships WHERE discovery_round_id=%s", (round_id,))
             if int(cur.fetchone()["pending"]):
                 raise GPUError("DISCOVERY_SYNTHESIS_BEFORE_FREEZE", round_id)
-            batches = self.store.objects_list(round_["project_id"], "CandidateBatch", limit=None, data_filters={"discovery_round_id": round_id})
+            # A recovery wave is a continuation of the same frozen search, not
+            # an independent replacement.  Its archive must aggregate all
+            # source waves; otherwise a successfully repaired FAR/MID/NEAR
+            # slot still looks incomplete because Wave 1's coverage vanished.
+            source_round_ids = list(round_["data"].get("source_round_ids") or [])
+            source_round_ids.append(str(round_id))
+            source_round_ids = list(dict.fromkeys(str(item) for item in source_round_ids))
+            batches = [
+                batch
+                for source_round_id in source_round_ids
+                for batch in self.store.objects_list(
+                    round_["project_id"], "CandidateBatch", limit=None,
+                    data_filters={"discovery_round_id": source_round_id},
+                )
+            ]
             candidates = [self.store.object_get(candidate_id) for batch in batches for candidate_id in batch["data"].get("candidate_ids", [])]
             negatives = self.store.objects_list(round_["project_id"], "NegativeResult", limit=None)
             screened = [(candidate, self._dead_screen(round_["project_id"], candidate, negatives)) for candidate in candidates]
@@ -902,6 +916,8 @@ class DistributedDiscoveryService:
             health = "HEALTHY" if not health_flags else health_flags[0]
             coverage = {
                 "generated_candidate_count": len(candidates), "candidate_batch_count": len(batches),
+                "source_round_ids": source_round_ids,
+                "coverage_recover": "COVERAGE_CONTINUED" if len(source_round_ids) > 1 else "NOT_REQUIRED",
                 "independent_generator_count": len({item["data"]["worker_session_id"] for item in candidates if item["data"].get("independent_generation")}),
                 "generation_operator_count": len({item["data"]["generation_operator"] for item in candidates}),
                 "peer_isolation_used": round_["data"].get("independent_generation", True),
@@ -915,9 +931,10 @@ class DistributedDiscoveryService:
                 "archive_survivor_count": len(survivors), "portfolio_health": health,
                 "portfolio_health_flags": health_flags,
                 "causal_object_distribution": dict(Counter(str(item["data"]["diversity_signature"].get("causal_object") or "UNSPECIFIED") for item in candidates)),
+                "recovery_budget_exhausted": bool(unfilled and int(round_["data"].get("generation_wave", 1)) >= int((round_["data"].get("generation_budget") or {}).get("max_generation_waves", 1))),
             }
             archive_id = str(uuid.uuid4())
-            archive = {"implementation_version": DDE_VERSION, "discovery_round_id": str(round_id), "mechanistic_niche_ids": niche_ids, "survivor_candidate_ids": [str(item["id"]) for item in survivors], "duplicate_candidate_ids": duplicate_ids, "dead_memory_screen": [{"candidate_id": str(candidate["id"]), **screen} for candidate, screen in screened], "coverage": coverage, "selected_candidate_id": str(survivors[0]["id"]) if survivors else None, "runner_up_candidate_id": str(survivors[1]["id"]) if len(survivors) > 1 else None, "created_at": now.isoformat(), "not_evidence": True}
+            archive = {"implementation_version": DDE_VERSION, "discovery_round_id": str(round_id), "source_round_ids": source_round_ids, "coverage_recover": coverage["coverage_recover"], "mechanistic_niche_ids": niche_ids, "survivor_candidate_ids": [str(item["id"]) for item in survivors], "duplicate_candidate_ids": duplicate_ids, "dead_memory_screen": [{"candidate_id": str(candidate["id"]), **screen} for candidate, screen in screened], "coverage": coverage, "selected_candidate_id": str(survivors[0]["id"]) if survivors else None, "runner_up_candidate_id": str(survivors[1]["id"]) if len(survivors) > 1 else None, "created_at": now.isoformat(), "not_evidence": True}
             cur.execute("INSERT INTO research_objects(id,project_id,kind,status,data,created_at) VALUES(%s,%s,'CrossWorkerQDArchive','ARCHIVED',%s,%s)", (archive_id, round_["project_id"], self._json(archive), now))
             self.store._event(cur, round_["project_id"], "QD_ARCHIVE_CREATED", archive_id, json.loads(self._json({"round_id": round_id, "survivor_count": len(survivors), "portfolio_health": health})))
             coverage_id = str(uuid.uuid4())
@@ -954,10 +971,10 @@ class DistributedDiscoveryService:
         maximum = int((data.get("generation_budget") or {}).get("max_generation_waves", 1))
         if not any(deficits.values()) or wave >= maximum:
             return None
-        return self.recovery_wave_create(round_id, "RECOVER_DISCOVERY_WAVE", automatic=True)
+        return self.coverage_recover(round_id, "RECOVER_DISCOVERY_WAVE", automatic=True)
 
-    def recovery_wave_create(self, round_id: str, confirmation: str, *, automatic: bool = False) -> dict:
-        """Open one peer-isolated recovery wave from incomplete realized coverage."""
+    def coverage_recover(self, round_id: str, confirmation: str, *, automatic: bool = False) -> dict:
+        """Continue a frozen discovery search until its reserved coverage is realized."""
         if not automatic and confirmation != "RECOVER_DISCOVERY_WAVE":
             raise GPUError("DISCOVERY_RECOVERY_CONFIRMATION_REQUIRED", "RECOVER_DISCOVERY_WAVE")
         with self.store._connect() as conn, conn.cursor() as cur:
@@ -984,8 +1001,12 @@ class DistributedDiscoveryService:
                 if str((item.get("data") or {}).get("recovery_of_round_id")) == str(round_id)
             ), None)
             if result is None:
+                source_round_ids = list(data.get("source_round_ids") or [])
+                source_round_ids.append(str(round_id))
+                source_round_ids = list(dict.fromkeys(str(item) for item in source_round_ids))
                 recovery = {**data, "phase": "INDEPENDENT_GENERATION", "peer_visibility": "HIDDEN",
                             "generation_wave": wave + 1, "required_distance_coverage": deficits,
+                            "source_round_ids": source_round_ids,
                             "recovery_of_round_id": str(round_id), "recovery_archive_id": str(archive_id),
                             "recovery_reason": "REALIZED_DISTANCE_COVERAGE_INCOMPLETE",
                             "started_at": self._now().isoformat(), "generation_frozen_at": None,
@@ -1000,12 +1021,21 @@ class DistributedDiscoveryService:
             if str(data.get("recovery_round_id") or "") != str(result["id"]):
                 cur.execute(
                     "UPDATE research_objects SET data=%s WHERE id=%s",
-                    (self._json({**data, "recovery_round_id": str(result["id"])}), round_id),
+                    (self._json({
+                        **data,
+                        "phase": "COVERAGE_CONTINUED",
+                        "recovery_round_id": str(result["id"]),
+                        "coverage_recover": "COVERAGE_CONTINUED",
+                    }), round_id),
                 )
                 self.store._event(cur, parent["project_id"], "DISCOVERY_RECOVERY_LINKED", round_id, {
                     "recovery_round_id": str(result["id"]), "automatic": automatic,
                 })
             return result
+
+    def recovery_wave_create(self, round_id: str, confirmation: str) -> dict:
+        """Backward-compatible public alias for :meth:`coverage_recover`."""
+        return self.coverage_recover(round_id, confirmation)
 
     def outcome_get(self, candidate_id: str) -> dict:
         candidate_id = str(candidate_id)

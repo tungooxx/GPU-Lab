@@ -1519,6 +1519,12 @@ async def discovery_recovery_wave_create(discovery_round_id: str, confirmation: 
 
 
 @mcp.tool()
+async def discovery_coverage_recover(discovery_round_id: str, confirmation: str):
+    """Continue one frozen discovery search when realized reserved coverage is incomplete."""
+    return await call(distributed_discovery().coverage_recover, discovery_round_id, confirmation)
+
+
+@mcp.tool()
 async def discovery_candidate_submit(
     discovery_round_id: str, candidate_batch_id: str, worker_id: str, session_id: str,
     candidate: DiscoveryCandidateInput,

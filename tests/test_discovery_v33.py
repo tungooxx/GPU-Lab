@@ -204,12 +204,81 @@ def test_incomplete_synthesis_automatically_opens_only_the_remaining_frozen_wave
     service._round = lambda _round_id: parent
     service.archive_get = lambda _archive_id: archive
     calls: list[tuple[str, str, bool]] = []
-    service.recovery_wave_create = lambda round_id, confirmation, automatic=False: calls.append(
+    service.coverage_recover = lambda round_id, confirmation, automatic=False: calls.append(
         (round_id, confirmation, automatic)
     ) or {"id": "recovery"}
 
     assert service._recovery_wave_after_synthesis("round", "archive") == {"id": "recovery"}
     assert calls == [("round", "RECOVER_DISCOVERY_WAVE", True)]
+
+
+def test_coverage_recovery_preserves_source_round_lineage_and_hidden_isolation():
+    parent = {
+        "id": "root", "project_id": "project", "kind": "DiscoveryRound", "status": "COMPLETED",
+        "data": {
+            "archive_id": "archive", "generation_wave": 1,
+            "generation_budget": {"max_generation_waves": 2},
+            "required_distance_coverage": {"NEAR": 1, "MID": 1, "FAR": 1},
+            "frozen_state_hash": "frozen", "peer_visibility": "VISIBLE_FOR_SYNTHESIS",
+        },
+    }
+    archive = {"id": "archive", "kind": "CrossWorkerQDArchive", "data": {
+        "coverage": {"filled_distance_slots": {"NEAR": 1, "MID": 0, "FAR": 0}},
+    }}
+    created: list[dict] = []
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, *_args, **_kwargs):
+            return None
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def cursor():
+            return Cursor()
+
+    class Store:
+        @staticmethod
+        def _connect():
+            return Connection()
+
+        @staticmethod
+        def object_get(identifier):
+            return parent if identifier == "root" else archive
+
+        @staticmethod
+        def objects_list(*_args, **_kwargs):
+            return []
+
+        @staticmethod
+        def object_create(_project_id, _kind, data, _event, _status):
+            created.append(data)
+            return {"id": "recovery", "data": data}
+
+        @staticmethod
+        def _event(*_args, **_kwargs):
+            return None
+
+    service = DistributedDiscoveryService.__new__(DistributedDiscoveryService)
+    service.store = Store()
+    service._event = lambda *_args, **_kwargs: None
+
+    recovered = service.coverage_recover("root", "RECOVER_DISCOVERY_WAVE")
+    assert recovered["id"] == "recovery"
+    assert created[0]["source_round_ids"] == ["root"]
+    assert created[0]["required_distance_coverage"] == {"NEAR": 0, "MID": 1, "FAR": 1}
+    assert created[0]["peer_visibility"] == "HIDDEN"
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
