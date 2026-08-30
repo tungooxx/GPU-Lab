@@ -339,7 +339,7 @@ def test_round_isolates_batches_then_archives_distinct_candidates():
     project_id = store.project_create(f"dde-v33-{time.time_ns()}", "Independent discovery")['project_id']
     first = lab.join(None, "dde-a", "CODEX", project_id)
     second = lab.join(None, "dde-b", "LOCAL_AGENT", project_id)
-    round_ = dde.create_round(project_id, None, "DIVERGENT_SEARCH")
+    round_ = dde.create_round(project_id, None, "DIVERGENT_SEARCH", baseline_signature={"causal_object": "baseline"})
     assert all(
         "data_hash" in record and "data" not in record
         for record in round_["data"]["frozen_state"]["records"]
@@ -408,7 +408,7 @@ def test_empty_batch_requires_explicit_honest_abstention():
     dde = DistributedDiscoveryService(store)
     project_id = store.project_create(f"dde-abstain-{time.time_ns()}", "Honest distant abstention")['project_id']
     worker = lab.join(None, "dde-abstain", "CODEX", project_id)
-    round_ = dde.create_round(project_id, None, "PARADIGM_RESET")
+    round_ = dde.create_round(project_id, None, "PARADIGM_RESET", baseline_signature={"causal_object": "baseline"})
     batch = dde.join_round(round_["id"], worker["worker"]["id"], worker["session_id"], "ONTOLOGY_CHALLENGE", "ORTHOGONAL")
     with pytest.raises(GPUError) as exc:
         dde.batch_freeze(round_["id"], batch["id"], worker["worker"]["id"], worker["session_id"])
@@ -424,7 +424,7 @@ def test_distance_reservations_prevent_near_slots_from_consuming_open_search():
     dde = DistributedDiscoveryService(store)
     project_id = store.project_create(f"dde-reserved-{time.time_ns()}", "Distance reservation")['project_id']
     workers = [lab.join(None, f"reserved-{index}", "CODEX", project_id) for index in range(4)]
-    round_ = dde.create_round(project_id, None, "DIVERGENT_SEARCH")
+    round_ = dde.create_round(project_id, None, "DIVERGENT_SEARCH", baseline_signature={"causal_object": "baseline"})
     dde.join_round(round_["id"], workers[0]["worker"]["id"], workers[0]["session_id"], "LOCAL_CAUSAL_REPAIR", "NEAR")
     with pytest.raises(GPUError) as exc:
         dde.join_round(round_["id"], workers[1]["worker"]["id"], workers[1]["session_id"], "LOCAL_CAUSAL_REPAIR", "NEAR")
@@ -439,7 +439,10 @@ def test_isolated_round_blocks_peer_finding_messages_and_detects_stale_state():
     project_id = store.project_create(f"dde-isolation-{time.time_ns()}", "Message isolation")['project_id']
     first = lab.join(None, "isolation-a", "CODEX", project_id)
     second = lab.join(None, "isolation-b", "LOCAL_AGENT", project_id)
-    round_ = dde.create_round(project_id, None, "MECHANISM_SEARCH")
+    round_ = dde.create_round(
+        project_id, None, "MECHANISM_SEARCH",
+        baseline_signature={"causal_object": "baseline"},
+    )
     batch = dde.join_round(round_["id"], first["worker"]["id"], first["session_id"], "CAUSAL_INVERSION", "FAR")
     with pytest.raises(GPUError) as exc:
         lab.message_send(
@@ -458,7 +461,7 @@ def test_engineering_bookkeeping_does_not_self_stale_a_discovery_round():
     store = ResearchStore(TEST_DATABASE_URL)
     dde = DistributedDiscoveryService(store)
     project_id = store.project_create(f"dde-engineering-bookkeeping-{time.time_ns()}", "Snapshot scope")['project_id']
-    round_ = dde.create_round(project_id, None, "MECHANISM_SEARCH")
+    round_ = dde.create_round(project_id, None, "MECHANISM_SEARCH", baseline_signature={"causal_object": "baseline"})
 
     store.object_create(project_id, "EngineeringTask", {"purpose": "non-scientific review"}, "ENGINEERING_DIFF_REVIEWED")
 
@@ -472,7 +475,7 @@ def test_brain_portfolio_bookkeeping_does_not_invalidate_the_archive_it_consumes
     store = ResearchStore(TEST_DATABASE_URL)
     dde = DistributedDiscoveryService(store)
     project_id = store.project_create(f"dde-control-plane-{time.time_ns()}", "Archive freshness")['project_id']
-    round_ = dde.create_round(project_id, None, "MECHANISM_SEARCH")
+    round_ = dde.create_round(project_id, None, "MECHANISM_SEARCH", baseline_signature={"causal_object": "baseline"})
 
     for kind in ("HypothesisPortfolio", "ResearchSituation", "CandidatePortfolio", "ResearchActionCandidate", "ResearchDecision"):
         store.object_create(project_id, kind, {"control_plane": True}, "BRAIN_BOOKKEEPING")
@@ -488,7 +491,7 @@ def test_stale_transition_expires_open_batches_and_makes_them_visibly_non_writea
     lab, dde = LabController(store), DistributedDiscoveryService(store)
     project_id = store.project_create(f"dde-stale-open-{time.time_ns()}", "Stale open batch")['project_id']
     worker = lab.join(None, "stale-open", "CODEX", project_id)
-    round_ = dde.create_round(project_id, None, "MECHANISM_SEARCH")
+    round_ = dde.create_round(project_id, None, "MECHANISM_SEARCH", baseline_signature={"causal_object": "baseline"})
     batch = dde.join_round(round_["id"], worker["worker"]["id"], worker["session_id"], "CAUSAL_INVERSION", "FAR")
     store.object_create(project_id, "Claim", {"statement": "external scientific change", "scope": "test"}, "CLAIM_CREATED")
 
@@ -516,12 +519,62 @@ def test_stale_transition_expires_open_batches_and_makes_them_visibly_non_writea
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_expired_independent_generation_work_claim_creates_fresh_batch_lane():
+    """A new claimant must never inherit an expired generator session's batch."""
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab, dde = LabController(store, lease_seconds=30), DistributedDiscoveryService(store)
+    project_id = store.project_create(f"dde-reassigned-lane-{time.time_ns()}", "Fresh replacement lane")['project_id']
+    original = lab.join(None, "dde-original-generator", "CODEX", project_id)
+    replacement = lab.join(None, "dde-replacement-generator", "LOCAL_AGENT", project_id)
+    round_ = dde.create_round(
+        project_id, None, "MECHANISM_SEARCH",
+        baseline_signature={"causal_object": "baseline"},
+    )
+    original_batch = dde.join_round(
+        round_["id"], original["worker"]["id"], original["session_id"], "CAUSAL_INVERSION", "FAR"
+    )
+    work = dde.lab_work_items(round_["id"])[0]
+    claimed = lab.claim_work(work["id"], original["worker"]["id"], original["session_id"])
+    lab.start_work(claimed["id"], original["worker"]["id"], original["session_id"])
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE lab_work_leases SET expires_at=NOW() - INTERVAL '1 second' WHERE id=%s",
+            (claimed["lease_id"],),
+        )
+    assert lab.recover_stale_leases(project_id)["recovered"] == 1
+    assert lab.work_get(work["id"])["status"] == "READY"
+
+    rebound = lab.claim_work(work["id"], replacement["worker"]["id"], replacement["session_id"])
+    replacement_batch_id = rebound["related_refs"]["candidate_batch_id"]
+    assert replacement_batch_id != original_batch["id"]
+    assert rebound["related_refs"]["replaced_candidate_batch_id"] == str(original_batch["id"])
+    assert rebound["related_refs"]["discovery_batch_recovery"] == "FRESH_INDEPENDENT_REPLACEMENT"
+    assert dde.batch_get(round_["id"], original_batch["id"], original["session_id"])["effective_status"] == "EXPIRED"
+    replacement_batch = dde.batch_get(round_["id"], replacement_batch_id, replacement["session_id"])
+    assert replacement_batch["writeable"] is True
+    assert replacement_batch["data"]["worker_session_id"] == replacement["session_id"]
+    assert replacement_batch["data"]["replacement_for_batch_id"] == str(original_batch["id"])
+
+    candidate = dde.submit_candidate(
+        round_["id"], replacement_batch_id, replacement["worker"]["id"], replacement["session_id"],
+        _candidate("fresh replacement", {"causal_object": "replacement"}),
+    )
+    assert candidate["data"]["candidate_batch_id"] == replacement_batch_id
+    with pytest.raises(GPUError) as exc:
+        dde.submit_candidate(
+            round_["id"], original_batch["id"], original["worker"]["id"], original["session_id"],
+            _candidate("expired lane", {"causal_object": "expired"}),
+        )
+    assert exc.value.error_type == "DISCOVERY_BATCH_NOT_WRITABLE"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_stale_transition_and_candidate_submission_leave_no_joined_active_batch():
     store = ResearchStore(TEST_DATABASE_URL)
     lab, dde = LabController(store), DistributedDiscoveryService(store)
     project_id = store.project_create(f"dde-stale-race-{time.time_ns()}", "Stale race")['project_id']
     worker = lab.join(None, "stale-race", "CODEX", project_id)
-    round_ = dde.create_round(project_id, None, "MECHANISM_SEARCH")
+    round_ = dde.create_round(project_id, None, "MECHANISM_SEARCH", baseline_signature={"causal_object": "baseline"})
     batch = dde.join_round(round_["id"], worker["worker"]["id"], worker["session_id"], "CAUSAL_INVERSION", "FAR")
     store.object_create(project_id, "Claim", {"statement": "external scientific change", "scope": "test"}, "CLAIM_CREATED")
     barrier = Barrier(2)
@@ -558,7 +611,7 @@ def test_stale_round_cannot_be_synthesized_into_a_new_execution_portfolio():
     lab, dde = LabController(store), DistributedDiscoveryService(store)
     project_id = store.project_create(f"dde-stale-{time.time_ns()}", "Stale round")['project_id']
     worker = lab.join(None, "stale-worker", "CODEX", project_id)
-    round_ = dde.create_round(project_id, None, "MECHANISM_SEARCH")
+    round_ = dde.create_round(project_id, None, "MECHANISM_SEARCH", baseline_signature={"causal_object": "baseline"})
     batch = dde.join_round(round_["id"], worker["worker"]["id"], worker["session_id"], "CAUSAL_INVERSION", "FAR")
     dde.submit_candidate(round_["id"], batch["id"], worker["worker"]["id"], worker["session_id"], _candidate("candidate", {"causal_object": "new"}))
     dde.batch_freeze(round_["id"], batch["id"], worker["worker"]["id"], worker["session_id"])

@@ -75,8 +75,9 @@ def test_two_workers_claim_distinct_work_and_messages_are_not_evidence():
     assert lab.start_work(work_a["id"], first_worker, first["session_id"])["status"] == "RUNNING"
     state_b = lab.state_get(project_id, second["session_id"])
     assert {item["id"] for item in state_b["running_work_items"]} == {work_a["id"]}
-    with pytest.raises(GPUError, match="LAB_WORK_NOT_CLAIMABLE"):
+    with pytest.raises(GPUError) as exc_info:
         lab.claim_work(work_a["id"], second_worker, second["session_id"])
+    assert exc_info.value.error_type == "LAB_WORK_NOT_CLAIMABLE"
     assert lab.claim_work(work_b["id"], second_worker, second["session_id"])["id"] == work_b["id"]
 
 
@@ -106,8 +107,9 @@ def test_dependency_target_type_is_never_inferred_from_a_uuid():
     lab = LabController(store)
     project = store.project_create(f"lab-dependency-type-{time.time_ns()}", "Typed dependency")
     joined = lab.join(None, "typed-dependency-worker", "CODEX", project["project_id"])
-    with pytest.raises(GPUError, match="LAB_DEPENDENCY_TARGET_TYPE_REQUIRED"):
+    with pytest.raises(GPUError) as exc_info:
         lab.create_work(project["project_id"], "REVIEW", "Type required", "No inference", "REVIEWER", joined["worker"]["id"], created_session_id=joined["session_id"], dependencies=[{"target_id": str(uuid.uuid4()), "required_statuses": ["COMPLETED"]}])
+    assert exc_info.value.error_type == "LAB_DEPENDENCY_TARGET_TYPE_REQUIRED"
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
@@ -146,13 +148,15 @@ def test_v355_objective_is_versioned_and_proposals_merge_into_existing_work():
     assert lab.canonical_objective_create(
         project_id, "SCIENTIFIC", "Inspect E201", "Does E201 satisfy the frozen metric contract?",
     )["id"] == objective["id"]
-    with pytest.raises(GPUError, match="CANONICAL_OBJECTIVE_VERSION_TRANSITION_REQUIRED"):
+    with pytest.raises(GPUError) as exc_info:
         lab.canonical_objective_create(project_id, "SCIENTIFIC", "Inspect E201", "A different question")
+    assert exc_info.value.error_type == "CANONICAL_OBJECTIVE_VERSION_TRANSITION_REQUIRED"
 
-    authority = lab.authority_key(project_id, "E201", "v4", "RESULT_INSPECTION")
+    gate = lab.gate_ensure(project_id, "RESULT_INSPECTION", "E201", "v4", worker_id, session_id)
+    authority = gate["authority_key"]
     canonical = lab.create_work(
         project_id, "REVIEW", "Inspect E201", "Canonical review", "RESULT_INSPECTOR", worker_id,
-        created_session_id=session_id, authority_key=authority, authority_status="AUTHORITATIVE",
+        created_session_id=session_id, authority_key=authority, gate_id=gate["id"], authority_status="AUTHORITATIVE",
         canonical_subject_version="v4", subject_id="E201", canonical_objective_id=objective["id"],
     )
     proposal = lab.work_propose(
@@ -202,12 +206,13 @@ def test_v36_branch_cannot_cross_objective_boundary():
     first = lab.canonical_objective_create(project_id, "SCIENTIFIC", "First", "First question")
     second = lab.canonical_objective_create(project_id, "SCIENTIFIC", "Second", "Second question")
     branch = lab.hypothesis_branch_create(project_id, first["id"])
-    with pytest.raises(GPUError, match="HYPOTHESIS_BRANCH_OBJECTIVE_MISMATCH"):
+    with pytest.raises(GPUError) as exc_info:
         lab.create_work(
             project_id, "ANALYSIS", "Wrong branch", "Must not cross objectives", "RESULT_INSPECTOR",
             joined["worker"]["id"], created_session_id=joined["session_id"],
             canonical_objective_id=second["id"], branch_id=branch["id"],
         )
+    assert exc_info.value.error_type == "HYPOTHESIS_BRANCH_OBJECTIVE_MISMATCH"
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
@@ -429,18 +434,20 @@ def test_v36_speculation_classes_and_expensive_budget_are_enforced():
         speculation_class="SAFE_SPECULATIVE",
     )
     assert safe["speculation_class"] == "SAFE_SPECULATIVE"
-    with pytest.raises(GPUError, match="LAB_WORK_SPECULATION_CONDITION_REQUIRED"):
+    with pytest.raises(GPUError) as exc_info:
         disabled.create_work(
             project_id, "ANALYSIS", "Bad conditional", "No trigger", "RESULT_INSPECTOR",
             worker_id, created_session_id=session_id, canonical_objective_id=objective["id"], branch_id=branch["id"],
             speculation_class="CONDITIONAL_SPECULATIVE",
         )
-    with pytest.raises(GPUError, match="LAB_SPECULATIVE_WORK_POLICY_DISABLED"):
+    assert exc_info.value.error_type == "LAB_WORK_SPECULATION_CONDITION_REQUIRED"
+    with pytest.raises(GPUError) as exc_info:
         disabled.create_work(
             project_id, "RUN_EXPERIMENT", "Gated expensive run", "Not approved", "EXPERIMENT_OWNER",
             worker_id, created_session_id=session_id, canonical_objective_id=objective["id"], branch_id=branch["id"],
             speculation_class="EXPENSIVE_SPECULATIVE", related_refs={"brain_approval": "B1"}, expected_value=1,
         )
+    assert exc_info.value.error_type == "LAB_SPECULATIVE_WORK_POLICY_DISABLED"
 
     enabled = LabController(store, feature_flags={"SPECULATIVE_WORK_POLICY": True})
     enabled.budget_set(project_id, worker_id, session_id, {"max_concurrent_expensive_speculative_runs": 1})
@@ -455,8 +462,9 @@ def test_v36_speculation_classes_and_expensive_budget_are_enforced():
         worker_id, created_session_id=session_id, canonical_objective_id=objective["id"], branch_id=branch["id"],
         speculation_class="EXPENSIVE_SPECULATIVE", related_refs={"brain_approval": "B2"}, expected_value=1,
     )
-    with pytest.raises(GPUError, match="LAB_SPECULATIVE_BUDGET_EXCEEDED"):
+    with pytest.raises(GPUError) as exc_info:
         enabled.claim_work(second["id"], worker_id, session_id)
+    assert exc_info.value.error_type == "LAB_SPECULATIVE_BUDGET_EXCEEDED"
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
@@ -936,12 +944,13 @@ def test_dormant_equivalence_is_reserved_before_it_can_wake():
         worker["worker"]["id"], created_session_id=worker["session_id"], dependencies=dependency,
         equivalence_key="same-review", dormant_until_dependencies=True,
     )
-    with pytest.raises(GPUError, match="LAB_EQUIVALENT_WORK_ACTIVE"):
+    with pytest.raises(GPUError) as exc_info:
         lab.create_work(
             project_id, "REVIEW", "Duplicate review", "Same review", "ADVERSARIAL_REVIEWER",
             worker["worker"]["id"], created_session_id=worker["session_id"], dependencies=dependency,
             equivalence_key="same-review", dormant_until_dependencies=True,
         )
+    assert exc_info.value.error_type == "LAB_EQUIVALENT_WORK_ACTIVE"
     claimed = lab.claim_work(prerequisite["id"], worker["worker"]["id"], worker["session_id"])
     lab.complete_work(claimed["id"], worker["worker"]["id"], worker["session_id"], summary="Implemented")
     assert lab.resolve_dependencies(project_id) == {"ready": 0, "waiting": 0, "invalidated": 0}
@@ -971,8 +980,9 @@ def test_budget_and_expired_lease_release_work_without_touching_experiment():
     first_work = lab.create_work(project_id, "REVIEW", "First", "First", "ADVERSARIAL_REVIEWER", first["worker"]["id"], created_session_id=first["session_id"])
     second_work = lab.create_work(project_id, "REVIEW", "Second", "Second", "ADVERSARIAL_REVIEWER", second["worker"]["id"], created_session_id=second["session_id"])
     lab.claim_work(first_work["id"], first["worker"]["id"], first["session_id"])
-    with pytest.raises(GPUError, match="LAB_WORKER_BUDGET_EXCEEDED"):
+    with pytest.raises(GPUError) as exc_info:
         lab.claim_work(second_work["id"], second["worker"]["id"], second["session_id"])
+    assert exc_info.value.error_type == "LAB_WORKER_BUDGET_EXCEEDED"
 
     # Lease recovery releases only coordination ownership; the external run remains canonical and running.
     run = store.object_create(project_id, "ExperimentRun", {"label": "must-not-cancel"}, "EXPERIMENT_STARTED", "running")
@@ -1514,13 +1524,14 @@ def test_review_pass_transition_is_atomic_and_cannot_bypass_hard_approval():
     lab.preflight_run(gate["id"], worker_id, session_id, {"frozen_bytes": True})
     claimed = lab.claim_work(review["id"], worker_id, session_id)
 
-    with pytest.raises(GPUError, match="LAB_SUCCESSOR_HARD_GATE_DEPENDENCY_REQUIRED"):
+    with pytest.raises(GPUError) as exc_info:
         lab.review_pass_transition(
             claimed["id"], gate["id"], worker_id, session_id,
             {"kind": "RUN_EXPERIMENT", "title": "Confirmation", "description": "Must stay sealed.",
              "scientific_role": "EXECUTION", "equivalence_key": "confirmation-v1",
              "confirmation_authorization_required": True},
         )
+    assert exc_info.value.error_type == "LAB_SUCCESSOR_HARD_GATE_DEPENDENCY_REQUIRED"
 
     transitioned = lab.review_pass_transition(
         claimed["id"], gate["id"], worker_id, session_id,
@@ -1574,8 +1585,9 @@ def test_project_scope_and_message_acknowledgement_require_active_session():
     assert lab.message_list(two, outsider["worker"]["id"]) == []
     assert lab.message_mark_read(one, recipient["worker"]["id"], recipient["session_id"], [message["id"]]) == {"marked_read": 1}
     assert lab.message_list(one, recipient["worker"]["id"], unread_only=True) == []
-    with pytest.raises(GPUError, match="LAB_MESSAGE_RECIPIENT_NOT_IN_PROJECT"):
+    with pytest.raises(GPUError) as exc_info:
         lab.message_send(one, sender["worker"]["id"], sender["session_id"], "REQUEST_REVIEW", "Bad", "No cross-project recipient", to_worker_id=outsider["worker"]["id"])
+    assert exc_info.value.error_type == "LAB_MESSAGE_RECIPIENT_NOT_IN_PROJECT"
 
 
 def _execution_authority_records():

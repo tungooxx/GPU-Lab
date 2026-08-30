@@ -2403,6 +2403,16 @@ class LabController:
             session = self._session(cur, session_id, worker_id, str(target["project_id"]))
             if str(session["current_project_id"]) != str(target["project_id"]):
                 raise GPUError("LAB_PROJECT_MISMATCH", work_item_id)
+            # An independent DiscoveryBatch is cryptographically/provenance
+            # bound to its original generator session.  Reassigning only the
+            # operational WorkItem would otherwise leave the new worker unable
+            # to submit (or, worse, let it inherit another worker's lane).
+            # Replace the expired lane atomically before the new claim.  The
+            # old batch remains immutable historical record and is excluded
+            # from synthesis; the new batch is a fresh independent lane.
+            target = self._fresh_discovery_batch_for_reassigned_claim(
+                cur, target, worker_id, session_id, now
+            )
             # `_session(... FOR UPDATE)` serializes competing schedulers for one
             # runtime, but the second caller must not be allowed to replace the
             # first caller's fresh assignment after it obtains that lock.
@@ -3208,6 +3218,124 @@ class LabController:
             else "COMPLETED"
         )
         return result
+
+    def _fresh_discovery_batch_for_reassigned_claim(
+        self, cur, item: dict, worker_id: str, session_id: str, now: datetime
+    ) -> dict:
+        """Replace an expired DDE generation lane when its WorkItem is claimed.
+
+        Candidate batches are owned by a worker *session*, not merely by a
+        WorkItem.  A new claimant must never inherit an open independent batch
+        from the expired session.  This transaction retires that lane and
+        creates an equivalent fresh lane with the same frozen operator and
+        distance reservation before ownership of the WorkItem changes.
+        """
+        if item.get("kind") != "DISCOVERY_GENERATION":
+            return item
+        refs = dict(item.get("related_refs") or {})
+        round_id = str(refs.get("discovery_round_id") or "")
+        batch_id = str(refs.get("candidate_batch_id") or "")
+        if not round_id or not batch_id:
+            raise GPUError("DISCOVERY_GENERATION_BINDING_REQUIRED", str(item["id"]))
+        cur.execute(
+            "SELECT * FROM research_objects WHERE id=%s AND project_id=%s AND kind='DiscoveryRound' FOR UPDATE",
+            (round_id, item["project_id"]),
+        )
+        round_ = cur.fetchone()
+        if not round_:
+            raise GPUError("DISCOVERY_ROUND_NOT_FOUND", round_id)
+        round_data = dict(round_["data"] or {})
+        if round_["status"] != "ACTIVE" or round_data.get("phase") != "INDEPENDENT_GENERATION":
+            raise GPUError("DISCOVERY_ROUND_NOT_GENERATING", "Cannot replace a generation lane outside independent generation.")
+        cur.execute(
+            "SELECT * FROM discovery_round_memberships WHERE discovery_round_id=%s AND candidate_batch_id=%s FOR UPDATE",
+            (round_id, batch_id),
+        )
+        member = cur.fetchone()
+        if not member:
+            raise GPUError("DISCOVERY_BATCH_NOT_FOUND", batch_id)
+        if str(member["worker_id"]) == str(worker_id) and str(member["worker_session_id"]) == str(session_id):
+            return item
+        if member["status"] not in {"JOINED", "EXPIRED"}:
+            raise GPUError("DISCOVERY_BATCH_REASSIGNMENT_NOT_ALLOWED", str(member["status"]))
+        cur.execute(
+            "SELECT 1 FROM discovery_round_memberships WHERE discovery_round_id=%s AND worker_session_id=%s FOR UPDATE",
+            (round_id, session_id),
+        )
+        if cur.fetchone():
+            raise GPUError("DISCOVERY_WORKER_ALREADY_ASSIGNED", session_id)
+        cur.execute(
+            "SELECT * FROM research_objects WHERE id=%s AND project_id=%s AND kind='CandidateBatch' FOR UPDATE",
+            (batch_id, item["project_id"]),
+        )
+        old_batch = cur.fetchone()
+        if not old_batch:
+            raise GPUError("DISCOVERY_BATCH_NOT_FOUND", batch_id)
+        if member["status"] == "JOINED":
+            old_data = {
+                **dict(old_batch["data"] or {}),
+                "status": "EXPIRED",
+                "expired_at": now.isoformat(),
+                "expiration_reason": "WORKITEM_REASSIGNED_FRESH_LANE",
+            }
+            cur.execute(
+                "UPDATE research_objects SET status='EXPIRED',data=%s WHERE id=%s",
+                (json.dumps(old_data, default=str), batch_id),
+            )
+            cur.execute(
+                "UPDATE discovery_round_memberships SET status='EXPIRED',frozen_at=%s,"
+                "failure_reason='WORKITEM_REASSIGNED_FRESH_LANE' WHERE discovery_round_id=%s AND candidate_batch_id=%s",
+                (now, round_id, batch_id),
+            )
+            self._event(cur, item["project_id"], "DISCOVERY_BATCH_EXPIRED", batch_id, {
+                "round_id": round_id, "reason": "WORKITEM_REASSIGNED_FRESH_LANE",
+            })
+        replacement_batch_id = str(uuid.uuid4())
+        replacement_data = {
+            "discovery_round_id": round_id,
+            "worker_id": str(worker_id),
+            "worker_session_id": str(session_id),
+            "generation_operator": member["generation_operator"],
+            "requested_distance": member["requested_distance"],
+            "candidate_ids": [],
+            "status": "JOINED",
+            "immutable_after_freeze": True,
+            "created_at": now.isoformat(),
+            "replacement_for_batch_id": batch_id,
+            "replacement_reason": "EXPIRED_WORKITEM_REASSIGNED",
+        }
+        cur.execute(
+            "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+            "VALUES(%s,%s,'CandidateBatch','ACTIVE',%s,%s)",
+            (replacement_batch_id, item["project_id"], json.dumps(replacement_data), now),
+        )
+        cur.execute(
+            "INSERT INTO discovery_round_memberships(discovery_round_id,worker_id,worker_session_id,"
+            "candidate_batch_id,generation_operator,requested_distance,status,independent_generation,joined_at) "
+            "VALUES(%s,%s,%s,%s,%s,%s,'JOINED',%s,%s)",
+            (round_id, worker_id, session_id, replacement_batch_id, member["generation_operator"],
+             member["requested_distance"], member["independent_generation"], now),
+        )
+        refs.update({
+            "candidate_batch_id": replacement_batch_id,
+            "replaced_candidate_batch_id": batch_id,
+            "discovery_batch_recovery": "FRESH_INDEPENDENT_REPLACEMENT",
+        })
+        cur.execute(
+            "UPDATE lab_work_items SET related_refs=%s,updated_at=%s,work_version=work_version+1 WHERE id=%s RETURNING *",
+            (json.dumps(refs), now, item["id"]),
+        )
+        updated = cur.fetchone()
+        self._event(cur, item["project_id"], "DISCOVERY_BATCH_REPLACEMENT_JOINED", replacement_batch_id, {
+            "round_id": round_id, "replaced_batch_id": batch_id, "work_item_id": str(item["id"]),
+            "worker_id": str(worker_id), "session_id": str(session_id),
+            "generation_operator": member["generation_operator"], "requested_distance": member["requested_distance"],
+        })
+        self._event(cur, item["project_id"], "DISCOVERY_GENERATION_WORK_REBOUND", str(item["id"]), {
+            "old_batch_id": batch_id, "new_batch_id": replacement_batch_id,
+            "mode": "FRESH_INDEPENDENT_REPLACEMENT",
+        })
+        return updated
 
     def review_material_repair_transition(
         self, review_work_item_id: str, gate_id: str, worker_id: str, session_id: str,

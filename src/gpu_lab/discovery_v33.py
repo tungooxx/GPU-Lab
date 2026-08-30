@@ -450,14 +450,18 @@ class DistributedDiscoveryService:
             existing = cur.fetchone()
             if existing:
                 return self.store.object_get(str(existing["candidate_batch_id"]))
-            cur.execute("SELECT count(*) AS count FROM discovery_round_memberships WHERE discovery_round_id=%s", (round_id,))
+            cur.execute(
+                "SELECT count(*) AS count FROM discovery_round_memberships "
+                "WHERE discovery_round_id=%s AND status<>'EXPIRED'",
+                (round_id,),
+            )
             member_count = int(cur.fetchone()["count"])
             max_workers = round_["data"]["generation_budget"]["max_workers"]
             if member_count >= max_workers:
                 raise GPUError("DISCOVERY_WORKER_BUDGET_EXHAUSTED", round_id)
             cur.execute(
                 "SELECT requested_distance,count(*) AS count FROM discovery_round_memberships "
-                "WHERE discovery_round_id=%s GROUP BY requested_distance",
+                "WHERE discovery_round_id=%s AND status<>'EXPIRED' GROUP BY requested_distance",
                 (round_id,),
             )
             assignments = {row["requested_distance"]: int(row["count"]) for row in cur.fetchall()}
@@ -491,7 +495,7 @@ class DistributedDiscoveryService:
         """
         round_ = self._round(round_id)
         self._assert_independent_phase(round_)
-        members = self._members(round_id)
+        members = [member for member in self._members(round_id) if member["status"] != "EXPIRED"]
         used_operators = {member["generation_operator"] for member in members}
         counts = Counter(member["requested_distance"] for member in members)
         required_coverage = round_["data"]["required_distance_coverage"]
@@ -755,6 +759,8 @@ class DistributedDiscoveryService:
         controller = LabController(self.store)
         items: list[dict] = []
         for member in self._members(round_id):
+            if member["status"] != "JOINED":
+                continue
             item = controller.create_work(
                 str(round_["project_id"]), "DISCOVERY_GENERATION",
                 f"Independent discovery: {member['generation_operator']}",
@@ -765,7 +771,11 @@ class DistributedDiscoveryService:
                     "peer_visibility": "HIDDEN",
                 }, equivalence_key=f"dde-v33:{round_id}:{member['worker_session_id']}",
                 created_session_id=member["worker_session_id"], subject_id=str(round_id),
-                recovery_policy={"reassign_same_work_item": True, "fallback_live_work_item": False},
+                recovery_policy={
+                    "reassign_same_work_item": True,
+                    "fallback_live_work_item": False,
+                    "discovery_batch_recovery": "FRESH_INDEPENDENT_REPLACEMENT",
+                },
             )
             items.append(item)
         return items
@@ -861,6 +871,10 @@ class DistributedDiscoveryService:
                     data_filters={"discovery_round_id": source_round_id},
                 )
             ]
+            # A batch whose generator expired before freezing is historical
+            # provenance, not an admissible independent-generation result.
+            # Its replacement lane owns the still-open reservation.
+            batches = [batch for batch in batches if batch["status"] == "FROZEN"]
             candidates = [self.store.object_get(candidate_id) for batch in batches for candidate_id in batch["data"].get("candidate_ids", [])]
             negatives = self.store.objects_list(round_["project_id"], "NegativeResult", limit=None)
             screened = [(candidate, self._dead_screen(round_["project_id"], candidate, negatives)) for candidate in candidates]
