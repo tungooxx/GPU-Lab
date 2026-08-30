@@ -117,3 +117,31 @@ def test_v366_attack_without_code_preserves_independent_duplicate_origins():
     assert len(synthesis["data"]["unique_challenge_ids"]) == 1
     assert len(synthesis["data"]["duplicate_challenge_ids"]) == 1
     assert store.objects_list(project_id, "EngineeringResult", limit=None) == []
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v5_regression_fidelity_is_not_full_scientific_design_self_correction():
+    store = ResearchStore(TEST_DATABASE_URL)
+    correction = ScientificSelfCorrectionService(store)
+    project_id = store.project_create(f"v366-v5-{time.time_ns()}", "V5 correction regression") ["project_id"]
+    design = correction.create_design(project_id, "V5 GRU-256 + learned G", {
+        "recurrent_state": "GRU-256", "objective": "predictive-state", "binding": "learned G",
+    }, scientific_risk="HIGH", engineering_risk="SCIENCE_CRITICAL")
+    statements = [
+        ("Persistent plan state requires or materially benefits from recurrence.", "NECESSITY"),
+        ("A 256D recurrent state preserves relevant persistent information.", "CAPACITY"),
+        ("Predictive training identifies behaviorally relevant latent state.", "IDENTIFIABILITY"),
+        ("Learned G binds recurrent state to intervention space causally.", "CAUSALITY"),
+        ("GRU effects are not merely transition/action-history statistics.", "TEMPORAL"),
+        ("Temporal controls discriminate persistence from nuisance memory.", "CONTROL_VALIDITY"),
+        ("Static binding/capacity cannot equally explain gains.", "ALTERNATIVE_MECHANISM"),
+    ]
+    # A7 is a competing-explanation question but is registered under the
+    # closest first-class assumption type rather than hidden as prose.
+    ids = [correction.assumption_create(design["id"], text, "CAPACITY" if kind == "ALTERNATIVE_MECHANISM" else kind, centrality="CENTRAL")["id"] for text, kind in statements]
+    fidelity = correction.fidelity_record(design["id"], implementation_ref="commit:v5", science_to_code_map={"gru": "model.py", "G": "binding.py"}, deterministic_checks=["test_v5_wiring"], verdict="FIDELITY_CONFIRMED", rationale="Exact code mapping verified.")
+    coverage = correction.design_coverage(design["id"])
+    assert fidelity["status"] == "FIDELITY_CONFIRMED"
+    assert coverage["assumption_count"] == 7
+    assert set(coverage["missing_assumption_ids"]) == set(ids)
+    assert coverage["synthesis"] is None
