@@ -57,6 +57,7 @@ class PromptCompiler:
             for name in (
                 "scientific_policy", "engineering_policy", "decision_policy", "evidence_policy",
                 "critic_policy", "retrieval_policy", "strategy_policy", "literature_policy", "meta_review_policy",
+                "correction_policy",
             )
         }
         lines = [
@@ -71,6 +72,11 @@ class PromptCompiler:
             "- Negative transfer is valuable evidence; invalid implementation is not negative transfer.",
             "- Do not promote a strategy to GLOBAL merely because it worked a few times; scope promotion is an explicit reversible decision.",
             "- During independent discovery, preserve STATE_ONLY_GENERATION workers so strategy memory cannot homogenize candidate generation.",
+            "Scientific self-correction layers:",
+            "- DESIGN: attack the scientific idea, its assumptions, stronger alternatives, degeneracies, and discriminating controls; never use a vote as scientific adjudication.",
+            "- IMPLEMENTATION: verify the exact science-to-code mapping and deterministic checks; fidelity never certifies the idea itself.",
+            "- INTERPRETATION: after a result, attack whether it supports the claim; performance never by itself establishes mechanism.",
+            "- Do not create generic code-review chains when deterministic engineering validation or a bounded fidelity check answers the actual question.",
             "Operating policy:",
             *[f"- {name}: {json.dumps(value, sort_keys=True)}" for name, value in sections.items() if value],
             f"Provider adaptation: {self._provider_note(provider)}",

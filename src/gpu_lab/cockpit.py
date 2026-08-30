@@ -290,6 +290,22 @@ class CockpitController:
             ]
             cur.execute(
                 "SELECT id,status,data,created_at FROM research_objects WHERE project_id=%s "
+                "AND kind='ScientificDesign' ORDER BY created_at DESC LIMIT 12",
+                (project_id,),
+            )
+            scientific_designs = [
+                {
+                    "id": str(row["id"]), "status": row["status"],
+                    "name": row["data"].get("name"),
+                    "design_status": row["data"].get("design_status"),
+                    "correction_status": row["data"].get("design_self_correction_status"),
+                    "risk": row["data"].get("scientific_design_risk"),
+                    "created_at": row["created_at"],
+                }
+                for row in cur.fetchall()
+            ]
+            cur.execute(
+                "SELECT id,status,data,created_at FROM research_objects WHERE project_id=%s "
                 "AND kind='StrategyTransferCandidate' ORDER BY created_at DESC LIMIT 12",
                 (project_id,),
             )
@@ -322,6 +338,7 @@ class CockpitController:
             "discovery_rounds": discovery_rounds,
             "discovery_archives": discovery_archives,
             "correction_cases": correction_cases,
+            "scientific_designs": scientific_designs,
             "strategy_transfers": strategy_transfers,
             "portfolio_scheduler": portfolio,
         }

@@ -3920,7 +3920,7 @@ class LabController:
             if since:
                 events = [event for event in events if event["created_at"].isoformat() > since]
             return {
-                "context_version": "v3.5.5",
+                "context_version": "v3.6.6",
                 "generated_at": self._now(),
                 "worker": {"worker_id": str(session["worker_id"]), "session_id": session_id, "status": session["status"]},
                 "project": {"project_id": project_id, "project_state_version": state["research_state_version"]},
@@ -3930,6 +3930,7 @@ class LabController:
                     "authority_key": item["authority_key"], "subject_id": item["subject_id"],
                     "subject_version": item["canonical_subject_version"], "status": item["status"],
                     "role": item["scientific_role"], "mode": item["kind"],
+                    "correction_layer": (item["related_refs"] or {}).get("correction_layer"),
                 },
                 "lease": None if not lease else {"lease_id": str(lease["id"]), "version": lease["lease_version"], "owner": str(lease["worker_id"]), "expires_at": lease["expires_at"]},
                 "dependencies": {"unresolved": unresolved, "newly_resolved": []},
