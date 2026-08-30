@@ -77,3 +77,32 @@ def test_v366_result_interpretation_is_separate_from_evidence_admission():
     attack = correction.interpretation_attack_record(project_id, result["id"], claim="Mechanism improves planning.", verdict="MECHANISM_NONSPECIFIC", strongest_alternative="Strongest null improves equally.", rationale="The result does not distinguish mechanisms.")
     assert attack["kind"] == "ResultInterpretationAttack"
     assert attack["data"]["does_not_admit_evidence"] is True
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v366_attack_without_code_preserves_independent_duplicate_origins():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab, correction = LabController(store), ScientificSelfCorrectionService(store)
+    project_id = store.project_create(f"v366-isolation-{time.time_ns()}", "attack before code") ["project_id"]
+    first = lab.join(None, "idea-a", "CODEX", project_id)
+    second = lab.join(None, "idea-b", "LOCAL_AGENT", project_id)
+    design = correction.create_design(project_id, "No-code design", {"mechanism": "recurrent carrier"}, scientific_risk="HIGH")
+    assumption = correction.assumption_create(design["id"], "The carrier is distinguishable from transition memory.", "IDENTIFIABILITY", centrality="CENTRAL")
+    batch = correction.attack_batch_create(design["id"])
+    correction.attack_join(batch["id"], first["worker"]["id"], first["session_id"], "CAUSAL_IDENTIFIABILITY_ATTACKER")
+    correction.attack_join(batch["id"], second["worker"]["id"], second["session_id"], "DEGENERATE_SOLUTION_ATTACKER")
+    duplicate = {
+        "target_assumption_id": assumption["id"], "challenge_type": "TEMPORAL_CONFOUND",
+        "statement": "Transition memory can explain the same behavior.", "severity": "MEDIUM",
+        "competing_explanation": "H_TRANSITION_MEMORY",
+        "proposed_discriminating_test": "Permute transition order while preserving marginal action frequencies.",
+    }
+    for worker in (first, second):
+        correction.attack_submit(batch["id"], worker["worker"]["id"], worker["session_id"],
+                                 verdict="DISCRIMINATING_EXPERIMENT_REQUIRED", challenges=[duplicate])
+        correction.attack_freeze(batch["id"], worker["worker"]["id"], worker["session_id"])
+    synthesis = correction.synthesize(batch["id"], "DISCRIMINATING_EXPERIMENT_REQUIRED", "The independent attacks converge on one unresolved discriminator.")
+    assert len(synthesis["data"]["attack_ids"]) == 2
+    assert len(synthesis["data"]["unique_challenge_ids"]) == 1
+    assert len(synthesis["data"]["duplicate_challenge_ids"]) == 1
+    assert store.objects_list(project_id, "EngineeringResult", limit=None) == []
