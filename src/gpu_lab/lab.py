@@ -30,6 +30,10 @@ ACTIVE_WORK_STATUSES = {
 }
 EQUIVALENCE_ACTIVE_WORK_STATUSES = ACTIVE_WORK_STATUSES | {"DORMANT"}
 AUTHORITY_STATUSES = {"AUTHORITATIVE", "SUPPORTING", "RECOVERY_TEMPLATE", "OBSOLETE", "SUPERSEDED"}
+WORK_AUTHORITY_CLASSES = {"AUTHORITATIVE", "SPECULATIVE", "PREPARATORY", "SUPPORTING", "INDEPENDENT_REVIEW", "RECOVERY"}
+PROMOTION_STATES = {"NOT_APPLICABLE", "BLOCKED", "CONDITIONALLY_ELIGIBLE", "ELIGIBLE", "PROMOTED", "REBASE_REQUIRED", "INVALIDATED", "SUPERSEDED"}
+REVIEW_VERDICTS = {"PASS", "PASS_WITH_NONMATERIAL_NOTES", "MATERIAL_REPAIR_REQUIRED", "REJECT", "INVALID_REVIEW", "INCONCLUSIVE"}
+DEPENDENCY_PREDICATES = {"STATUS_IN", "REVIEW_VERDICT_EQUALS", "REVIEW_VERDICT_IN"}
 OBJECTIVE_STATUSES = {"ACTIVE", "BLOCKED", "RESOLVED", "SUPERSEDED", "PAUSED", "CANCELLED"}
 PROPOSAL_STATUSES = {"PROPOSED", "MERGED_INTO_EXISTING", "SATISFIED_BY_TERMINAL", "MATERIALIZED", "REJECTED_DUPLICATE", "REJECTED_LOW_VALUE", "REJECTED_STALE", "SUPERSEDED"}
 DEPENDENCY_SCOPES = {"WORKITEM_LOCAL", "BRANCH", "PORTFOLIO", "OBJECTIVE_GLOBAL"}
@@ -235,6 +239,21 @@ class LabController:
                 ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS resource_class TEXT NOT NULL DEFAULT 'REASONING';
                 ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS preferred_worker_id UUID REFERENCES research_workers(id);
                 ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS affinity_reason TEXT;
+                ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS authority_class TEXT NOT NULL DEFAULT 'SUPPORTING';
+                ALTER TABLE lab_work_items ADD COLUMN IF NOT EXISTS promotion_state TEXT NOT NULL DEFAULT 'NOT_APPLICABLE';
+                ALTER TABLE lab_work_dependencies ADD COLUMN IF NOT EXISTS predicate_type TEXT NOT NULL DEFAULT 'STATUS_IN';
+                ALTER TABLE lab_work_dependencies ADD COLUMN IF NOT EXISTS predicate_value JSONB NOT NULL DEFAULT '[]'::jsonb;
+                CREATE TABLE IF NOT EXISTS lab_review_results (
+                    id UUID PRIMARY KEY, project_id UUID NOT NULL REFERENCES research_projects(id),
+                    review_work_item_id UUID NOT NULL REFERENCES lab_work_items(id),
+                    target_subject_id TEXT NOT NULL, target_subject_version TEXT NOT NULL,
+                    review_type TEXT NOT NULL, verdict TEXT NOT NULL, findings JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    materiality TEXT, reviewed_hashes JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    lineage_snapshot_id TEXT, created_at TIMESTAMPTZ NOT NULL,
+                    UNIQUE(project_id,review_work_item_id,review_type)
+                );
+                CREATE INDEX IF NOT EXISTS lab_review_results_subject_idx
+                    ON lab_review_results(project_id,target_subject_id,target_subject_version,review_type,created_at DESC);
                 DO $$ BEGIN
                     ALTER TABLE lab_work_items ADD CONSTRAINT lab_work_items_branch_fk
                         FOREIGN KEY(branch_id) REFERENCES hypothesis_branches(id) NOT VALID;
@@ -1274,10 +1293,22 @@ class LabController:
                     dependency_scope: str = "WORKITEM_LOCAL",
                     preferred_worker_id: str | None = None,
                     affinity_reason: str | None = None,
-                    required_capabilities: list[str] | None = None) -> dict:
+                    required_capabilities: list[str] | None = None,
+                    authority_class: str | None = None,
+                    promotion_state: str | None = None) -> dict:
         now, ident = self._now(), str(uuid.uuid4())
         dependencies = dependencies or []
         authority_status = self._validate(authority_status, AUTHORITY_STATUSES, "LAB_WORK_AUTHORITY_STATUS")
+        authority_class = self._validate(
+            authority_class or ("AUTHORITATIVE" if authority_status == "AUTHORITATIVE" else "SUPPORTING"),
+            WORK_AUTHORITY_CLASSES, "LAB_WORK_AUTHORITY_CLASS",
+        )
+        promotion_state = self._validate(
+            promotion_state or ("ELIGIBLE" if authority_class == "AUTHORITATIVE" else "NOT_APPLICABLE"),
+            PROMOTION_STATES, "LAB_WORK_PROMOTION_STATE",
+        )
+        if authority_class in {"SPECULATIVE", "PREPARATORY"} and promotion_state in {"ELIGIBLE", "PROMOTED"}:
+            raise GPUError("LAB_SPECULATIVE_PROMOTION_FORBIDDEN", "Speculative/preparatory work requires explicit rebase and promotion")
         dependency_scope = self._validate(dependency_scope, DEPENDENCY_SCOPES, "LAB_WORK_DEPENDENCY_SCOPE")
         speculation_class = self._validate(speculation_class, SPECULATION_CLASSES, "LAB_WORK_SPECULATION_CLASS")
         inferred_resource = "TRAINING" if kind.upper() == "TRAINING_RUN" else "GPU" if kind.upper() == "RUN_EXPERIMENT" else "REVIEW" if kind.upper() in {"REVIEW", "CORRECTION"} else "REASONING"
@@ -1401,13 +1432,14 @@ class LabController:
             try:
                 cur.execute(
                     "INSERT INTO lab_work_items(id,project_id,kind,title,description,scientific_role,status,priority,expected_value,estimated_cost,"
-                    "created_by,parent_work_item_id,branch_id,related_refs,equivalence_key,authority_key,gate_id,canonical_subject_version,authority_status,subject_id,recovery_policy,canonical_objective_id,speculation_class,speculation_condition,resource_class,dependency_scope,preferred_worker_id,affinity_reason,created_at,updated_at) "
-                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    "created_by,parent_work_item_id,branch_id,related_refs,equivalence_key,authority_key,gate_id,canonical_subject_version,authority_status,subject_id,recovery_policy,canonical_objective_id,speculation_class,speculation_condition,resource_class,dependency_scope,preferred_worker_id,affinity_reason,authority_class,promotion_state,created_at,updated_at) "
+                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (ident, project_id, kind, title, description, scientific_role, status, priority, expected_value, estimated_cost,
                      created_by, parent_work_item_id, branch_id, json.dumps(related_refs or {}), equivalence_key, authority_key, gate_id,
                      canonical_subject_version, authority_status, subject_id, json.dumps(recovery_policy or {}),
                      canonical_objective_id, speculation_class, json.dumps(speculation_condition), resource_class,
-                     dependency_scope, preferred_worker_id, affinity_reason.strip()[:1000] if affinity_reason else None, now, now),
+                     dependency_scope, preferred_worker_id, affinity_reason.strip()[:1000] if affinity_reason else None,
+                     authority_class, promotion_state, now, now),
                 )
             except Exception as exc:
                 if getattr(exc, "sqlstate", None) == "23505":
@@ -1433,6 +1465,7 @@ class LabController:
                 "canonical_objective_id": canonical_objective_id, "dependency_scope": dependency_scope,
                 "branch_id": branch_id, "equivalence_key": equivalence_key,
                 "resource_class": resource_class, "speculation_class": speculation_class,
+                "authority_class": authority_class, "promotion_state": promotion_state,
                 "preferred_worker_id": preferred_worker_id,
                 "dormant_until_dependencies": dormant_until_dependencies,
             })
@@ -1445,7 +1478,7 @@ class LabController:
         if not item:
             raise GPUError("LAB_WORK_NOT_FOUND", work_item_id)
         cur.execute(
-            "SELECT target_type,target_id,required_statuses,invalidating_statuses,description,dependency_scope "
+            "SELECT target_type,target_id,required_statuses,invalidating_statuses,description,dependency_scope,predicate_type,predicate_value "
             "FROM lab_work_dependencies WHERE work_item_id=%s ORDER BY created_at",
             (work_item_id,),
         )
@@ -1656,6 +1689,21 @@ class LabController:
     def _dependency_status(self, cur, project_id: str, dependency: dict) -> tuple[bool, bool, str]:
         """Return (satisfied, invalidated, explanation) for one typed dependency."""
         target_type, target_id = dependency["target_type"], dependency["target_id"]
+        predicate_type = str(dependency.get("predicate_type") or "STATUS_IN").upper()
+        predicate_value = dependency.get("predicate_value") or dependency.get("required_statuses") or []
+        if predicate_type in {"REVIEW_VERDICT_EQUALS", "REVIEW_VERDICT_IN"}:
+            if target_type != "REVIEW_RESULT":
+                return False, True, "review-verdict predicate requires REVIEW_RESULT"
+            expected = [str(item).upper() for item in (predicate_value if isinstance(predicate_value, list) else [predicate_value])]
+            cur.execute(
+                "SELECT verdict FROM lab_review_results WHERE id=%s AND project_id=%s",
+                (target_id, project_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False, False, f"review result {target_id} is unavailable"
+            verdict = str(row["verdict"]).upper()
+            return verdict in expected, verdict in {"REJECT", "INVALID_REVIEW"}, f"review result {target_id} verdict is {verdict}"
         if target_type == "WORK_ITEM":
             cur.execute("SELECT status FROM lab_work_items WHERE id=%s AND project_id=%s", (target_id, project_id))
         elif target_type == "SCIENTIFIC_GATE":
@@ -1679,7 +1727,7 @@ class LabController:
             return False, True, f"dependency {target_id} is operationally obsolete ({status})"
         if status in invalidating:
             return False, True, f"dependency {target_id} entered invalidating status {status}"
-        required = dependency["required_statuses"] or []
+        required = predicate_value
         return (not required or status in required), False, f"dependency {target_id} is {status}"
 
     def _branch_dependency_status(self, cur, project_id: str, dependency: dict) -> tuple[bool, bool, str]:
@@ -1718,13 +1766,27 @@ class LabController:
             target_id = str(dependency.get("target_id", ""))
             if not target_id:
                 raise GPUError("LAB_DEPENDENCY_TARGET_REQUIRED", "target_id")
-            if target_type not in {"WORK_ITEM", "SCIENTIFIC_GATE", "RESEARCH_OBJECT", "EXPERIMENT_RUN", "ENGINEERING_RESULT", "RESEARCH_DECISION", "EVIDENCE_UNIT", "ARTIFACT"}:
+            if target_type not in {"WORK_ITEM", "SCIENTIFIC_GATE", "RESEARCH_OBJECT", "EXPERIMENT_RUN", "ENGINEERING_RESULT", "RESEARCH_DECISION", "EVIDENCE_UNIT", "ARTIFACT", "REVIEW_RESULT"}:
                 raise GPUError("LAB_DEPENDENCY_TYPE_INVALID", target_type)
+            predicate_type = self._validate(
+                str(dependency.get("predicate_type", "STATUS_IN")), DEPENDENCY_PREDICATES,
+                "LAB_DEPENDENCY_PREDICATE",
+            )
+            predicate_value = dependency.get("predicate_value", dependency.get("required_statuses", []))
+            if predicate_type == "REVIEW_VERDICT_EQUALS":
+                predicate_value = [predicate_value] if isinstance(predicate_value, str) else predicate_value
+                if not isinstance(predicate_value, list) or len(predicate_value) != 1:
+                    raise GPUError("LAB_REVIEW_VERDICT_PREDICATE_INVALID", target_id)
+            if predicate_type == "REVIEW_VERDICT_IN" and not isinstance(predicate_value, list):
+                raise GPUError("LAB_REVIEW_VERDICT_PREDICATE_INVALID", target_id)
+            if predicate_type.startswith("REVIEW_VERDICT"):
+                if target_type != "REVIEW_RESULT" or any(str(item).upper() not in REVIEW_VERDICTS for item in predicate_value):
+                    raise GPUError("LAB_REVIEW_VERDICT_PREDICATE_INVALID", target_id)
             required_statuses = dependency.get("required_statuses", [])
             exists_only = dependency.get("allow_exists_only", False)
             if not isinstance(required_statuses, list) or any(not isinstance(status, str) or not status.strip() for status in required_statuses):
                 raise GPUError("LAB_DEPENDENCY_REQUIRED_STATUS_INVALID", target_id)
-            if not required_statuses and exists_only is not True:
+            if predicate_type == "STATUS_IN" and not required_statuses and exists_only is not True:
                 raise GPUError(
                     "LAB_DEPENDENCY_REQUIRED_STATUS_REQUIRED",
                     "Specify required_statuses or explicitly set allow_exists_only=true",
@@ -1736,10 +1798,11 @@ class LabController:
                 "LAB_DEPENDENCY_SCOPE",
             )
             cur.execute(
-                "INSERT INTO lab_work_dependencies(id,work_item_id,target_type,target_id,required_statuses,invalidating_statuses,description,dependency_scope,created_at) "
-                "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                "INSERT INTO lab_work_dependencies(id,work_item_id,target_type,target_id,required_statuses,invalidating_statuses,description,dependency_scope,predicate_type,predicate_value,created_at) "
+                "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (str(uuid.uuid4()), work_item_id, target_type, target_id, json.dumps(required_statuses),
-                 json.dumps(dependency.get("invalidating_statuses", [])), str(dependency.get("description", "")), scope, now),
+                 json.dumps(dependency.get("invalidating_statuses", [])), str(dependency.get("description", "")), scope,
+                 predicate_type, json.dumps(predicate_value), now),
             )
 
     def resolve_dependencies(self, project_id: str) -> dict[str, int]:
@@ -2083,9 +2146,6 @@ class LabController:
             cur.execute("UPDATE lab_work_leases SET released_at=%s,release_reason='EXPERIMENT_RUN_ATTACHED' WHERE id=%s AND released_at IS NULL", (now, item["lease_id"]))
             cur.execute("UPDATE lab_work_items SET status='RUNNING_DETACHED',related_refs=%s,assigned_worker_id=NULL,assigned_session_id=NULL,lease_id=NULL,blocked_reason=%s,updated_at=%s WHERE id=%s", (json.dumps(refs), "Canonical ExperimentRun is executing or reserved for exact retry; this WorkItem cannot be claimed.", now, work_item_id))
             cur.execute("UPDATE research_worker_sessions SET current_work_item_id=NULL,active_role=NULL,status='ACTIVE',last_heartbeat_at=%s WHERE id=%s", (now, session_id))
-            # A detached ExperimentRun continues independently.  The worker that
-            # launched it is available for another bounded WorkItem unless one of
-            # its other live sessions still owns work.
             cur.execute(
                 "UPDATE research_workers w SET availability_state='AVAILABLE',availability_updated_at=%s,"
                 "idle_reason=NULL,idle_since=NULL WHERE w.id=%s AND NOT EXISTS ("
@@ -2095,6 +2155,76 @@ class LabController:
             )
             self._event(cur, item["project_id"], "WORK_ITEM_EXPERIMENT_ATTACHED", work_item_id, {"run_id": run_id, "worker_id": worker_id})
         return self.work_get(work_item_id)
+
+    def review_result_record(
+        self, project_id: str, review_work_item_id: str, target_subject_id: str,
+        target_subject_version: str, review_type: str, verdict: str,
+        findings: list[dict[str, Any]] | None = None, materiality: str | None = None,
+        reviewed_hashes: dict[str, str] | None = None, lineage_snapshot_id: str | None = None,
+    ) -> dict:
+        """Persist a review verdict independently of its operational WorkItem.
+
+        A completed reviewer task says only that reviewing ended.  Every
+        promotion/certification dependency must target this immutable verdict.
+        """
+        verdict = self._validate(verdict, REVIEW_VERDICTS, "REVIEW_VERDICT")
+        if not target_subject_id or not target_subject_version or not review_type.strip():
+            raise GPUError("LAB_REVIEW_RESULT_BINDING_REQUIRED", "subject id, version, and review type")
+        if not isinstance(findings or [], list) or not isinstance(reviewed_hashes or {}, dict):
+            raise GPUError("LAB_REVIEW_RESULT_FIELDS_INVALID", "findings and reviewed_hashes")
+        now, ident = self._now(), str(uuid.uuid4())
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT project_id,status FROM lab_work_items WHERE id=%s FOR UPDATE", (review_work_item_id,))
+            work = cur.fetchone()
+            if not work or str(work["project_id"]) != str(project_id):
+                raise GPUError("LAB_REVIEW_WORK_NOT_FOUND", review_work_item_id)
+            cur.execute(
+                "INSERT INTO lab_review_results(id,project_id,review_work_item_id,target_subject_id,target_subject_version,review_type,verdict,findings,materiality,reviewed_hashes,lineage_snapshot_id,created_at) "
+                "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT(project_id,review_work_item_id,review_type) DO UPDATE SET verdict=EXCLUDED.verdict,findings=EXCLUDED.findings,materiality=EXCLUDED.materiality,reviewed_hashes=EXCLUDED.reviewed_hashes,lineage_snapshot_id=EXCLUDED.lineage_snapshot_id "
+                "RETURNING *",
+                (ident, project_id, review_work_item_id, target_subject_id, target_subject_version, review_type.strip(), verdict,
+                 json.dumps(findings or []), materiality, json.dumps(reviewed_hashes or {}), lineage_snapshot_id, now),
+            )
+            result = cur.fetchone()
+            self._event(cur, project_id, "REVIEW_RESULT_RECORDED", str(result["id"]), {
+                "review_work_item_id": review_work_item_id, "review_type": review_type.strip(),
+                "verdict": verdict, "target_subject_id": target_subject_id,
+                "target_subject_version": target_subject_version,
+            })
+        self.resolve_dependencies(project_id)
+        return self._record(result) or {}
+
+    def work_permissions_get(self, work_item_id: str) -> dict[str, Any]:
+        """Derive start, promotion, execution, and evidence permissions from facts."""
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM lab_work_items WHERE id=%s", (work_item_id,))
+            item = cur.fetchone()
+            if not item:
+                raise GPUError("LAB_WORK_NOT_FOUND", work_item_id)
+            cur.execute("SELECT * FROM lab_work_dependencies WHERE work_item_id=%s", (work_item_id,))
+            outcomes = [self._dependency_status(cur, str(item["project_id"]), dep) for dep in cur.fetchall()]
+            all_dependencies = all(satisfied for satisfied, _, _ in outcomes)
+            blocking = [detail for satisfied, _, detail in outcomes if not satisfied]
+            authority_class = item["authority_class"]
+            promotion_state = item["promotion_state"]
+            may_start = item["status"] == "READY" and not item.get("superseded_by") and not item.get("invalidated_at")
+            # Preparatory/speculative labor may start with their own bounded
+            # contract; unresolved authority is not a hidden work-start gate.
+            may_promote = (
+                authority_class == "AUTHORITATIVE" and promotion_state in {"ELIGIBLE", "CONDITIONALLY_ELIGIBLE"}
+                and all_dependencies and not item.get("superseded_by") and not item.get("invalidated_at")
+            )
+            may_execute = may_promote and item.get("gate_id") is not None and item.get("status") in {"CLAIMED", "RUNNING"}
+            return {
+                "work_item_id": str(item["id"]), "may_start_work": may_start,
+                "may_continue_work": item["status"] in {"CLAIMED", "RUNNING"},
+                "may_finalize_subject": may_promote, "may_certify": may_promote,
+                "may_promote_authority": may_promote, "may_execute_science": may_execute,
+                "may_access_confirmation": False, "may_admit_evidence": False,
+                "blocking_conditions": blocking, "satisfied_conditions": [detail for ok, _, detail in outcomes if ok],
+                "permission_snapshot_version": f"{item['work_version']}:{promotion_state}:{authority_class}",
+            }
 
     def experiment_run_terminal(self, run_id: str, run_status: str) -> dict[str, int]:
         """Project terminal runs without treating technical failure as evidence.

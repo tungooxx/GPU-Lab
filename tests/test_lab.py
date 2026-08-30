@@ -23,6 +23,27 @@ def test_host_maintenance_capabilities_are_claim_gated():
     )
 
 
+def test_completed_review_work_cannot_satisfy_a_nonpass_verdict_dependency():
+    """v3.6.5 CPDS regression: COMPLETED is operational, not semantic PASS."""
+    class Cursor:
+        def execute(self, *_args, **_kwargs):
+            return None
+
+        @staticmethod
+        def fetchone():
+            return {"verdict": "MATERIAL_REPAIR_REQUIRED"}
+
+    satisfied, invalidated, detail = LabController.__new__(LabController)._dependency_status(
+        Cursor(), "project", {
+            "target_type": "REVIEW_RESULT", "target_id": "review-result",
+            "predicate_type": "REVIEW_VERDICT_EQUALS", "predicate_value": ["PASS"],
+            "required_statuses": [], "invalidating_statuses": [],
+        },
+    )
+    assert (satisfied, invalidated) == (False, False)
+    assert "MATERIAL_REPAIR_REQUIRED" in detail
+
+
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_two_workers_claim_distinct_work_and_messages_are_not_evidence():
     store = ResearchStore(TEST_DATABASE_URL)

@@ -1958,6 +1958,7 @@ async def lab_work_create(
     dependency_scope: str = "WORKITEM_LOCAL",
     preferred_worker_id: str | None = None, affinity_reason: str | None = None,
     required_capabilities: list[str] | None = None,
+    authority_class: str | None = None, promotion_state: str | None = None,
 ):
     """Create dependency-aware work; optional worker affinity is never exclusive."""
     return await call(
@@ -1974,7 +1975,29 @@ async def lab_work_create(
         dependency_scope=dependency_scope,
         preferred_worker_id=preferred_worker_id, affinity_reason=affinity_reason,
         required_capabilities=required_capabilities,
+        authority_class=authority_class, promotion_state=promotion_state,
     )
+
+
+@mcp.tool()
+async def review_result_record(
+    project_id: str, review_work_item_id: str, target_subject_id: str,
+    target_subject_version: str, review_type: str, verdict: str,
+    findings: list[dict[str, Any]] | None = None, materiality: str | None = None,
+    reviewed_hashes: dict[str, str] | None = None, lineage_snapshot_id: str | None = None,
+):
+    """Persist a typed review verdict; completed review work never implies PASS."""
+    return await call(
+        lab().review_result_record, project_id, review_work_item_id, target_subject_id,
+        target_subject_version, review_type, verdict, findings, materiality,
+        reviewed_hashes, lineage_snapshot_id,
+    )
+
+
+@mcp.tool()
+async def lab_work_permissions_get(work_item_id: str):
+    """Derive work-start, certification, promotion, and execution permissions separately."""
+    return await call(lab().work_permissions_get, work_item_id)
 
 
 @mcp.tool()
