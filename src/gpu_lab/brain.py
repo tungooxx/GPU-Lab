@@ -1193,9 +1193,47 @@ class ResearchBrain:
         prior = decision["data"].get("execution_binding")
         if prior:
             if prior != binding:
-                raise GPUError(
-                    "RESEARCH_DECISION_ALREADY_BOUND",
-                    "Decision is already bound to another execution request",
+                # Permit a corrected request only after the old one was
+                # conclusively cancelled before dispatch.  The condition is
+                # deliberately stricter than a generic cancellation: a real
+                # process, artifact, or scientific observation must never be
+                # silently rebound under the same Decision.
+                with self.store._connect() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id,status,data FROM research_objects "
+                        "WHERE project_id=%s AND kind='ExperimentRun' "
+                        "AND data->>'experiment_id'=%s AND data->>'decision_id'=%s "
+                        "AND data->>'request_fingerprint'=%s ORDER BY created_at DESC FOR UPDATE",
+                        (experiment["project_id"], experiment_id, decision_id, prior.get("request_fingerprint")),
+                    )
+                    prior_runs = cur.fetchall()
+                recoverable = []
+                for run in prior_runs:
+                    abandonment = (run.get("data") or {}).get("legacy_abandonment") or {}
+                    provenance = abandonment.get("provenance") or {}
+                    if (
+                        run.get("status") == "cancelled"
+                        and abandonment.get("verified_missing_backing_job") is True
+                        and provenance.get("technical_non_scientific") is True
+                    ):
+                        recoverable.append(str(run["id"]))
+                if not recoverable:
+                    raise GPUError(
+                        "RESEARCH_DECISION_ALREADY_BOUND",
+                        "Decision is already bound to another execution request",
+                    )
+                return self.store.object_update(
+                    decision_id,
+                    {
+                        "execution_binding": binding,
+                        "execution_binding_recovery": {
+                            "rebound_from_request_fingerprint": prior.get("request_fingerprint"),
+                            "rebound_after_unsubmitted_run_ids": recoverable,
+                            "scientific_evidence_created": False,
+                        },
+                    },
+                    decision["status"],
+                    "RESEARCH_DECISION_REBOUND_AFTER_UNSUBMITTED_ATTEMPT",
                 )
             return {**decision, "idempotent_replay": True}
         return self.store.object_update(

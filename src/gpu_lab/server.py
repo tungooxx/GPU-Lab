@@ -3286,9 +3286,9 @@ async def execution_decision_bind(
 ):
     """Bind a compatible ResearchDecision to the exact executable request.
 
-    This is safe to use for a RESERVED run whose backing local job is absent:
-    it changes only decision provenance, and the caller must still retry the
-    canonical execution with its original execution_attempt_uuid.
+    A different request is accepted only when the previous binding is tied to
+    a server-verified, pre-submission technical cancellation.  Submitted or
+    scientifically observable attempts remain immutable.
     """
     fingerprint = _execution_action_fingerprint(
         experiment_id, command, working_directory, env, python_env

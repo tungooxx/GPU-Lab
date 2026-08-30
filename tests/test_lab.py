@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from gpu_lab.cockpit import CockpitController
+from gpu_lab.brain import ResearchBrain
 from gpu_lab.errors import GPUError
 from gpu_lab.lab import ACTIVE_WORK_STATUSES, LabController
 from gpu_lab.research import ResearchStore
@@ -1642,6 +1643,20 @@ def test_one_shot_authority_allows_only_exact_retry_attempt_uuid():
     assert replay["execution_attempt_uuid"] == "attempt-1"
 
 
+def test_one_shot_authority_allows_replacement_after_proven_unsubmitted_cancellation():
+    args = _execution_authority_records()
+    abandoned = [{
+        "idempotency_key": "attempt-invalid-path", "run_id": "r", "status": "cancelled",
+        "run_status": "cancelled",
+        "run_data": {"legacy_abandonment": {"verified_missing_backing_job": True,
+                     "provenance": {"technical_non_scientific": True}}},
+    }]
+    result = LabController._validate_frozen_execution_authority_records(
+        *args[:5], *args[5:], [(True, False, "ok")], True, abandoned, "attempt-corrected-path"
+    )
+    assert result["validated"] is True
+
+
 def _detached_execution_authority_records():
     project, experiment_id, work, worker, session, item, gate, experiment, hypothesis = _execution_authority_records()
     item.update({
@@ -1802,6 +1817,50 @@ def test_frozen_authority_detached_exact_reserved_retry_is_db_safe():
     with store._connect() as conn, conn.cursor() as cur:
         cur.execute("SELECT count(*) AS n FROM research_execution_attempts WHERE experiment_id=%s", (experiment["id"],))
         assert cur.fetchone()["n"] == 1
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_one_shot_can_replace_only_proven_unsubmitted_technical_cancellation():
+    store = ResearchStore(TEST_DATABASE_URL)
+    project = store.project_create(f"unsubmitted-retry-{time.time_ns()}", "Unsubmitted retry canary")["project_id"]
+    hypothesis = store.object_create(project, "Hypothesis", {"label": "h"}, "CREATED", "ACTIVE")
+    experiment = store.object_create(
+        project, "Experiment", {"frozen": True, "hypothesis_id": hypothesis["id"],
+                                  "plan": {"research_question": "Does recovery preserve one-shot semantics?"}},
+        "EXPERIMENT_PREREGISTERED", "ACTIVE",
+    )
+    decision = store.object_create(
+        project, "ResearchDecision", {
+            "hypotheses_affected": [hypothesis["id"]],
+            "selected_action": {"action_type": "FROZEN_DIAGNOSTIC", "question_addressed": "Does recovery preserve one-shot semantics?"},
+            "execution_binding": {"experiment_id": str(experiment["id"]), "request_fingerprint": "bad-path"},
+        }, "DECISION_CREATED", "SELECTED",
+    )
+    first = store.run_reserve(
+        experiment["id"], "attempt-invalid-path", "remote_unsubmitted_01", "bad-path",
+        {"executor": "vast", "decision_id": str(decision["id"])}, True,
+    )
+    store.legacy_reserved_run_abandon(
+        first["run_id"], first["job_id"], "Invalid remote working directory; no job submitted.",
+        {"technical_non_scientific": True},
+    )
+
+    rebound = ResearchBrain(store).execution_decision_bind(
+        str(experiment["id"]), str(decision["id"]), "corrected-path"
+    )
+    assert rebound["data"]["execution_binding"]["request_fingerprint"] == "corrected-path"
+    second = store.run_reserve(
+        experiment["id"], "attempt-corrected-path", "remote_unsubmitted_02", "corrected-path",
+        {"executor": "vast", "decision_id": str(decision["id"])}, True,
+    )
+    assert second["run_id"] != first["run_id"]
+
+    with pytest.raises(GPUError) as rejected:
+        store.run_reserve(
+            experiment["id"], "attempt-third", "remote_unsubmitted_03", "third-path",
+            {"executor": "vast", "decision_id": str(decision["id"])}, True,
+        )
+    assert rejected.value.error_type == "EXPERIMENT_ONE_SHOT_ALREADY_RESERVED"
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")

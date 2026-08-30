@@ -4292,13 +4292,36 @@ class ResearchStore:
                 raise GPUError("EXPERIMENT_NOT_PREREGISTERED", experiment_id)
             if one_shot:
                 cur.execute(
-                    "SELECT run_id,job_id,idempotency_key,request_fingerprint,status "
-                    "FROM research_execution_attempts WHERE experiment_id=%s ORDER BY created_at,run_id",
+                    "SELECT a.run_id,a.job_id,a.idempotency_key,a.request_fingerprint,a.status,"
+                    "r.status AS run_status,r.data AS run_data "
+                    "FROM research_execution_attempts a "
+                    "JOIN research_objects r ON r.id=a.run_id "
+                    "WHERE a.experiment_id=%s ORDER BY a.created_at,a.run_id",
                     (experiment_id,),
                 )
                 prior_attempts = cur.fetchall()
-                conflicting = [row for row in prior_attempts if str(row["idempotency_key"]) != str(idempotency_key)]
-                if conflicting or len(prior_attempts) > 1:
+                # A one-shot experiment is not a one-shot *reservation*.  A
+                # reservation proven to have been cancelled before dispatch is
+                # operational bookkeeping, not an execution.  It may be
+                # replaced once the corrected immutable executor request is
+                # bound, while every submitted or scientifically observable
+                # attempt remains permanently exclusive.
+                def pre_submission_technical_cancellation(row: dict[str, Any]) -> bool:
+                    abandonment = (row.get("run_data") or {}).get("legacy_abandonment") or {}
+                    provenance = abandonment.get("provenance") or {}
+                    return (
+                        row.get("status") == "cancelled"
+                        and row.get("run_status") == "cancelled"
+                        and abandonment.get("verified_missing_backing_job") is True
+                        and provenance.get("technical_non_scientific") is True
+                    )
+
+                blocking_attempts = [
+                    row for row in prior_attempts
+                    if not pre_submission_technical_cancellation(row)
+                ]
+                conflicting = [row for row in blocking_attempts if str(row["idempotency_key"]) != str(idempotency_key)]
+                if conflicting or len(blocking_attempts) > 1:
                     raise GPUError(
                         "EXPERIMENT_ONE_SHOT_ALREADY_RESERVED",
                         "A one-shot Experiment already has a different canonical execution attempt",
@@ -4400,6 +4423,19 @@ class ResearchStore:
                     "idempotency_key": idempotency_key,
                 },
             )
+            if one_shot and prior_attempts:
+                replaced = [
+                    str(row["run_id"]) for row in prior_attempts
+                    if pre_submission_technical_cancellation(row)
+                ]
+                if replaced:
+                    self._event(
+                        cur,
+                        experiment["project_id"],
+                        "EXPERIMENT_EXECUTION_REPLACES_UNSUBMITTED_ATTEMPT",
+                        run_id,
+                        {"replaced_run_ids": replaced, "idempotency_key": idempotency_key},
+                    )
             return self._execution_mapping(cur, run_id, job_id, idempotency_key, False)
 
     def run_mark_submitted(self, run_id: str) -> dict:

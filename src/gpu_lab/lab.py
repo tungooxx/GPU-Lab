@@ -1954,8 +1954,21 @@ class LabController:
         recovery = item.get("recovery_policy") or {}
         one_shot = bool(recovery.get("one_shot") or recovery.get("requires_no_existing_run"))
         if one_shot and attempts:
-            keys = {str(row.get("idempotency_key")) for row in attempts}
-            if not execution_attempt_uuid or keys != {str(execution_attempt_uuid)} or len(attempts) != 1:
+            def pre_submission_technical_cancellation(row: dict[str, Any]) -> bool:
+                abandonment = (row.get("run_data") or {}).get("legacy_abandonment") or {}
+                provenance = abandonment.get("provenance") or {}
+                return (
+                    row.get("status") == "cancelled"
+                    and row.get("run_status") == "cancelled"
+                    and abandonment.get("verified_missing_backing_job") is True
+                    and provenance.get("technical_non_scientific") is True
+                )
+
+            blocking_attempts = [row for row in attempts if not pre_submission_technical_cancellation(row)]
+            keys = {str(row.get("idempotency_key")) for row in blocking_attempts}
+            if blocking_attempts and (
+                not execution_attempt_uuid or keys != {str(execution_attempt_uuid)} or len(blocking_attempts) != 1
+            ):
                 raise GPUError("EXPERIMENT_ONE_SHOT_ALREADY_RESERVED", experiment_id)
         return {
             "validated": True,
@@ -2010,8 +2023,10 @@ class LabController:
             )
             lease_active = cur.fetchone() is not None
             cur.execute(
-                "SELECT run_id,job_id,idempotency_key,request_fingerprint,status FROM research_execution_attempts "
-                "WHERE experiment_id=%s ORDER BY created_at,run_id",
+                "SELECT a.run_id,a.job_id,a.idempotency_key,a.request_fingerprint,a.status,"
+                "r.status AS run_status,r.data AS run_data "
+                "FROM research_execution_attempts a JOIN research_objects r ON r.id=a.run_id "
+                "WHERE a.experiment_id=%s ORDER BY a.created_at,a.run_id",
                 (experiment_id,),
             )
             attempts = cur.fetchall()
