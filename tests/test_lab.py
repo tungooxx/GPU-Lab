@@ -298,7 +298,7 @@ def test_v36_feature_gated_scheduler_claims_existing_work_or_records_healthy_idl
     branch = lab.hypothesis_branch_create(project_id, objective["id"], scientific_distance="FAR")
     lab.hypothesis_portfolio_ensure(project_id, objective["id"])
     gate = lab.gate_ensure(project_id, "RESULT_INSPECTION", "E-v36", "v1", planner["worker"]["id"], planner["session_id"])
-    work = lab.gate_work_ensure(
+    work = lab.gate_authority_work_ensure(
         gate["id"], "REVIEW", "Inspect E-v36", "Canonical existing work", "RESULT_INSPECTOR",
         planner["worker"]["id"], planner["session_id"], branch_id=branch["id"],
     )
@@ -1736,7 +1736,7 @@ def _db_frozen_execution_fixture(label: str):
         project_id, "ONE_SHOT_EXECUTION", experiment["id"], subject_version,
         worker_id, session_id, semantic_review_required=False,
     )
-    work = lab.gate_work_ensure(
+    work = lab.gate_authority_work_ensure(
         gate["id"], "MECHANISM_TEST", "Execute frozen DB canary", "One-shot exact authority canary",
         "EXPERIMENT_OWNER", worker_id, session_id,
         recovery_policy={"one_shot": True, "requires_no_existing_run": True},
@@ -1867,6 +1867,32 @@ def test_one_shot_can_replace_only_proven_unsubmitted_technical_cancellation():
             {"executor": "vast", "decision_id": str(decision["id"])}, True,
         )
     assert rejected.value.error_type == "EXPERIMENT_ONE_SHOT_ALREADY_RESERVED"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_detached_authority_recovers_same_owner_after_unsubmitted_cancellation():
+    store, lab, project_id, joined, experiment, work = _db_frozen_execution_fixture("unsubmitted-detached-recovery")
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    old_uuid = "attempt-invalid-remote-path"
+    authority = lab.frozen_execution_authority_validate(project_id, experiment["id"], work["id"], worker_id, session_id, old_uuid)
+    reserved = store.run_reserve(
+        experiment["id"], old_uuid, f"remote_recovery_{uuid.uuid4().hex}", "old-fingerprint",
+        {"executor": "vast", "decision_id": "fixture", "command": "bash run.sh", "working_directory": "/outside", "environment": {}}, True,
+    )
+    lab.attach_experiment_run(work["id"], worker_id, session_id, reserved["run_id"], authority)
+    store.legacy_reserved_run_abandon(
+        reserved["run_id"], reserved["job_id"], "Remote cwd rejected before dispatch.",
+        {"technical_non_scientific": True},
+    )
+    recovered = lab.recover_unsubmitted_execution_authority(work["id"], worker_id, session_id, "attempt-corrected-remote-path")
+    assert recovered["recovered"] is True
+    restored = lab.work_get(work["id"])
+    assert restored["status"] == "RUNNING"
+    assert restored["related_refs"]["unsubmitted_execution_recovery"]["run_id"] == str(reserved["run_id"])
+    fresh = lab.frozen_execution_authority_validate(
+        project_id, experiment["id"], work["id"], worker_id, session_id, "attempt-corrected-remote-path"
+    )
+    assert fresh["validated"] is True
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")

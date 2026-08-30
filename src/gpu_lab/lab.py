@@ -2038,6 +2038,103 @@ class LabController:
                 bool(self.feature_flags.get("AUTHORITY_PROMOTION_V365")),
             )
 
+    def recover_unsubmitted_execution_authority(
+        self, work_item_id: str, worker_id: str, session_id: str,
+        replacement_attempt_uuid: str | None,
+    ) -> dict[str, Any]:
+        """Restore a detached execution WorkItem after a proven non-dispatch.
+
+        A canonical run is normally detached from a renewable worker lease so
+        only its exact reserved UUID can be retried.  If that reservation is
+        terminally cancelled with server evidence that no process ever existed,
+        retaining the detached pointer turns bookkeeping into a permanent
+        one-shot deadlock.  Only the same recorded owner may reclaim it here;
+        the subsequent frozen-authority validation still enforces the gate,
+        promoted authority, dependencies, and any non-recoverable attempts.
+        """
+        if not replacement_attempt_uuid:
+            return {"recovered": False, "reason": "NO_REPLACEMENT_ATTEMPT"}
+        now = self._now()
+        expiry = now + timedelta(seconds=self.lease_seconds)
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM lab_work_items WHERE id=%s FOR UPDATE", (work_item_id,))
+            item = cur.fetchone()
+            if not item:
+                raise GPUError("LAB_WORK_NOT_FOUND", work_item_id)
+            self._session(cur, session_id, worker_id, str(item["project_id"]))
+            if item["status"] != "RUNNING_DETACHED":
+                return {"recovered": False, "reason": "NOT_DETACHED", "status": item["status"]}
+            refs = item.get("related_refs") or {}
+            old_attempt_uuid = str(refs.get("execution_attempt_uuid") or "")
+            if str(replacement_attempt_uuid) == old_attempt_uuid:
+                return {"recovered": False, "reason": "EXACT_RETRY", "status": item["status"]}
+            if (
+                str(refs.get("execution_owner_worker_id") or "") != str(worker_id)
+                or str(refs.get("execution_owner_session_id") or "") != str(session_id)
+            ):
+                raise GPUError("LAB_WORK_OWNERSHIP_MISMATCH", work_item_id)
+            old_run_id = refs.get("experiment_run_id")
+            if not old_run_id:
+                raise GPUError("LAB_EXECUTION_RECOVERY_RUN_MISSING", work_item_id)
+            cur.execute(
+                "SELECT r.status AS run_status,r.data AS run_data,a.status AS attempt_status "
+                "FROM research_objects r JOIN research_execution_attempts a ON a.run_id=r.id "
+                "WHERE r.id=%s FOR UPDATE",
+                (old_run_id,),
+            )
+            run = cur.fetchone()
+            abandonment = ((run or {}).get("run_data") or {}).get("legacy_abandonment") or {}
+            provenance = abandonment.get("provenance") or {}
+            recoverable = (
+                run is not None
+                and run.get("run_status") == "cancelled"
+                and run.get("attempt_status") == "cancelled"
+                and abandonment.get("verified_missing_backing_job") is True
+                and provenance.get("technical_non_scientific") is True
+            )
+            if not recoverable:
+                raise GPUError("LAB_EXECUTION_RECOVERY_NOT_UNSUBMITTED", str(old_run_id))
+            lease_id = str(uuid.uuid4())
+            historical_ref = {
+                "run_id": str(old_run_id), "attempt_uuid": old_attempt_uuid,
+                "reason": "VERIFIED_UNSUBMITTED_TECHNICAL_CANCELLATION",
+                "recovered_at": now.isoformat(),
+            }
+            updated_refs = {
+                **refs,
+                "unsubmitted_execution_recovery": historical_ref,
+            }
+            for key in (
+                "experiment_run_id", "execution_attempt_uuid", "execution_request_fingerprint",
+                "execution_owner_worker_id", "execution_owner_session_id",
+            ):
+                updated_refs.pop(key, None)
+            cur.execute(
+                "UPDATE lab_work_items SET status='RUNNING',assigned_worker_id=%s,assigned_session_id=%s,"
+                "lease_id=%s,related_refs=%s,blocked_reason=NULL,updated_at=%s,work_version=work_version+1 "
+                "WHERE id=%s",
+                (worker_id, session_id, lease_id, json.dumps(updated_refs), now, work_item_id),
+            )
+            cur.execute(
+                "INSERT INTO lab_work_leases(id,work_item_id,worker_id,worker_session_id,acquired_at,heartbeat_at,expires_at,lease_version) "
+                "VALUES(%s,%s,%s,%s,%s,%s,%s,1)",
+                (lease_id, work_item_id, worker_id, session_id, now, now, expiry),
+            )
+            cur.execute(
+                "UPDATE research_worker_sessions SET current_work_item_id=%s,active_role=%s,status='BUSY',last_heartbeat_at=%s WHERE id=%s",
+                (work_item_id, item["scientific_role"], now, session_id),
+            )
+            cur.execute(
+                "UPDATE research_workers SET availability_state='EXECUTING',availability_updated_at=%s,idle_reason=NULL,idle_since=NULL WHERE id=%s",
+                (now, worker_id),
+            )
+            self._event(cur, item["project_id"], "WORK_ITEM_UNSUBMITTED_EXECUTION_RECOVERED", work_item_id, {
+                "previous_run_id": str(old_run_id), "previous_attempt_uuid": old_attempt_uuid,
+                "replacement_attempt_uuid": str(replacement_attempt_uuid), "worker_id": str(worker_id),
+            })
+        return {"recovered": True, "work_item_id": str(work_item_id), "lease_id": lease_id,
+                "replacement_attempt_uuid": str(replacement_attempt_uuid)}
+
     def work_list(self, project_id: str, statuses: list[str] | None = None, limit: int = 100) -> list[dict]:
         with self.store._connect() as conn, conn.cursor() as cur:
             sql, args = "SELECT * FROM lab_work_items WHERE project_id=%s", [project_id]

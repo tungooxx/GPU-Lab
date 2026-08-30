@@ -4871,6 +4871,12 @@ async def research_experiment_execute(
     if authority is not None:
         if not all(supplied_lab_authority):
             return {"error": {"type": "LAB_EXECUTION_AUTHORITY_REQUIRED", "message": "Authority-bound Decision requires the owning Lab WorkItem context"}}
+        recovery = await call(
+            lab().recover_unsubmitted_execution_authority,
+            lab_work_item_id, lab_worker_id, lab_session_id, idempotency_key,
+        )
+        if "error" in recovery:
+            return recovery
         current_authority = await call(
             lab().frozen_execution_authority_validate,
             str(experiment["project_id"]), experiment_id, lab_work_item_id, lab_worker_id, lab_session_id, idempotency_key,
@@ -5009,6 +5015,22 @@ async def research_experiment_execute(
         else:
             response["lab_work_item"] = attachment
     return response
+
+
+@mcp.tool()
+async def lab_execution_unsubmitted_recover(
+    work_item_id: str, worker_id: str, session_id: str, replacement_attempt_uuid: str,
+):
+    """Recover the same owner from a verified pre-submission cancelled run.
+
+    This operation is unavailable for submitted, artifact-bearing, or
+    scientific executions. It restores the work lease only; it never creates a
+    Run or starts a provider process.
+    """
+    return await call(
+        lab().recover_unsubmitted_execution_authority,
+        work_item_id, worker_id, session_id, replacement_attempt_uuid,
+    )
 
 
 @mcp.tool()
