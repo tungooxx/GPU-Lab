@@ -4581,6 +4581,7 @@ async def research_experiment_execute(
     lab_session_id: str | None = None,
     runtime_fingerprint: str | None = None,
     instance_id: str | None = None,
+    confirmation_authorization_id: str | None = None,
 ):
     """Run a preregistered experiment with a ResearchDecision created by research_decision_create.
 
@@ -4610,6 +4611,23 @@ async def research_experiment_execute(
     experiment = await call(research().object_get, experiment_id)
     if "error" in experiment:
         return experiment
+    plan = experiment.get("data", {}).get("plan", {})
+    confirmation_required = bool(
+        plan.get("confirmation_required")
+        or str(plan.get("phase", "")).upper() == "CONFIRMATION"
+        or str(plan.get("execution_phase", "")).upper() == "CONFIRMATION"
+    )
+    if confirmation_required and not confirmation_authorization_id:
+        return {"error": {"type": "CONFIRMATION_AUTHORIZATION_REQUIRED", "message": "Protected confirmation execution requires confirmation_authorization_id"}}
+    if confirmation_authorization_id:
+        confirmation = await call(
+            engineering().confirmation_authorization_validate,
+            str(experiment["project_id"]), confirmation_authorization_id, experiment_id,
+        )
+        if "error" in confirmation:
+            return confirmation
+        if not confirmation_required:
+            return {"error": {"type": "CONFIRMATION_AUTHORIZATION_UNEXPECTED", "message": "This experiment is not marked as confirmation"}}
     requires_canary = bool(experiment.get("data", {}).get("plan", {}).get("require_exact_runtime_canary"))
     if requires_canary and not runtime_fingerprint:
         return {"error": {"type": "RUNTIME_CANARY_REQUIRED", "message": "Provide the exact runtime fingerprint"}}
@@ -4635,6 +4653,7 @@ async def research_experiment_execute(
         "env": env or {},
         "python_env": python_env,
         "instance_id": instance_id,
+        "confirmation_authorization_id": confirmation_authorization_id,
     }
     fingerprint = hashlib.sha256(
         json.dumps(request, sort_keys=True, separators=(",", ":")).encode()
@@ -4681,6 +4700,7 @@ async def research_experiment_execute(
             "working_directory": working_directory,
             "environment": env or {},
             "python_env": python_env,
+            "confirmation_authorization_id": confirmation_authorization_id,
         },
     )
     # Keep the legacy run_reserve call shape unchanged unless current frozen

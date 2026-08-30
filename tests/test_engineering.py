@@ -229,6 +229,10 @@ def test_final_release_review_binds_rc_and_seals_confirmation():
         "project", candidate["id"], "confirmation-approver", "PASS", "Confirmation budget authorized.",
     )
     assert auth["status"] == "APPROVED"
+    assert service.confirmation_authorization_validate("project", auth["id"], "experiment-1")["id"] == auth["id"]
+    with pytest.raises(GPUError) as wrong_experiment:
+        service.confirmation_authorization_validate("project", auth["id"], "experiment-2")
+    assert wrong_experiment.value.error_type == "CONFIRMATION_EXPERIMENT_MISMATCH"
 
 
 def test_result_cannot_be_recorded_twice_after_completion():

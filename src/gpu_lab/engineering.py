@@ -800,6 +800,25 @@ class EngineeringService:
             "scientific_result": "NOT_ASSESSED",
         }, "CONFIRMATION_AUTHORIZATION_RECORDED", "APPROVED" if verdict == "PASS" else "BLOCKED")
 
+    def confirmation_authorization_validate(
+        self, project_id: str, confirmation_authorization_id: str, experiment_id: str,
+    ) -> dict:
+        """Fail closed before a protected confirmation execution is reserved."""
+        authorization = self._validate_parent(
+            project_id, confirmation_authorization_id, "ConfirmationAuthorization", "confirmation_authorization"
+        )
+        if authorization.get("status") != "APPROVED" or authorization.get("data", {}).get("verdict") != "PASS":
+            raise GPUError("CONFIRMATION_AUTHORIZATION_NOT_APPROVED", confirmation_authorization_id)
+        candidate_id = authorization.get("data", {}).get("release_candidate_id")
+        candidate = self.pre_science_release_candidate_get(str(candidate_id))
+        if str(candidate.get("project_id")) != str(project_id):
+            raise GPUError("RESEARCH_PROJECT_MISMATCH", str(candidate_id))
+        if candidate.get("status") != "APPROVED" or not candidate.get("data", {}).get("final_release_review_id"):
+            raise GPUError("CONFIRMATION_RELEASE_NOT_FROZEN", str(candidate_id))
+        if str(candidate.get("data", {}).get("experiment_id")) != str(experiment_id):
+            raise GPUError("CONFIRMATION_EXPERIMENT_MISMATCH", experiment_id)
+        return authorization
+
     def task_verify(self, task_id: str) -> dict:
         task = self.task_get(task_id)
         result_id = task["data"].get("latest_result_id")
