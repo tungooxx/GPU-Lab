@@ -1278,8 +1278,10 @@ def _db_frozen_execution_fixture(label: str):
         "EXPERIMENT_OWNER", worker_id, session_id,
         recovery_policy={"one_shot": True, "requires_no_existing_run": True},
     )
-    lab.preflight_run(gate["id"], worker_id, session_id, {"fixture_ready": True})
-    lab.gate_resolve(gate["id"], worker_id, session_id, "PASS", rationale="DB canary only")
+    preflight = lab.preflight_run(gate["id"], worker_id, session_id, {"fixture_ready": True})
+    assert preflight["gate"]["status"] == "PASS"
+    resolved = lab.gate_resolve(gate["id"], worker_id, session_id, "PASS", rationale="DB canary only")
+    assert resolved["idempotent"] is True
     lab.claim_work(work["id"], worker_id, session_id)
     lab.start_work(work["id"], worker_id, session_id)
     return store, lab, project_id, joined, experiment, work

@@ -969,16 +969,33 @@ class LabController:
                      json.dumps(normalized), json.dumps(failures), json.dumps(warnings), result_hash, status, validator_version, now),
                 )
                 result = cur.fetchone()
-            next_status = "AWAITING_SEMANTIC_REVIEW" if result["status"] == "PASS" else "PREFLIGHT_FAILED"
+            # A gate can explicitly be classified as a technical-only delta at
+            # creation time.  In that case its subject version still receives
+            # an immutable deterministic preflight, but it must not be routed
+            # through a second semantic review which the policy deliberately
+            # declared unnecessary.  Previously both paths were sent to
+            # AWAITING_SEMANTIC_REVIEW, leaving provenance/runtime-only repairs
+            # in a needless review loop and requiring a manual no-op resolve.
+            if result["status"] == "FAIL":
+                next_status = "PREFLIGHT_FAILED"
+            elif gate["semantic_review_required"]:
+                next_status = "AWAITING_SEMANTIC_REVIEW"
+            else:
+                next_status = "PASS"
             cur.execute(
-                "UPDATE scientific_gates SET deterministic_preflight_id=%s,status=%s,resolved_at=NULL WHERE id=%s",
-                (result["id"], next_status, gate_id),
+                "UPDATE scientific_gates SET deterministic_preflight_id=%s,status=%s,resolved_at=%s WHERE id=%s",
+                (result["id"], next_status, now if next_status == "PASS" else None, gate_id),
             )
             self._event(cur, gate["project_id"], "DETERMINISTIC_PREFLIGHT_REUSED" if reused else "DETERMINISTIC_PREFLIGHT_COMPLETED", result["id"], {
                 "gate_id": gate_id, "status": result["status"], "subject_hash": subject_hash,
                 "validator_version": validator_version,
             })
-            self._event(cur, gate["project_id"], "SCIENTIFIC_GATE_PREFLIGHT_FAILED" if result["status"] == "FAIL" else "SCIENTIFIC_GATE_PREFLIGHT_PASSED", gate_id, {"preflight_id": str(result["id"])})
+            self._event(cur, gate["project_id"], "SCIENTIFIC_GATE_PREFLIGHT_FAILED" if result["status"] == "FAIL" else "SCIENTIFIC_GATE_PREFLIGHT_PASSED", gate_id, {"preflight_id": str(result["id"]), "semantic_review_required": gate["semantic_review_required"]})
+            if next_status == "PASS":
+                self._event(cur, gate["project_id"], "SCIENTIFIC_GATE_AUTO_RESOLVED_TECHNICAL_DELTA", gate_id, {
+                    "preflight_id": str(result["id"]),
+                    "rationale": "semantic_review_required=false; deterministic preflight passed",
+                })
         return {"gate": self.gate_get(gate_id), "preflight": self._record(result), "reused": reused}
 
     def gate_resolve(
