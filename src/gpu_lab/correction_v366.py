@@ -169,6 +169,13 @@ class ScientificSelfCorrectionService:
         known = {str(item["id"]) for item in design_assumptions}
         if not required or not set(required).issubset(known):
             raise GPUError("DESIGN_ATTACK_ASSUMPTIONS_REQUIRED", "Attack only frozen assumptions of this design")
+        risk = str(design["data"].get("scientific_design_risk") or "MODERATE").upper()
+        intensity = {
+            "LOW": {"minimum_independent_attacks": 1, "operators": ["NECESSITY_ATTACKER"]},
+            "MODERATE": {"minimum_independent_attacks": 1, "operators": ["STRONGEST_NULL_ATTACKER"]},
+            "HIGH": {"minimum_independent_attacks": 3, "operators": ["NECESSITY_ATTACKER", "CAUSAL_IDENTIFIABILITY_ATTACKER", "DEGENERATE_SOLUTION_ATTACKER"]},
+            "CONFIRMATORY": {"minimum_independent_attacks": 3, "operators": ["STRONGEST_NULL_ATTACKER", "CAUSAL_IDENTIFIABILITY_ATTACKER", "MEASUREMENT_ATTACKER"]},
+        }[risk]
         now, batch_id = self._now(), uuid.uuid4()
         snapshot_hash = design["data"]["semantic_hash"]
         with self.store._connect() as conn, conn.cursor() as cur:
@@ -177,9 +184,13 @@ class ScientificSelfCorrectionService:
             if existing:
                 return self.attack_batch_get(str(existing["id"]))
             cur.execute("INSERT INTO design_attack_batches(id,project_id,design_id,design_snapshot_hash,status,peer_visibility,required_assumption_ids,created_at) VALUES(%s,%s,%s,%s,'GENERATING','HIDDEN',%s,%s)", (batch_id, design["project_id"], design_id, snapshot_hash, self._json(required), now))
+            self.store._event(cur, design["project_id"], "DESIGN_ATTACK_INTENSITY_SELECTED", design_id, {"scientific_design_risk": risk, **intensity})
             cur.execute("UPDATE research_objects SET status='UNDER_ATTACK',data=%s WHERE id=%s", (self._json({**design["data"], "design_status": "UNDER_ATTACK"}), design_id))
             self.store._event(cur, design["project_id"], "DESIGN_ATTACK_STARTED", design_id, {"batch_id": str(batch_id), "required_assumption_ids": required})
-        return self.attack_batch_get(str(batch_id))
+        result = self.attack_batch_get(str(batch_id))
+        result["scientific_design_risk"] = risk
+        result["recommended_attack_intensity"] = intensity
+        return result
 
     def attack_batch_get(self, batch_id: str, requester_session_id: str | None = None) -> dict:
         with self.store._connect() as conn, conn.cursor() as cur:
@@ -197,6 +208,15 @@ class ScientificSelfCorrectionService:
                 item.pop("attack_id", None)
             result["members"].append(item)
         result["peer_attacks_visible"] = result["peer_visibility"] != "HIDDEN"
+        design = self._object(str(result["design_id"]), "ScientificDesign")
+        risk = str(design["data"].get("scientific_design_risk") or "MODERATE").upper()
+        result["scientific_design_risk"] = risk
+        result["recommended_attack_intensity"] = {
+            "LOW": {"minimum_independent_attacks": 1, "operators": ["NECESSITY_ATTACKER"]},
+            "MODERATE": {"minimum_independent_attacks": 1, "operators": ["STRONGEST_NULL_ATTACKER"]},
+            "HIGH": {"minimum_independent_attacks": 3, "operators": ["NECESSITY_ATTACKER", "CAUSAL_IDENTIFIABILITY_ATTACKER", "DEGENERATE_SOLUTION_ATTACKER"]},
+            "CONFIRMATORY": {"minimum_independent_attacks": 3, "operators": ["STRONGEST_NULL_ATTACKER", "CAUSAL_IDENTIFIABILITY_ATTACKER", "MEASUREMENT_ATTACKER"]},
+        }[risk]
         return result
 
     def attack_join(self, batch_id: str, worker_id: str, session_id: str, attack_operator: str) -> dict:

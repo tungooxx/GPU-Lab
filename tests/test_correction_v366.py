@@ -43,6 +43,8 @@ def test_v366_fidelity_pass_never_completes_idea_attack_and_peer_isolation_holds
     assert correction.design_coverage(design["id"])["synthesis"] is None
 
     batch = correction.attack_batch_create(design["id"], [recurrence["id"], binding["id"]])
+    assert batch["recommended_attack_intensity"]["minimum_independent_attacks"] == 3
+    assert "DEGENERATE_SOLUTION_ATTACKER" in batch["recommended_attack_intensity"]["operators"]
     first = correction.attack_join(batch["id"], one["worker"]["id"], one["session_id"], "TEMPORAL_CONFOUND")
     second = correction.attack_join(batch["id"], two["worker"]["id"], two["session_id"], "STRONGEST_NULL_ATTACKER")
     hidden = correction.attack_batch_get(batch["id"], one["session_id"])
