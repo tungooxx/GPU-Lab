@@ -432,21 +432,26 @@ class ScientificSelfCorrectionService:
         all_ids = {str(item["id"]) for item in assumptions}
         return {"design_id": str(design_id), "design_status": design["data"].get("design_status"), "assumption_count": len(assumptions), "covered_assumption_ids": sorted(covered), "missing_assumption_ids": sorted(all_ids - covered), "synthesis": latest, "implementation_fidelity_is_not_design_correction": True}
 
-    def review_target_classifier(self, project_id: str, target_id: str) -> dict:
-        target = self.store.object_get(str(target_id))
-        if str(target["project_id"]) != str(project_id):
-            raise GPUError("RESEARCH_PROJECT_MISMATCH", str(target_id))
-        text = " ".join(str(target["data"].get(key, "")) for key in ("title", "description", "task_type", "purpose", "rationale")).lower()
-        if target["kind"] in {"ScientificDesignAttack", "DesignChallenge", "DesignAttackSynthesis"} or any(word in text for word in ("mechanism", "identifiability", "competing explanation", "design attack")):
+    @staticmethod
+    def _classify_review_target(kind: str, data: dict[str, Any]) -> str:
+        text = " ".join(str(data.get(key, "")) for key in ("title", "description", "task_type", "purpose", "rationale", "scientific_role")).lower()
+        if kind in {"ScientificDesignAttack", "DesignChallenge", "DesignAttackSynthesis"} or any(word in text for word in ("mechanism", "identifiability", "competing explanation", "design attack")):
             label = "DESIGN_ATTACK"
-        elif target["kind"] in {"ImplementationFidelityCheck", "EngineeringResult"} or "science-to-code" in text or "fidelity" in text:
+        elif kind in {"ImplementationFidelityCheck", "EngineeringResult"} or "science-to-code" in text or "fidelity" in text:
             label = "IMPLEMENTATION_FIDELITY"
-        elif target["kind"] == "ResultInterpretationAttack" or "interpretation" in text or "claim" in text:
+        elif kind == "ResultInterpretationAttack" or "interpretation" in text or "claim" in text:
             label = "RESULT_INTERPRETATION"
         elif any(word in text for word in ("format", "path", "logging", "shell", "lint", "hash")):
             label = "DETERMINISTIC_ENGINEERING"
         else:
             label = "UNKNOWN"
+        return label
+
+    def review_target_classifier(self, project_id: str, target_id: str) -> dict:
+        target = self.store.object_get(str(target_id))
+        if str(target["project_id"]) != str(project_id):
+            raise GPUError("RESEARCH_PROJECT_MISMATCH", str(target_id))
+        label = self._classify_review_target(target["kind"], target["data"])
         return {"read_only": True, "implementation_version": VERSION, "target_id": str(target_id), "classification": label, "canonical_history_mutated": False}
 
     def production_audit(self, project_id: str) -> dict:
@@ -459,14 +464,30 @@ class ScientificSelfCorrectionService:
             "DETERMINISTIC_ENGINEERING": [], "MIXED": [], "UNKNOWN": [],
         }
         for record in records:
-            label = self.review_target_classifier(project_id, str(record["id"]))["classification"]
+            label = self._classify_review_target(record["kind"], record["data"])
             classifications.setdefault(label, []).append(str(record["id"]))
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,kind,title,description,scientific_role,related_refs FROM lab_work_items "
+                "WHERE project_id=%s AND (kind ILIKE '%%REVIEW%%' OR scientific_role ILIKE '%%REVIEW%%' "
+                "OR scientific_role ILIKE '%%ATTACK%%' OR scientific_role ILIKE '%%FIDELITY%%')",
+                (project_id,),
+            )
+            work_items = cur.fetchall()
+        for item in work_items:
+            payload = {
+                "title": item["title"], "description": item["description"],
+                "scientific_role": item["scientific_role"], **(item["related_refs"] or {}),
+            }
+            label = self._classify_review_target(str(item["kind"]), payload)
+            classifications.setdefault(label, []).append(f"work:{item['id']}")
         designs = self.store.objects_list(project_id, "ScientificDesign", limit=None)
         coverage = [self.design_coverage(str(design["id"])) for design in designs]
         incomplete = [entry["design_id"] for entry in coverage if entry["missing_assumption_ids"] or not entry["synthesis"]]
         return {
             "read_only": True, "implementation_version": VERSION,
             "review_like_work_by_type": classifications,
+            "review_like_work_item_count": len(work_items),
             "major_designs_lacking_explicit_self_correction": incomplete,
             "design_coverage": coverage,
             "generic_code_review_frequency": len(classifications["UNKNOWN"]),

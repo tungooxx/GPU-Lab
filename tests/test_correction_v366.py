@@ -147,3 +147,20 @@ def test_v5_regression_fidelity_is_not_full_scientific_design_self_correction():
     assert coverage["assumption_count"] == 7
     assert set(coverage["missing_assumption_ids"]) == set(ids)
     assert coverage["synthesis"] is None
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v366_read_only_audit_classifies_review_like_lab_workitems():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab, correction = LabController(store), ScientificSelfCorrectionService(store)
+    project_id = store.project_create(f"v366-audit-{time.time_ns()}", "audit") ["project_id"]
+    worker = lab.join(None, "audit-worker", "CODEX", project_id)
+    work = lab.create_work(
+        project_id, "REVIEW", "Fidelity map", "Check the science-to-code fidelity surface.",
+        "IMPLEMENTATION_FIDELITY_CHECK", created_by=worker["worker"]["id"],
+        created_session_id=worker["session_id"],
+    )
+    audit = correction.production_audit(project_id)
+    assert audit["read_only"] is True
+    assert audit["review_like_work_item_count"] == 1
+    assert f"work:{work['id']}" in audit["review_like_work_by_type"]["IMPLEMENTATION_FIDELITY"]
