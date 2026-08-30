@@ -2628,6 +2628,7 @@ async def pre_science_release_candidate_create(
     scientific_hashes: dict[str, str], successor_work: dict[str, str],
     semantic_review_required: bool = True,
     scientific_spec_id: str | None = None,
+    design_attack_synthesis_id: str | None = None,
 ):
     """Bind one immutable pre-science release candidate; this never authorizes execution."""
     return await call(
@@ -2635,6 +2636,7 @@ async def pre_science_release_candidate_create(
         project_id, canonical_subject_version, experiment_id, research_decision_id,
         engineering_result_id, deterministic_preflight_id, runtime_fingerprint,
         scientific_hashes, successor_work, semantic_review_required, scientific_spec_id,
+        design_attack_synthesis_id,
     )
 
 

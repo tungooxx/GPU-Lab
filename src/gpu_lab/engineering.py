@@ -658,6 +658,7 @@ class EngineeringService:
         scientific_hashes: dict[str, str], successor_work: dict[str, Any],
         semantic_review_required: bool = True,
         scientific_spec_id: str | None = None,
+        design_attack_synthesis_id: str | None = None,
     ) -> dict:
         """Create one immutable bundle for a pre-science release.
 
@@ -689,6 +690,16 @@ class EngineeringService:
             supplied_hash = hashes.get("scientific_semantic_hash")
             if supplied_hash != spec["data"].get("scientific_semantic_hash"):
                 raise GPUError("PRE_SCIENCE_RELEASE_SPEC_HASH_MISMATCH", scientific_spec_id)
+
+        synthesis = None
+        if design_attack_synthesis_id:
+            synthesis = self._validate_parent(
+                project_id, design_attack_synthesis_id, "DesignAttackSynthesis", "design_attack_synthesis"
+            )
+            if synthesis["status"] != "ACCEPTED_FOR_TEST" or synthesis["data"].get("synthesis_verdict") not in {
+                "RETAIN_FOR_TEST", "RETAIN_WITH_NARROWER_CLAIM",
+            }:
+                raise GPUError("PRE_SCIENCE_RELEASE_DESIGN_ATTACK_NOT_ACCEPTED", design_attack_synthesis_id)
 
         experiment = self._validate_parent(project_id, experiment_id, "Experiment", "experiment")
         decision = self._validate_parent(project_id, research_decision_id, "ResearchDecision", "research_decision")
@@ -728,6 +739,8 @@ class EngineeringService:
             "runtime_fingerprint": runtime_fingerprint,
             "scientific_hashes": dict(sorted(hashes.items())),
             "scientific_spec_id": scientific_spec_id,
+            "design_attack_synthesis_id": design_attack_synthesis_id,
+            "design_self_correction_status": "ACCEPTED_FOR_TEST" if synthesis else "NOT_BOUND",
             "successor_work": {field: successor_work[field] for field in successor_required},
             "semantic_review_required": semantic_review_required,
             "execution_authorized": False,
