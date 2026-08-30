@@ -32,6 +32,7 @@ from .cockpit_auth import issue_session, password_matches, verify_session
 from .cockpit_dashboard import COCKPIT_HTML
 from .config import Settings
 from .correction_v34 import DistributedCorrectionService
+from .correction_v366 import ScientificSelfCorrectionService
 from .dashboard import DASHBOARD_HTML
 from .discovery import breakthrough_signal, local_search_collapse_diagnosis
 from .discovery_v33 import DistributedDiscoveryService
@@ -78,7 +79,7 @@ def _source_sha(path: Path) -> str | None:
 
 _RUNTIME_SOURCE_PATHS = {
     name: Path(__file__).with_name(name)
-    for name in ("server.py", "brain.py", "research.py", "lab.py", "discovery_v33.py", "correction_v34.py")
+    for name in ("server.py", "brain.py", "research.py", "lab.py", "discovery_v33.py", "correction_v34.py", "correction_v366.py")
 }
 # Captured at module import, before any MCP request creates the singleton Brain.
 # This detects source mounts changing underneath a long-lived Python process;
@@ -86,8 +87,9 @@ _RUNTIME_SOURCE_PATHS = {
 # state across incompatible class definitions.
 _LOADED_SOURCE_SHAS = {name: _source_sha(path) for name, path in _RUNTIME_SOURCE_PATHS.items()}
 
-settings, service, research_store, research_brain, brain_bench_service, epistemic_service, literature_service, executable_paper_service, qd_service, branch_service, meta_research_service, strategy_service, policy_lab_service, lab_controller_service, distributed_discovery_service, correction_service = (
+settings, service, research_store, research_brain, brain_bench_service, epistemic_service, literature_service, executable_paper_service, qd_service, branch_service, meta_research_service, strategy_service, policy_lab_service, lab_controller_service, distributed_discovery_service, correction_service, scientific_correction_service = (
     Settings(),
+    None,
     None,
     None,
     None,
@@ -161,6 +163,10 @@ _READ_ONLY_TOOLS = {
     "correction_case_get",
     "correction_challenge_get",
     "correction_shadow_preview",
+    "design_attack_batch_get",
+    "scientific_design_coverage_get",
+    "review_target_classifier_v366",
+    "scientific_self_correction_audit_v366",
     "runtime_code_version",
     "research_benchmark_list",
     "research_benchmark_episode_get",
@@ -388,6 +394,37 @@ class CorrectionChallengeInput(BaseModel):
     proposed_discriminating_test: str | None = None
     reasoning_only: bool | None = None
     confidence: float | None = None
+
+
+class DesignChallengeInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    target_assumption_id: str | None = None
+    challenge_type: Literal[
+        "ALTERNATIVE_MECHANISM", "DEGENERATE_SOLUTION", "NECESSITY_CHALLENGE",
+        "IDENTIFIABILITY_CHALLENGE", "CONTROL_FAILURE", "NULL_MISSING",
+        "REPRESENTATION_CONFUSION", "CAPACITY_CONFOUND", "OPTIMIZATION_CONFOUND",
+        "TEMPORAL_CONFOUND", "MEASUREMENT_INVALIDITY",
+    ]
+    statement: str = Field(min_length=1, max_length=12_000)
+    competing_explanation: str | None = None
+    why_current_controls_fail: str | None = None
+    distinguishing_prediction: str | None = None
+    proposed_discriminating_test: str | None = None
+    severity: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"] = "MEDIUM"
+
+
+class DesignAttackSubmissionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    verdict: Literal[
+        "SURVIVES_CURRENT_ATTACK", "MATERIAL_ASSUMPTION_CHALLENGED", "REVISE_DESIGN",
+        "NARROW_CLAIM", "STRONG_NULL_MISSING", "NON_IDENTIFIABLE",
+        "DEGENERATE_ALTERNATIVE_EXISTS", "DISCRIMINATING_EXPERIMENT_REQUIRED",
+        "SUPERSEDE_DESIGN", "INSUFFICIENT_ATTACK_COVERAGE",
+    ]
+    challenges: list[DesignChallengeInput] = Field(default_factory=list)
+    competing_explanations: list[dict[str, Any]] = Field(default_factory=list)
+    degenerate_explanations: list[dict[str, Any]] = Field(default_factory=list)
+    discriminating_tests: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class EngineeringInspectedFile(BaseModel):
@@ -986,6 +1023,16 @@ def correction() -> DistributedCorrectionService:
             if correction_service is None:
                 correction_service = DistributedCorrectionService(research())
     return correction_service
+
+
+def scientific_correction() -> ScientificSelfCorrectionService:
+    """Return the v3.6.6 three-layer correction coordinator."""
+    global scientific_correction_service
+    if scientific_correction_service is None:
+        with _singleton_lock:
+            if scientific_correction_service is None:
+                scientific_correction_service = ScientificSelfCorrectionService(research())
+    return scientific_correction_service
 
 
 def research_operators() -> ResearchOperatorService:
@@ -1730,6 +1777,115 @@ async def correction_hindsight_record(correction_record_id: str, hindsight: dict
 async def correction_shadow_preview(project_id: str, target_id: str):
     """Read-only v3.4 correction planning. It creates no case, challenge, evidence, or experiment."""
     return await call(correction().shadow_preview, project_id, target_id)
+
+
+@mcp.tool()
+async def scientific_design_create(
+    project_id: str, name: str, specification: dict[str, Any], source_object_id: str | None = None,
+    scientific_risk: Literal["LOW", "MODERATE", "HIGH", "CONFIRMATORY"] = "MODERATE",
+    engineering_risk: Literal["DETERMINISTIC", "SCIENCE_CRITICAL", "HIGH_AMBIGUITY"] = "DETERMINISTIC",
+):
+    """Freeze an attackable scientific idea. This does not create code or authorize execution."""
+    return await call(scientific_correction().create_design, project_id, name, specification,
+                      source_object_id=source_object_id, scientific_risk=scientific_risk,
+                      engineering_risk=engineering_risk)
+
+
+@mcp.tool()
+async def design_assumption_create(
+    scientific_design_id: str, statement: str,
+    assumption_type: Literal["NECESSITY", "SUFFICIENCY", "IDENTIFIABILITY", "REPRESENTATION", "CAUSALITY", "CONTROL_VALIDITY", "INVARIANCE", "GENERALIZATION", "MEASUREMENT", "OPTIMIZATION", "CAPACITY", "TEMPORAL"],
+    centrality: Literal["PERIPHERAL", "MATERIAL", "CENTRAL"] = "MATERIAL",
+    falsifiable_prediction: str | None = None, provenance: dict[str, Any] | None = None,
+):
+    """Persist one explicit, falsifiable scientific-design assumption."""
+    return await call(scientific_correction().assumption_create, scientific_design_id, statement,
+                      assumption_type, centrality=centrality,
+                      falsifiable_prediction=falsifiable_prediction, provenance=provenance)
+
+
+@mcp.tool()
+async def design_attack_batch_create(scientific_design_id: str, assumption_ids: list[str] | None = None):
+    """Open a peer-isolated independent scientific-design attack batch."""
+    return await call(scientific_correction().attack_batch_create, scientific_design_id, assumption_ids)
+
+
+@mcp.tool()
+async def design_attack_batch_get(design_attack_batch_id: str, requester_session_id: str | None = None):
+    """Read attack-batch state; peer attack identities stay hidden until freeze."""
+    return await call(scientific_correction().attack_batch_get, design_attack_batch_id, requester_session_id)
+
+
+@mcp.tool()
+async def scientific_design_attack_join(design_attack_batch_id: str, worker_id: str, session_id: str, attack_operator: str):
+    """Join one independent idea-attack slot. It is not an implementation review."""
+    return await call(scientific_correction().attack_join, design_attack_batch_id, worker_id, session_id, attack_operator)
+
+
+@mcp.tool()
+async def scientific_design_attack_submit(design_attack_batch_id: str, worker_id: str, session_id: str, submission: DesignAttackSubmissionInput):
+    """Submit the caller's isolated scientific attack with first-class alternatives and discriminators."""
+    return await call(scientific_correction().attack_submit, design_attack_batch_id, worker_id, session_id,
+                      **submission.model_dump())
+
+
+@mcp.tool()
+async def scientific_design_attack_freeze(design_attack_batch_id: str, worker_id: str, session_id: str):
+    """Freeze one attack; peers become visible only after every joined attack freezes."""
+    return await call(scientific_correction().attack_freeze, design_attack_batch_id, worker_id, session_id)
+
+
+@mcp.tool()
+async def design_attack_synthesize(
+    design_attack_batch_id: str,
+    synthesis_verdict: Literal["RETAIN_FOR_TEST", "RETAIN_WITH_NARROWER_CLAIM", "REVISE_BEFORE_TEST", "DISCRIMINATING_EXPERIMENT_REQUIRED", "SUPERSEDE", "INSUFFICIENT_CORRECTION"],
+    rationale: str,
+):
+    """Synthesize frozen attacks by challenge materiality, never majority vote."""
+    return await call(scientific_correction().synthesize, design_attack_batch_id, synthesis_verdict, rationale)
+
+
+@mcp.tool()
+async def scientific_design_coverage_get(scientific_design_id: str):
+    """Read assumption/challenge coverage; fidelity checks never count as design correction."""
+    return await call(scientific_correction().design_coverage, scientific_design_id)
+
+
+@mcp.tool()
+async def implementation_fidelity_record(
+    scientific_design_id: str, implementation_ref: str, science_to_code_map: dict[str, Any],
+    deterministic_checks: list[str],
+    verdict: Literal["FIDELITY_CONFIRMED", "FIDELITY_VIOLATION", "SCIENTIFIC_DRIFT_DETECTED", "DETERMINISTIC_TEST_MISSING", "INCONCLUSIVE"],
+    rationale: str,
+):
+    """Record a narrow exact-byte science-to-code fidelity check, not an idea verdict."""
+    return await call(scientific_correction().fidelity_record, scientific_design_id,
+                      implementation_ref=implementation_ref, science_to_code_map=science_to_code_map,
+                      deterministic_checks=deterministic_checks, verdict=verdict, rationale=rationale)
+
+
+@mcp.tool()
+async def result_interpretation_attack_record(
+    project_id: str, result_id: str, claim: str,
+    verdict: Literal["SURVIVES_CURRENT_ATTACK", "MECHANISM_NONSPECIFIC", "NARROW_CLAIM", "IMPLEMENTATION_VALIDITY_REQUIRED", "INSUFFICIENT_EVIDENCE", "INCONCLUSIVE"],
+    strongest_alternative: str, rationale: str,
+):
+    """Record a post-result causal-inference attack; this never admits evidence or changes a claim."""
+    return await call(scientific_correction().interpretation_attack_record, project_id, result_id,
+                      claim=claim, verdict=verdict, strongest_alternative=strongest_alternative,
+                      rationale=rationale)
+
+
+@mcp.tool()
+async def review_target_classifier_v366(project_id: str, target_id: str):
+    """Read-only shadow classifier for design, fidelity, interpretation, or deterministic engineering work."""
+    return await call(scientific_correction().review_target_classifier, project_id, target_id)
+
+
+@mcp.tool()
+async def scientific_self_correction_audit_v366(project_id: str):
+    """Read-only v3.6.6 audit of review-like records and missing design correction."""
+    return await call(scientific_correction().production_audit, project_id)
 
 
 @mcp.tool()

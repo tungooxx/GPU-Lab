@@ -140,6 +140,17 @@ RESEARCH_OBJECT_KINDS = (
     "ScientificDisagreement",
     "CorrectionRecord",
     "CorrectionHindsight",
+    # v3.6.6 keeps scientific idea correction, implementation fidelity, and
+    # result interpretation as deliberately separate durable records.
+    "ScientificDesign",
+    "DesignAssumption",
+    "ScientificDesignAttack",
+    "DesignChallenge",
+    "DesignAttackSynthesis",
+    "RequiredDiscriminator",
+    "ImplementationFidelityCheck",
+    "ResultInterpretationAttack",
+    "ReviewTargetClassification",
     "RuntimeCanary",
 )
 RESEARCH_OBJECT_STATUSES = {
@@ -221,6 +232,12 @@ RESEARCH_OBJECT_STATUSES = {
     "PROSPECTIVE_TESTING",
     "CROSS_PROJECT_SUPPORTED",
     "CROSS_DOMAIN_SUPPORTED",
+    "UNDER_ATTACK",
+    "ACCEPTED_FOR_TEST",
+    "REPAIR_REQUIRED",
+    "FIDELITY_CONFIRMED",
+    "FIDELITY_VIOLATION",
+    "PASS_FOR_TEST",
 }
 
 # Orthogonal epistemic classifications. These are metadata about the role and
