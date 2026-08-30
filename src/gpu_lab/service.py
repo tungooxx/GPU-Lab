@@ -19,14 +19,78 @@ class GPUService:
             Repository(settings.db_path),
             SSHClient(settings),
         )
-        self.provider = VastProvider(settings.vast_api_key) if settings.vast_api_key else None
+        self.providers: dict[str, VastProvider] = {}
+        if settings.vast_api_key:
+            self.providers["team"] = VastProvider(settings.vast_api_key)
+        if settings.vast_personal_api_key:
+            self.providers["personal"] = VastProvider(settings.vast_personal_api_key)
+        # Compatibility alias for existing callers/tests.  New routing always
+        # uses the non-secret account label retained on an Instance.
+        self.provider = self.providers.get("team") or self.providers.get("personal")
 
-    def _provider(self) -> VastProvider:
-        if not self.provider:
+    def _configured_providers(self) -> dict[str, VastProvider]:
+        """Return account providers while preserving the legacy injection seam.
+
+        Older callers and tests replace ``service.provider`` directly.  Treat a
+        replacement of that compatibility alias as a Team-provider override;
+        otherwise a process with both configured credentials would keep using
+        the original Team client unexpectedly.
+        """
+        providers = dict(self.providers)
+        if self.provider and (
+            "team" not in providers or self.provider is not providers.get("team")
+        ):
+            # Direct replacement historically meant “use exactly this fake /
+            # injected provider”.  Do not unexpectedly contact another real
+            # account in that legacy mode.
+            return {"team": self.provider}
+        return providers
+
+    def _provider(self, account: str | None = None) -> VastProvider:
+        normalized = (account or "").strip().lower()
+        providers = self._configured_providers()
+        provider = providers.get(normalized) if normalized else self.provider
+        if not provider and normalized == "team":
+            provider = self.provider  # compatibility with injected test providers
+        if not provider:
             raise GPUError(
-                "PROVIDER_NOT_CONFIGURED", "VAST_API_KEY is required for Vast operations"
+                "PROVIDER_NOT_CONFIGURED", f"Vast account {normalized or 'default'} is not configured"
             )
-        return self.provider
+        return provider
+
+    @staticmethod
+    def _account(item: Instance) -> str:
+        return str(item.metadata.get("vast_account") or "team").lower()
+
+    @staticmethod
+    def _tag_account(item: Instance, account: str) -> Instance:
+        item.metadata = {**item.metadata, "vast_account": account, "provider_visible": True}
+        return item
+
+    def _instance_payload(self, item: Instance) -> dict:
+        payload = item.model_dump(mode="json", exclude={"metadata"})
+        payload["vast_account"] = self._account(item)
+        return payload
+
+    async def _resolve_instance(self, ident: str) -> Instance:
+        existing = self.repo.get_instance(ident)
+        if existing:
+            return existing
+        # A raw Vast id can be newly discovered from either configured account.
+        for account, provider in self._configured_providers().items():
+            if not hasattr(provider, "get_instance"):
+                continue
+            try:
+                item = self._tag_account(await provider.get_instance(ident), account)
+                self.repo.save_instance(item)
+                return item
+            except GPUError as exc:
+                if exc.error_type not in {"PROVIDER_NOT_FOUND", "INSTANCE_NOT_FOUND"}:
+                    raise
+        raise GPUError("INSTANCE_NOT_FOUND", f"No configured Vast account can see instance {ident}")
+
+    def _provider_for_item(self, item: Instance) -> VastProvider:
+        return self._provider(self._account(item))
 
     def _instance(self, ident: str) -> Instance:
         item = self.repo.get_instance(ident)
@@ -41,16 +105,18 @@ class GPUService:
         return str(candidate)
 
     async def gpu_list(self) -> list[dict]:
-        if self.provider:
-            visible = await self.provider.list_instances()
-            visible_ids = {item.id for item in visible}
+        visible_by_account: dict[str, set[str]] = {}
+        providers = self._configured_providers()
+        for account, provider in providers.items():
+            visible = [self._tag_account(item, account) for item in await provider.list_instances()]
+            visible_by_account[account] = {item.id for item in visible}
             for item in visible:
                 self.repo.save_instance(item)
             # Preserve historical instance/job references, but never present an
             # instance missing from Vast as live.  A later provider refresh can
             # revive the record if it reappears (for example after scheduling).
             for item in self.repo.list_instances():
-                if item.provider == "vast" and item.id not in visible_ids:
+                if item.provider == "vast" and self._account(item) == account and item.id not in visible_by_account[account]:
                     if item.status == "destroyed":
                         continue
                     item.status = "provider_missing"
@@ -60,19 +126,22 @@ class GPUService:
                         "provider_missing_at": datetime.now(UTC).isoformat(),
                     }
                     self.repo.save_instance(item)
-        return [x.model_dump(mode="json", exclude={"metadata"}) for x in self.repo.list_instances()]
+        return [self._instance_payload(x) for x in self.repo.list_instances()]
 
     async def gpu_status(self, instance_id: str) -> dict:
-        item = self._instance(instance_id)
-        if self.provider:
-            try:
-                item = await self.provider.get_instance(instance_id)
-                self.repo.save_instance(item)
-            except GPUError:
-                pass
+        item = await self._resolve_instance(instance_id)
+        try:
+            item = self._tag_account(
+                await self._provider_for_item(item).get_instance(instance_id),
+                self._account(item),
+            )
+            self.repo.save_instance(item)
+        except GPUError:
+            pass
         result = {
             "instance_id": item.id,
             "provider": item.provider,
+            "vast_account": self._account(item),
             "provider_status": item.status,
             "ssh_reachable": False,
         }
@@ -109,9 +178,10 @@ class GPUService:
         return result
 
     async def gpu_search(
-        self, gpu_name: str | None, min_vram_gb: int | None, max_hourly_price: float | None
+        self, gpu_name: str | None, min_vram_gb: int | None, max_hourly_price: float | None,
+        account: str = "team",
     ) -> list[dict]:
-        offers = await self._provider().search_offers(
+        offers = await self._provider(account).search_offers(
             gpu_name=gpu_name, min_vram_gb=min_vram_gb, max_hourly_price=max_hourly_price
         )
         return [
@@ -129,30 +199,33 @@ class GPUService:
         ]
 
     async def gpu_create(
-        self, offer_id: str, disk_gb: int = 100, image: str | None = None, label: str | None = None
+        self, offer_id: str, disk_gb: int = 100, image: str | None = None, label: str | None = None,
+        account: str = "team",
     ) -> dict:
-        item = await self._provider().create_instance(
+        account = account.strip().lower()
+        item = self._tag_account(await self._provider(account).create_instance(
             offer_id, disk_gb=disk_gb, image=image, label=label
-        )
+        ), account)
         self.repo.save_instance(item)
         return {
-            "instance": item.model_dump(mode="json", exclude={"metadata"}),
+            "instance": self._instance_payload(item),
             "chosen_offer_id": offer_id,
             "reason": "explicit offer selected by caller",
         }
 
     async def gpu_start(self, instance_id: str) -> dict:
-        item = await self._provider().start_instance(instance_id)
+        existing = await self._resolve_instance(instance_id)
+        item = self._tag_account(await self._provider_for_item(existing).start_instance(instance_id), self._account(existing))
         self.repo.save_instance(item)
         return {
-            "instance": item.model_dump(mode="json", exclude={"metadata"}),
+            "instance": self._instance_payload(item),
             "requested_state": "running",
             "note": "Vast may report scheduling until host resources are available.",
         }
 
     async def gpu_stop(self, instance_id: str) -> dict:
-        await self._provider().stop_instance(instance_id)
-        item = self._instance(instance_id)
+        item = await self._resolve_instance(instance_id)
+        await self._provider_for_item(item).stop_instance(instance_id)
         item.status = "stopped"
         self.repo.save_instance(item)
         return {"instance_id": instance_id, "status": "stopped"}
@@ -162,10 +235,10 @@ class GPUService:
             raise GPUError(
                 "CONFIRMATION_REQUIRED", "Pass confirmation='DESTROY' to destroy an instance"
             )
-        item = self._instance(instance_id)
+        item = await self._resolve_instance(instance_id)
         already_deleted = False
         try:
-            await self._provider().destroy_instance(instance_id)
+            await self._provider_for_item(item).destroy_instance(instance_id)
         except GPUError as exc:
             if exc.error_type != "PROVIDER_NOT_FOUND":
                 raise

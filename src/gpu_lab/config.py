@@ -7,6 +7,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
     vast_api_key: str | None = None
+    # Optional second Vast account. Tokens are never returned through MCP;
+    # instances retain only this non-secret account label for routing.
+    vast_personal_api_key: str | None = None
     gpu_lab_ssh_private_key_path: Path | None = None
     gpu_lab_data_dir: Path = Path("./data")
     gpu_lab_database_url: str = "sqlite:///./data/gpu_lab.db"

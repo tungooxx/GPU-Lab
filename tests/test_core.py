@@ -88,6 +88,37 @@ async def test_gpu_list_marks_provider_missing_instances_without_deleting_histor
 
 
 @pytest.mark.asyncio
+async def test_gpu_service_discovers_and_routes_personal_vast_instances(tmp_path):
+    service = GPUService(Settings(gpu_lab_database_url=f"sqlite:///{tmp_path / 'db.sqlite'}"))
+    personal = Instance(id="vast_49238665", provider_instance_id="49238665", status="running")
+
+    class TeamProvider:
+        async def list_instances(self):
+            return []
+
+    class PersonalProvider:
+        async def list_instances(self):
+            return [personal]
+
+        async def get_instance(self, instance_id):
+            assert instance_id in {"49238665", "vast_49238665"}
+            return personal
+
+        async def start_instance(self, instance_id):
+            assert instance_id in {"49238665", "vast_49238665"}
+            return personal
+
+    service.providers = {"team": TeamProvider(), "personal": PersonalProvider()}
+    service.provider = service.providers["team"]
+    listed = await service.gpu_list()
+    assert next(item for item in listed if item["id"] == "vast_49238665")["vast_account"] == "personal"
+    discovered = await service._resolve_instance("49238665")
+    assert service._account(discovered) == "personal"
+    started = await service.gpu_start("49238665")
+    assert started["instance"]["vast_account"] == "personal"
+
+
+@pytest.mark.asyncio
 async def test_offer_search_uses_model_substring(monkeypatch):
     provider = VastProvider("not-a-real-key")
 

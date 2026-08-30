@@ -1309,17 +1309,19 @@ async def gpu_search(
     gpu_name: str | None = None,
     min_vram_gb: int | None = None,
     max_hourly_price: float | None = None,
+    account: Literal["team", "personal"] = "team",
 ):
-    """Return safely ranked Vast offers; create requires an explicit offer ID."""
-    return await call(svc().gpu_search, gpu_name, min_vram_gb, max_hourly_price)
+    """Return Vast offers from the selected configured account; creation requires an explicit offer ID."""
+    return await call(svc().gpu_search, gpu_name, min_vram_gb, max_hourly_price, account)
 
 
 @mcp.tool()
 async def gpu_create(
-    offer_id: str, disk_gb: int = 100, image: str | None = None, label: str | None = None
+    offer_id: str, disk_gb: int = 100, image: str | None = None, label: str | None = None,
+    account: Literal["team", "personal"] = "team",
 ):
-    """Create a Vast instance from a caller-selected offer."""
-    return await call(svc().gpu_create, offer_id, disk_gb, image, label)
+    """Create a Vast instance in the selected configured account."""
+    return await call(svc().gpu_create, offer_id, disk_gb, image, label, account)
 
 
 @mcp.tool()
