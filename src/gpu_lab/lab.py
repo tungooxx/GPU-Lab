@@ -404,6 +404,38 @@ class LabController:
         })
         return lease
 
+    def planner_authorize(self, project_id: str, worker_id: str, session_id: str,
+                          confirmation: str) -> dict:
+        """Apply an explicit user-directed planner handoff for one project."""
+        if confirmation != "AUTHORIZE_PLANNER":
+            raise GPUError("LAB_PLANNER_AUTHORIZATION_CONFIRMATION_REQUIRED", "AUTHORIZE_PLANNER")
+        now = self._now()
+        expiry = now + timedelta(seconds=PLANNER_LEASE_SECONDS)
+        with self.store._connect() as conn, conn.cursor() as cur:
+            self._session(cur, session_id, worker_id, project_id)
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"planner:{project_id}",))
+            cur.execute("SELECT * FROM lab_project_planner_leases WHERE project_id=%s FOR UPDATE", (project_id,))
+            previous = cur.fetchone()
+            if previous:
+                cur.execute(
+                    "UPDATE lab_project_planner_leases SET worker_id=%s,session_id=%s,acquired_at=%s,heartbeat_at=%s,"
+                    "expires_at=%s,lease_version=lease_version+1 WHERE project_id=%s RETURNING *",
+                    (worker_id, session_id, now, now, expiry, project_id),
+                )
+            else:
+                cur.execute(
+                    "INSERT INTO lab_project_planner_leases(project_id,worker_id,session_id,acquired_at,heartbeat_at,expires_at) "
+                    "VALUES(%s,%s,%s,%s,%s,%s) RETURNING *",
+                    (project_id, worker_id, session_id, now, now, expiry),
+                )
+            lease = self._record(cur.fetchone()) or {}
+            self._event(cur, project_id, "PROJECT_PLANNER_AUTHORIZED", None, {
+                "worker_id": worker_id, "session_id": session_id,
+                "previous_worker_id": str(previous["worker_id"]) if previous else None,
+                "expires_at": expiry.isoformat(),
+            })
+            return {"planner_lease": lease, "replaced_worker_id": str(previous["worker_id"]) if previous else None}
+
     def work_proposal_materialize(
         self, proposal_id: str, planner_worker_id: str, session_id: str,
         kind: str, title: str, description: str, scientific_role: str,

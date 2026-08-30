@@ -1757,6 +1757,17 @@ async def lab_work_planner_candidates(project_id: str, limit: int = 50):
     """Return agenda-aware planning candidates without automatically creating work for idle workers."""
     return await call(lab().work_planner_candidates, project_id, limit)
 
+
+@mcp.tool()
+async def lab_planner_authorize(project_id: str, worker_id: str, session_id: str,
+                                confirmation: str):
+    """Explicitly make one live worker the sole temporary planner for a project.
+
+    Replaces any current planner lease. Requires confirmation exactly
+    ``AUTHORIZE_PLANNER``.
+    """
+    return await call(lab().planner_authorize, project_id, worker_id, session_id, confirmation)
+
 @mcp.tool()
 async def research_portfolio_scheduler_shadow(project_id: str, limit: int = 50):
     """Read-only v3.6 branch-aware assignment suggestions using existing canonical READY work only."""
