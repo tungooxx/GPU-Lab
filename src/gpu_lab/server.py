@@ -638,6 +638,14 @@ def lab() -> LabController:
                     "PLANNER_ON_IDLE": settings.planner_on_idle,
                     "GPU_WORKER_DETACH": settings.gpu_worker_detach,
                     "SPECULATIVE_WORK_POLICY": settings.speculative_work_policy,
+                    "VERDICT_AWARE_DEPENDENCIES_V365": settings.verdict_aware_dependencies_v365,
+                    "PERMISSION_ENGINE_V365": settings.permission_engine_v365,
+                    "SPECULATIVE_WORK_V365": settings.speculative_work_v365,
+                    "REVIEW_HARNESS_PREP_V365": settings.review_harness_prep_v365,
+                    "TYPED_GUARDS_V365": settings.typed_guards_v365,
+                    "EVIDENCE_UNIQUENESS_V365": settings.evidence_uniqueness_v365,
+                    "AUTHORITY_PROMOTION_V365": settings.authority_promotion_v365,
+                    "SEMANTIC_CONSISTENCY_AUDITOR_V365": settings.semantic_consistency_auditor_v365,
                 })
     return lab_controller_service
 
@@ -2007,6 +2015,12 @@ async def lab_work_permissions_get(work_item_id: str):
 
 
 @mcp.tool()
+async def lab_work_authority_promote(work_item_id: str, expected_work_version: int | None = None):
+    """Atomically promote certified authoritative work; completion alone is insufficient."""
+    return await call(lab().authority_promote, work_item_id, expected_work_version)
+
+
+@mcp.tool()
 async def speculative_binding_create(
     work_item_id: str, parent_subject_id: str, parent_subject_version: str,
     parent_semantic_fingerprint: str, reusable_if_parent_changes: bool,
@@ -2108,10 +2122,10 @@ async def scientific_gate_resolve(
 @mcp.tool()
 async def scientific_review_pass_transition(
     review_work_item_id: str, gate_id: str, worker_id: str, session_id: str,
-    successor_spec: dict[str, Any], rationale: str = "",
+    successor_spec: dict[str, Any], rationale: str = "", review_result: dict | None = None,
 ):
-    """Atomically close a passing review, pass its gate, and create/reuse its predetermined successor."""
-    result = await call(lab().review_pass_transition, review_work_item_id, gate_id, worker_id, session_id, successor_spec, rationale)
+    """Atomically record a passing verdict, pass its gate, and create/reuse its predetermined successor."""
+    result = await call(lab().review_pass_transition, review_work_item_id, gate_id, worker_id, session_id, successor_spec, rationale, review_result)
     if "error" not in result and result.get("successor", {}).get("status") == "READY":
         wake = await call(cockpit().wake_ready_work, result["successor"]["project_id"])
         if "error" not in wake:

@@ -76,6 +76,16 @@ class Settings(BaseSettings):
     planner_on_idle: bool = False
     gpu_worker_detach: bool = False
     speculative_work_policy: bool = False
+    # v3.6.5 rolls authority changes out independently from permissive work
+    # scheduling.  These flags are intentionally off until shadow audits pass.
+    verdict_aware_dependencies_v365: bool = False
+    permission_engine_v365: bool = False
+    speculative_work_v365: bool = False
+    review_harness_prep_v365: bool = False
+    typed_guards_v365: bool = False
+    evidence_uniqueness_v365: bool = False
+    authority_promotion_v365: bool = False
+    semantic_consistency_auditor_v365: bool = False
     gpu_lab_dashboard_monitor_enabled: bool = True
     gpu_lab_cockpit_password: str | None = None
     gpu_lab_cockpit_session_secret: str | None = None

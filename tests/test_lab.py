@@ -1114,7 +1114,8 @@ def test_scientific_gate_authority_preflight_unlock_and_supersession():
     first = lab.gate_work_ensure(gate["id"], "REVIEW", "Canonical review", "Review E1", "RESULT_INSPECTOR", worker_id, session_id)
     second = lab.gate_work_ensure(gate["id"], "REVIEW", "Duplicate review", "Must reuse", "RESULT_INSPECTOR", worker_id, session_id)
     assert first["id"] == second["id"]
-    assert first["authority_status"] == "AUTHORITATIVE"
+    assert first["authority_status"] == "SUPPORTING"
+    assert first["authority_class"] == "INDEPENDENT_REVIEW"
 
     dependent = lab.create_work(
         project_id, "GENERALIZATION", "Conditional next work", "Wait for gate", "SCIENTIST",
@@ -1124,13 +1125,15 @@ def test_scientific_gate_authority_preflight_unlock_and_supersession():
     assert dependent["status"] == "DORMANT"
     failed = lab.preflight_run(gate["id"], worker_id, session_id, {"checkpoint": False, "tokenizer": True})
     assert failed["preflight"]["status"] == "FAIL"
-    with pytest.raises(GPUError, match="PREFLIGHT_NOT_PASS"):
+    with pytest.raises(GPUError) as error:
         lab.gate_resolve(gate["id"], worker_id, session_id, "PASS")
+    assert error.value.error_type == "SCIENTIFIC_GATE_PREFLIGHT_NOT_PASS"
 
     passed = lab.preflight_run(gate["id"], worker_id, session_id, {"checkpoint": True, "tokenizer": True})
     assert passed["preflight"]["status"] == "PASS"
-    with pytest.raises(GPUError, match="SEMANTIC_REVIEW_REQUIRED"):
+    with pytest.raises(GPUError) as error:
         lab.gate_resolve(gate["id"], worker_id, session_id, "PASS")
+    assert error.value.error_type == "SCIENTIFIC_GATE_SEMANTIC_REVIEW_REQUIRED"
     claimed_review = lab.claim_work(first["id"], worker_id, session_id)
     lab.complete_work(claimed_review["id"], worker_id, session_id, summary="Semantic review passed")
     resolved = lab.gate_resolve(gate["id"], worker_id, session_id, "PASS", first["id"], rationale="Semantic review passed")
@@ -1138,8 +1141,9 @@ def test_scientific_gate_authority_preflight_unlock_and_supersession():
     assert lab.work_get(dependent["id"])["status"] == "READY"
     repeated = lab.gate_resolve(gate["id"], worker_id, session_id, "PASS", first["id"])
     assert repeated["idempotent"] is True
-    with pytest.raises(GPUError, match="ALREADY_RESOLVED"):
+    with pytest.raises(GPUError) as error:
         lab.gate_resolve(gate["id"], worker_id, session_id, "FAIL", first["id"])
+    assert error.value.error_type == "SCIENTIFIC_GATE_ALREADY_RESOLVED"
 
     obsolete = lab.create_work(
         project_id, "REVIEW", "Obsolete E1 follow-up", "Bound to E1", "RESULT_INSPECTOR",
@@ -1153,6 +1157,139 @@ def test_scientific_gate_authority_preflight_unlock_and_supersession():
     assert lab.work_get(obsolete["id"])["status"] == "SUPERSEDED"
     synced = lab.sync(session_id, project_id, current_work_item_id=claimed["id"], expected_work_version=claimed["work_version"])
     assert synced["lease_state"] == "LEASE_LOST"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v365_mrr_review_cannot_pass_gate_or_release_authority():
+    """CPDS regression: COMPLETED + MATERIAL_REPAIR_REQUIRED is not PASS."""
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store, feature_flags={"VERDICT_AWARE_DEPENDENCIES_V365": True})
+    project_id = store.project_create(f"lab-v365-cpds-{time.time_ns()}", "Verdict authority") ["project_id"]
+    joined = lab.join(None, "v365-cpds-reviewer", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    gate = lab.gate_ensure(project_id, "SEMANTIC", "cpds-v1", "v1", worker_id, session_id)
+    review = lab.gate_work_ensure(
+        gate["id"], "REVIEW", "CPDS semantic review", "Review frozen semantics.",
+        "ADVERSARIAL_REVIEWER", worker_id, session_id,
+    )
+    lab.preflight_run(gate["id"], worker_id, session_id, {"frozen_semantics": True})
+    claimed = lab.claim_work(review["id"], worker_id, session_id)
+    lab.complete_work(claimed["id"], worker_id, session_id, summary="MRR: algebraic collapse")
+    result = lab.review_result_record(
+        project_id, review["id"], "cpds-v1", "v1", "SEMANTIC",
+        "MATERIAL_REPAIR_REQUIRED", findings=[{"issue": "STATIC_ONESHOT collapses onto STATIC_REPEAT"}],
+    )
+
+    with pytest.raises(GPUError) as error:
+        lab.gate_resolve(gate["id"], worker_id, session_id, "PASS", review["id"])
+    assert error.value.error_type == "SCIENTIFIC_GATE_REVIEW_VERDICT_NOT_PASS"
+    assert lab.gate_get(gate["id"])["status"] != "PASS"
+
+    # This reproduces the former unsafe release shape.  It is intentionally
+    # created as legacy-style work so the v3.6.5 auditor must detect it.
+    adapter_gate = lab.gate_ensure(project_id, "ADAPTER_RELEASE", "cpds-v1", "v1", worker_id, session_id)
+    released = lab.create_work(
+        project_id, "IMPLEMENT", "CPDS adapter", "Must not become authoritative after MRR.",
+        "ENGINEER", worker_id, created_session_id=session_id, subject_id="cpds-v1",
+        authority_key=adapter_gate["authority_key"], gate_id=adapter_gate["id"], canonical_subject_version="v1",
+        authority_status="AUTHORITATIVE",
+        authority_class="AUTHORITATIVE", promotion_state="PROMOTED",
+        dependencies=[{"target_type": "WORK_ITEM", "target_id": review["id"], "required_statuses": ["COMPLETED"]}],
+    )
+    assert released["status"] == "READY"
+    audit = lab.consistency_audit_v365(project_id, persist=True)
+    assert any(
+        conflict["conflict_type"] == "VERDICT_AUTHORITY_MISMATCH"
+        and conflict["review_result_id"] == result["id"]
+        for conflict in audit["conflicts"]
+    )
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v365_execution_permission_requires_atomic_promotion_after_pass():
+    store = ResearchStore(TEST_DATABASE_URL)
+    flags = {"VERDICT_AWARE_DEPENDENCIES_V365": True, "AUTHORITY_PROMOTION_V365": True}
+    lab = LabController(store, feature_flags=flags)
+    project_id = store.project_create(f"lab-v365-promotion-{time.time_ns()}", "Promotion authority")["project_id"]
+    joined = lab.join(None, "v365-promotion-reviewer", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    gate = lab.gate_ensure(project_id, "SEMANTIC", "promotion-subject", "v1", worker_id, session_id)
+    review = lab.gate_work_ensure(
+        gate["id"], "REVIEW", "Promotion semantic review", "Review exact semantic subject.",
+        "ADVERSARIAL_REVIEWER", worker_id, session_id,
+    )
+    lab.preflight_run(gate["id"], worker_id, session_id, {"frozen_semantics": True})
+    claimed_review = lab.claim_work(review["id"], worker_id, session_id)
+    lab.complete_work(claimed_review["id"], worker_id, session_id, summary="Semantic PASS")
+    review_result = lab.review_result_record(
+        project_id, review["id"], "promotion-subject", "v1", "SEMANTIC", "PASS",
+    )
+    lab.gate_resolve(gate["id"], worker_id, session_id, "PASS", review["id"])
+    authority = lab.create_work(
+        project_id, "IMPLEMENT", "Certified adapter", "Exact adapter bytes.", "ENGINEER", worker_id,
+        created_session_id=session_id, authority_key=gate["authority_key"], gate_id=gate["id"],
+        canonical_subject_version="v1", authority_status="AUTHORITATIVE", authority_class="AUTHORITATIVE",
+        promotion_state="ELIGIBLE", subject_id="promotion-subject",
+        dependencies=[{
+            "target_type": "REVIEW_RESULT", "target_id": review_result["id"],
+            "predicate_type": "REVIEW_VERDICT_EQUALS", "predicate_value": "PASS",
+        }],
+    )
+    before = lab.work_permissions_get(authority["id"])
+    assert before["may_promote_authority"] is True
+    assert before["may_execute_science"] is False
+    promoted = lab.authority_promote(authority["id"], authority["work_version"])
+    assert promoted["promotion_state"] == "PROMOTED"
+    claimed_authority = lab.claim_work(promoted["id"], worker_id, session_id)
+    after = lab.work_permissions_get(claimed_authority["id"])
+    assert after["may_execute_science"] is True
+
+    speculative = lab.create_work(
+        project_id, "IMPLEMENT", "Speculative scaffold", "Reusable plumbing only.", "ENGINEER", worker_id,
+        created_session_id=session_id, authority_class="SPECULATIVE", promotion_state="BLOCKED",
+    )
+    with pytest.raises(GPUError) as error:
+        lab.authority_promote(speculative["id"], speculative["work_version"])
+    assert error.value.error_type == "LAB_PROMOTION_AUTHORITY_CLASS_REQUIRED"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v365_atomic_pass_transition_requires_and_records_immutable_verdict():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store, feature_flags={"VERDICT_AWARE_DEPENDENCIES_V365": True})
+    project_id = store.project_create(f"lab-v365-atomic-pass-{time.time_ns()}", "Atomic PASS") ["project_id"]
+    joined = lab.join(None, "v365-atomic-reviewer", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    gate = lab.gate_ensure(project_id, "SEMANTIC", "atomic-subject", "v1", worker_id, session_id)
+    review = lab.gate_work_ensure(
+        gate["id"], "REVIEW", "Atomic semantic review", "Review exact subject.",
+        "ADVERSARIAL_REVIEWER", worker_id, session_id,
+    )
+    lab.preflight_run(gate["id"], worker_id, session_id, {"frozen_semantics": True})
+    claimed = lab.claim_work(review["id"], worker_id, session_id)
+    successor = {
+        "kind": "ANALYSIS", "title": "Predetermined successor", "description": "Released only by PASS.",
+        "scientific_role": "SCIENTIST", "equivalence_key": f"v365-atomic-successor-{time.time_ns()}",
+    }
+    with pytest.raises(GPUError) as error:
+        lab.review_pass_transition(claimed["id"], gate["id"], worker_id, session_id, successor)
+    assert error.value.error_type == "SCIENTIFIC_GATE_REVIEW_VERDICT_REQUIRED"
+    transitioned = lab.review_pass_transition(
+        claimed["id"], gate["id"], worker_id, session_id, successor,
+        review_result={
+            "target_subject_id": "atomic-subject", "target_subject_version": "v1", "review_type": "SEMANTIC",
+            "verdict": "PASS", "reviewed_hashes": {"spec": "sha256:test"},
+        },
+    )
+    assert transitioned["gate"]["status"] == "PASS"
+    assert transitioned["successor"]["status"] == "READY"
+    persisted_gate = lab.gate_get(gate["id"])
+    assert persisted_gate["semantic_review_result_id"]
+    with pytest.raises(GPUError) as error:
+        lab.review_result_record(
+            project_id, review["id"], "atomic-subject", "v1", "SEMANTIC", "MATERIAL_REPAIR_REQUIRED",
+        )
+    assert error.value.error_type == "LAB_REVIEW_RESULT_IMMUTABLE"
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")

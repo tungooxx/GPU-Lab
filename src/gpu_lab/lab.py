@@ -254,6 +254,7 @@ class LabController:
                 );
                 CREATE INDEX IF NOT EXISTS lab_review_results_subject_idx
                     ON lab_review_results(project_id,target_subject_id,target_subject_version,review_type,created_at DESC);
+                ALTER TABLE scientific_gates ADD COLUMN IF NOT EXISTS semantic_review_result_id UUID REFERENCES lab_review_results(id);
                 CREATE TABLE IF NOT EXISTS lab_speculative_bindings (
                     id UUID PRIMARY KEY, project_id UUID NOT NULL REFERENCES research_projects(id),
                     work_item_id UUID NOT NULL UNIQUE REFERENCES lab_work_items(id),
@@ -1015,17 +1016,30 @@ class LabController:
         estimated_cost: float | None = None, dependencies: list[dict] | None = None,
         recovery_policy: dict[str, Any] | None = None, branch_id: str | None = None,
     ) -> dict:
-        """Create or reuse the sole active authoritative WorkItem for a ScientificGate."""
+        """Create or reuse the sole active independent-review slot for a gate."""
         gate = self.gate_get(gate_id)
         if gate["status"] in {"SUPERSEDED", "INVALID", "PASS", "FAIL"}:
             raise GPUError("SCIENTIFIC_GATE_NOT_ACTIONABLE", gate["status"])
+        # Review slots are singleton per gate/version.  They are deliberately
+        # supporting work, so authority-key arbitration alone cannot reuse
+        # them; reuse explicitly before creating an equivalence-key duplicate.
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM lab_work_items WHERE gate_id=%s AND authority_class='INDEPENDENT_REVIEW' "
+                "AND status=ANY(%s) ORDER BY created_at LIMIT 1",
+                (gate_id, list(ACTIVE_WORK_STATUSES)),
+            )
+            existing = cur.fetchone()
+            if existing:
+                return {**(self._record(existing) or {}), "dedupe_result": "REUSED_ACTIVE"}
         refs = {"scientific_object_id": gate["scientific_object_id"], "gate_id": gate_id}
         return self.create_work(
             gate["project_id"], kind, title, description, scientific_role,
             worker_id, priority, expected_value, estimated_cost, refs, dependencies,
             gate["authority_key"], None, session_id, gate["authority_key"], gate_id,
-            gate["canonical_subject_version"], "AUTHORITATIVE", gate["scientific_object_id"], recovery_policy,
+            gate["canonical_subject_version"], "SUPPORTING", gate["scientific_object_id"], recovery_policy,
             canonical_objective_id=None, branch_id=branch_id,
+            authority_class="INDEPENDENT_REVIEW", promotion_state="NOT_APPLICABLE",
         )
 
     @staticmethod
@@ -1153,12 +1167,40 @@ class LabController:
                     raise GPUError("SCIENTIFIC_GATE_REVIEW_MISMATCH", semantic_review_work_item_id)
                 if review["status"] != "COMPLETED":
                     raise GPUError("SCIENTIFIC_GATE_REVIEW_NOT_COMPLETED", semantic_review_work_item_id)
+            semantic_review_result_id = None
+            if gate["semantic_review_required"] and self.feature_flags.get("VERDICT_AWARE_DEPENDENCIES_V365"):
+                # A terminal review task is operational information only.  The
+                # version-bound verdict is the authority fact a semantic gate
+                # consumes.  This check deliberately happens in the same
+                # gate-locking transaction as the PASS/FAIL transition.
+                cur.execute(
+                    "SELECT id,verdict,target_subject_id,target_subject_version FROM lab_review_results "
+                    "WHERE project_id=%s AND review_work_item_id=%s ORDER BY created_at DESC LIMIT 1 FOR SHARE",
+                    (gate["project_id"], semantic_review_work_item_id),
+                )
+                review_result = cur.fetchone()
+                if not review_result:
+                    raise GPUError("SCIENTIFIC_GATE_REVIEW_VERDICT_REQUIRED", str(semantic_review_work_item_id))
+                if (
+                    str(review_result["target_subject_id"]) != str(gate["scientific_object_id"])
+                    or str(review_result["target_subject_version"]) != str(gate["canonical_subject_version"])
+                ):
+                    raise GPUError("SCIENTIFIC_GATE_REVIEW_RESULT_BINDING_MISMATCH", str(review_result["id"]))
+                verdict = str(review_result["verdict"]).upper()
+                passing_verdict = verdict in {"PASS", "PASS_WITH_NONMATERIAL_NOTES"}
+                if semantic_status == "PASS" and not passing_verdict:
+                    raise GPUError("SCIENTIFIC_GATE_REVIEW_VERDICT_NOT_PASS", verdict)
+                if semantic_status == "FAIL" and passing_verdict:
+                    raise GPUError("SCIENTIFIC_GATE_REVIEW_VERDICT_CONTRADICTS_STATUS", verdict)
+                semantic_review_result_id = str(review_result["id"])
             cur.execute(
-                "UPDATE scientific_gates SET status=%s,semantic_review_work_item_id=COALESCE(%s,semantic_review_work_item_id),resolved_at=%s WHERE id=%s",
-                (semantic_status, semantic_review_work_item_id, now, gate_id),
+                "UPDATE scientific_gates SET status=%s,semantic_review_work_item_id=COALESCE(%s,semantic_review_work_item_id),"
+                "semantic_review_result_id=COALESCE(%s,semantic_review_result_id),resolved_at=%s WHERE id=%s",
+                (semantic_status, semantic_review_work_item_id, semantic_review_result_id, now, gate_id),
             )
             self._event(cur, gate["project_id"], "SCIENTIFIC_GATE_RESOLVED", gate_id, {
                 "status": semantic_status, "semantic_review_work_item_id": semantic_review_work_item_id,
+                "semantic_review_result_id": semantic_review_result_id,
                 "rationale": rationale[:4000],
             })
         dependency_changes = self.resolve_dependencies(str(gate["project_id"]))
@@ -1536,7 +1578,7 @@ class LabController:
         item: dict[str, Any], gate: dict[str, Any], experiment: dict[str, Any], hypothesis: dict[str, Any],
         dependency_outcomes: list[tuple[bool, bool, str]], lease_active: bool,
         attempts: list[dict[str, Any]], execution_attempt_uuid: str | None = None,
-        detached_retry: bool = False,
+        detached_retry: bool = False, require_promoted_authority: bool = False,
     ) -> dict[str, Any]:
         """Validate current execution authority without consulting discovery ranking."""
         if str(item.get("project_id")) != str(project_id) or str(experiment.get("project_id")) != str(project_id):
@@ -1570,6 +1612,8 @@ class LabController:
                 raise GPUError("LAB_WORK_OWNERSHIP_MISMATCH", work_item_id)
         if item.get("authority_status") != "AUTHORITATIVE" or item.get("superseded_by") or item.get("invalidated_at"):
             raise GPUError("LAB_EXECUTION_AUTHORITY_INVALID", "WorkItem is not current authoritative work")
+        if require_promoted_authority and item.get("promotion_state") != "PROMOTED":
+            raise GPUError("LAB_EXECUTION_AUTHORITY_NOT_PROMOTED", str(item.get("promotion_state")))
         if str(item.get("subject_id")) != str(experiment_id):
             raise GPUError("LAB_EXECUTION_AUTHORITY_MISMATCH", "WorkItem subject differs from Experiment")
         if not item.get("gate_id") or not item.get("canonical_subject_version"):
@@ -1664,6 +1708,7 @@ class LabController:
                 self._record(item) or {}, self._record(gate) or {}, dict(experiment),
                 dict(hypothesis), outcomes, lease_active,
                 [dict(row) for row in attempts], execution_attempt_uuid, detached_retry,
+                bool(self.feature_flags.get("AUTHORITY_PROMOTION_V365")),
             )
 
     def work_list(self, project_id: str, statuses: list[str] | None = None, limit: int = 100) -> list[dict]:
@@ -2198,19 +2243,41 @@ class LabController:
             raise GPUError("LAB_REVIEW_RESULT_FIELDS_INVALID", "findings and reviewed_hashes")
         now, ident = self._now(), str(uuid.uuid4())
         with self.store._connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT project_id,status FROM lab_work_items WHERE id=%s FOR UPDATE", (review_work_item_id,))
+            cur.execute("SELECT project_id,status,authority_class FROM lab_work_items WHERE id=%s FOR UPDATE", (review_work_item_id,))
             work = cur.fetchone()
             if not work or str(work["project_id"]) != str(project_id):
                 raise GPUError("LAB_REVIEW_WORK_NOT_FOUND", review_work_item_id)
+            if self.feature_flags.get("VERDICT_AWARE_DEPENDENCIES_V365"):
+                if work["authority_class"] != "INDEPENDENT_REVIEW":
+                    raise GPUError("LAB_REVIEW_RESULT_REVIEWER_CLASS_REQUIRED", review_work_item_id)
+                if work["status"] != "COMPLETED":
+                    raise GPUError("LAB_REVIEW_RESULT_WORK_NOT_COMPLETED", review_work_item_id)
             cur.execute(
-                "INSERT INTO lab_review_results(id,project_id,review_work_item_id,target_subject_id,target_subject_version,review_type,verdict,findings,materiality,reviewed_hashes,lineage_snapshot_id,created_at) "
-                "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-                "ON CONFLICT(project_id,review_work_item_id,review_type) DO UPDATE SET verdict=EXCLUDED.verdict,findings=EXCLUDED.findings,materiality=EXCLUDED.materiality,reviewed_hashes=EXCLUDED.reviewed_hashes,lineage_snapshot_id=EXCLUDED.lineage_snapshot_id "
-                "RETURNING *",
-                (ident, project_id, review_work_item_id, target_subject_id, target_subject_version, review_type.strip(), verdict,
-                 json.dumps(findings or []), materiality, json.dumps(reviewed_hashes or {}), lineage_snapshot_id, now),
+                "SELECT * FROM lab_review_results WHERE project_id=%s AND review_work_item_id=%s AND review_type=%s FOR UPDATE",
+                (project_id, review_work_item_id, review_type.strip()),
             )
             result = cur.fetchone()
+            immutable_payload = {
+                "target_subject_id": target_subject_id, "target_subject_version": target_subject_version,
+                "verdict": verdict, "findings": findings or [], "materiality": materiality,
+                "reviewed_hashes": reviewed_hashes or {}, "lineage_snapshot_id": lineage_snapshot_id,
+            }
+            if result:
+                existing_payload = {
+                    "target_subject_id": result["target_subject_id"], "target_subject_version": result["target_subject_version"],
+                    "verdict": result["verdict"], "findings": result["findings"] or [], "materiality": result["materiality"],
+                    "reviewed_hashes": result["reviewed_hashes"] or {}, "lineage_snapshot_id": result["lineage_snapshot_id"],
+                }
+                if existing_payload != immutable_payload:
+                    raise GPUError("LAB_REVIEW_RESULT_IMMUTABLE", review_work_item_id)
+            else:
+                cur.execute(
+                    "INSERT INTO lab_review_results(id,project_id,review_work_item_id,target_subject_id,target_subject_version,review_type,verdict,findings,materiality,reviewed_hashes,lineage_snapshot_id,created_at) "
+                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *",
+                    (ident, project_id, review_work_item_id, target_subject_id, target_subject_version, review_type.strip(), verdict,
+                     json.dumps(findings or []), materiality, json.dumps(reviewed_hashes or {}), lineage_snapshot_id, now),
+                )
+                result = cur.fetchone()
             self._event(cur, project_id, "REVIEW_RESULT_RECORDED", str(result["id"]), {
                 "review_work_item_id": review_work_item_id, "review_type": review_type.strip(),
                 "verdict": verdict, "target_subject_id": target_subject_id,
@@ -2239,16 +2306,71 @@ class LabController:
                 authority_class == "AUTHORITATIVE" and promotion_state in {"ELIGIBLE", "CONDITIONALLY_ELIGIBLE"}
                 and all_dependencies and not item.get("superseded_by") and not item.get("invalidated_at")
             )
-            may_execute = may_promote and item.get("gate_id") is not None and item.get("status") in {"CLAIMED", "RUNNING"}
+            gate_pass = False
+            if item.get("gate_id"):
+                cur.execute(
+                    "SELECT status,superseded_by,invalidation_reason FROM scientific_gates WHERE id=%s AND project_id=%s",
+                    (item["gate_id"], item["project_id"]),
+                )
+                gate = cur.fetchone()
+                gate_pass = bool(gate and gate["status"] == "PASS" and not gate["superseded_by"] and not gate["invalidation_reason"])
+                if not gate_pass:
+                    blocking.append("scientific gate is not a current PASS")
+            else:
+                blocking.append("work item has no scientific gate")
+            # Eligibility says an atomic promotion may be requested.  It is
+            # deliberately insufficient for an execution permission: exact
+            # authority must first be promoted in a version-fenced mutation.
+            may_execute = (
+                authority_class == "AUTHORITATIVE" and promotion_state == "PROMOTED"
+                and all_dependencies and gate_pass and item.get("status") in {"CLAIMED", "RUNNING"}
+            )
             return {
                 "work_item_id": str(item["id"]), "may_start_work": may_start,
                 "may_continue_work": item["status"] in {"CLAIMED", "RUNNING"},
-                "may_finalize_subject": may_promote, "may_certify": may_promote,
+                "may_finalize_subject": may_promote, "may_certify": may_promote and gate_pass,
                 "may_promote_authority": may_promote, "may_execute_science": may_execute,
                 "may_access_confirmation": False, "may_admit_evidence": False,
                 "blocking_conditions": blocking, "satisfied_conditions": [detail for ok, _, detail in outcomes if ok],
                 "permission_snapshot_version": f"{item['work_version']}:{promotion_state}:{authority_class}",
             }
+
+    def authority_promote(self, work_item_id: str, expected_work_version: int | None = None) -> dict:
+        """Atomically mark exact, certified authority as promoted.
+
+        This is deliberately separate from work completion and cannot promote a
+        speculative/preparatory binding.
+        """
+        now = self._now()
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM lab_work_items WHERE id=%s FOR UPDATE", (work_item_id,))
+            item = cur.fetchone()
+            if not item:
+                raise GPUError("LAB_WORK_NOT_FOUND", work_item_id)
+            if expected_work_version is not None and int(item["work_version"]) != int(expected_work_version):
+                raise GPUError("LAB_WORK_VERSION_STALE", work_item_id)
+            if item["authority_class"] != "AUTHORITATIVE" or item["authority_status"] != "AUTHORITATIVE":
+                raise GPUError("LAB_PROMOTION_AUTHORITY_CLASS_REQUIRED", work_item_id)
+            if item["promotion_state"] == "PROMOTED":
+                return self._record(item) or {}
+            if item["promotion_state"] not in {"ELIGIBLE", "CONDITIONALLY_ELIGIBLE"}:
+                raise GPUError("LAB_PROMOTION_NOT_ELIGIBLE", str(item["promotion_state"]))
+            cur.execute("SELECT * FROM lab_work_dependencies WHERE work_item_id=%s", (work_item_id,))
+            outcomes = [self._dependency_status(cur, str(item["project_id"]), dep) for dep in cur.fetchall()]
+            if any(invalidated for _, invalidated, _ in outcomes):
+                raise GPUError("LAB_PROMOTION_DEPENDENCY_INVALIDATED", "; ".join(detail for _, invalidated, detail in outcomes if invalidated))
+            if any(not satisfied for satisfied, _, _ in outcomes):
+                raise GPUError("LAB_PROMOTION_DEPENDENCY_UNSATISFIED", "; ".join(detail for satisfied, _, detail in outcomes if not satisfied))
+            if item.get("gate_id"):
+                cur.execute("SELECT status,superseded_by,invalidation_reason FROM scientific_gates WHERE id=%s FOR SHARE", (item["gate_id"],))
+                gate = cur.fetchone()
+                if not gate or gate["status"] != "PASS" or gate["superseded_by"] or gate["invalidation_reason"]:
+                    raise GPUError("LAB_PROMOTION_GATE_NOT_PASS", work_item_id)
+            cur.execute("UPDATE lab_work_items SET promotion_state='PROMOTED',updated_at=%s,work_version=work_version+1 WHERE id=%s RETURNING *", (now, work_item_id))
+            promoted = cur.fetchone()
+            self._event(cur, item["project_id"], "WORK_AUTHORITY_PROMOTED", work_item_id, {"work_version": promoted["work_version"]})
+            self._outbox(cur, item["project_id"], "WORK_AUTHORITY_PROMOTED", work_item_id, f"work-promoted:{work_item_id}:{promoted['work_version']}", {"work_item_id": work_item_id})
+        return self._record(promoted) or {}
 
     def speculative_binding_create(
         self, work_item_id: str, parent_subject_id: str, parent_subject_version: str,
@@ -2434,7 +2556,7 @@ class LabController:
 
     def review_pass_transition(
         self, review_work_item_id: str, gate_id: str, worker_id: str, session_id: str,
-        successor_spec: dict[str, Any], rationale: str = "",
+        successor_spec: dict[str, Any], rationale: str = "", review_result: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Atomically close a passing review and materialize its known successor.
 
@@ -2485,6 +2607,59 @@ class LabController:
             cur.execute("SELECT status FROM lab_deterministic_preflights WHERE id=%s", (gate["deterministic_preflight_id"],))
             if (cur.fetchone() or {}).get("status") != "PASS":
                 raise GPUError("SCIENTIFIC_GATE_PREFLIGHT_NOT_PASS", gate_id)
+            review_result_id = None
+            if self.feature_flags.get("VERDICT_AWARE_DEPENDENCIES_V365"):
+                if review["authority_class"] != "INDEPENDENT_REVIEW":
+                    raise GPUError("SCIENTIFIC_GATE_REVIEWER_CLASS_REQUIRED", review_work_item_id)
+                if not isinstance(review_result, dict):
+                    raise GPUError("SCIENTIFIC_GATE_REVIEW_VERDICT_REQUIRED", review_work_item_id)
+                target_subject_id = str(review_result.get("target_subject_id") or "")
+                target_subject_version = str(review_result.get("target_subject_version") or "")
+                review_type = str(review_result.get("review_type") or "").strip()
+                verdict = self._validate(str(review_result.get("verdict") or ""), REVIEW_VERDICTS, "REVIEW_VERDICT")
+                findings = review_result.get("findings") or []
+                reviewed_hashes = review_result.get("reviewed_hashes") or {}
+                if not target_subject_id or not target_subject_version or not review_type:
+                    raise GPUError("LAB_REVIEW_RESULT_BINDING_REQUIRED", "subject id, version, and review type")
+                if not isinstance(findings, list) or not isinstance(reviewed_hashes, dict):
+                    raise GPUError("LAB_REVIEW_RESULT_FIELDS_INVALID", "findings and reviewed_hashes")
+                if target_subject_id != str(gate["scientific_object_id"]) or target_subject_version != str(gate["canonical_subject_version"]):
+                    raise GPUError("SCIENTIFIC_GATE_REVIEW_RESULT_BINDING_MISMATCH", review_work_item_id)
+                if verdict not in {"PASS", "PASS_WITH_NONMATERIAL_NOTES"}:
+                    raise GPUError("SCIENTIFIC_GATE_REVIEW_VERDICT_NOT_PASS", verdict)
+                immutable_payload = {
+                    "target_subject_id": target_subject_id, "target_subject_version": target_subject_version,
+                    "verdict": verdict, "findings": findings, "materiality": review_result.get("materiality"),
+                    "reviewed_hashes": reviewed_hashes, "lineage_snapshot_id": review_result.get("lineage_snapshot_id"),
+                }
+                cur.execute(
+                    "SELECT * FROM lab_review_results WHERE project_id=%s AND review_work_item_id=%s AND review_type=%s FOR UPDATE",
+                    (review["project_id"], review_work_item_id, review_type),
+                )
+                stored_result = cur.fetchone()
+                if stored_result:
+                    stored_payload = {
+                        "target_subject_id": stored_result["target_subject_id"], "target_subject_version": stored_result["target_subject_version"],
+                        "verdict": stored_result["verdict"], "findings": stored_result["findings"] or [], "materiality": stored_result["materiality"],
+                        "reviewed_hashes": stored_result["reviewed_hashes"] or {}, "lineage_snapshot_id": stored_result["lineage_snapshot_id"],
+                    }
+                    if stored_payload != immutable_payload:
+                        raise GPUError("LAB_REVIEW_RESULT_IMMUTABLE", review_work_item_id)
+                    review_result_id = str(stored_result["id"])
+                else:
+                    review_result_id = str(uuid.uuid4())
+                    cur.execute(
+                        "INSERT INTO lab_review_results(id,project_id,review_work_item_id,target_subject_id,target_subject_version,review_type,verdict,findings,materiality,reviewed_hashes,lineage_snapshot_id,created_at) "
+                        "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        (review_result_id, review["project_id"], review_work_item_id, target_subject_id,
+                         target_subject_version, review_type, verdict, json.dumps(findings), review_result.get("materiality"),
+                         json.dumps(reviewed_hashes), review_result.get("lineage_snapshot_id"), now),
+                    )
+                    self._event(cur, review["project_id"], "REVIEW_RESULT_RECORDED", review_result_id, {
+                        "review_work_item_id": review_work_item_id, "review_type": review_type,
+                        "verdict": verdict, "target_subject_id": target_subject_id,
+                        "target_subject_version": target_subject_version,
+                    })
 
             # Create/reuse the successor while the gate/review authority is
             # locked.  The partial unique equivalence index arbitrates races.
@@ -2527,12 +2702,16 @@ class LabController:
                 })
             cur.execute("UPDATE lab_work_leases SET released_at=%s,release_reason='REVIEW_PASSED',lease_version=lease_version+1 WHERE id=%s AND released_at IS NULL", (now, review["lease_id"]))
             cur.execute("UPDATE lab_work_items SET status='COMPLETED',completed_at=%s,updated_at=%s,work_version=work_version+1 WHERE id=%s", (now, now, review_work_item_id))
-            cur.execute("UPDATE scientific_gates SET status='PASS',semantic_review_work_item_id=%s,resolved_at=%s WHERE id=%s", (review_work_item_id, now, gate_id))
+            cur.execute(
+                "UPDATE scientific_gates SET status='PASS',semantic_review_work_item_id=%s,"
+                "semantic_review_result_id=COALESCE(%s,semantic_review_result_id),resolved_at=%s WHERE id=%s",
+                (review_work_item_id, review_result_id, now, gate_id),
+            )
             cur.execute("UPDATE research_worker_sessions SET current_work_item_id=NULL,active_role=NULL,status='ACTIVE',last_heartbeat_at=%s WHERE id=%s", (now, session_id))
             cur.execute("UPDATE research_workers SET availability_state='AVAILABLE',availability_updated_at=%s,idle_reason=NULL,idle_since=NULL WHERE id=%s", (now, worker_id))
             self._event(cur, review["project_id"], "SCIENTIFIC_GATE_REVIEW_PASSED_ATOMIC", gate_id, {
                 "review_work_item_id": review_work_item_id, "successor_work_item_id": str(successor["id"]),
-                "successor_reused": reused, "rationale": rationale[:4000],
+                "successor_reused": reused, "review_result_id": review_result_id, "rationale": rationale[:4000],
             })
             result = {"gate": self._record(gate) or {}, "review_work_item_id": review_work_item_id,
                       "successor": self._record(successor) or {}, "successor_reused": reused}
