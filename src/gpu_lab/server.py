@@ -430,7 +430,16 @@ class EngineeringBaselineInput(BaseModel):
 
 
 class DeterministicPreflightCheck(BaseModel):
-    passed: bool
+    """Typed deterministic guard input; ``passed`` is legacy compatibility only."""
+    predicate: Literal[
+        "MUST_BE_TRUE", "MUST_BE_FALSE", "EQUALS", "NOT_EQUALS", "IN_SET", "NOT_IN_SET",
+        "EXISTS", "NOT_EXISTS", "HASH_EQUALS", "VERSION_EQUALS", "VERDICT_EQUALS", "VERDICT_IN",
+        "GREATER_THAN", "GREATER_OR_EQUAL", "LESS_THAN", "LESS_OR_EQUAL", "ATTESTATION_VALID",
+        "INFORMATIONAL",
+    ] | None = None
+    observed: Any | None = None
+    expected: Any | None = None
+    passed: bool | None = None
     warning: str | None = None
     detail: str | None = None
 
@@ -2174,6 +2183,21 @@ async def scientific_gate_version_supersede(
     return await call(
         lab().supersede_gate_version, old_gate_id, successor_gate_id,
         worker_id, session_id, rationale,
+    )
+
+
+@mcp.tool()
+async def scientific_gate_revoke_malformed_authority(
+    gate_id: str, replacement_gate_id: str, worker_id: str, session_id: str,
+    correction_reason: Literal[
+        "MALFORMED_SUBJECT_VERSION", "DUPLICATE_EXECUTION_AUTHORITY", "INVALID_PROVENANCE_BINDING",
+    ],
+    rationale: str,
+):
+    """Auditably retire an erroneous PASS gate in favor of a current same-subject PASS replacement."""
+    return await call(
+        lab().gate_revoke_malformed_authority, gate_id, replacement_gate_id,
+        worker_id, session_id, correction_reason, rationale,
     )
 
 

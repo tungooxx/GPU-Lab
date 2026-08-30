@@ -34,6 +34,12 @@ WORK_AUTHORITY_CLASSES = {"AUTHORITATIVE", "SPECULATIVE", "PREPARATORY", "SUPPOR
 PROMOTION_STATES = {"NOT_APPLICABLE", "BLOCKED", "CONDITIONALLY_ELIGIBLE", "ELIGIBLE", "PROMOTED", "REBASE_REQUIRED", "INVALIDATED", "SUPERSEDED"}
 REVIEW_VERDICTS = {"PASS", "PASS_WITH_NONMATERIAL_NOTES", "MATERIAL_REPAIR_REQUIRED", "REJECT", "INVALID_REVIEW", "INCONCLUSIVE"}
 DEPENDENCY_PREDICATES = {"STATUS_IN", "REVIEW_VERDICT_EQUALS", "REVIEW_VERDICT_IN"}
+GUARD_PREDICATES = {
+    "MUST_BE_TRUE", "MUST_BE_FALSE", "EQUALS", "NOT_EQUALS", "IN_SET", "NOT_IN_SET",
+    "EXISTS", "NOT_EXISTS", "HASH_EQUALS", "VERSION_EQUALS", "VERDICT_EQUALS", "VERDICT_IN",
+    "GREATER_THAN", "GREATER_OR_EQUAL", "LESS_THAN", "LESS_OR_EQUAL", "ATTESTATION_VALID",
+    "INFORMATIONAL",
+}
 OBJECTIVE_STATUSES = {"ACTIVE", "BLOCKED", "RESOLVED", "SUPERSEDED", "PAUSED", "CANCELLED"}
 PROPOSAL_STATUSES = {"PROPOSED", "MERGED_INTO_EXISTING", "SATISFIED_BY_TERMINAL", "MATERIALIZED", "REJECTED_DUPLICATE", "REJECTED_LOW_VALUE", "REJECTED_STALE", "SUPERSEDED"}
 DEPENDENCY_SCOPES = {"WORKITEM_LOCAL", "BRANCH", "PORTFOLIO", "OBJECTIVE_GLOBAL"}
@@ -41,6 +47,7 @@ BRANCH_STATES = {"OPEN", "WAITING", "BLOCKED", "SUPPORTED_WITHIN_SCOPE", "WEAKEN
 SPECULATION_CLASSES = {"NON_SPECULATIVE", "SAFE_SPECULATIVE", "CONDITIONAL_SPECULATIVE", "EXPENSIVE_SPECULATIVE"}
 RESOURCE_CLASSES = {"REASONING", "ENGINEERING", "GPU", "TRAINING", "LITERATURE", "REVIEW", "SYNTHESIS"}
 GATE_STATUSES = {"PENDING", "PREFLIGHT_FAILED", "AWAITING_SEMANTIC_REVIEW", "REPAIR_REQUIRED", "PASS", "FAIL", "INVALID", "SUPERSEDED"}
+GATE_REVOCATION_REASONS = {"MALFORMED_SUBJECT_VERSION", "DUPLICATE_EXECUTION_AUTHORITY", "INVALID_PROVENANCE_BINDING"}
 PREFLIGHT_STATUSES = {"PASS", "FAIL"}
 COORDINATION_VERSION = "lab-coordination-v3.2.2-gates-v1"
 PLANNER_LEASE_SECONDS = 300
@@ -916,6 +923,11 @@ class LabController:
         gate_key = gate_key.strip().upper()
         if not gate_key or not scientific_object_id or not canonical_subject_version:
             raise GPUError("SCIENTIFIC_GATE_IDENTITY_REQUIRED", "gate_key, scientific_object_id, and canonical_subject_version")
+        # A canonical subject version is one immutable identity, never a
+        # mutable composite such as ``release_sha+review-id``.  Review IDs
+        # belong in ReviewResult bindings, not in authority identity.
+        if not canonical_subject_version.strip() or "+" in canonical_subject_version or any(char.isspace() for char in canonical_subject_version):
+            raise GPUError("SCIENTIFIC_GATE_VERSION_NOT_ATOMIC", canonical_subject_version)
         authority_key = self.authority_key(project_id, scientific_object_id, canonical_subject_version, gate_key)
         now = self._now()
         with self.store._connect() as conn, conn.cursor() as cur:
@@ -1043,7 +1055,65 @@ class LabController:
         )
 
     @staticmethod
-    def _normalize_preflight_checks(checks: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    def _evaluate_guard_predicate(name: str, declaration: dict[str, Any]) -> dict[str, Any]:
+        """Evaluate a typed guard without conflating an observed value with PASS.
+
+        ``False`` is a valid passing observation for MUST_BE_FALSE.  Legacy
+        ``passed`` checks remain supported only as an already-evaluated
+        compatibility representation; new authority-critical callers can
+        declare the predicate and its observation explicitly.
+        """
+        predicate = declaration.get("predicate", declaration.get("type"))
+        if predicate is None:
+            if isinstance(declaration.get("passed"), bool):
+                return {key: declaration[key] for key in sorted(declaration)}
+            raise GPUError("PREFLIGHT_GUARD_PREDICATE_REQUIRED", name)
+        predicate = str(predicate).upper()
+        if predicate not in GUARD_PREDICATES:
+            raise GPUError("INVALID_GUARD_PREDICATE", predicate)
+        observed_present = "observed" in declaration or "value" in declaration
+        observed = declaration["observed"] if "observed" in declaration else declaration.get("value")
+        expected = declaration.get("expected")
+        if predicate == "INFORMATIONAL":
+            passed = True
+        elif predicate == "EXISTS":
+            passed = observed_present and observed is not None
+        elif predicate == "NOT_EXISTS":
+            passed = not observed_present or observed is None
+        else:
+            if not observed_present:
+                raise GPUError("PREFLIGHT_GUARD_OBSERVATION_REQUIRED", name)
+            if predicate == "MUST_BE_TRUE" or predicate == "ATTESTATION_VALID":
+                passed = observed is True
+            elif predicate == "MUST_BE_FALSE":
+                passed = observed is False
+            elif predicate in {"EQUALS", "HASH_EQUALS", "VERSION_EQUALS", "VERDICT_EQUALS"}:
+                passed = observed == expected
+            elif predicate == "NOT_EQUALS":
+                passed = observed != expected
+            elif predicate in {"IN_SET", "VERDICT_IN"}:
+                if not isinstance(expected, list):
+                    raise GPUError("PREFLIGHT_GUARD_EXPECTED_SET_REQUIRED", name)
+                passed = observed in expected
+            elif predicate == "NOT_IN_SET":
+                if not isinstance(expected, list):
+                    raise GPUError("PREFLIGHT_GUARD_EXPECTED_SET_REQUIRED", name)
+                passed = observed not in expected
+            else:
+                if not isinstance(observed, (int, float)) or not isinstance(expected, (int, float)):
+                    raise GPUError("PREFLIGHT_GUARD_NUMERIC_EXPECTED", name)
+                passed = {
+                    "GREATER_THAN": observed > expected,
+                    "GREATER_OR_EQUAL": observed >= expected,
+                    "LESS_THAN": observed < expected,
+                    "LESS_OR_EQUAL": observed <= expected,
+                }[predicate]
+        result = {key: declaration[key] for key in sorted(declaration) if key not in {"passed", "type"}}
+        result.update({"predicate": predicate, "passed": bool(passed)})
+        return result
+
+    @classmethod
+    def _normalize_preflight_checks(cls, checks: dict[str, Any]) -> dict[str, dict[str, Any]]:
         if not checks:
             raise GPUError("PREFLIGHT_CHECKS_REQUIRED", "At least one deterministic check is required")
         normalized: dict[str, dict[str, Any]] = {}
@@ -1051,9 +1121,9 @@ class LabController:
             if not isinstance(name, str) or not name.strip():
                 raise GPUError("PREFLIGHT_CHECK_NAME_INVALID", str(name))
             if isinstance(value, bool):
-                normalized[name] = {"passed": value}
-            elif isinstance(value, dict) and isinstance(value.get("passed"), bool):
-                normalized[name] = {key: value[key] for key in sorted(value)}
+                normalized[name] = {"passed": value, "predicate": "LEGACY_PASSED"}
+            elif isinstance(value, dict):
+                normalized[name] = cls._evaluate_guard_predicate(name, value)
             else:
                 raise GPUError("PREFLIGHT_CHECK_INVALID", name)
         return {name: normalized[name] for name in sorted(normalized)}
@@ -1340,6 +1410,101 @@ class LabController:
             })
         dependency_changes = self.resolve_dependencies(str(old["project_id"]))
         return {"old_gate_id": old_gate_id, "successor_gate_id": successor_gate_id, "status": "SUPERSEDED", "dependency_changes": dependency_changes}
+
+    def gate_revoke_malformed_authority(
+        self, gate_id: str, replacement_gate_id: str, worker_id: str, session_id: str,
+        correction_reason: str, rationale: str,
+    ) -> dict[str, Any]:
+        """Auditably retire an erroneous terminal gate without rewriting history.
+
+        This is deliberately narrower than a generic "change PASS" operation.
+        It requires a current, passing replacement bound to the same scientific
+        object and an explicit recognized identity/provenance defect.  The old
+        verdict and all events remain durable; only its current authority is
+        revoked and live child work is retired.
+        """
+        correction_reason = self._validate(
+            correction_reason, GATE_REVOCATION_REASONS, "SCIENTIFIC_GATE_REVOCATION_REASON"
+        )
+        if not rationale.strip():
+            raise GPUError("SCIENTIFIC_GATE_REVOCATION_RATIONALE_REQUIRED", "rationale")
+        if gate_id == replacement_gate_id:
+            raise GPUError("SCIENTIFIC_GATE_REVOCATION_REPLACEMENT_REQUIRED", gate_id)
+        now = self._now()
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM scientific_gates WHERE id=ANY(%s) FOR UPDATE", ([gate_id, replacement_gate_id],))
+            gates = {str(item["id"]): item for item in cur.fetchall()}
+            gate, replacement = gates.get(gate_id), gates.get(replacement_gate_id)
+            if not gate or not replacement:
+                raise GPUError("SCIENTIFIC_GATE_NOT_FOUND", "gate or replacement")
+            self._session(cur, session_id, worker_id, str(gate["project_id"]))
+            if str(gate["project_id"]) != str(replacement["project_id"]):
+                raise GPUError("RESEARCH_PROJECT_MISMATCH", replacement_gate_id)
+            if str(gate["scientific_object_id"]) != str(replacement["scientific_object_id"]):
+                raise GPUError("SCIENTIFIC_GATE_REVOCATION_SUBJECT_MISMATCH", replacement_gate_id)
+            if replacement["status"] != "PASS" or replacement["superseded_by"] or replacement["invalidation_reason"]:
+                raise GPUError("SCIENTIFIC_GATE_REVOCATION_REPLACEMENT_NOT_CURRENT_PASS", replacement_gate_id)
+            if gate["status"] == "SUPERSEDED":
+                if str(gate["superseded_by"] or "") != str(replacement_gate_id):
+                    raise GPUError("SCIENTIFIC_GATE_ALREADY_REVOKED", gate_id)
+                return {"gate_id": gate_id, "replacement_gate_id": replacement_gate_id, "status": "SUPERSEDED", "idempotent": True}
+            if gate["status"] != "PASS":
+                raise GPUError("SCIENTIFIC_GATE_REVOCATION_PASS_REQUIRED", str(gate["status"]))
+            old_version, replacement_version = str(gate["canonical_subject_version"]), str(replacement["canonical_subject_version"])
+            if correction_reason == "MALFORMED_SUBJECT_VERSION":
+                if "+" not in old_version or old_version.split("+", 1)[0] != replacement_version:
+                    raise GPUError("SCIENTIFIC_GATE_REVOCATION_NOT_MALFORMED_VERSION", old_version)
+            elif correction_reason == "DUPLICATE_EXECUTION_AUTHORITY":
+                if old_version != replacement_version:
+                    raise GPUError("SCIENTIFIC_GATE_REVOCATION_NOT_DUPLICATE_VERSION", old_version)
+            # INVALID_PROVENANCE_BINDING is intentionally allowed across
+            # versions, provided the current replacement is same-subject PASS.
+            cur.execute(
+                "UPDATE scientific_gates SET status='SUPERSEDED',superseded_by=%s,invalidation_reason=%s,resolved_at=%s WHERE id=%s",
+                (replacement_gate_id, f"Revoked {correction_reason}: {rationale.strip()[:3600]}", now, gate_id),
+            )
+            cur.execute(
+                "SELECT * FROM lab_work_items WHERE gate_id=%s AND status=ANY(%s) FOR UPDATE",
+                (gate_id, list(ACTIVE_WORK_STATUSES)),
+            )
+            retired = cur.fetchall()
+            retired_ids = [str(item["id"]) for item in retired]
+            for item in retired:
+                cur.execute(
+                    "UPDATE lab_work_leases SET released_at=%s,release_reason='MALFORMED_GATE_REVOKED',lease_version=lease_version+1 "
+                    "WHERE work_item_id=%s AND released_at IS NULL",
+                    (now, item["id"]),
+                )
+                cur.execute(
+                    "UPDATE lab_work_items SET status='SUPERSEDED',authority_status='SUPERSEDED',promotion_state='SUPERSEDED',"
+                    "superseded_by=%s,invalidated_reason=%s,invalidated_at=%s,assigned_worker_id=NULL,assigned_session_id=NULL,"
+                    "lease_id=NULL,updated_at=%s,work_version=work_version+1 WHERE id=%s",
+                    (replacement_gate_id, f"Gate revoked: {correction_reason}", now, now, item["id"]),
+                )
+                cur.execute(
+                    "UPDATE research_worker_sessions SET current_work_item_id=NULL,active_role=NULL,status='ACTIVE',last_heartbeat_at=%s "
+                    "WHERE current_work_item_id=%s",
+                    (now, item["id"]),
+                )
+            self._event(cur, gate["project_id"], "SCIENTIFIC_GATE_AUTHORITY_REVOKED", gate_id, {
+                "replacement_gate_id": replacement_gate_id,
+                "correction_reason": correction_reason,
+                "old_canonical_subject_version": old_version,
+                "replacement_canonical_subject_version": replacement_version,
+                "retired_work_item_ids": retired_ids,
+                "rationale": rationale.strip()[:4000],
+            })
+            self._outbox(cur, gate["project_id"], "SCIENTIFIC_GATE_AUTHORITY_REVOKED", gate_id,
+                         f"gate-revoked:{gate_id}:{replacement_gate_id}", {
+                             "gate_id": gate_id, "replacement_gate_id": replacement_gate_id,
+                             "correction_reason": correction_reason,
+                         })
+        changes = self.resolve_dependencies(str(gate["project_id"]))
+        return {
+            "gate_id": gate_id, "replacement_gate_id": replacement_gate_id, "status": "SUPERSEDED",
+            "correction_reason": correction_reason, "retired_work_item_ids": retired_ids,
+            "dependency_changes": changes,
+        }
 
     def create_work(self, project_id: str, kind: str, title: str, description: str,
                     scientific_role: str, created_by: str | None = None, priority: float = 0,

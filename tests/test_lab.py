@@ -44,6 +44,20 @@ def test_completed_review_work_cannot_satisfy_a_nonpass_verdict_dependency():
     assert "MATERIAL_REPAIR_REQUIRED" in detail
 
 
+def test_typed_preflight_guards_treat_false_and_information_correctly():
+    checks = LabController._normalize_preflight_checks({
+        "heldout_test_access": {"predicate": "MUST_BE_FALSE", "observed": False},
+        "actual_gpu": {"predicate": "INFORMATIONAL", "observed": "RTX4090"},
+        "exact_release": {"predicate": "HASH_EQUALS", "observed": "abc", "expected": "abc"},
+    })
+    assert checks["heldout_test_access"]["passed"] is True
+    assert checks["actual_gpu"]["passed"] is True
+    assert checks["exact_release"]["passed"] is True
+    with pytest.raises(GPUError) as missing_observation:
+        LabController._normalize_preflight_checks({"seal": {"predicate": "MUST_BE_TRUE"}})
+    assert missing_observation.value.error_type == "PREFLIGHT_GUARD_OBSERVATION_REQUIRED"
+
+
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_two_workers_claim_distinct_work_and_messages_are_not_evidence():
     store = ResearchStore(TEST_DATABASE_URL)
@@ -1346,6 +1360,42 @@ def test_v365_material_repair_transition_is_atomic_and_rebases_speculation():
     permissions = lab.work_permissions_get(speculative["id"])
     assert permissions["may_promote_authority"] is False
     assert permissions["may_execute_science"] is False
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_terminal_malformed_pass_gate_can_be_auditably_revoked():
+    """A bad duplicate PASS must be retireable without rewriting its history."""
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-gate-revoke-{time.time_ns()}", "Gate revocation") ["project_id"]
+    joined = lab.join(None, "gate-revoke-worker", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    release = "3d47ac6714f87560d1220fa03e3a8677e3a7d09c"
+    replacement = lab.gate_ensure(project_id, "EXECUTION", "experiment-gate-revoke", release, worker_id, session_id)
+    malformed_id = str(uuid.uuid4())
+    now = lab._now()
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE scientific_gates SET status='PASS',resolved_at=%s WHERE id=%s", (now, replacement["id"]))
+        cur.execute(
+            "INSERT INTO scientific_gates(id,project_id,gate_key,scientific_object_id,canonical_subject_version,authority_key,semantic_review_required,status,coordination_version,created_at,resolved_at) "
+            "VALUES(%s,%s,'EXECUTION_LEGACY','experiment-gate-revoke',%s,%s,TRUE,'PASS','legacy',%s,%s)",
+            (malformed_id, project_id, f"{release}+legacy-pass-review", f"{project_id}:bad-gate", now, now),
+        )
+    retired = lab.create_work(
+        project_id, "IMPLEMENT", "Legacy malformed gate child", "Must be retired with gate.", "ENGINEER",
+        worker_id, created_session_id=session_id, gate_id=malformed_id,
+    )
+    result = lab.gate_revoke_malformed_authority(
+        malformed_id, replacement["id"], worker_id, session_id, "MALFORMED_SUBJECT_VERSION",
+        "Legacy migration appended review identifiers to immutable release identity.",
+    )
+    assert result["status"] == "SUPERSEDED"
+    assert result["retired_work_item_ids"] == [retired["id"]]
+    assert lab.gate_get(malformed_id)["superseded_by"] == replacement["id"]
+    assert lab.work_get(retired["id"])["status"] == "SUPERSEDED"
+    with pytest.raises(GPUError) as error:
+        lab.gate_ensure(project_id, "EXECUTION", "new-experiment", f"{release}+review", worker_id, session_id)
+    assert error.value.error_type == "SCIENTIFIC_GATE_VERSION_NOT_ATOMIC"
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
