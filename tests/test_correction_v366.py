@@ -25,10 +25,14 @@ def test_v366_kinds_and_statuses_are_registered():
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_v366_fidelity_pass_never_completes_idea_attack_and_peer_isolation_holds():
     store = ResearchStore(TEST_DATABASE_URL)
-    lab, correction = LabController(store), ScientificSelfCorrectionService(store)
+    lab, correction = LabController(store, feature_flags={"LEAN_ENGINEERING_REVIEW_V366": True}), ScientificSelfCorrectionService(store)
     project_id = store.project_create(f"v366-{time.time_ns()}", "idea correction") ["project_id"]
     one = lab.join(None, "attack-a", "CODEX", project_id)
     two = lab.join(None, "attack-b", "LOCAL_AGENT", project_id)
+    with pytest.raises(GPUError) as exc:
+        lab.create_work(project_id, "REVIEW", "Read code again", "Generic code review", "GENERIC_CODE_REVIEW",
+                        created_by=one["worker"]["id"], created_session_id=one["session_id"])
+    assert exc.value.error_type == "LAB_GENERIC_REVIEW_SUPPRESSED"
     design = correction.create_design(project_id, "V5", {"carrier": "GRU-256", "binding": "G"}, scientific_risk="HIGH")
     recurrence = correction.assumption_create(design["id"], "Persistent plan state materially benefits from recurrence.", "NECESSITY", centrality="CENTRAL")
     binding = correction.assumption_create(design["id"], "G causally binds the carrier to interventions.", "CAUSALITY", centrality="CENTRAL")

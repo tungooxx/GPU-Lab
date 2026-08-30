@@ -1635,6 +1635,25 @@ class LabController:
         dependencies = dependencies or []
         normalized_evidence_need = self._evidence_need_normalize(evidence_need) if evidence_need is not None else None
         authority_status = self._validate(authority_status, AUTHORITY_STATUSES, "LAB_WORK_AUTHORITY_STATUS")
+        # v3.6.6 classifies review-like labor at the scheduling boundary.  The
+        # caller must name the correction layer; generic code reading is not a
+        # default successor to a passing deterministic engineering result.
+        related_refs = dict(related_refs or {})
+        role_upper = scientific_role.strip().upper()
+        correction_layer = (
+            "DESIGN" if role_upper in {"SCIENTIFIC_DESIGN_ATTACK", "DESIGN_ATTACK"}
+            else "IMPLEMENTATION" if role_upper in {"IMPLEMENTATION_FIDELITY_CHECK", "IMPLEMENTATION_FIDELITY"}
+            else "INTERPRETATION" if role_upper in {"RESULT_INTERPRETATION_ATTACK", "RESULT_INTERPRETATION"}
+            else None
+        )
+        if correction_layer:
+            existing_layer = related_refs.get("correction_layer")
+            if existing_layer and str(existing_layer).upper() != correction_layer:
+                raise GPUError("LAB_CORRECTION_LAYER_CONFLICT", str(existing_layer))
+            related_refs["correction_layer"] = correction_layer
+        if self.feature_flags.get("LEAN_ENGINEERING_REVIEW_V366") and role_upper in {"CODE_REVIEW", "GENERIC_CODE_REVIEW", "INDEPENDENT_CODE_REVIEW"}:
+            if not related_refs.get("non_deterministic_science_critical_risk"):
+                raise GPUError("LAB_GENERIC_REVIEW_SUPPRESSED", "Use deterministic validation or a bounded IMPLEMENTATION_FIDELITY_CHECK")
         authority_class = self._validate(
             authority_class or ("AUTHORITATIVE" if authority_status == "AUTHORITATIVE" else "SUPPORTING"),
             WORK_AUTHORITY_CLASSES, "LAB_WORK_AUTHORITY_CLASS",
@@ -1661,7 +1680,6 @@ class LabController:
         if required_capabilities is not None:
             if not isinstance(required_capabilities, list) or any(not isinstance(item, str) or not item.strip() for item in required_capabilities):
                 raise GPUError("LAB_WORK_REQUIRED_CAPABILITIES_INVALID", "required_capabilities must be a list of nonempty strings")
-            related_refs = dict(related_refs or {})
             existing_required = related_refs.get("required_capabilities")
             if existing_required is not None and set(existing_required) != set(required_capabilities):
                 raise GPUError("LAB_WORK_REQUIRED_CAPABILITIES_CONFLICT", "related_refs.required_capabilities")

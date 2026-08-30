@@ -692,6 +692,14 @@ def lab() -> LabController:
                     "EVIDENCE_UNIQUENESS_V365": settings.evidence_uniqueness_v365,
                     "AUTHORITY_PROMOTION_V365": settings.authority_promotion_v365,
                     "SEMANTIC_CONSISTENCY_AUDITOR_V365": settings.semantic_consistency_auditor_v365,
+                    "SCIENTIFIC_DESIGN_ATTACK_V366": settings.scientific_design_attack_v366,
+                    "DESIGN_ASSUMPTIONS_V366": settings.design_assumptions_v366,
+                    "DESIGN_ATTACK_SYNTHESIS_V366": settings.design_attack_synthesis_v366,
+                    "LEAN_ENGINEERING_REVIEW_V366": settings.lean_engineering_review_v366,
+                    "TARGETED_FIDELITY_V366": settings.targeted_fidelity_v366,
+                    "REVIEW_TARGET_CLASSIFIER_V366": settings.review_target_classifier_v366,
+                    "RESULT_INTERPRETATION_ATTACK_V366": settings.result_interpretation_attack_v366,
+                    "REVIEW_TO_REGRESSION_TEST_V366": settings.review_to_regression_test_v366,
                 })
     return lab_controller_service
 
