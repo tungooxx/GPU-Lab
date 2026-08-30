@@ -26,6 +26,10 @@ class Store:
         self.events.append(event_type)
         return item
 
+    def objects_list(self, project_id, kind, limit=None):
+        items = [item for item in self.items.values() if item["project_id"] == project_id and item["kind"] == kind]
+        return items if limit is None else items[:limit]
+
 
 def _task(service):
     task = service.task_create(
@@ -176,6 +180,25 @@ def test_unverified_task_cannot_be_handed_to_scientific_execution():
     with pytest.raises(GPUError) as blocked:
         service.assert_ready_for_experiment(task["id"], "experiment-1")
     assert blocked.value.error_type == "ENGINEERING_RESULT_REQUIRED"
+
+
+def test_scientific_spec_is_canonical_and_escalation_is_project_scoped():
+    store = Store()
+    service = EngineeringService(store)
+    first = service.scientific_spec_create(
+        "project", "experiment-1", {"question": "Does the intervention help?", "metric": "accuracy"},
+        "lineage-1", "2026-08-30T00:00:00Z", project_state_version=7,
+    )
+    # Dict insertion order must not change the frozen semantic identity.
+    repeated = service.scientific_spec_create(
+        "project", "experiment-1", {"metric": "accuracy", "question": "Does the intervention help?"},
+        "lineage-1", "2026-08-30T00:00:00Z", project_state_version=7,
+    )
+    assert repeated["id"] == first["id"]
+    assert repeated["idempotent"] is True
+    with pytest.raises(GPUError) as foreign_project:
+        service.review_escalation_reason_create("other-project", first["id"], "MATERIAL_NEW_SCIENTIFIC_EVIDENCE", "New evidence")
+    assert foreign_project.value.error_type == "RESEARCH_PROJECT_MISMATCH"
 
 
 def test_result_cannot_be_recorded_twice_after_completion():

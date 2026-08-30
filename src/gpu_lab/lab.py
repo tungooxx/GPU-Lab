@@ -2152,6 +2152,114 @@ class LabController:
         self.resolve_dependencies(str(item["project_id"]))
         return self.work_get(work_item_id)
 
+    def review_pass_transition(
+        self, review_work_item_id: str, gate_id: str, worker_id: str, session_id: str,
+        successor_spec: dict[str, Any], rationale: str = "",
+    ) -> dict[str, Any]:
+        """Atomically close a passing review and materialize its known successor.
+
+        This is deterministic closure, not a second worker task.  A successor
+        whose specification still requires human or confirmation authorization
+        is persisted as WAITING_DEPENDENCY; it is never made claimable merely
+        because a release review passed.
+        """
+        if not isinstance(successor_spec, dict):
+            raise GPUError("LAB_SUCCESSOR_SPEC_INVALID", "successor_spec must be an object")
+        required = ("kind", "title", "description", "scientific_role", "equivalence_key")
+        if any(not str(successor_spec.get(field, "")).strip() for field in required):
+            raise GPUError("LAB_SUCCESSOR_SPEC_REQUIRED", ", ".join(required))
+        if not isinstance(successor_spec.get("related_refs", {}), dict):
+            raise GPUError("LAB_SUCCESSOR_REFS_INVALID", "related_refs must be an object")
+        if not isinstance(successor_spec.get("dependencies", []), list):
+            raise GPUError("LAB_SUCCESSOR_DEPENDENCIES_INVALID", "dependencies must be a list")
+        if not isinstance(successor_spec.get("recovery_policy", {}), dict):
+            raise GPUError("LAB_SUCCESSOR_RECOVERY_POLICY_INVALID", "recovery_policy must be an object")
+        hard_gate_requested = bool(
+            successor_spec.get("human_approval_required")
+            or successor_spec.get("confirmation_authorization_required")
+        )
+        # Waiting without a durable dependency is merely a cosmetic state:
+        # resolve_dependencies would make it READY again.  Refuse that unsafe
+        # shape rather than allowing a final review to bypass an approval.
+        if hard_gate_requested and not successor_spec.get("dependencies"):
+            raise GPUError("LAB_SUCCESSOR_HARD_GATE_DEPENDENCY_REQUIRED", "human/confirmation approval requires typed dependencies")
+        now = self._now()
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM lab_work_items WHERE id=%s FOR UPDATE", (review_work_item_id,))
+            review = cur.fetchone()
+            if not review:
+                raise GPUError("LAB_WORK_NOT_FOUND", review_work_item_id)
+            self._session(cur, session_id, worker_id, str(review["project_id"]))
+            if str(review["assigned_worker_id"] or "") != str(worker_id) or str(review["assigned_session_id"] or "") != str(session_id):
+                raise GPUError("LAB_WORK_NOT_OWNED", review_work_item_id)
+            if str(review["gate_id"] or "") != str(gate_id):
+                raise GPUError("SCIENTIFIC_GATE_REVIEW_MISMATCH", review_work_item_id)
+            cur.execute("SELECT * FROM scientific_gates WHERE id=%s AND project_id=%s FOR UPDATE", (gate_id, review["project_id"]))
+            gate = cur.fetchone()
+            if not gate:
+                raise GPUError("SCIENTIFIC_GATE_NOT_FOUND", gate_id)
+            if gate["status"] not in {"PENDING", "AWAITING_SEMANTIC_REVIEW"}:
+                raise GPUError("SCIENTIFIC_GATE_NOT_RESOLVABLE", gate["status"])
+            if not gate["deterministic_preflight_id"]:
+                raise GPUError("SCIENTIFIC_GATE_PREFLIGHT_REQUIRED", gate_id)
+            cur.execute("SELECT status FROM lab_deterministic_preflights WHERE id=%s", (gate["deterministic_preflight_id"],))
+            if (cur.fetchone() or {}).get("status") != "PASS":
+                raise GPUError("SCIENTIFIC_GATE_PREFLIGHT_NOT_PASS", gate_id)
+
+            # Create/reuse the successor while the gate/review authority is
+            # locked.  The partial unique equivalence index arbitrates races.
+            equivalence_key = str(successor_spec["equivalence_key"])
+            cur.execute(
+                "SELECT * FROM lab_work_items WHERE project_id=%s AND equivalence_key=%s "
+                "AND status=ANY(%s) ORDER BY created_at LIMIT 1 FOR UPDATE",
+                (review["project_id"], equivalence_key, list(EQUIVALENCE_ACTIVE_WORK_STATUSES | {"COMPLETED"})),
+            )
+            successor = cur.fetchone()
+            reused = successor is not None
+            if not successor:
+                successor_id = str(uuid.uuid4())
+                hard_gate = hard_gate_requested
+                status = "WAITING_DEPENDENCY" if hard_gate else "READY"
+                refs = dict(successor_spec.get("related_refs") or {})
+                refs.update({"predecessor_review_work_item_id": review_work_item_id, "gate_id": gate_id,
+                             "deterministic_successor": True})
+                cur.execute(
+                    "INSERT INTO lab_work_items(id,project_id,kind,title,description,scientific_role,status,priority,expected_value,estimated_cost,"
+                    "created_by,parent_work_item_id,related_refs,equivalence_key,authority_key,gate_id,canonical_subject_version,authority_status,subject_id,"
+                    "recovery_policy,canonical_objective_id,speculation_class,speculation_condition,resource_class,dependency_scope,created_at,updated_at) "
+                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (successor_id, review["project_id"], str(successor_spec["kind"]), str(successor_spec["title"]),
+                     str(successor_spec["description"]), str(successor_spec["scientific_role"]), status,
+                     float(successor_spec.get("priority", 0)), successor_spec.get("expected_value"), successor_spec.get("estimated_cost"),
+                     worker_id, review_work_item_id, json.dumps(refs), equivalence_key,
+                     successor_spec.get("authority_key"), successor_spec.get("gate_id"), successor_spec.get("canonical_subject_version"),
+                     str(successor_spec.get("authority_status", "SUPPORTING")), successor_spec.get("subject_id"),
+                     json.dumps(successor_spec.get("recovery_policy") or {}), successor_spec.get("canonical_objective_id"),
+                     "NON_SPECULATIVE", json.dumps({}), str(successor_spec.get("resource_class", "REASONING")),
+                     "WORKITEM_LOCAL", now, now),
+                )
+                self._replace_dependencies(cur, successor_id, successor_spec.get("dependencies") or [], now)
+                cur.execute("SELECT * FROM lab_work_items WHERE id=%s", (successor_id,))
+                successor = cur.fetchone()
+                self._event(cur, review["project_id"], "WORK_ITEM_SUCCESSOR_MATERIALIZED", successor_id, {
+                    "predecessor_review_work_item_id": review_work_item_id, "gate_id": gate_id,
+                    "hard_gate": hard_gate, "equivalence_key": equivalence_key,
+                })
+            cur.execute("UPDATE lab_work_leases SET released_at=%s,release_reason='REVIEW_PASSED',lease_version=lease_version+1 WHERE id=%s AND released_at IS NULL", (now, review["lease_id"]))
+            cur.execute("UPDATE lab_work_items SET status='COMPLETED',completed_at=%s,updated_at=%s,work_version=work_version+1 WHERE id=%s", (now, now, review_work_item_id))
+            cur.execute("UPDATE scientific_gates SET status='PASS',semantic_review_work_item_id=%s,resolved_at=%s WHERE id=%s", (review_work_item_id, now, gate_id))
+            cur.execute("UPDATE research_worker_sessions SET current_work_item_id=NULL,active_role=NULL,status='ACTIVE',last_heartbeat_at=%s WHERE id=%s", (now, session_id))
+            cur.execute("UPDATE research_workers SET availability_state='AVAILABLE',availability_updated_at=%s,idle_reason=NULL,idle_since=NULL WHERE id=%s", (now, worker_id))
+            self._event(cur, review["project_id"], "SCIENTIFIC_GATE_REVIEW_PASSED_ATOMIC", gate_id, {
+                "review_work_item_id": review_work_item_id, "successor_work_item_id": str(successor["id"]),
+                "successor_reused": reused, "rationale": rationale[:4000],
+            })
+            result = {"gate": self._record(gate) or {}, "review_work_item_id": review_work_item_id,
+                      "successor": self._record(successor) or {}, "successor_reused": reused}
+        result["dependency_changes"] = self.resolve_dependencies(str(review["project_id"]))
+        result["gate"] = self.gate_get(gate_id)
+        return result
+
     def recover_stale_leases(self, project_id: str | None = None) -> dict[str, int]:
         """Reconcile orphaned work without cancelling external execution.
 

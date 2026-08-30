@@ -2033,6 +2033,15 @@ async def scientific_gate_resolve(
 
 
 @mcp.tool()
+async def scientific_review_pass_transition(
+    review_work_item_id: str, gate_id: str, worker_id: str, session_id: str,
+    successor_spec: dict[str, Any], rationale: str = "",
+):
+    """Atomically close a passing review, pass its gate, and create/reuse its predetermined successor."""
+    return await call(lab().review_pass_transition, review_work_item_id, gate_id, worker_id, session_id, successor_spec, rationale)
+
+
+@mcp.tool()
 async def scientific_subject_supersede(
     project_id: str, old_subject_id: str, new_subject_id: str, rationale: str,
     worker_id: str, session_id: str, successor_gate_id: str | None = None,

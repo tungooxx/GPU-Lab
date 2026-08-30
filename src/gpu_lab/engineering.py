@@ -254,7 +254,9 @@ class EngineeringService:
         return review
 
     def review_escalation_reason_create(self, project_id: str, scientific_spec_id: str, reason: str, rationale: str) -> dict:
-        self.scientific_spec_get(scientific_spec_id)
+        spec = self.scientific_spec_get(scientific_spec_id)
+        if str(spec["project_id"]) != str(project_id):
+            raise GPUError("RESEARCH_PROJECT_MISMATCH", scientific_spec_id)
         allowed = {
             "PRIOR_REVIEW_INVALIDATED", "REVIEWER_RELIED_ON_FALSE_FACTS", "MATERIAL_SCIENTIFIC_CONTRADICTION",
             "MATERIAL_NEW_SCIENTIFIC_EVIDENCE", "CONFIRMATION_OR_PUBLICATION_POLICY", "UNKNOWN_DRIFT_CONSEQUENTIAL",
@@ -285,6 +287,8 @@ class EngineeringService:
             raise GPUError("SCIENTIFIC_VARIABLE_DRIFT_INVALID", scientific_variable_drift)
         if not rationale.strip() or not required_verification:
             raise GPUError("DELTA_MANIFEST_FIELDS_REQUIRED", "rationale and required_verification")
+        if not isinstance(previous_hashes, dict) or not isinstance(current_hashes, dict):
+            raise GPUError("DELTA_MANIFEST_HASHES_INVALID", "previous_hashes and current_hashes must be objects")
         if drift == "FALSE" and scientific_semantic_hash_before != scientific_semantic_hash_after:
             raise GPUError("SCIENTIFIC_VARIABLE_DRIFT_CONTRADICTION", "FALSE requires matching semantic hashes")
         payload = {

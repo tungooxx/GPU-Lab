@@ -1110,6 +1110,42 @@ def test_scientific_gate_authority_preflight_unlock_and_supersession():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_review_pass_transition_is_atomic_and_cannot_bypass_hard_approval():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-review-transition-{time.time_ns()}", "Atomic review transition")["project_id"]
+    joined = lab.join(None, "review-transition-worker", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    gate = lab.gate_ensure(project_id, "RESULT_ASSESSMENT", "E-transition", "v1", worker_id, session_id)
+    review = lab.gate_work_ensure(
+        gate["id"], "REVIEW", "Final release review", "Review the frozen release.",
+        "ADVERSARIAL_REVIEWER", worker_id, session_id,
+    )
+    lab.preflight_run(gate["id"], worker_id, session_id, {"frozen_bytes": True})
+    claimed = lab.claim_work(review["id"], worker_id, session_id)
+
+    with pytest.raises(GPUError, match="LAB_SUCCESSOR_HARD_GATE_DEPENDENCY_REQUIRED"):
+        lab.review_pass_transition(
+            claimed["id"], gate["id"], worker_id, session_id,
+            {"kind": "RUN_EXPERIMENT", "title": "Confirmation", "description": "Must stay sealed.",
+             "scientific_role": "EXECUTION", "equivalence_key": "confirmation-v1",
+             "confirmation_authorization_required": True},
+        )
+
+    transitioned = lab.review_pass_transition(
+        claimed["id"], gate["id"], worker_id, session_id,
+        {"kind": "ANALYSIS", "title": "Predetermined successor", "description": "Continue after release PASS.",
+         "scientific_role": "SCIENTIST", "equivalence_key": "successor-v1",
+         "related_refs": {"work_root_type": "RECOVERY_OPERATION"}},
+        rationale="Final release review passed.",
+    )
+    assert transitioned["gate"]["status"] == "PASS"
+    assert lab.work_get(review["id"])["status"] == "COMPLETED"
+    assert transitioned["successor"]["status"] == "READY"
+    assert transitioned["successor"]["related_refs"]["deterministic_successor"] is True
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_concurrent_gate_authority_creation_reuses_one_work_item():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)
