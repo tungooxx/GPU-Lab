@@ -1507,6 +1507,12 @@ async def discovery_round_recommend_assignments(discovery_round_id: str, worker_
 
 
 @mcp.tool()
+async def discovery_recovery_wave_create(discovery_round_id: str, confirmation: str):
+    """Create one frozen, peer-isolated recovery wave for missing realized distance coverage."""
+    return await call(distributed_discovery().recovery_wave_create, discovery_round_id, confirmation)
+
+
+@mcp.tool()
 async def discovery_candidate_submit(
     discovery_round_id: str, candidate_batch_id: str, worker_id: str, session_id: str,
     candidate: DiscoveryCandidateInput,

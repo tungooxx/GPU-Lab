@@ -929,6 +929,42 @@ class DistributedDiscoveryService:
             raise GPUError("DISCOVERY_ARCHIVE_NOT_FOUND", archive_id)
         return {**archive, "survivors": [self.store.object_get(candidate_id) for candidate_id in archive["data"].get("survivor_candidate_ids", [])]}
 
+    def recovery_wave_create(self, round_id: str, confirmation: str) -> dict:
+        """Open one peer-isolated recovery wave from incomplete realized coverage."""
+        if confirmation != "RECOVER_DISCOVERY_WAVE":
+            raise GPUError("DISCOVERY_RECOVERY_CONFIRMATION_REQUIRED", "RECOVER_DISCOVERY_WAVE")
+        parent = self._round(round_id)
+        data = parent["data"]
+        archive_id = data.get("archive_id")
+        if not archive_id:
+            raise GPUError("DISCOVERY_RECOVERY_ARCHIVE_REQUIRED", round_id)
+        coverage = self.archive_get(str(archive_id))["data"].get("coverage") or {}
+        required = data.get("required_distance_coverage") or {}
+        realized = coverage.get("filled_distance_slots") or coverage.get("scientific_distance_distribution") or {}
+        deficits = {key: max(int(value) - int(realized.get(key, 0)), 0) for key, value in required.items()}
+        if not any(deficits.values()):
+            raise GPUError("DISCOVERY_RECOVERY_NOT_REQUIRED", round_id)
+        wave = int(data.get("generation_wave", 1))
+        maximum = int((data.get("generation_budget") or {}).get("max_generation_waves", 1))
+        if wave >= maximum:
+            raise GPUError("DISCOVERY_RECOVERY_BUDGET_EXHAUSTED", round_id)
+        for item in self.store.objects_list(str(parent["project_id"]), "DiscoveryRound", limit=None):
+            if str((item.get("data") or {}).get("recovery_of_round_id")) == str(round_id):
+                return item
+        recovery = {**data, "phase": "INDEPENDENT_GENERATION", "peer_visibility": "HIDDEN",
+                    "generation_wave": wave + 1, "required_distance_coverage": deficits,
+                    "recovery_of_round_id": str(round_id), "recovery_archive_id": str(archive_id),
+                    "recovery_reason": "REALIZED_DISTANCE_COVERAGE_INCOMPLETE",
+                    "started_at": self._now().isoformat(), "generation_frozen_at": None,
+                    "completed_at": None, "archive_id": None, "coverage_id": None}
+        result = self.store.object_create(str(parent["project_id"]), "DiscoveryRound", recovery,
+                                          "DISCOVERY_RECOVERY_WAVE_CREATED", "ACTIVE")
+        self._event(str(parent["project_id"]), "DISCOVERY_RECOVERY_WAVE_CREATED", result["id"], {
+            "parent_round_id": str(round_id), "generation_wave": wave + 1,
+            "realized_deficits": deficits, "frozen_state_hash": data.get("frozen_state_hash"),
+        })
+        return result
+
     def outcome_get(self, candidate_id: str) -> dict:
         candidate_id = str(candidate_id)
         candidate = self.store.object_get(candidate_id)
