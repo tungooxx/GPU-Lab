@@ -282,7 +282,10 @@ class GenericToolResult(BaseModel):
 class DiscoveryLineageResponseInput(BaseModel):
     """One explicit response to one record returned by the lineage audit."""
 
-    record_id: str = Field(description="Exact Research OS record ID from discovery_context_build.")
+    record_id: str = Field(
+        validation_alias=AliasChoices("record_id", "experiment_or_record", "id"),
+        description="Exact Research OS record ID from discovery_context_build.",
+    )
     implication_for_candidate: str = Field(description="What this prior result implies for the candidate.")
     candidate_already_addresses_it: bool = Field(
         description="Whether the candidate's design already addresses that implication."

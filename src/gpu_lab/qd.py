@@ -221,7 +221,14 @@ class HypothesisQDService:
 
     def hypothesis_lineage_audit(self, project_id: str, candidate: dict[str, Any]) -> dict[str, Any]:
         context = self.discovery_context_build(project_id, candidate)
-        responses = {str(item.get("record_id")): item for item in candidate.get("lineage_responses", []) if isinstance(item, dict)}
+        # Accept reviewed historical spellings while normalizing to the public
+        # ``record_id`` contract. Direct audit callers do not pass through the
+        # Pydantic MCP model, so this belongs here as well as in server.py.
+        responses = {
+            str(item.get("record_id") or item.get("experiment_or_record") or item.get("id")): item
+            for item in candidate.get("lineage_responses", [])
+            if isinstance(item, dict) and (item.get("record_id") or item.get("experiment_or_record") or item.get("id"))
+        }
         important = [
             record for record in context["related_records"]
             if record["epistemic_classification"] in {"SCIENTIFIC_VALID", "REPRESENTATION_RESULT", "CAUSAL_RESULT"}

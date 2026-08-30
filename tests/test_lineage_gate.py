@@ -58,3 +58,18 @@ def test_lineage_audit_does_not_make_unrelated_history_a_prerequisite():
     audit = service.hypothesis_lineage_audit("project", candidate)
     assert audit["passed"] is True
     assert audit["falsified_prerequisites_still_relevant"] == []
+
+
+def test_lineage_audit_accepts_reviewed_record_id_aliases():
+    service = HypothesisQDService(Store())
+    candidate = {
+        "mechanism": "whole task success uses twelve action gate",
+        "enabling_method": "variable slot control",
+        "mechanistic_hypothesis": "state representation changes action selection",
+        "falsified_prerequisites": ["twelve action gate is required"],
+        "lineage_responses": [
+            {"experiment_or_record": "negative-1", "implication_for_candidate": "Do not retain the gate.", "candidate_already_addresses_it": True},
+            {"id": "run-1", "implication_for_candidate": "Use representation controls.", "candidate_already_addresses_it": True},
+        ],
+    }
+    assert service.hypothesis_lineage_audit("project", candidate)["passed"] is True
