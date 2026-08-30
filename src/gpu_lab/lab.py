@@ -3671,6 +3671,57 @@ class LabController:
             cur.execute("SELECT * FROM lab_consistency_conflicts WHERE project_id=%s AND status=%s ORDER BY detected_at", (project_id, status.upper()))
             return [self._record(row) or {} for row in cur.fetchall()]
 
+    def consistency_audit_v365(self, project_id: str, persist: bool = False) -> dict[str, Any]:
+        """Detect authority granted despite a non-PASS typed review verdict."""
+        detected: list[dict[str, Any]] = []
+        now = self._now()
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT w.id AS work_item_id,w.subject_id,w.canonical_subject_version,w.promotion_state,"
+                "r.id AS review_result_id,r.review_work_item_id,r.verdict "
+                "FROM lab_work_items w JOIN lab_review_results r ON r.project_id=w.project_id "
+                "AND r.target_subject_id=w.subject_id AND r.target_subject_version=w.canonical_subject_version "
+                "WHERE w.project_id=%s AND w.authority_class='AUTHORITATIVE' "
+                "AND w.promotion_state='PROMOTED' AND r.verdict NOT IN ('PASS','PASS_WITH_NONMATERIAL_NOTES')",
+                (project_id,),
+            )
+            for row in cur.fetchall():
+                detected.append({
+                    "conflict_type": "VERDICT_AUTHORITY_MISMATCH",
+                    "work_item_id": str(row["work_item_id"]), "review_result_id": str(row["review_result_id"]),
+                    "review_work_item_id": str(row["review_work_item_id"]), "verdict": row["verdict"],
+                    "detail": "Promoted authority is incompatible with a non-PASS review verdict.",
+                })
+            cur.execute(
+                "SELECT downstream.id AS work_item_id,r.id AS review_result_id,r.review_work_item_id,r.verdict "
+                "FROM lab_work_dependencies d JOIN lab_work_items downstream ON downstream.id=d.work_item_id "
+                "JOIN lab_work_items review_work ON review_work.id=d.target_id::uuid "
+                "JOIN lab_review_results r ON r.review_work_item_id=review_work.id AND r.project_id=downstream.project_id "
+                "WHERE downstream.project_id=%s AND d.target_type='WORK_ITEM' "
+                "AND review_work.status='COMPLETED' AND r.verdict NOT IN ('PASS','PASS_WITH_NONMATERIAL_NOTES') "
+                "AND downstream.status IN ('READY','CLAIMED','RUNNING','RUNNING_DETACHED')",
+                (project_id,),
+            )
+            for row in cur.fetchall():
+                detected.append({
+                    "conflict_type": "COMPLETED_REVIEW_NONPASS_RELEASE",
+                    "work_item_id": str(row["work_item_id"]), "review_result_id": str(row["review_result_id"]),
+                    "review_work_item_id": str(row["review_work_item_id"]), "verdict": row["verdict"],
+                    "detail": "Downstream work is active because review completion was used instead of its verdict.",
+                })
+            if persist:
+                for conflict in detected:
+                    key = f"v365:{conflict['conflict_type']}:{conflict['work_item_id']}:{conflict['review_result_id']}"
+                    cur.execute(
+                        "INSERT INTO lab_consistency_conflicts(id,project_id,conflict_key,conflict_type,status,object_ids,details,detected_at) "
+                        "VALUES(%s,%s,%s,%s,'OPEN',%s,%s,%s) "
+                        "ON CONFLICT(project_id,conflict_key) DO UPDATE SET status='OPEN',details=EXCLUDED.details,detected_at=EXCLUDED.detected_at,resolved_at=NULL",
+                        (str(uuid.uuid4()), project_id, key, conflict["conflict_type"],
+                         json.dumps([conflict["work_item_id"], conflict["review_result_id"]]), json.dumps(conflict), now),
+                    )
+                    self._event(cur, project_id, "V365_CONSISTENCY_CONFLICT_DETECTED", conflict["work_item_id"], conflict)
+        return {"audit_version": "v3.6.5", "persisted": persist, "conflicts": detected, "conflict_count": len(detected)}
+
     def _lab_budget_get(self, project_id: str) -> dict[str, Any]:
         with self.store._connect() as conn, conn.cursor() as cur:
             return self._budget(cur, project_id)

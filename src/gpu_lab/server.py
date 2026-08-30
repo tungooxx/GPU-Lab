@@ -1852,6 +1852,12 @@ async def lab_consistency_conflicts_get(project_id: str, status: str = "OPEN"):
 
 
 @mcp.tool()
+async def lab_consistency_audit_v365(project_id: str, persist: bool = False):
+    """Audit verdict/authority contradictions; persist only explicit conflict records."""
+    return await call(lab().consistency_audit_v365, project_id, persist)
+
+
+@mcp.tool()
 async def canonical_projection_shadow_v355(project_id: str):
     """Read-only v3.5.5 canonical projection for staged rollout and conflict review."""
     return await call(lab().v355_shadow_projection, project_id)
