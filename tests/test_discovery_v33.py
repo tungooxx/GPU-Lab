@@ -142,6 +142,31 @@ def test_recovery_wave_idempotence_normalizes_uuid_identity():
     }
 
     class Store:
+        class Cursor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def execute(self, *_args, **_kwargs):
+                return None
+
+        class Connection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            @staticmethod
+            def cursor():
+                return Store.Cursor()
+
+        @staticmethod
+        def _connect():
+            return Store.Connection()
+
         @staticmethod
         def object_get(identifier):
             return parent if str(identifier) == str(parent_id) else archive
@@ -150,12 +175,41 @@ def test_recovery_wave_idempotence_normalizes_uuid_identity():
         def objects_list(_project_id, _kind, limit=None):
             return [existing]
 
+        @staticmethod
+        def _event(*_args, **_kwargs):
+            return None
+
     service = DistributedDiscoveryService.__new__(DistributedDiscoveryService)
     service.store = Store()
     service._event = lambda *_args, **_kwargs: None
 
     recovered = service.recovery_wave_create(str(parent_id), "RECOVER_DISCOVERY_WAVE")
     assert str(recovered["id"]) == str(existing_id)
+
+
+def test_incomplete_synthesis_automatically_opens_only_the_remaining_frozen_wave():
+    parent = {
+        "id": "round", "project_id": "project",
+        "data": {
+            "generation_wave": 1,
+            "generation_budget": {"max_generation_waves": 2},
+            "required_distance_coverage": {"NEAR": 1, "MID": 1, "FAR": 1},
+        },
+    }
+    archive = {
+        "id": "archive",
+        "data": {"coverage": {"filled_distance_slots": {"NEAR": 1, "MID": 0, "FAR": 0}}},
+    }
+    service = DistributedDiscoveryService.__new__(DistributedDiscoveryService)
+    service._round = lambda _round_id: parent
+    service.archive_get = lambda _archive_id: archive
+    calls: list[tuple[str, str, bool]] = []
+    service.recovery_wave_create = lambda round_id, confirmation, automatic=False: calls.append(
+        (round_id, confirmation, automatic)
+    ) or {"id": "recovery"}
+
+    assert service._recovery_wave_after_synthesis("round", "archive") == {"id": "recovery"}
+    assert calls == [("round", "RECOVER_DISCOVERY_WAVE", True)]
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
