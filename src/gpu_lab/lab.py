@@ -873,6 +873,57 @@ class LabController:
                  COORDINATION_VERSION, semantic_review_required, now),
             )
             gate = cur.fetchone()
+            # A newer canonical subject version makes any *non-terminal* gate
+            # for the same subject/key operationally obsolete.  Keep terminal
+            # PASS/FAIL evidence intact, but retire old pending/preflight/review
+            # gates and their READY/active work in this transaction.  Leaving
+            # those cards READY is unsafe: a worker can otherwise execute a
+            # version that the authority layer has already replaced.
+            cur.execute(
+                "SELECT id FROM scientific_gates WHERE project_id=%s AND gate_key=%s "
+                "AND scientific_object_id=%s AND canonical_subject_version<>%s "
+                "AND status NOT IN ('PASS','FAIL','INVALID','SUPERSEDED') FOR UPDATE",
+                (project_id, gate_key, scientific_object_id, canonical_subject_version),
+            )
+            stale_gate_ids = [str(row["id"]) for row in cur.fetchall()]
+            superseded_work = 0
+            if stale_gate_ids:
+                cur.execute(
+                    "UPDATE scientific_gates SET status='SUPERSEDED',superseded_by=%s,"
+                    "invalidation_reason=%s,resolved_at=%s WHERE id=ANY(%s)",
+                    (ident, f"Replaced by canonical subject version {canonical_subject_version}", now, stale_gate_ids),
+                )
+                cur.execute(
+                    "SELECT * FROM lab_work_items WHERE gate_id=ANY(%s) AND status=ANY(%s) FOR UPDATE",
+                    (stale_gate_ids, list(ACTIVE_WORK_STATUSES)),
+                )
+                for stale_work in cur.fetchall():
+                    cur.execute(
+                        "UPDATE lab_work_leases SET released_at=%s,release_reason='CANONICAL_VERSION_SUPERSEDED',"
+                        "lease_version=lease_version+1 WHERE work_item_id=%s AND released_at IS NULL",
+                        (now, stale_work["id"]),
+                    )
+                    cur.execute(
+                        "UPDATE lab_work_items SET status='SUPERSEDED',authority_status='SUPERSEDED',superseded_by=%s,"
+                        "invalidated_reason=%s,invalidated_at=%s,completed_at=%s,assigned_worker_id=NULL,"
+                        "assigned_session_id=NULL,lease_id=NULL,updated_at=%s,work_version=work_version+1 WHERE id=%s",
+                        (ident, f"Replaced by canonical subject version {canonical_subject_version}", now, now, now, stale_work["id"]),
+                    )
+                    cur.execute(
+                        "UPDATE research_worker_sessions SET current_work_item_id=NULL,active_role=NULL,status='ACTIVE',"
+                        "last_heartbeat_at=%s WHERE current_work_item_id=%s",
+                        (now, stale_work["id"]),
+                    )
+                    self._event(cur, project_id, "WORK_ITEM_SUPERSEDED", stale_work["id"], {
+                        "successor_gate_id": ident,
+                        "reason": f"Replaced by canonical subject version {canonical_subject_version}",
+                    })
+                    superseded_work += 1
+                self._event(cur, project_id, "SCIENTIFIC_GATE_VERSION_AUTO_SUPERSEDED", ident, {
+                    "superseded_gate_ids": stale_gate_ids,
+                    "superseded_work_items": superseded_work,
+                    "canonical_subject_version": canonical_subject_version,
+                })
             self._event(cur, project_id, "SCIENTIFIC_GATE_CREATED", ident, {
                 "gate_key": gate_key, "scientific_object_id": scientific_object_id,
                 "canonical_subject_version": canonical_subject_version, "authority_key": authority_key,

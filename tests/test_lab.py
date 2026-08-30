@@ -67,6 +67,28 @@ def test_dependency_target_type_is_never_inferred_from_a_uuid():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_new_canonical_gate_version_retires_old_nonterminal_work():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(
+        f"lab-gate-version-retirement-{time.time_ns()}", "Version retirement"
+    )["project_id"]
+    joined = lab.join(None, "version-retirement-worker", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    old_gate = lab.gate_ensure(project_id, "EXECUTION", "experiment-1", "commit:old", worker_id, session_id)
+    old_work = lab.gate_work_ensure(
+        old_gate["id"], "REVIEW", "Old version review", "Must not survive a newer version.",
+        "REVIEWER", worker_id, session_id,
+    )
+
+    new_gate = lab.gate_ensure(project_id, "EXECUTION", "experiment-1", "commit:new", worker_id, session_id)
+
+    assert lab.gate_get(old_gate["id"])["status"] == "SUPERSEDED"
+    assert lab.work_get(old_work["id"])["status"] == "SUPERSEDED"
+    assert new_gate["status"] == "PENDING"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_v355_objective_is_versioned_and_proposals_merge_into_existing_work():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)
