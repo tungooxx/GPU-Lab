@@ -591,6 +591,7 @@ class EngineeringService:
         deterministic_preflight_id: str, runtime_fingerprint: str,
         scientific_hashes: dict[str, str], successor_work: dict[str, Any],
         semantic_review_required: bool = True,
+        scientific_spec_id: str | None = None,
     ) -> dict:
         """Create one immutable bundle for a pre-science release.
 
@@ -613,6 +614,15 @@ class EngineeringService:
         successor_required = ("kind", "title", "description", "scientific_role")
         if any(not str(successor_work.get(field, "")).strip() for field in successor_required):
             raise GPUError("PRE_SCIENCE_RELEASE_SUCCESSOR_REQUIRED", ", ".join(successor_required))
+
+        spec = None
+        if scientific_spec_id:
+            spec = self._validate_parent(project_id, scientific_spec_id, "ScientificSpecVersion", "scientific_spec")
+            if str(spec["data"].get("subject_id")) != str(experiment_id):
+                raise GPUError("PRE_SCIENCE_RELEASE_SPEC_SUBJECT_MISMATCH", scientific_spec_id)
+            supplied_hash = hashes.get("scientific_semantic_hash")
+            if supplied_hash != spec["data"].get("scientific_semantic_hash"):
+                raise GPUError("PRE_SCIENCE_RELEASE_SPEC_HASH_MISMATCH", scientific_spec_id)
 
         experiment = self._validate_parent(project_id, experiment_id, "Experiment", "experiment")
         decision = self._validate_parent(project_id, research_decision_id, "ResearchDecision", "research_decision")
@@ -651,25 +661,144 @@ class EngineeringService:
             "deterministic_preflight_result_hash": str(preflight["result_hash"]),
             "runtime_fingerprint": runtime_fingerprint,
             "scientific_hashes": dict(sorted(hashes.items())),
+            "scientific_spec_id": scientific_spec_id,
             "successor_work": {field: successor_work[field] for field in successor_required},
             "semantic_review_required": semantic_review_required,
             "execution_authorized": False,
             "scientific_result": "NOT_ASSESSED",
         }
         existing = self.store.objects_list(project_id, "PreScienceReleaseCandidate", limit=None)
+        superseded_candidates = []
         for candidate in existing:
             if candidate.get("data") == payload:
                 return {**candidate, "idempotent": True}
-        return self.store.object_create(
+        # There is one current release assembly for a scientific version. The
+        # immutable prior RC remains auditable but cannot survive as a second
+        # executable/reviewable authority.
+        for candidate in existing:
+            data = candidate.get("data", {})
+            same_spec = scientific_spec_id and str(data.get("scientific_spec_id")) == str(scientific_spec_id)
+            legacy_same_subject = not scientific_spec_id and (
+                str(data.get("experiment_id")) == str(experiment_id)
+                and str(data.get("canonical_subject_version")) == str(canonical_subject_version)
+            )
+            if (same_spec or legacy_same_subject) and candidate.get("status") in {"PREPARED", "APPROVED"}:
+                superseded_candidates.append(candidate)
+        created = self.store.object_create(
             project_id, "PreScienceReleaseCandidate", payload,
             "PRE_SCIENCE_RELEASE_CANDIDATE_CREATED", "PREPARED",
         )
+        for candidate in superseded_candidates:
+            self.store.object_update(candidate["id"], {
+                "superseded_by_release_candidate": created["id"],
+                "supersession_reason": "A newer immutable PRE_SCIENCE release candidate was assembled.",
+            }, "SUPERSEDED", "PRE_SCIENCE_RELEASE_CANDIDATE_SUPERSEDED")
+        return created
 
     def pre_science_release_candidate_get(self, candidate_id: str) -> dict:
         candidate = self.store.object_get(candidate_id)
         if candidate["kind"] != "PreScienceReleaseCandidate":
             raise GPUError("PRE_SCIENCE_RELEASE_CANDIDATE_REQUIRED", candidate_id)
         return candidate
+
+    def final_pre_science_release_review_record(
+        self, release_candidate_id: str, reviewer_id: str, verdict: str,
+        rationale: str, completed_checks: list[str],
+        latest_relevant_scientific_event_at: str,
+        review_escalation_reason_id: str | None = None,
+    ) -> dict:
+        """Record the second (and normally final) full review boundary.
+
+        It binds review evidence to exact RC bytes. A technical repair must
+        create a new RC and use DeltaReview; it cannot append arbitrary full
+        reviews to an unchanged scientific specification.
+        """
+        candidate = self.pre_science_release_candidate_get(release_candidate_id)
+        if candidate.get("status") == "SUPERSEDED":
+            raise GPUError("PRE_SCIENCE_RELEASE_CANDIDATE_SUPERSEDED", release_candidate_id)
+        verdict = verdict.upper()
+        if verdict not in {"PASS", "FAIL", "ESCALATE_SCIENTIFIC_REVIEW"}:
+            raise GPUError("FINAL_RELEASE_REVIEW_VERDICT_INVALID", verdict)
+        if not reviewer_id.strip() or not rationale.strip() or not latest_relevant_scientific_event_at:
+            raise GPUError("FINAL_RELEASE_REVIEW_FIELDS_REQUIRED", "reviewer_id, rationale, latest_relevant_scientific_event_at")
+        if not isinstance(completed_checks, list) or not completed_checks:
+            raise GPUError("FINAL_RELEASE_REVIEW_CHECKS_REQUIRED", "completed_checks")
+        spec_id = candidate.get("data", {}).get("scientific_spec_id")
+        if not spec_id:
+            raise GPUError("FINAL_RELEASE_REVIEW_SPEC_REQUIRED", release_candidate_id)
+        spec = self.scientific_spec_get(str(spec_id))
+        project_id = str(candidate["project_id"])
+        if str(spec["project_id"]) != project_id:
+            raise GPUError("RESEARCH_PROJECT_MISMATCH", str(spec_id))
+        semantic_reviews = [
+            item for item in self.store.objects_list(project_id, "ScientificSemanticReview", limit=None)
+            if str(item.get("data", {}).get("scientific_spec_id")) == str(spec_id)
+            and item.get("data", {}).get("verdict") == "PASS"
+            and item.get("status") == "APPROVED"
+        ]
+        if not semantic_reviews:
+            raise GPUError("FINAL_RELEASE_REVIEW_SEMANTIC_REVIEW_REQUIRED", str(spec_id))
+        semantic = semantic_reviews[-1]
+        if str(semantic["data"].get("scientific_semantic_hash")) != str(spec["data"].get("scientific_semantic_hash")):
+            raise GPUError("FINAL_RELEASE_REVIEW_SEMANTIC_HASH_MISMATCH", str(spec_id))
+        if str(semantic["data"].get("lineage_snapshot_id")) != str(spec["data"].get("lineage_snapshot_id")):
+            raise GPUError("FINAL_RELEASE_REVIEW_LINEAGE_MISMATCH", str(spec_id))
+        if str(semantic["data"].get("reviewer_id")) == reviewer_id:
+            raise GPUError("FINAL_RELEASE_REVIEW_INDEPENDENCE_REQUIRED", "semantic and final reviewer must differ")
+        prior = [
+            item for item in self.store.objects_list(project_id, "FinalPreScienceReleaseReview", limit=None)
+            if str(item.get("data", {}).get("scientific_spec_id")) == str(spec_id)
+            and item.get("data", {}).get("verdict") == "PASS"
+        ]
+        if prior and not review_escalation_reason_id:
+            raise GPUError("FINAL_RELEASE_REVIEW_LIMIT_REACHED", "An unchanged ScientificSpecVersion already has final release PASS")
+        if review_escalation_reason_id:
+            self._validate_parent(project_id, review_escalation_reason_id, "ReviewEscalationReason", "review_escalation_reason")
+        payload = {
+            "release_candidate_id": release_candidate_id,
+            "scientific_spec_id": str(spec_id),
+            "scientific_semantic_hash": spec["data"]["scientific_semantic_hash"],
+            "lineage_snapshot_id": spec["data"]["lineage_snapshot_id"],
+            "lineage_as_of": spec["data"]["lineage_as_of"],
+            "latest_relevant_scientific_event_at": latest_relevant_scientific_event_at,
+            "semantic_review_id": semantic["id"],
+            "reviewer_id": reviewer_id,
+            "verdict": verdict,
+            "rationale": rationale,
+            "completed_checks": _bounded_strings(completed_checks, "completed_checks"),
+            "review_escalation_reason_id": review_escalation_reason_id,
+            "scientific_result": "NOT_ASSESSED",
+        }
+        review = self.store.object_create(project_id, "FinalPreScienceReleaseReview", payload,
+                                          "FINAL_PRE_SCIENCE_RELEASE_REVIEW_RECORDED",
+                                          "APPROVED" if verdict == "PASS" else "BLOCKED")
+        if verdict == "PASS":
+            self.store.object_update(release_candidate_id, {"final_release_review_id": review["id"], "frozen": True},
+                                     "APPROVED", "PRE_SCIENCE_RELEASE_CANDIDATE_FROZEN")
+        return review
+
+    def confirmation_authorization_create(
+        self, project_id: str, release_candidate_id: str, approver_id: str,
+        verdict: str, rationale: str,
+    ) -> dict:
+        """Create the explicit, separate authorization required for confirmation."""
+        candidate = self.pre_science_release_candidate_get(release_candidate_id)
+        if str(candidate["project_id"]) != str(project_id):
+            raise GPUError("RESEARCH_PROJECT_MISMATCH", release_candidate_id)
+        verdict = verdict.upper()
+        if verdict not in {"PASS", "FAIL"} or not approver_id.strip() or not rationale.strip():
+            raise GPUError("CONFIRMATION_AUTHORIZATION_INVALID", "approver_id, verdict, rationale")
+        if verdict == "PASS":
+            final_id = candidate.get("data", {}).get("final_release_review_id")
+            if candidate.get("status") != "APPROVED" or not final_id:
+                raise GPUError("CONFIRMATION_FINAL_RELEASE_REVIEW_REQUIRED", release_candidate_id)
+        return self.store.object_create(project_id, "ConfirmationAuthorization", {
+            "release_candidate_id": release_candidate_id,
+            "approver_id": approver_id,
+            "verdict": verdict,
+            "rationale": rationale,
+            "scientific_result": "NOT_ASSESSED",
+        }, "CONFIRMATION_AUTHORIZATION_RECORDED", "APPROVED" if verdict == "PASS" else "BLOCKED")
 
     def task_verify(self, task_id: str) -> dict:
         task = self.task_get(task_id)

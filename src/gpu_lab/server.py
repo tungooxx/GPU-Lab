@@ -2290,13 +2290,14 @@ async def pre_science_release_candidate_create(
     deterministic_preflight_id: str, runtime_fingerprint: str,
     scientific_hashes: dict[str, str], successor_work: dict[str, str],
     semantic_review_required: bool = True,
+    scientific_spec_id: str | None = None,
 ):
     """Bind one immutable pre-science release candidate; this never authorizes execution."""
     return await call(
         engineering().pre_science_release_candidate_create,
         project_id, canonical_subject_version, experiment_id, research_decision_id,
         engineering_result_id, deterministic_preflight_id, runtime_fingerprint,
-        scientific_hashes, successor_work, semantic_review_required,
+        scientific_hashes, successor_work, semantic_review_required, scientific_spec_id,
     )
 
 
@@ -2304,6 +2305,29 @@ async def pre_science_release_candidate_create(
 async def pre_science_release_candidate_get(candidate_id: str):
     """Read an immutable pre-science release bundle and its bound records."""
     return await call(engineering().pre_science_release_candidate_get, candidate_id)
+
+
+@mcp.tool()
+async def final_pre_science_release_review_record(
+    release_candidate_id: str, reviewer_id: str,
+    verdict: Literal["PASS", "FAIL", "ESCALATE_SCIENTIFIC_REVIEW"],
+    rationale: str, completed_checks: list[str], latest_relevant_scientific_event_at: str,
+    review_escalation_reason_id: str | None = None,
+):
+    """Record independent final PRE_SCIENCE review of exact release-candidate bytes."""
+    return await call(engineering().final_pre_science_release_review_record, release_candidate_id, reviewer_id,
+                      verdict, rationale, completed_checks, latest_relevant_scientific_event_at,
+                      review_escalation_reason_id)
+
+
+@mcp.tool()
+async def confirmation_authorization_create(
+    project_id: str, release_candidate_id: str, approver_id: str,
+    verdict: Literal["PASS", "FAIL"], rationale: str,
+):
+    """Create the hard-sealed confirmation authorization after final release approval."""
+    return await call(engineering().confirmation_authorization_create, project_id, release_candidate_id,
+                      approver_id, verdict, rationale)
 
 
 @mcp.tool()

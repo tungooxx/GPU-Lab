@@ -201,6 +201,36 @@ def test_scientific_spec_is_canonical_and_escalation_is_project_scoped():
     assert foreign_project.value.error_type == "RESEARCH_PROJECT_MISMATCH"
 
 
+def test_final_release_review_binds_rc_and_seals_confirmation():
+    store = Store()
+    service = EngineeringService(store)
+    spec = service.scientific_spec_create(
+        "project", "experiment-1", {"question": "Does it help?", "metric": "accuracy"},
+        "lineage-1", "2026-08-30T00:00:00Z",
+    )
+    semantic = service.semantic_review_record(
+        spec["id"], "semantic-reviewer", "PASS", "Sound frozen semantics.", "2026-08-30T00:00:00Z",
+    )
+    candidate = store.object_create("project", "PreScienceReleaseCandidate", {
+        "experiment_id": "experiment-1", "scientific_spec_id": spec["id"],
+        "scientific_hashes": {"scientific_semantic_hash": spec["data"]["scientific_semantic_hash"]},
+    }, "FIXTURE", "PREPARED")
+    with pytest.raises(GPUError) as self_review:
+        service.final_pre_science_release_review_record(
+            candidate["id"], "semantic-reviewer", "PASS", "Cannot self-certify.", ["preflight"], "2026-08-30T00:00:00Z",
+        )
+    assert self_review.value.error_type == "FINAL_RELEASE_REVIEW_INDEPENDENCE_REQUIRED"
+    final = service.final_pre_science_release_review_record(
+        candidate["id"], "release-reviewer", "PASS", "Exact RC is coherent.", ["preflight"], "2026-08-30T00:00:00Z",
+    )
+    assert final["status"] == "APPROVED"
+    assert store.items[candidate["id"]]["status"] == "APPROVED"
+    auth = service.confirmation_authorization_create(
+        "project", candidate["id"], "confirmation-approver", "PASS", "Confirmation budget authorized.",
+    )
+    assert auth["status"] == "APPROVED"
+
+
 def test_result_cannot_be_recorded_twice_after_completion():
     service = EngineeringService(Store())
     task = _task(service)
