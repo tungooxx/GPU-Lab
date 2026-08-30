@@ -4260,7 +4260,7 @@ class LabController:
             return [self._record(row) or {} for row in cur.fetchall()]
 
     def consistency_audit_v365(self, project_id: str, persist: bool = False) -> dict[str, Any]:
-        """Detect authority granted despite a non-PASS typed review verdict."""
+        """Detect semantic authority contradictions, including legacy mutations."""
         detected: list[dict[str, Any]] = []
         now = self._now()
         with self.store._connect() as conn, conn.cursor() as cur:
@@ -4297,17 +4297,51 @@ class LabController:
                     "review_work_item_id": str(row["review_work_item_id"]), "verdict": row["verdict"],
                     "detail": "Downstream work is active because review completion was used instead of its verdict.",
                 })
+            cur.execute(
+                "SELECT scientific_object_id,array_agg(id::text ORDER BY created_at) AS gate_ids,"
+                "array_agg(canonical_subject_version ORDER BY created_at) AS versions "
+                "FROM scientific_gates WHERE project_id=%s AND status='PASS' AND superseded_by IS NULL "
+                "AND invalidation_reason IS NULL AND authoritative_work_item_id IS NOT NULL "
+                "GROUP BY scientific_object_id HAVING count(*)>1",
+                (project_id,),
+            )
+            for row in cur.fetchall():
+                detected.append({
+                    "conflict_type": "DUPLICATE_EXECUTION_AUTHORITY",
+                    "work_item_id": str(row["scientific_object_id"]),
+                    "gate_ids": list(row["gate_ids"]), "versions": list(row["versions"]),
+                    "detail": "More than one unsuperseded PASS gate has execution authority for this scientific object.",
+                })
+            cur.execute(
+                "SELECT id FROM lab_work_items WHERE project_id=%s AND authority_class IN ('SPECULATIVE','PREPARATORY') "
+                "AND promotion_state='PROMOTED'",
+                (project_id,),
+            )
+            for row in cur.fetchall():
+                detected.append({
+                    "conflict_type": "SPECULATIVE_OUTPUT_PROMOTED_EARLY",
+                    "work_item_id": str(row["id"]),
+                    "detail": "Speculative/preparatory work may not become promoted authority directly.",
+                })
             if persist:
                 for conflict in detected:
-                    key = f"v365:{conflict['conflict_type']}:{conflict['work_item_id']}:{conflict['review_result_id']}"
+                    identity = str(conflict.get("review_result_id") or ":".join(conflict.get("gate_ids") or []))
+                    key = f"v365:{conflict['conflict_type']}:{conflict['work_item_id']}:{identity}"
                     cur.execute(
                         "INSERT INTO lab_consistency_conflicts(id,project_id,conflict_key,conflict_type,status,object_ids,details,detected_at) "
                         "VALUES(%s,%s,%s,%s,'OPEN',%s,%s,%s) "
                         "ON CONFLICT(project_id,conflict_key) DO UPDATE SET status='OPEN',details=EXCLUDED.details,detected_at=EXCLUDED.detected_at,resolved_at=NULL",
                         (str(uuid.uuid4()), project_id, key, conflict["conflict_type"],
-                         json.dumps([conflict["work_item_id"], conflict["review_result_id"]]), json.dumps(conflict), now),
+                         json.dumps([conflict["work_item_id"], *conflict.get("gate_ids", []), *([conflict["review_result_id"]] if conflict.get("review_result_id") else [])]), json.dumps(conflict), now),
                     )
-                    self._event(cur, project_id, "V365_CONSISTENCY_CONFLICT_DETECTED", conflict["work_item_id"], conflict)
+                    try:
+                        uuid.UUID(str(conflict["work_item_id"]))
+                        event_subject_id: str | None = str(conflict["work_item_id"])
+                    except (ValueError, TypeError):
+                        # An experiment/subject identity can be an external
+                        # immutable ID rather than a ResearchObject UUID.
+                        event_subject_id = None
+                    self._event(cur, project_id, "V365_CONSISTENCY_CONFLICT_DETECTED", event_subject_id, conflict)
         return {"audit_version": "v3.6.5", "persisted": persist, "conflicts": detected, "conflict_count": len(detected)}
 
     def _lab_budget_get(self, project_id: str) -> dict[str, Any]:

@@ -1381,10 +1381,18 @@ def test_terminal_malformed_pass_gate_can_be_auditably_revoked():
             "VALUES(%s,%s,'EXECUTION_LEGACY','experiment-gate-revoke',%s,%s,TRUE,'PASS','legacy',%s,%s)",
             (malformed_id, project_id, f"{release}+legacy-pass-review", f"{project_id}:bad-gate", now, now),
         )
+    lab.create_work(
+        project_id, "RUN_EXPERIMENT", "Current authority", "Canonical execution authority.", "EXECUTION", worker_id,
+        created_session_id=session_id, gate_id=replacement["id"], authority_status="AUTHORITATIVE",
+        authority_class="AUTHORITATIVE", promotion_state="PROMOTED",
+    )
     retired = lab.create_work(
         project_id, "IMPLEMENT", "Legacy malformed gate child", "Must be retired with gate.", "ENGINEER",
-        worker_id, created_session_id=session_id, gate_id=malformed_id,
+        worker_id, created_session_id=session_id, gate_id=malformed_id, authority_status="AUTHORITATIVE",
+        authority_class="AUTHORITATIVE", promotion_state="PROMOTED",
     )
+    audit = lab.consistency_audit_v365(project_id, persist=True)
+    assert any(conflict["conflict_type"] == "DUPLICATE_EXECUTION_AUTHORITY" for conflict in audit["conflicts"])
     result = lab.gate_revoke_malformed_authority(
         malformed_id, replacement["id"], worker_id, session_id, "MALFORMED_SUBJECT_VERSION",
         "Legacy migration appended review identifiers to immutable release identity.",
