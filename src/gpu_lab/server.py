@@ -2360,6 +2360,17 @@ async def review_escalation_reason_create(project_id: str, scientific_spec_id: s
 
 
 @mcp.tool()
+async def lineage_freshness_check_record(
+    scientific_spec_id: str, assessor_id: str, verdict: Literal["CURRENT", "STALE", "UNKNOWN"],
+    rationale: str, assessed_latest_scientific_event_at: str | None,
+    considered_record_ids: list[str], material_event_ids: list[str] | None = None,
+):
+    """Bind fast-path eligibility to the current project scientific-event frontier."""
+    return await call(engineering().lineage_freshness_check_record, scientific_spec_id, assessor_id, verdict,
+                      rationale, assessed_latest_scientific_event_at, considered_record_ids, material_event_ids)
+
+
+@mcp.tool()
 async def scientific_semantic_review_record(
     scientific_spec_id: str, reviewer_id: str, verdict: Literal["PASS", "FAIL", "ESCALATE_SCIENTIFIC_REVIEW"],
     rationale: str, latest_relevant_scientific_event_at: str,

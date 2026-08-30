@@ -88,6 +88,7 @@ RESEARCH_OBJECT_KINDS = (
     "PreScienceReleaseCandidate",
     "ScientificSpecVersion",
     "ScientificSemanticReview",
+    "LineageFreshnessCheck",
     "PreSciencePreflight",
     "FinalPreScienceReleaseReview",
     "DeltaManifest",

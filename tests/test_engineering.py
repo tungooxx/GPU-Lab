@@ -30,6 +30,9 @@ class Store:
         items = [item for item in self.items.values() if item["project_id"] == project_id and item["kind"] == kind]
         return items if limit is None else items[:limit]
 
+    def lab_state_summary(self, project_id):
+        return {"research_state_version": len(self.items), "latest_scientific_event_at": "2026-08-30T00:00:00Z"}
+
 
 def _task(service):
     task = service.task_create(
@@ -215,6 +218,11 @@ def test_final_release_review_binds_rc_and_seals_confirmation():
         "experiment_id": "experiment-1", "scientific_spec_id": spec["id"],
         "scientific_hashes": {"scientific_semantic_hash": spec["data"]["scientific_semantic_hash"]},
     }, "FIXTURE", "PREPARED")
+    freshness = service.lineage_freshness_check_record(
+        spec["id"], "lineage-assessor", "CURRENT", "No material later contradiction.",
+        "2026-08-30T00:00:00Z", ["lineage-1"], [],
+    )
+    assert freshness["status"] == "APPROVED"
     with pytest.raises(GPUError) as self_review:
         service.final_pre_science_release_review_record(
             candidate["id"], "semantic-reviewer", "PASS", "Cannot self-certify.", ["preflight"], "2026-08-30T00:00:00Z",

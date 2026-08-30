@@ -268,6 +268,57 @@ class EngineeringService:
             "scientific_result": "NOT_ASSESSED",
         }, "REVIEW_ESCALATION_REASON_RECORDED", "APPROVED")
 
+    def lineage_freshness_check_record(
+        self, scientific_spec_id: str, assessor_id: str, verdict: str, rationale: str,
+        assessed_latest_scientific_event_at: str | None, considered_record_ids: list[str],
+        material_event_ids: list[str] | None = None,
+    ) -> dict:
+        """Bind a fast-path decision to the live project evidence frontier.
+
+        A ``CURRENT`` result means the assessor examined all materially
+        relevant evidence through the exact current event frontier and found
+        no material contradiction. It is deliberately separate from semantic
+        review: a technical delta can renew freshness without recreating the
+        scientific review ladder.
+        """
+        spec = self.scientific_spec_get(scientific_spec_id)
+        verdict = verdict.upper()
+        if verdict not in {"CURRENT", "STALE", "UNKNOWN"}:
+            raise GPUError("LINEAGE_FRESHNESS_VERDICT_INVALID", verdict)
+        if not assessor_id.strip() or not rationale.strip() or not isinstance(considered_record_ids, list):
+            raise GPUError("LINEAGE_FRESHNESS_FIELDS_REQUIRED", "assessor_id, rationale, considered_record_ids")
+        material_event_ids = material_event_ids or []
+        if not isinstance(material_event_ids, list):
+            raise GPUError("LINEAGE_FRESHNESS_MATERIAL_EVENTS_INVALID", "material_event_ids")
+        live = self.store.lab_state_summary(str(spec["project_id"]))
+        actual_latest = live.get("latest_scientific_event_at")
+        if assessed_latest_scientific_event_at != actual_latest:
+            raise GPUError("LINEAGE_FRESHNESS_FRONTIER_CHANGED", json.dumps({
+                "assessed_latest_scientific_event_at": assessed_latest_scientific_event_at,
+                "actual_latest_scientific_event_at": actual_latest,
+            }))
+        if verdict == "CURRENT" and material_event_ids:
+            raise GPUError("LINEAGE_FRESHNESS_MATERIAL_EVENT_DECLARED", "CURRENT cannot include material events")
+        if verdict == "CURRENT" and actual_latest and not considered_record_ids:
+            raise GPUError("LINEAGE_FRESHNESS_CONSIDERATION_REQUIRED", "considered_record_ids")
+        payload = {
+            "scientific_spec_id": scientific_spec_id,
+            "scientific_semantic_hash": spec["data"]["scientific_semantic_hash"],
+            "lineage_snapshot_id": spec["data"]["lineage_snapshot_id"],
+            "lineage_as_of": spec["data"]["lineage_as_of"],
+            "assessor_id": assessor_id,
+            "verdict": verdict,
+            "rationale": rationale,
+            "assessed_latest_scientific_event_at": assessed_latest_scientific_event_at,
+            "project_state_version": live.get("research_state_version"),
+            "considered_record_ids": _bounded_strings(considered_record_ids, "considered_record_ids"),
+            "material_event_ids": _bounded_strings(material_event_ids, "material_event_ids"),
+            "scientific_result": "NOT_ASSESSED",
+        }
+        return self.store.object_create(str(spec["project_id"]), "LineageFreshnessCheck", payload,
+                                        "LINEAGE_FRESHNESS_CHECK_RECORDED",
+                                        "APPROVED" if verdict == "CURRENT" else "BLOCKED")
+
     def delta_manifest_create(
         self, project_id: str, base_release_candidate_id: str, candidate_release_candidate_id: str,
         changed_files: list[str], changed_fields: list[str], changed_artifacts: list[str],
@@ -743,6 +794,20 @@ class EngineeringService:
             raise GPUError("FINAL_RELEASE_REVIEW_SEMANTIC_HASH_MISMATCH", str(spec_id))
         if str(semantic["data"].get("lineage_snapshot_id")) != str(spec["data"].get("lineage_snapshot_id")):
             raise GPUError("FINAL_RELEASE_REVIEW_LINEAGE_MISMATCH", str(spec_id))
+        freshness = [
+            item for item in self.store.objects_list(project_id, "LineageFreshnessCheck", limit=None)
+            if str(item.get("data", {}).get("scientific_spec_id")) == str(spec_id)
+            and item.get("data", {}).get("verdict") == "CURRENT"
+            and item.get("status") == "APPROVED"
+        ]
+        if not freshness:
+            raise GPUError("FINAL_RELEASE_LINEAGE_FRESHNESS_REQUIRED", str(spec_id))
+        current_frontier = self.store.lab_state_summary(project_id).get("latest_scientific_event_at")
+        latest_freshness = freshness[-1]
+        if latest_freshness["data"].get("assessed_latest_scientific_event_at") != current_frontier:
+            raise GPUError("FINAL_RELEASE_LINEAGE_FRESHNESS_STALE", str(spec_id))
+        if latest_relevant_scientific_event_at != current_frontier:
+            raise GPUError("FINAL_RELEASE_REVIEW_FRONTIER_CHANGED", str(spec_id))
         if str(semantic["data"].get("reviewer_id")) == reviewer_id:
             raise GPUError("FINAL_RELEASE_REVIEW_INDEPENDENCE_REQUIRED", "semantic and final reviewer must differ")
         prior = [
