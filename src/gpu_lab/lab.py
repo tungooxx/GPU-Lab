@@ -302,6 +302,19 @@ class LabController:
                 );
                 CREATE INDEX IF NOT EXISTS lab_evidence_needs_project_need_idx
                     ON lab_evidence_needs(project_id,need_key);
+                CREATE TABLE IF NOT EXISTS lab_review_harnesses (
+                    id UUID PRIMARY KEY, project_id UUID NOT NULL REFERENCES research_projects(id),
+                    scientific_object_id TEXT NOT NULL, scientific_spec_version TEXT NOT NULL,
+                    scientific_semantic_hash TEXT NOT NULL, target_interface_version TEXT NOT NULL,
+                    prepared_by_worker_id UUID NOT NULL REFERENCES research_workers(id),
+                    prepared_by_session_id UUID NOT NULL REFERENCES research_worker_sessions(id),
+                    invariants JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    adversarial_cases JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    protected_data_access BOOLEAN NOT NULL DEFAULT FALSE,
+                    implementation_peer_exposure TEXT NOT NULL DEFAULT 'NONE',
+                    status TEXT NOT NULL DEFAULT 'FROZEN', created_at TIMESTAMPTZ NOT NULL,
+                    UNIQUE(project_id,scientific_object_id,scientific_spec_version,scientific_semantic_hash,target_interface_version,prepared_by_worker_id)
+                );
                 DO $$ BEGIN
                     ALTER TABLE lab_work_items ADD CONSTRAINT lab_work_items_branch_fk
                         FOREIGN KEY(branch_id) REFERENCES hypothesis_branches(id) NOT VALID;
@@ -2653,6 +2666,66 @@ class LabController:
                 "parent_subject_version": parent_subject_version, "authority_effect": "NONE",
             })
         return self._record(binding) or {}
+
+    def review_harness_prepare(
+        self, project_id: str, scientific_object_id: str, scientific_spec_version: str,
+        scientific_semantic_hash: str, target_interface_version: str, worker_id: str,
+        session_id: str, invariants: list[str], adversarial_cases: list[dict[str, Any]],
+        protected_data_access: bool = False,
+    ) -> dict[str, Any]:
+        """Freeze an independent reviewer oracle before mutable bytes are exposed.
+
+        A harness is preparation, not certification: it cannot pass a gate or
+        promote authority.  It is deliberately confirmation-safe and binds to
+        the frozen scientific interface/semantic identity rather than code.
+        """
+        required = (scientific_object_id, scientific_spec_version, scientific_semantic_hash, target_interface_version)
+        if any(not str(value).strip() for value in required):
+            raise GPUError("REVIEW_HARNESS_BINDING_REQUIRED", "object, spec version, semantic hash, interface version")
+        if protected_data_access:
+            raise GPUError("REVIEW_HARNESS_CONFIRMATION_ACCESS_FORBIDDEN", scientific_object_id)
+        if not isinstance(invariants, list) or not invariants or any(not isinstance(value, str) or not value.strip() for value in invariants):
+            raise GPUError("REVIEW_HARNESS_INVARIANTS_REQUIRED", "nonempty invariant strings")
+        if not isinstance(adversarial_cases, list) or any(not isinstance(value, dict) for value in adversarial_cases):
+            raise GPUError("REVIEW_HARNESS_CASES_INVALID", "adversarial_cases")
+        now, ident = self._now(), str(uuid.uuid4())
+        with self.store._connect() as conn, conn.cursor() as cur:
+            self._session(cur, session_id, worker_id, project_id)
+            cur.execute(
+                "SELECT * FROM lab_review_harnesses WHERE project_id=%s AND scientific_object_id=%s "
+                "AND scientific_spec_version=%s AND scientific_semantic_hash=%s AND target_interface_version=%s "
+                "AND prepared_by_worker_id=%s FOR UPDATE",
+                (project_id, scientific_object_id, scientific_spec_version, scientific_semantic_hash,
+                 target_interface_version, worker_id),
+            )
+            existing = cur.fetchone()
+            if existing:
+                return {**(self._record(existing) or {}), "dedupe_result": "REUSED_FROZEN"}
+            cur.execute(
+                "INSERT INTO lab_review_harnesses(id,project_id,scientific_object_id,scientific_spec_version,scientific_semantic_hash,target_interface_version,prepared_by_worker_id,prepared_by_session_id,invariants,adversarial_cases,protected_data_access,implementation_peer_exposure,status,created_at) "
+                "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,FALSE,'NONE','FROZEN',%s) RETURNING *",
+                (ident, project_id, scientific_object_id, scientific_spec_version, scientific_semantic_hash,
+                 target_interface_version, worker_id, session_id, json.dumps(invariants), json.dumps(adversarial_cases), now),
+            )
+            harness = cur.fetchone()
+            self._event(cur, project_id, "REVIEW_HARNESS_PREPARED", ident, {
+                "scientific_object_id": scientific_object_id,
+                "scientific_spec_version": scientific_spec_version,
+                "scientific_semantic_hash": scientific_semantic_hash,
+                "target_interface_version": target_interface_version,
+                "implementation_peer_exposure": "NONE",
+            })
+        return {**(self._record(harness) or {}), "dedupe_result": "CREATED"}
+
+    def review_harness_list(self, project_id: str, scientific_object_id: str | None = None) -> list[dict]:
+        with self.store._connect() as conn, conn.cursor() as cur:
+            sql, args = "SELECT * FROM lab_review_harnesses WHERE project_id=%s", [project_id]
+            if scientific_object_id:
+                sql += " AND scientific_object_id=%s"
+                args.append(scientific_object_id)
+            sql += " ORDER BY created_at DESC"
+            cur.execute(sql, args)
+            return [self._record(row) or {} for row in cur.fetchall()]
 
     def speculative_rebase_assess(
         self, binding_id: str, new_parent_version: str, changed_semantic_fields: list[str],

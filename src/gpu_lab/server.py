@@ -2013,6 +2013,26 @@ async def evidence_need_lookup(project_id: str, evidence_need: dict[str, Any]):
 
 
 @mcp.tool()
+async def review_harness_prepare(
+    project_id: str, scientific_object_id: str, scientific_spec_version: str,
+    scientific_semantic_hash: str, target_interface_version: str, worker_id: str,
+    session_id: str, invariants: list[str], adversarial_cases: list[dict[str, Any]],
+):
+    """Freeze a reviewer-owned semantic oracle before implementation bytes are reviewed."""
+    return await call(
+        lab().review_harness_prepare, project_id, scientific_object_id, scientific_spec_version,
+        scientific_semantic_hash, target_interface_version, worker_id, session_id,
+        invariants, adversarial_cases,
+    )
+
+
+@mcp.tool()
+async def review_harness_list(project_id: str, scientific_object_id: str | None = None):
+    """List frozen reviewer harnesses without treating them as approval."""
+    return await call(lab().review_harness_list, project_id, scientific_object_id)
+
+
+@mcp.tool()
 async def review_result_record(
     project_id: str, review_work_item_id: str, target_subject_id: str,
     target_subject_version: str, review_type: str, verdict: str,

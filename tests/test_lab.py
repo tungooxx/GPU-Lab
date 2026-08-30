@@ -1436,6 +1436,33 @@ def test_evidence_need_suppresses_reinspection_but_allows_explicit_independent_r
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_reviewer_harness_is_frozen_preparatory_not_authority():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-review-harness-{time.time_ns()}", "Reviewer harness")["project_id"]
+    joined = lab.join(None, "harness-reviewer", "CODEX", project_id)
+    harness = lab.review_harness_prepare(
+        project_id, "semantic-candidate", "v1", "sha256:semantic", "adapter-interface-v1",
+        joined["worker"]["id"], joined["session_id"], ["must not collapse algebraically"],
+        [{"name": "static-collapse", "expected": "distinct"}],
+    )
+    assert harness["status"] == "FROZEN"
+    assert harness["implementation_peer_exposure"] == "NONE"
+    assert harness["protected_data_access"] is False
+    assert lab.review_harness_prepare(
+        project_id, "semantic-candidate", "v1", "sha256:semantic", "adapter-interface-v1",
+        joined["worker"]["id"], joined["session_id"], ["must not collapse algebraically"],
+        [{"name": "static-collapse", "expected": "distinct"}],
+    )["dedupe_result"] == "REUSED_FROZEN"
+    with pytest.raises(GPUError) as protected:
+        lab.review_harness_prepare(
+            project_id, "semantic-candidate", "v1", "sha256:semantic", "adapter-interface-v1",
+            joined["worker"]["id"], joined["session_id"], ["no confirmation"], [], protected_data_access=True,
+        )
+    assert protected.value.error_type == "REVIEW_HARNESS_CONFIRMATION_ACCESS_FORBIDDEN"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_review_pass_transition_is_atomic_and_cannot_bypass_hard_approval():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)
