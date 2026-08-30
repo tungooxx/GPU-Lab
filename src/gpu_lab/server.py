@@ -2293,6 +2293,68 @@ async def pre_science_release_candidate_get(candidate_id: str):
 
 
 @mcp.tool()
+async def scientific_spec_create(
+    project_id: str, subject_id: str, protected_scientific_fields: dict[str, Any],
+    lineage_snapshot_id: str, lineage_as_of: str, project_state_version: int | None = None,
+    world_model_version: str | None = None,
+):
+    """Freeze protected scientific semantics and compute their canonical semantic hash."""
+    return await call(engineering().scientific_spec_create, project_id, subject_id, protected_scientific_fields,
+                      lineage_snapshot_id, lineage_as_of, project_state_version, world_model_version)
+
+
+@mcp.tool()
+async def scientific_spec_get(spec_id: str):
+    """Read one frozen ScientificSpecVersion and its semantic fingerprint."""
+    return await call(engineering().scientific_spec_get, spec_id)
+
+
+@mcp.tool()
+async def review_escalation_reason_create(project_id: str, scientific_spec_id: str, reason: str, rationale: str):
+    """Record the explicit reason required for an exceptional third full review."""
+    return await call(engineering().review_escalation_reason_create, project_id, scientific_spec_id, reason, rationale)
+
+
+@mcp.tool()
+async def scientific_semantic_review_record(
+    scientific_spec_id: str, reviewer_id: str, verdict: Literal["PASS", "FAIL", "ESCALATE_SCIENTIFIC_REVIEW"],
+    rationale: str, latest_relevant_scientific_event_at: str,
+    review_escalation_reason_id: str | None = None,
+):
+    """Record semantic review #1; repeated full review needs a durable escalation reason."""
+    return await call(engineering().semantic_review_record, scientific_spec_id, reviewer_id, verdict, rationale,
+                      latest_relevant_scientific_event_at, review_escalation_reason_id)
+
+
+@mcp.tool()
+async def delta_manifest_create(
+    project_id: str, base_release_candidate_id: str, candidate_release_candidate_id: str,
+    changed_files: list[str], changed_fields: list[str], changed_artifacts: list[str], changed_configs: list[str],
+    previous_hashes: dict[str, str], current_hashes: dict[str, str],
+    scientific_semantic_hash_before: str, scientific_semantic_hash_after: str,
+    scientific_variable_drift: Literal["FALSE", "TRUE", "UNKNOWN"],
+    affected_engineering_invariants: list[str], affected_preflight_checks: list[str],
+    unaffected_review_refs: list[str], required_verification: list[str], rationale: str,
+):
+    """Classify a post-review change before choosing deterministic, delta, or semantic review."""
+    return await call(engineering().delta_manifest_create, project_id, base_release_candidate_id,
+                      candidate_release_candidate_id, changed_files, changed_fields, changed_artifacts,
+                      changed_configs, previous_hashes, current_hashes, scientific_semantic_hash_before,
+                      scientific_semantic_hash_after, scientific_variable_drift, affected_engineering_invariants,
+                      affected_preflight_checks, unaffected_review_refs, required_verification, rationale)
+
+
+@mcp.tool()
+async def delta_review_record(
+    delta_manifest_id: str, reviewer_id: str,
+    verdict: Literal["PASS", "FAIL", "ESCALATE_SCIENTIFIC_REVIEW"], rationale: str,
+    completed_checks: list[str],
+):
+    """Record focused engineering DeltaReview; PASS requires all declared deterministic checks."""
+    return await call(engineering().delta_review_record, delta_manifest_id, reviewer_id, verdict, rationale, completed_checks)
+
+
+@mcp.tool()
 async def engineering_task_verify(task_id: str):
     """Check implementation readiness; this never assesses a hypothesis."""
     return await call(engineering().task_verify, task_id)

@@ -7,6 +7,8 @@ inside the existing assessment services.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any
 
 from .errors import GPUError
@@ -158,6 +160,176 @@ class EngineeringService:
         if str(item.get("project_id")) != str(project_id):
             raise GPUError("RESEARCH_PROJECT_MISMATCH", identifier)
         return item
+
+    @staticmethod
+    def _canonical_hash(value: Any) -> str:
+        return hashlib.sha256(
+            json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str).encode("utf-8")
+        ).hexdigest()
+
+    def scientific_spec_create(
+        self, project_id: str, subject_id: str, protected_scientific_fields: dict[str, Any],
+        lineage_snapshot_id: str, lineage_as_of: str, project_state_version: int | None = None,
+        world_model_version: str | None = None,
+    ) -> dict:
+        """Freeze the scientific semantics that a semantic review may approve.
+
+        Operational identifiers (worker, GPU, path, runtime timestamp) are
+        deliberately not part of this fingerprint.  They belong in release
+        candidates and deterministic preflight, not scientific identity.
+        """
+        if not subject_id or not lineage_snapshot_id or not lineage_as_of:
+            raise GPUError("SCIENTIFIC_SPEC_IDENTITY_REQUIRED", "subject_id, lineage_snapshot_id, lineage_as_of")
+        if not isinstance(protected_scientific_fields, dict) or not protected_scientific_fields:
+            raise GPUError("SCIENTIFIC_SPEC_PROTECTED_FIELDS_REQUIRED", "protected_scientific_fields")
+        semantic_hash = self._canonical_hash(protected_scientific_fields)
+        payload = {
+            "subject_id": subject_id,
+            "protected_scientific_fields": protected_scientific_fields,
+            "scientific_semantic_hash": semantic_hash,
+            "lineage_snapshot_id": lineage_snapshot_id,
+            "lineage_as_of": lineage_as_of,
+            "project_state_version": project_state_version,
+            "world_model_version": world_model_version,
+            "frozen": True,
+            "scientific_result": "NOT_ASSESSED",
+        }
+        for existing in self.store.objects_list(project_id, "ScientificSpecVersion", limit=None):
+            if existing.get("data") == payload:
+                return {**existing, "idempotent": True}
+        return self.store.object_create(project_id, "ScientificSpecVersion", payload, "SCIENTIFIC_SPEC_FROZEN", "PREPARED")
+
+    def scientific_spec_get(self, spec_id: str) -> dict:
+        spec = self.store.object_get(spec_id)
+        if spec["kind"] != "ScientificSpecVersion":
+            raise GPUError("SCIENTIFIC_SPEC_REQUIRED", spec_id)
+        return spec
+
+    def semantic_review_record(
+        self, scientific_spec_id: str, reviewer_id: str, verdict: str,
+        rationale: str, latest_relevant_scientific_event_at: str,
+        review_escalation_reason_id: str | None = None,
+    ) -> dict:
+        """Record review #1 for a frozen scientific specification.
+
+        A second semantic review of unchanged semantics needs a durable
+        escalation reason; this prevents technical work from silently
+        restarting the scientific review ladder.
+        """
+        spec = self.scientific_spec_get(scientific_spec_id)
+        verdict = verdict.upper()
+        if verdict not in {"PASS", "FAIL", "ESCALATE_SCIENTIFIC_REVIEW"}:
+            raise GPUError("SEMANTIC_REVIEW_VERDICT_INVALID", verdict)
+        if not reviewer_id.strip() or not rationale.strip() or not latest_relevant_scientific_event_at:
+            raise GPUError("SEMANTIC_REVIEW_FIELDS_REQUIRED", "reviewer_id, rationale, latest_relevant_scientific_event_at")
+        prior = [
+            item for item in self.store.objects_list(str(spec["project_id"]), "ScientificSemanticReview", limit=None)
+            if str(item.get("data", {}).get("scientific_spec_id")) == str(scientific_spec_id)
+            and item.get("data", {}).get("verdict") == "PASS"
+        ]
+        if prior and not review_escalation_reason_id:
+            raise GPUError("SEMANTIC_REVIEW_LIMIT_REACHED", "An unchanged ScientificSpecVersion already has semantic PASS; use DeltaReview or provide ReviewEscalationReason")
+        if review_escalation_reason_id:
+            reason = self._validate_parent(str(spec["project_id"]), review_escalation_reason_id, "ReviewEscalationReason", "review_escalation_reason")
+            if not str(reason.get("data", {}).get("reason", "")).strip():
+                raise GPUError("REVIEW_ESCALATION_REASON_REQUIRED", review_escalation_reason_id)
+        payload = {
+            "scientific_spec_id": scientific_spec_id,
+            "scientific_semantic_hash": spec["data"]["scientific_semantic_hash"],
+            "lineage_snapshot_id": spec["data"]["lineage_snapshot_id"],
+            "lineage_as_of": spec["data"]["lineage_as_of"],
+            "project_state_version": spec["data"].get("project_state_version"),
+            "world_model_version": spec["data"].get("world_model_version"),
+            "latest_relevant_scientific_event_at": latest_relevant_scientific_event_at,
+            "reviewer_id": reviewer_id,
+            "verdict": verdict,
+            "rationale": rationale,
+            "review_escalation_reason_id": review_escalation_reason_id,
+            "scientific_result": "NOT_ASSESSED",
+        }
+        status = "APPROVED" if verdict == "PASS" else "BLOCKED"
+        review = self.store.object_create(str(spec["project_id"]), "ScientificSemanticReview", payload, "SCIENTIFIC_SEMANTIC_REVIEW_RECORDED", status)
+        if verdict == "PASS":
+            self.store.object_update(scientific_spec_id, {"semantic_review_id": review["id"]}, "APPROVED", "SCIENTIFIC_SPEC_SEMANTIC_REVIEW_PASSED")
+        return review
+
+    def review_escalation_reason_create(self, project_id: str, scientific_spec_id: str, reason: str, rationale: str) -> dict:
+        self.scientific_spec_get(scientific_spec_id)
+        allowed = {
+            "PRIOR_REVIEW_INVALIDATED", "REVIEWER_RELIED_ON_FALSE_FACTS", "MATERIAL_SCIENTIFIC_CONTRADICTION",
+            "MATERIAL_NEW_SCIENTIFIC_EVIDENCE", "CONFIRMATION_OR_PUBLICATION_POLICY", "UNKNOWN_DRIFT_CONSEQUENTIAL",
+        }
+        if reason.upper() not in allowed or not rationale.strip():
+            raise GPUError("REVIEW_ESCALATION_REASON_INVALID", reason)
+        return self.store.object_create(project_id, "ReviewEscalationReason", {
+            "scientific_spec_id": scientific_spec_id, "reason": reason.upper(), "rationale": rationale,
+            "scientific_result": "NOT_ASSESSED",
+        }, "REVIEW_ESCALATION_REASON_RECORDED", "APPROVED")
+
+    def delta_manifest_create(
+        self, project_id: str, base_release_candidate_id: str, candidate_release_candidate_id: str,
+        changed_files: list[str], changed_fields: list[str], changed_artifacts: list[str],
+        changed_configs: list[str], previous_hashes: dict[str, str], current_hashes: dict[str, str],
+        scientific_semantic_hash_before: str, scientific_semantic_hash_after: str,
+        scientific_variable_drift: str, affected_engineering_invariants: list[str],
+        affected_preflight_checks: list[str], unaffected_review_refs: list[str],
+        required_verification: list[str], rationale: str,
+    ) -> dict:
+        """Create a mechanical release delta classification before any review."""
+        base = self.pre_science_release_candidate_get(base_release_candidate_id)
+        candidate = self.pre_science_release_candidate_get(candidate_release_candidate_id)
+        if str(base["project_id"]) != project_id or str(candidate["project_id"]) != project_id:
+            raise GPUError("RESEARCH_PROJECT_MISMATCH", "release candidates")
+        drift = scientific_variable_drift.upper()
+        if drift not in {"FALSE", "TRUE", "UNKNOWN"}:
+            raise GPUError("SCIENTIFIC_VARIABLE_DRIFT_INVALID", scientific_variable_drift)
+        if not rationale.strip() or not required_verification:
+            raise GPUError("DELTA_MANIFEST_FIELDS_REQUIRED", "rationale and required_verification")
+        if drift == "FALSE" and scientific_semantic_hash_before != scientific_semantic_hash_after:
+            raise GPUError("SCIENTIFIC_VARIABLE_DRIFT_CONTRADICTION", "FALSE requires matching semantic hashes")
+        payload = {
+            "base_release_candidate_id": base_release_candidate_id,
+            "candidate_release_candidate_id": candidate_release_candidate_id,
+            "base_subject_id": base["data"].get("experiment_id"),
+            "base_subject_version": base["data"].get("canonical_subject_version"),
+            "changed_files": _bounded_strings(changed_files, "changed_files"),
+            "changed_fields": _bounded_strings(changed_fields, "changed_fields"),
+            "changed_artifacts": _bounded_strings(changed_artifacts, "changed_artifacts"),
+            "changed_configs": _bounded_strings(changed_configs, "changed_configs"),
+            "previous_hashes": dict(sorted(previous_hashes.items())),
+            "current_hashes": dict(sorted(current_hashes.items())),
+            "scientific_semantic_hash_before": scientific_semantic_hash_before,
+            "scientific_semantic_hash_after": scientific_semantic_hash_after,
+            "scientific_variable_drift": drift,
+            "affected_engineering_invariants": _bounded_strings(affected_engineering_invariants, "affected_engineering_invariants"),
+            "affected_preflight_checks": _bounded_strings(affected_preflight_checks, "affected_preflight_checks"),
+            "unaffected_review_refs": _bounded_strings(unaffected_review_refs, "unaffected_review_refs"),
+            "required_verification": _bounded_strings(required_verification, "required_verification"),
+            "rationale": rationale,
+            "scientific_result": "NOT_ASSESSED",
+        }
+        return self.store.object_create(project_id, "DeltaManifest", payload, "DELTA_MANIFEST_CREATED", "PREPARED")
+
+    def delta_review_record(self, delta_manifest_id: str, reviewer_id: str, verdict: str, rationale: str, completed_checks: list[str]) -> dict:
+        manifest = self.store.object_get(delta_manifest_id)
+        if manifest["kind"] != "DeltaManifest":
+            raise GPUError("ENGINEERING_DELTA_MANIFEST_KIND_INVALID", delta_manifest_id)
+        verdict = verdict.upper()
+        if verdict not in {"PASS", "FAIL", "ESCALATE_SCIENTIFIC_REVIEW"}:
+            raise GPUError("DELTA_REVIEW_VERDICT_INVALID", verdict)
+        drift = manifest["data"].get("scientific_variable_drift")
+        if drift in {"TRUE", "UNKNOWN"} and verdict == "PASS":
+            raise GPUError("DELTA_REVIEW_SCIENTIFIC_ESCALATION_REQUIRED", drift)
+        required = set(manifest["data"].get("required_verification", []))
+        if verdict == "PASS" and not required.issubset(set(completed_checks)):
+            raise GPUError("DELTA_REVIEW_CHECKS_MISSING", ", ".join(sorted(required - set(completed_checks))))
+        if not reviewer_id.strip() or not rationale.strip():
+            raise GPUError("DELTA_REVIEW_FIELDS_REQUIRED", "reviewer_id and rationale")
+        payload = {"delta_manifest_id": delta_manifest_id, "reviewer_id": reviewer_id, "verdict": verdict,
+                   "rationale": rationale, "completed_checks": _bounded_strings(completed_checks, "completed_checks"),
+                   "scientific_result": "NOT_ASSESSED"}
+        return self.store.object_create(str(manifest["project_id"]), "DeltaReview", payload,
+                                        "DELTA_REVIEW_RECORDED", "APPROVED" if verdict == "PASS" else "BLOCKED")
 
     def task_create(self, project_id: str, purpose: str, task_type: str,
                     change_request: str = "", repository: str = "",

@@ -86,6 +86,14 @@ RESEARCH_OBJECT_KINDS = (
     # A pre-execution release bundle.  It binds operational readiness without
     # being scientific evidence or an execution authorization.
     "PreScienceReleaseCandidate",
+    "ScientificSpecVersion",
+    "ScientificSemanticReview",
+    "PreSciencePreflight",
+    "FinalPreScienceReleaseReview",
+    "DeltaManifest",
+    "DeltaReview",
+    "ReviewEscalationReason",
+    "ConfirmationAuthorization",
     "ResearchPolicy",
     "PolicyHypothesis",
     "ResearchPolicyPatch",
