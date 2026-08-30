@@ -151,6 +151,8 @@ RESEARCH_OBJECT_KINDS = (
     "ImplementationFidelityCheck",
     "ResultInterpretationAttack",
     "ReviewTargetClassification",
+    "DesignChallengeHindsight",
+    "DeterministicRegressionProposal",
     "RuntimeCanary",
 )
 RESEARCH_OBJECT_STATUSES = {

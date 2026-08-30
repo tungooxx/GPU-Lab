@@ -1885,6 +1885,26 @@ async def result_interpretation_attack_record(
 
 
 @mcp.tool()
+async def design_challenge_hindsight_record(
+    design_challenge_id: str,
+    outcome: Literal["VALIDATED", "PARTIALLY_VALIDATED", "FALSE_ALARM", "OVERBROAD", "STILL_UNRESOLVED"],
+    notes: str, evidence_refs: list[str] | None = None,
+):
+    """Record later challenge usefulness without rewriting the frozen independent attack."""
+    return await call(scientific_correction().challenge_hindsight_record, design_challenge_id,
+                      outcome=outcome, notes=notes, evidence_refs=evidence_refs)
+
+
+@mcp.tool()
+async def deterministic_regression_proposal_create(
+    project_id: str, source_id: str, test_reference: str, invariant: str, rationale: str,
+):
+    """Convert a repeatable implementation finding into a deterministic-test proposal."""
+    return await call(scientific_correction().regression_proposal_create, project_id, source_id,
+                      test_reference=test_reference, invariant=invariant, rationale=rationale)
+
+
+@mcp.tool()
 async def review_target_classifier_v366(project_id: str, target_id: str):
     """Read-only shadow classifier for design, fidelity, interpretation, or deterministic engineering work."""
     return await call(scientific_correction().review_target_classifier, project_id, target_id)

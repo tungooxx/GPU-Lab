@@ -66,6 +66,17 @@ def test_v366_fidelity_pass_never_completes_idea_attack_and_peer_isolation_holds
     assert synthesis["data"]["majority_vote_used"] is False
     assert synthesis["data"]["discriminating_experiment_ids"]
     assert store.object_get(design["id"])["status"] == "REPAIR_REQUIRED"
+    hindsight = correction.challenge_hindsight_record(
+        synthesis["data"]["unique_challenge_ids"][0], outcome="STILL_UNRESOLVED",
+        notes="The required discriminator has not run; no later evidence settles the challenge.",
+    )
+    assert hindsight["kind"] == "DesignChallengeHindsight"
+    regression = correction.regression_proposal_create(
+        project_id, fidelity["id"], test_reference="tests/test_binding.py::test_mapping",
+        invariant="The bound intervention map preserves the frozen carrier interface.",
+        rationale="A repeatable fidelity finding should become a deterministic guard.",
+    )
+    assert regression["kind"] == "DeterministicRegressionProposal"
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")

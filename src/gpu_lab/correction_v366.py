@@ -362,6 +362,47 @@ class ScientificSelfCorrectionService:
         data = {"implementation_version": VERSION, "result_id": str(result_id), "claim": claim[:12000], "verdict": verdict, "strongest_alternative": strongest_alternative[:12000], "rationale": rationale[:12000], "does_not_admit_evidence": True}
         return self.store.object_create(project_id, "ResultInterpretationAttack", data, "RESULT_INTERPRETATION_ATTACK_COMMITTED", "COMPLETED")
 
+    def challenge_hindsight_record(self, design_challenge_id: str, *, outcome: str,
+                                   notes: str, evidence_refs: list[str] | None = None) -> dict:
+        """Record whether later evidence validated an earlier idea-level challenge.
+
+        The original frozen attack remains immutable.  Hindsight is a separate
+        record so later results cannot be smuggled back into the critic's
+        original independent submission.
+        """
+        challenge = self._object(design_challenge_id, "DesignChallenge")
+        outcome = self._normal(outcome)
+        if outcome not in {"VALIDATED", "PARTIALLY_VALIDATED", "FALSE_ALARM", "OVERBROAD", "STILL_UNRESOLVED"} or not notes.strip():
+            raise GPUError("DESIGN_CHALLENGE_HINDSIGHT_INVALID", outcome)
+        refs = [str(ref) for ref in (evidence_refs or []) if str(ref)]
+        for ref in refs:
+            item = self.store.object_get(ref)
+            if str(item["project_id"]) != str(challenge["project_id"]):
+                raise GPUError("DESIGN_CHALLENGE_HINDSIGHT_PROJECT_MISMATCH", ref)
+        data = {
+            "implementation_version": VERSION, "design_challenge_id": str(design_challenge_id),
+            "outcome": outcome, "notes": notes[:12000], "evidence_refs": refs,
+            "recorded_at": self._now().isoformat(), "does_not_rewrite_frozen_attack": True,
+        }
+        return self.store.object_create(str(challenge["project_id"]), "DesignChallengeHindsight", data,
+                                        "DESIGN_CHALLENGE_HINDSIGHT_RECORDED", "COMPLETED")
+
+    def regression_proposal_create(self, project_id: str, source_id: str, *, test_reference: str,
+                                   invariant: str, rationale: str) -> dict:
+        """Turn a repeatable engineering finding into a deterministic test proposal."""
+        source = self.store.object_get(str(source_id))
+        if str(source["project_id"]) != str(project_id) or source["kind"] not in {"ImplementationFidelityCheck", "EngineeringResult"}:
+            raise GPUError("REVIEW_REGRESSION_SOURCE_INVALID", str(source_id))
+        if not test_reference.strip() or not invariant.strip() or not rationale.strip():
+            raise GPUError("REVIEW_REGRESSION_PROPOSAL_FIELDS_REQUIRED", "test_reference, invariant, rationale")
+        data = {
+            "implementation_version": VERSION, "source_id": str(source_id), "source_kind": source["kind"],
+            "test_reference": test_reference.strip(), "invariant": invariant.strip(), "rationale": rationale[:12000],
+            "status": "PROPOSED", "scientific_result": "NOT_ASSESSED",
+        }
+        return self.store.object_create(project_id, "DeterministicRegressionProposal", data,
+                                        "REVIEW_FINDING_CONVERTED_TO_REGRESSION", "PROPOSED")
+
     def design_coverage(self, design_id: str) -> dict:
         design = self._object(design_id, "ScientificDesign")
         assumptions = [item for item in self.store.objects_list(str(design["project_id"]), "DesignAssumption", limit=None) if str(item["data"].get("scientific_design_id")) == str(design_id)]
