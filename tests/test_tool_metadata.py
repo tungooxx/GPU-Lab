@@ -138,6 +138,17 @@ def test_operational_tool_contracts_expose_backend_enums_and_required_objects():
     assert any(item.get("$ref", "").endswith("/DeterministicPreflightCheck") for item in checks)
 
 
+def test_pre_science_release_candidate_exposes_every_immutable_binding():
+    schema = mcp._tool_manager._tools["pre_science_release_candidate_create"].fn_metadata.arg_model.model_json_schema()
+
+    assert {
+        "canonical_subject_version", "experiment_id", "research_decision_id",
+        "engineering_result_id", "deterministic_preflight_id", "runtime_fingerprint",
+        "scientific_hashes", "successor_work",
+    } <= set(schema["required"])
+    assert schema["properties"]["scientific_hashes"]["additionalProperties"] == {"type": "string"}
+
+
 def test_research_state_update_exposes_its_bounded_cache_fields():
     schema = mcp._tool_manager._tools["research_state_update"].fn_metadata.arg_model.model_json_schema()
     update = schema["$defs"]["ResearchStateUpdateInput"]
