@@ -943,6 +943,33 @@ class LabController:
                                 (worker_id, worker_name, runtime_type, json.dumps(capabilities or {}), now))
                     cur.execute("SELECT * FROM research_workers WHERE id=%s", (worker_id,))
                     worker = cur.fetchone()
+            # A durable worker identity outlives individual browser/runtime
+            # sessions.  Capabilities, however, describe the currently joined
+            # runtime and must be refreshable on rejoin.  Treat a supplied map
+            # as a patch so a reviewer can add SCIENTIFIC_REVIEW without
+            # accidentally dropping unrelated durable capabilities.
+            if capabilities is not None:
+                if not isinstance(capabilities, dict) or any(
+                    not isinstance(name, str) or not name.strip() or not isinstance(enabled, bool)
+                    for name, enabled in capabilities.items()
+                ):
+                    raise GPUError("LAB_WORKER_CAPABILITIES_INVALID", "capabilities must map nonempty names to booleans")
+                previous_capabilities = dict(worker["capabilities"] or {})
+                refreshed_capabilities = {
+                    **previous_capabilities,
+                    **{name.strip(): enabled for name, enabled in capabilities.items()},
+                }
+                if refreshed_capabilities != previous_capabilities:
+                    cur.execute(
+                        "UPDATE research_workers SET capabilities=%s WHERE id=%s RETURNING *",
+                        (json.dumps(refreshed_capabilities), worker["id"]),
+                    )
+                    worker = cur.fetchone()
+                    self._event(cur, project_id, "WORKER_CAPABILITIES_REFRESHED", None, {
+                        "worker_id": str(worker["id"]),
+                        "updated_capability_names": sorted(capabilities),
+                        "enabled_capability_names": sorted(self._capability_names(refreshed_capabilities)),
+                    })
             recovered = False
             if session_id:
                 cur.execute("SELECT * FROM research_worker_sessions WHERE id=%s AND worker_id=%s FOR UPDATE", (session_id, worker["id"]))

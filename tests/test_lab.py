@@ -24,6 +24,29 @@ def test_host_maintenance_capabilities_are_claim_gated():
     )
 
 
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_rejoin_refreshes_durable_worker_capabilities_without_replacing_identity():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"capability-refresh-{time.time_ns()}", "capability refresh")["project_id"]
+    original = lab.join(None, f"capability-refresh-a4-{uuid.uuid4().hex}", "CHATGPT_WEB", project_id, {"BRAIN_V32": True})
+    refreshed = lab.join(
+        original["worker"]["id"], None, "CHATGPT_WEB", project_id,
+        {"SCIENTIFIC_REVIEW": True}, session_id=original["session_id"],
+    )
+
+    assert refreshed["worker"]["id"] == original["worker"]["id"]
+    assert refreshed["session_id"] == original["session_id"]
+    assert refreshed["worker"]["capabilities"] == {"BRAIN_V32": True, "SCIENTIFIC_REVIEW": True}
+    work = lab.create_work(
+        project_id, "INDEPENDENT_REVIEW", "Fresh independent review", "Bounded scientific review.",
+        "SCIENTIFIC_REVIEW", created_by=original["worker"]["id"], created_session_id=original["session_id"],
+        required_capabilities=["SCIENTIFIC_REVIEW"],
+    )
+    claimed = lab.claim_work(work["id"], refreshed["worker"]["id"], refreshed["session_id"])
+    assert claimed["id"] == work["id"]
+
+
 def test_completed_review_work_cannot_satisfy_a_nonpass_verdict_dependency():
     """v3.6.5 CPDS regression: COMPLETED is operational, not semantic PASS."""
     class Cursor:

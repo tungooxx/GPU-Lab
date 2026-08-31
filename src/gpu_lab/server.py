@@ -4745,27 +4745,33 @@ async def anomaly_create(
 ):
     """Persist an unexpected observation with its scope, affected claims, and candidate explanations."""
     claims = affected_claim_ids or []
-    for claim_id in claims:
-        claim = research().object_get(claim_id)
-        if str(claim["project_id"]) != project_id or claim["kind"] != "Claim":
-            return {"error": {"type": "INVALID_ANOMALY_CLAIM", "message": claim_id}}
-    result = await call(
-        research().object_create,
-        project_id,
-        "Anomaly",
-        {
-            "expected": expected,
-            "observed": observed,
-            "scope": scope,
-            "priority": priority,
-            "model": model,
-            "dataset": dataset,
-            "experiment_id": experiment_id,
-            "affected_claim_ids": claims,
-            "possible_explanations": possible_explanations or [],
-        },
-        "ANOMALY_CREATED",
-    )
+
+    def create() -> dict:
+        # Keep validation in the same protected call boundary as persistence.
+        # Previously a missing or malformed claim escaped ``call`` and could
+        # surface to an HTTP transport as a 502 instead of a typed MCP error.
+        for claim_id in claims:
+            claim = research().object_get(claim_id)
+            if str(claim["project_id"]) != project_id or claim["kind"] != "Claim":
+                raise GPUError("INVALID_ANOMALY_CLAIM", claim_id)
+        return research().object_create(
+            project_id,
+            "Anomaly",
+            {
+                "expected": expected,
+                "observed": observed,
+                "scope": scope,
+                "priority": priority,
+                "model": model,
+                "dataset": dataset,
+                "experiment_id": experiment_id,
+                "affected_claim_ids": claims,
+                "possible_explanations": possible_explanations or [],
+            },
+            "ANOMALY_CREATED",
+        )
+
+    result = await call(create)
     if "error" not in result:
         for claim_id in claims:
             await call(research().edge_create, result["id"], claim_id, "AFFECTS")
