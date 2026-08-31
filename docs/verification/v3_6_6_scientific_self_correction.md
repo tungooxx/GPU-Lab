@@ -22,7 +22,7 @@ provenance without rewriting the historical artifact.
 
 Verification on 2026-08-31:
 
-- Windows suite: `399 passed, 107 skipped`.
+- Windows suite: `400 passed, 111 skipped`.
 - Fresh PostgreSQL v3.6.6 integration: targeted correction checks passed,
   including current-lineage and legacy-backfill regressions.
 - Covered invariants: peer isolation, fidelity != design correction, one

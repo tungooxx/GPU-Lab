@@ -18,5 +18,5 @@ product behavior is complete.
 | Cockpit/UI three-layer views | Cockpit projects distinct design, fidelity, and interpretation records | Implemented |
 | Confirmation/development separation | Existing v3.6.5 paths unchanged; no correction record grants execution | Preserved |
 
-Latest broad regression: `399 passed, 107 skipped` on Windows. Targeted
+Latest broad regression: `400 passed, 111 skipped` on Windows. Targeted
 PostgreSQL correction regressions pass as of 2026-08-31.
