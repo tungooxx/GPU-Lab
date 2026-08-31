@@ -117,6 +117,21 @@ class ScientificSelfCorrectionService:
             raise GPUError(f"{kind.upper()}_NOT_FOUND", str(ident))
         return value
 
+    @staticmethod
+    def _attack_intensity(risk: str) -> dict[str, Any]:
+        """Return the consequence-proportionate independence requirement.
+
+        This is deliberately a minimum coverage rule, not a voting rule.  A
+        material challenge still blocks acceptance even when every required
+        independent attack has been collected.
+        """
+        return {
+            "LOW": {"minimum_independent_attacks": 1, "operators": ["NECESSITY_ATTACKER"]},
+            "MODERATE": {"minimum_independent_attacks": 1, "operators": ["STRONGEST_NULL_ATTACKER"]},
+            "HIGH": {"minimum_independent_attacks": 3, "operators": ["NECESSITY_ATTACKER", "CAUSAL_IDENTIFIABILITY_ATTACKER", "DEGENERATE_SOLUTION_ATTACKER"]},
+            "CONFIRMATORY": {"minimum_independent_attacks": 3, "operators": ["STRONGEST_NULL_ATTACKER", "CAUSAL_IDENTIFIABILITY_ATTACKER", "MEASUREMENT_ATTACKER"]},
+        }[risk]
+
     def _session(self, cur, project_id: str, worker_id: str, session_id: str) -> None:
         cur.execute(
             "SELECT id FROM research_worker_sessions WHERE id=%s AND worker_id=%s "
@@ -180,12 +195,7 @@ class ScientificSelfCorrectionService:
         if not required or not set(required).issubset(known):
             raise GPUError("DESIGN_ATTACK_ASSUMPTIONS_REQUIRED", "Attack only frozen assumptions of this design")
         risk = str(design["data"].get("scientific_design_risk") or "MODERATE").upper()
-        intensity = {
-            "LOW": {"minimum_independent_attacks": 1, "operators": ["NECESSITY_ATTACKER"]},
-            "MODERATE": {"minimum_independent_attacks": 1, "operators": ["STRONGEST_NULL_ATTACKER"]},
-            "HIGH": {"minimum_independent_attacks": 3, "operators": ["NECESSITY_ATTACKER", "CAUSAL_IDENTIFIABILITY_ATTACKER", "DEGENERATE_SOLUTION_ATTACKER"]},
-            "CONFIRMATORY": {"minimum_independent_attacks": 3, "operators": ["STRONGEST_NULL_ATTACKER", "CAUSAL_IDENTIFIABILITY_ATTACKER", "MEASUREMENT_ATTACKER"]},
-        }[risk]
+        intensity = self._attack_intensity(risk)
         now, batch_id = self._now(), uuid.uuid4()
         snapshot_hash = design["data"]["semantic_hash"]
         with self.store._connect() as conn, conn.cursor() as cur:
@@ -221,12 +231,7 @@ class ScientificSelfCorrectionService:
         design = self._object(str(result["design_id"]), "ScientificDesign")
         risk = str(design["data"].get("scientific_design_risk") or "MODERATE").upper()
         result["scientific_design_risk"] = risk
-        result["recommended_attack_intensity"] = {
-            "LOW": {"minimum_independent_attacks": 1, "operators": ["NECESSITY_ATTACKER"]},
-            "MODERATE": {"minimum_independent_attacks": 1, "operators": ["STRONGEST_NULL_ATTACKER"]},
-            "HIGH": {"minimum_independent_attacks": 3, "operators": ["NECESSITY_ATTACKER", "CAUSAL_IDENTIFIABILITY_ATTACKER", "DEGENERATE_SOLUTION_ATTACKER"]},
-            "CONFIRMATORY": {"minimum_independent_attacks": 3, "operators": ["STRONGEST_NULL_ATTACKER", "CAUSAL_IDENTIFIABILITY_ATTACKER", "MEASUREMENT_ATTACKER"]},
-        }[risk]
+        result["recommended_attack_intensity"] = self._attack_intensity(risk)
         return result
 
     def attack_join(self, batch_id: str, worker_id: str, session_id: str, attack_operator: str) -> dict:
@@ -243,6 +248,13 @@ class ScientificSelfCorrectionService:
             member = cur.fetchone()
             if member:
                 return {key: str(value) if isinstance(value, uuid.UUID) else value for key, value in member.items()}
+            # A new browser/session for the same worker is not an independent
+            # scientific critic.  Keeping this invariant at join time prevents
+            # a session-restart from inflating high-risk attack coverage.
+            cur.execute("SELECT worker_session_id FROM design_attack_memberships WHERE batch_id=%s AND worker_id=%s FOR UPDATE", (batch_id, worker_id))
+            existing_worker = cur.fetchone()
+            if existing_worker:
+                raise GPUError("DESIGN_ATTACK_WORKER_ALREADY_JOINED", str(worker_id))
             design = self._object(str(batch["design_id"]), "ScientificDesign")
             attack_id = uuid.uuid4()
             data = {
@@ -262,7 +274,8 @@ class ScientificSelfCorrectionService:
     def attack_submit(self, batch_id: str, worker_id: str, session_id: str, *, verdict: str,
                       challenges: list[dict[str, Any]], competing_explanations: list[dict[str, Any]] | None = None,
                       degenerate_explanations: list[dict[str, Any]] | None = None,
-                      discriminating_tests: list[dict[str, Any]] | None = None) -> dict:
+                      discriminating_tests: list[dict[str, Any]] | None = None,
+                      considered_assumption_ids: list[str] | None = None) -> dict:
         verdict = self._normal(verdict)
         if verdict not in ATTACK_VERDICTS:
             raise GPUError("DESIGN_ATTACK_VERDICT_INVALID", verdict)
@@ -273,6 +286,9 @@ class ScientificSelfCorrectionService:
                 raise GPUError("DESIGN_ATTACK_NOT_WRITABLE", str(batch_id))
             self._session(cur, str(member["project_id"]), worker_id, session_id)
             required = {str(item) for item in member["required_assumption_ids"]}
+            considered = {str(item) for item in (considered_assumption_ids or required) if str(item)}
+            if not considered or not considered.issubset(required):
+                raise GPUError("DESIGN_ATTACK_ASSUMPTION_COVERAGE_INVALID", "considered assumptions must belong to the frozen batch")
             challenge_ids: list[str] = []
             for challenge in challenges:
                 ctype = self._normal(challenge.get("challenge_type"))
@@ -293,6 +309,7 @@ class ScientificSelfCorrectionService:
             attack = cur.fetchone()["data"]
             update = {**attack, "challenge_ids": challenge_ids, "challenges": challenges, "competing_explanations": competing_explanations or [],
                       "degenerate_explanations": degenerate_explanations or [], "discriminating_tests": discriminating_tests or [], "verdict": verdict,
+                      "considered_assumption_ids": sorted(considered),
                       "submitted_at": self._now().isoformat()}
             cur.execute("UPDATE research_objects SET data=%s WHERE id=%s", (self._json(update), member["attack_id"]))
         return self.store.object_get(str(member["attack_id"]))
@@ -394,6 +411,12 @@ class ScientificSelfCorrectionService:
                 return self.store.object_get(str(existing["synthesis_id"]))
             cur.execute("SELECT attack_id FROM design_attack_memberships WHERE batch_id=%s", (batch_id,))
             attacks = [self.store.object_get(str(row["attack_id"])) for row in cur.fetchall()]
+            design = self._object(str(batch["design_id"]), "ScientificDesign")
+            risk = str(design["data"].get("scientific_design_risk") or "MODERATE").upper()
+            intensity = self._attack_intensity(risk)
+            independent_workers = {str(attack["data"].get("attacker_worker_id")) for attack in attacks}
+            distinct_operators = {str(attack["data"].get("attack_operator")) for attack in attacks}
+            accepting = verdict in {"RETAIN_FOR_TEST", "RETAIN_WITH_NARROWER_CLAIM"}
             challenge_ids = [cid for attack in attacks for cid in attack["data"].get("challenge_ids", [])]
             challenges = [self.store.object_get(cid) for cid in challenge_ids]
             unique: dict[str, str] = {}
@@ -410,11 +433,25 @@ class ScientificSelfCorrectionService:
             # No vote: one unresolved material challenge prevents acceptance.
             if verdict in {"RETAIN_FOR_TEST", "RETAIN_WITH_NARROWER_CLAIM"} and material:
                 raise GPUError("DESIGN_ATTACK_MATERIAL_CHALLENGE_UNRESOLVED", "A material challenge cannot be outweighed by attack count")
+            if accepting and len(independent_workers) < intensity["minimum_independent_attacks"]:
+                raise GPUError(
+                    "DESIGN_ATTACK_INDEPENDENT_COVERAGE_INCOMPLETE",
+                    f"{risk} requires {intensity['minimum_independent_attacks']} independent workers; found {len(independent_workers)}",
+                )
+            if accepting and len(distinct_operators) < min(intensity["minimum_independent_attacks"], len(intensity["operators"])):
+                raise GPUError(
+                    "DESIGN_ATTACK_OPERATOR_DIVERSITY_INCOMPLETE",
+                    f"{risk} requires orthogonal attack operators; found {len(distinct_operators)}",
+                )
             required = {str(value) for value in batch["required_assumption_ids"]}
             # Coverage means an assumption was deliberately considered by an
             # isolated critic, whether that critic found a flaw or concluded
             # it currently survives.  Challenge count is not coverage.
-            covered = {str(item) for attack in attacks for item in attack["data"].get("target_assumption_ids", [])}
+            covered = {
+                str(item)
+                for attack in attacks
+                for item in attack["data"].get("considered_assumption_ids", attack["data"].get("target_assumption_ids", []))
+            }
             missing = sorted(required - covered)
             if verdict in {"RETAIN_FOR_TEST", "RETAIN_WITH_NARROWER_CLAIM"} and missing:
                 raise GPUError("DESIGN_ATTACK_COVERAGE_INCOMPLETE", ",".join(missing))
@@ -427,7 +464,6 @@ class ScientificSelfCorrectionService:
             data = {"implementation_version": VERSION, "design_attack_batch_id": str(batch_id), "design_id": str(batch["design_id"]), "design_version": batch["design_snapshot_hash"], "attack_ids": [str(x["id"]) for x in attacks], "unique_challenge_ids": list(unique.values()), "duplicate_challenge_ids": [str(x["id"]) for x in challenges if str(x["id"]) not in unique.values()], "challenged_assumption_ids": sorted(challenged), "surviving_assumption_ids": sorted(required - challenged), "unresolved_material_challenge_ids": material, "missing_assumption_attack_ids": missing, "discriminating_experiment_ids": discriminator_ids, "synthesis_verdict": verdict, "rationale": rationale[:12000], "majority_vote_used": False}
             status = "ACCEPTED_FOR_TEST" if verdict in {"RETAIN_FOR_TEST", "RETAIN_WITH_NARROWER_CLAIM"} else "REPAIR_REQUIRED"
             synthesis = self.store.object_create(str(batch["project_id"]), "DesignAttackSynthesis", data, "DESIGN_ATTACK_SYNTHESIZED", status)
-            design = self._object(str(batch["design_id"]), "ScientificDesign")
             transition_work, transition_reused = self._materialize_transition_work(
                 cur, batch, design, synthesis["id"], status,
             )
@@ -559,7 +595,22 @@ class ScientificSelfCorrectionService:
         assumptions = [item for item in self.store.objects_list(str(design["project_id"]), "DesignAssumption", limit=None) if str(item["data"].get("scientific_design_id")) == str(design_id)]
         syntheses = [item for item in self.store.objects_list(str(design["project_id"]), "DesignAttackSynthesis", limit=None) if str(item["data"].get("design_id")) == str(design_id)]
         latest = syntheses[-1] if syntheses else None
-        covered = set(latest["data"].get("challenged_assumption_ids", [])) | set(latest["data"].get("surviving_assumption_ids", [])) if latest else set()
+        # Coverage is useful before synthesis as well: a frozen partial attack
+        # must be visible as partial rather than appearing as no correction at
+        # all.  Syntheses retain the authoritative accepted/repaired outcome.
+        attacks = [
+            item for item in self.store.objects_list(str(design["project_id"]), "ScientificDesignAttack", limit=None)
+            if str(item["data"].get("target_design_id")) == str(design_id)
+            and item["status"] in {"FROZEN", "COMPLETED"}
+        ]
+        covered = {
+            str(assumption_id)
+            for attack in attacks
+            for assumption_id in attack["data"].get("considered_assumption_ids", attack["data"].get("target_assumption_ids", []))
+        }
+        if latest:
+            covered.update(latest["data"].get("challenged_assumption_ids", []))
+            covered.update(latest["data"].get("surviving_assumption_ids", []))
         all_ids = {str(item["id"]) for item in assumptions}
         return {"design_id": str(design_id), "design_status": design["data"].get("design_status"), "assumption_count": len(assumptions), "covered_assumption_ids": sorted(covered), "missing_assumption_ids": sorted(all_ids - covered), "synthesis": latest, "implementation_fidelity_is_not_design_correction": True}
 

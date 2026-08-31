@@ -156,6 +156,57 @@ def test_v366_attack_without_code_preserves_independent_duplicate_origins():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v366_high_risk_acceptance_requires_distinct_workers_and_orthogonal_operators():
+    """High-risk design acceptance cannot be inflated by session restarts."""
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab, correction = LabController(store), ScientificSelfCorrectionService(store)
+    project_id = store.project_create(f"v366-independence-{time.time_ns()}", "independence") ["project_id"]
+    worker = lab.join(None, "independence-a", "CODEX", project_id)
+    second_session = lab.join(worker["worker"]["id"], None, "CODEX", project_id)
+    design = correction.create_design(
+        project_id, "major new representation", {"representation": "novel recurrent carrier"}, scientific_risk="HIGH"
+    )
+    assumption = correction.assumption_create(design["id"], "The carrier is identifiable.", "IDENTIFIABILITY")
+    batch = correction.attack_batch_create(design["id"], [assumption["id"]])
+    correction.attack_join(batch["id"], worker["worker"]["id"], worker["session_id"], "NECESSITY_ATTACKER")
+    with pytest.raises(GPUError) as exc:
+        correction.attack_join(batch["id"], worker["worker"]["id"], second_session["session_id"], "CAUSAL_IDENTIFIABILITY_ATTACKER")
+    assert exc.value.error_type == "DESIGN_ATTACK_WORKER_ALREADY_JOINED"
+    correction.attack_submit(
+        batch["id"], worker["worker"]["id"], worker["session_id"],
+        verdict="SURVIVES_CURRENT_ATTACK", challenges=[], considered_assumption_ids=[assumption["id"]],
+    )
+    correction.attack_freeze(batch["id"], worker["worker"]["id"], worker["session_id"])
+    with pytest.raises(GPUError) as exc:
+        correction.synthesize(batch["id"], "RETAIN_FOR_TEST", "One critic cannot satisfy high-risk independence.")
+    assert exc.value.error_type == "DESIGN_ATTACK_INDEPENDENT_COVERAGE_INCOMPLETE"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v366_coverage_uses_assumptions_actually_considered_not_batch_membership():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab, correction = LabController(store), ScientificSelfCorrectionService(store)
+    project_id = store.project_create(f"v366-coverage-{time.time_ns()}", "coverage") ["project_id"]
+    worker = lab.join(None, "coverage-attacker", "CODEX", project_id)
+    design = correction.create_design(project_id, "scoped design", {"mechanism": "test"}, scientific_risk="LOW")
+    first = correction.assumption_create(design["id"], "First assumption.", "NECESSITY")
+    second = correction.assumption_create(design["id"], "Second assumption.", "CAUSALITY")
+    batch = correction.attack_batch_create(design["id"], [first["id"], second["id"]])
+    correction.attack_join(batch["id"], worker["worker"]["id"], worker["session_id"], "NECESSITY_ATTACKER")
+    correction.attack_submit(
+        batch["id"], worker["worker"]["id"], worker["session_id"],
+        verdict="SURVIVES_CURRENT_ATTACK", challenges=[], considered_assumption_ids=[first["id"]],
+    )
+    correction.attack_freeze(batch["id"], worker["worker"]["id"], worker["session_id"])
+    coverage = correction.design_coverage(design["id"])
+    assert coverage["covered_assumption_ids"] == [first["id"]]
+    assert coverage["missing_assumption_ids"] == [second["id"]]
+    with pytest.raises(GPUError) as exc:
+        correction.synthesize(batch["id"], "RETAIN_FOR_TEST", "The second assumption remains unexamined.")
+    assert exc.value.error_type == "DESIGN_ATTACK_COVERAGE_INCOMPLETE"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_v5_regression_fidelity_is_not_full_scientific_design_self_correction():
     store = ResearchStore(TEST_DATABASE_URL)
     correction = ScientificSelfCorrectionService(store)

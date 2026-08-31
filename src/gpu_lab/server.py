@@ -425,6 +425,10 @@ class DesignAttackSubmissionInput(BaseModel):
     competing_explanations: list[dict[str, Any]] = Field(default_factory=list)
     degenerate_explanations: list[dict[str, Any]] = Field(default_factory=list)
     discriminating_tests: list[dict[str, Any]] = Field(default_factory=list)
+    considered_assumption_ids: list[str] = Field(
+        default_factory=list,
+        description="Frozen assumptions actually considered; omit only to attest consideration of the entire frozen batch.",
+    )
 
 
 class EngineeringInspectedFile(BaseModel):
