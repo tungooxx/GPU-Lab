@@ -327,6 +327,10 @@ def test_v366_read_only_audit_classifies_review_like_lab_workitems():
     assert audit["historical_classification_persisted"] is False
     assert audit["major_designs_lacking_assumption_maps"] == []
     assert audit["result_interpretation_correction_coverage"]["inspected_result_ids"] == []
+    assert audit["likely_implementation_fidelity_checks"] == [f"work:{work['id']}"]
+    assert audit["review_bureaucracy_detector"]["engineering_review_amplification_work_item_ids"] == []
+    assert audit["correction_metrics"]["targeted_fidelity_checks"] == 0
+    assert audit["confirmation_integrity"]["v366_records_grant_confirmation_access"] is False
     backfill = correction.review_target_classification_persist(project_id, work["id"])
     assert backfill["kind"] == "ReviewTargetClassification"
     assert backfill["data"]["target_type"] == "WORK_ITEM"

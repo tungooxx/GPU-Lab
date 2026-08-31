@@ -918,7 +918,7 @@ class ScientificSelfCorrectionService:
             classifications.setdefault(label, []).append(str(record["id"]))
         with self.store._connect() as conn, conn.cursor() as cur:
             cur.execute(
-                "SELECT id,kind,title,description,scientific_role,related_refs FROM lab_work_items "
+                "SELECT id,kind,status,title,description,scientific_role,related_refs FROM lab_work_items "
                 "WHERE project_id=%s AND (kind ILIKE '%%REVIEW%%' OR scientific_role ILIKE '%%REVIEW%%' "
                 "OR scientific_role ILIKE '%%ATTACK%%' OR scientific_role ILIKE '%%FIDELITY%%')",
                 (project_id,),
@@ -956,10 +956,56 @@ class ScientificSelfCorrectionService:
         regression_sources = {str(item["data"].get("source_id")) for item in regression_proposals}
         engineering_results = self.store.objects_list(project_id, "EngineeringResult", limit=None)
         regression_opportunities = [str(item["id"]) for item in engineering_results if str(item["id"]) not in regression_sources]
+        design_attacks = self.store.objects_list(project_id, "ScientificDesignAttack", limit=None)
+        fidelity_checks = self.store.objects_list(project_id, "ImplementationFidelityCheck", limit=None)
+        fidelity_by_design: dict[str, list[str]] = {}
+        for check in fidelity_checks:
+            fidelity_by_design.setdefault(str(check["data"].get("scientific_design_id")), []).append(str(check["id"]))
+        implementation_overreview = {
+            design_id: ids for design_id, ids in fidelity_by_design.items() if len(ids) > 1
+        }
+        generic_work_ids = [
+            f"work:{item['id']}" for item in work_items
+            if "REVIEW" in str(item["kind"]).upper()
+            and not (item["related_refs"] or {}).get("correction_layer")
+            and self._classify_review_target(str(item["kind"]), {
+                "title": item["title"], "description": item["description"],
+                "scientific_role": item["scientific_role"], **(item["related_refs"] or {}),
+            }) == "UNKNOWN"
+        ]
+        legacy_attacks = [
+            str(item["id"]) for item in design_attacks
+            if (item["data"] or {}).get("legacy_extraction_key")
+        ]
+        required_discriminators = self.store.objects_list(project_id, "RequiredDiscriminator", limit=None)
+        confirmation_authorizations = self.store.objects_list(project_id, "ConfirmationAuthorization", limit=None)
+        design_deficits = []
+        for design, entry in zip(designs, coverage):
+            attack_ids = [
+                str(attack["id"]) for attack in design_attacks
+                if str((attack["data"] or {}).get("target_design_id")) == str(design["id"])
+            ]
+            discriminators = [
+                str(record["id"]) for record in required_discriminators
+                if str((record["data"] or {}).get("design_id")) == str(design["id"])
+            ]
+            missing = []
+            if not entry["assumption_count"]:
+                missing.append("ASSUMPTION_MAP")
+            if not attack_ids:
+                missing.append("INDEPENDENT_DESIGN_ATTACK")
+            if not discriminators and not entry["synthesis"]:
+                missing.append("DISCRIMINATOR_OR_EXPLICIT_SURVIVAL_RECORD")
+            if missing:
+                design_deficits.append({"design_id": str(design["id"]), "missing": missing})
         return {
             "read_only": True, "implementation_version": VERSION,
             "review_like_work_by_type": classifications,
             "review_like_work_item_count": len(work_items),
+            "likely_design_attacks": classifications["DESIGN_ATTACK"],
+            "likely_implementation_fidelity_checks": classifications["IMPLEMENTATION_FIDELITY"],
+            "likely_result_interpretation_attacks": classifications["RESULT_INTERPRETATION"],
+            "mechanical_reviews_that_should_be_deterministic": classifications["DETERMINISTIC_ENGINEERING"],
             "major_designs_lacking_explicit_self_correction": incomplete,
             "major_designs_lacking_assumption_maps": designs_without_assumption_maps,
             "implementation_reviews_not_counted_as_design_correction": fidelity_not_correction,
@@ -972,8 +1018,35 @@ class ScientificSelfCorrectionService:
             },
             "engineering_review_to_test_conversion_opportunity_ids": regression_opportunities,
             "design_coverage": coverage,
-            "generic_code_review_frequency": len(classifications["UNKNOWN"]),
+            "generic_code_review_frequency": len(generic_work_ids),
+            "review_bureaucracy_detector": {
+                "engineering_review_amplification_work_item_ids": generic_work_ids,
+                "remedy": "DETERMINISTIC_REGRESSION_PLUS_DELTA_VERIFICATION",
+            },
+            "self_correction_deficit_detector": {
+                "code": "DESIGN_SELF_CORRECTION_MISSING",
+                "designs": design_deficits,
+            },
+            "implementation_overreview_detector": {
+                "code": "IMPLEMENTATION_OVERREVIEW",
+                "repeated_fidelity_check_ids_by_design": implementation_overreview,
+            },
+            "legacy_design_attack_extraction_ids": legacy_attacks,
+            "correction_metrics": {
+                "major_designs_created": len(designs),
+                "major_designs_independently_attacked": len({str(item["data"].get("target_design_id")) for item in design_attacks if not (item["data"] or {}).get("legacy_extraction_key")}),
+                "design_assumptions_attacked": len({str(item) for entry in coverage for item in entry["covered_assumption_ids"]}),
+                "unique_material_challenges": len({str(item["id"]) for item in self.store.objects_list(project_id, "DesignChallenge", limit=None) if str((item["data"] or {}).get("severity")).upper() in {"HIGH", "CRITICAL"}}),
+                "discriminating_experiments_generated": len(required_discriminators),
+                "targeted_fidelity_checks": len(fidelity_checks),
+                "deterministic_engineering_checks": len(regression_proposals),
+                "interpretation_attacks": len(interpretation_attacks),
+            },
             "historical_classification_persisted": bool(persisted),
             "persisted_review_classification_count": len(persisted),
-            "confirmation_integrity": "UNCHANGED_BY_V366_AUDIT",
+            "confirmation_integrity": {
+                "status": "UNCHANGED_BY_V366_AUDIT",
+                "authorization_record_count": len(confirmation_authorizations),
+                "v366_records_grant_confirmation_access": False,
+            },
         }
