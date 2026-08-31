@@ -15,22 +15,25 @@ and synthesis without majority voting. A material unresolved challenge blocks a
 `RETAIN_FOR_TEST` synthesis regardless of how many other attackers found no
 issue.
 
-The initial shadow classifier is read-only and labels records as design attack,
-implementation fidelity, result interpretation, deterministic engineering, or
-unknown. Existing history is not rewritten.
+The read-only classifier labels records as design attack, implementation
+fidelity, result interpretation, deterministic engineering, or unknown. An
+explicit idempotent backfill can persist an inferred label with confidence and
+provenance without rewriting the historical artifact.
 
 Verification on 2026-08-31:
 
-- Windows suite: `396 passed, 97 skipped`.
-- Fresh PostgreSQL v3.6.6 integration: `6 passed`.
+- Windows suite: `398 passed, 102 skipped`.
+- Fresh PostgreSQL v3.6.6 integration: `7 passed`.
 - Covered invariants: peer isolation, fidelity != design correction, one
   material challenge overrides apparent majority, independent duplicate
   challenge origins collapse only during synthesis, discriminator creation,
   interpretation attack not admitting evidence, and the V5 GRU-256 + learned
   G assumption map remaining incomplete after an implementation-fidelity pass,
-  plus read-only classification of review-like Lab WorkItems.
+  bounded V5 missing-attack preview, persistent inferred classification,
+  atomic design finalization/repair successor materialization, and
+  interpretation-attack deduplication/provenance.
 
-Remaining rollout work is intentionally feature-flagged: planner policy and UI
-can consume these typed records after production shadow-audit review. Existing
-v3.6.5 permissioned authority and hard-sealed confirmation paths remain the
-source of truth.
+All v3.6.6 rollout flags default enabled for this release and are enforced at
+their public mutation boundaries; operators can selectively disable a feature
+without disabling unrelated correction layers. Existing v3.6.5 permissioned
+authority and hard-sealed confirmation paths remain the source of truth.
