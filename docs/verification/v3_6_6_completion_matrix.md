@@ -14,7 +14,7 @@ product behavior is complete.
 | Inferred migration labels preserve original history | `081ad41`; correction regression | Implemented |
 | V5 missing-attack generation | Read-only bounded proposal preview only | Partial: authorized planner materialization remains required |
 | Full legacy V5 A3/A4/A5/A6 extraction | No project-specific historical IDs are hard-coded or fabricated | Partial: audit support exists; historical mapping needs authorized review |
-| Scheduler policy for all correction phases | Design successor is materialized; generic scheduler classification is present | Partial: dedicated interpretation-phase scheduling remains to be added |
+| Scheduler policy for all correction phases | Design successor is materialized; bounded V5 and inspected-result interpretation work previews are available | Partial: authorized planner materialization remains required |
 | Cockpit/UI full three-layer views and audit controls | Basic scientific-design correction panel exists | Partial |
 | Confirmation/development separation | Existing v3.6.5 paths unchanged; no correction record grants execution | Preserved |
 

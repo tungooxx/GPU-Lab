@@ -100,6 +100,17 @@ def test_v366_result_interpretation_is_separate_from_evidence_admission():
     assert attack["data"]["does_not_admit_evidence"] is True
     assert attack["data"]["target_layer"] == "SCIENTIFIC_INTERPRETATION"
     assert attack["data"]["reviewer_identity_status"] == "VERIFIED"
+    unchallenged = store.object_create(
+        project_id, "ExperimentRun", {"metric": 0.7}, "RUN_RECORDED", "RESULT_INSPECTED"
+    )
+    preview = correction.interpretation_attack_work_preview(project_id)
+    assert preview["read_only"] is True
+    assert preview["mutated"] is False
+    assert len(preview["bounded_work_proposals"]) == 1
+    proposal = preview["bounded_work_proposals"][0]
+    assert proposal["kind"] == "RESULT_INTERPRETATION_ATTACK"
+    assert proposal["related_refs"]["result_id"] == unchallenged["id"]
+    assert proposal["related_refs"]["no_execution_authority"] is True
     repeat = correction.interpretation_attack_record(
         project_id, result["id"], claim="Mechanism improves planning.", verdict="MECHANISM_NONSPECIFIC",
         strongest_alternative="Same strongest null.", rationale="Same inference question.",
