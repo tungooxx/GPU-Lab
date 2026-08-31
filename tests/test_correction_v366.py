@@ -247,6 +247,33 @@ def test_v366_cockpit_projects_design_fidelity_and_interpretation_separately():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v366_legacy_design_attack_backfill_preserves_source_without_claiming_independence():
+    store = ResearchStore(TEST_DATABASE_URL)
+    correction = ScientificSelfCorrectionService(store)
+    project_id = store.project_create(f"v366-legacy-{time.time_ns()}", "legacy") ["project_id"]
+    design = correction.create_design(project_id, "V5 legacy", {"carrier": "GRU-256", "binding": "learned G"})
+    assumption = correction.assumption_create(design["id"], "The recurrent carrier is necessary.", "NECESSITY")
+    source = store.object_create(
+        project_id, "EngineeringResult", {"summary": "Historical reviewer questioned recurrence."},
+        "ENGINEERING_RESULT_RECORDED", "COMPLETED",
+    )
+    extracted = correction.legacy_design_attack_extract(
+        project_id, source["id"], design["id"], "The source explicitly challenges recurrence necessity.",
+        [assumption["id"]], [{
+            "target_assumption_id": assumption["id"], "challenge_type": "NECESSITY_CHALLENGE",
+            "statement": "A static carrier may be sufficient.", "severity": "MEDIUM",
+        }],
+    )
+    assert extracted["status"] == "FROZEN"
+    assert extracted["data"]["source_review_id"] == source["id"]
+    assert extracted["data"]["independence"]["does_not_count_toward_live_independent_batch_quorum"] is True
+    assert correction.design_coverage(design["id"])["covered_assumption_ids"] == [assumption["id"]]
+    assert str(correction.legacy_design_attack_extract(
+        project_id, source["id"], design["id"], "same source", [assumption["id"]]
+    )["id"]) == str(extracted["id"])
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_v5_regression_fidelity_is_not_full_scientific_design_self_correction():
     store = ResearchStore(TEST_DATABASE_URL)
     correction = ScientificSelfCorrectionService(store)

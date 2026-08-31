@@ -1860,6 +1860,24 @@ async def scientific_design_attack_freeze(design_attack_batch_id: str, worker_id
 
 
 @mcp.tool()
+async def legacy_design_attack_extract(
+    project_id: str, source_review_id: str, scientific_design_id: str, evidence_summary: str,
+    considered_assumption_ids: list[str], challenges: list[DesignChallengeInput] | None = None,
+):
+    """Backfill documented historical idea criticism without fabricating worker independence.
+
+    The resulting frozen partial attack improves lineage/coverage visibility but
+    cannot satisfy a live attack-batch quorum or authorize execution.
+    """
+    require_v366_feature("scientific_design_attack_v366")
+    return await call(
+        scientific_correction().legacy_design_attack_extract,
+        project_id, source_review_id, scientific_design_id, evidence_summary,
+        considered_assumption_ids, [item.model_dump() for item in (challenges or [])],
+    )
+
+
+@mcp.tool()
 async def design_attack_synthesize(
     design_attack_batch_id: str,
     synthesis_verdict: Literal["RETAIN_FOR_TEST", "RETAIN_WITH_NARROWER_CLAIM", "REVISE_BEFORE_TEST", "DISCRIMINATING_EXPERIMENT_REQUIRED", "SUPERSEDE", "INSUFFICIENT_CORRECTION"],

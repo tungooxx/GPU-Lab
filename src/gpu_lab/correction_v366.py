@@ -368,6 +368,106 @@ class ScientificSelfCorrectionService:
                 self.store._event(cur, member["project_id"], "DESIGN_ATTACK_COMMITTED", member["design_id"], {"batch_id": str(batch_id)})
         return self.store.object_get(str(member["attack_id"]))
 
+    def legacy_design_attack_extract(
+        self, project_id: str, source_review_id: str, scientific_design_id: str,
+        evidence_summary: str, considered_assumption_ids: list[str],
+        challenges: list[dict[str, Any]] | None = None,
+    ) -> dict:
+        """Backfill a documented historical idea attack without inventing independence.
+
+        This deliberately creates a frozen *partial* ScientificDesignAttack.
+        It carries the original review/work identifier and its supplied evidence
+        summary, but has no worker/session membership and can never inflate a
+        live independent-batch quorum or authorize a synthesis by itself.
+        """
+        design = self._object(scientific_design_id, "ScientificDesign")
+        if str(design["project_id"]) != str(project_id) or not evidence_summary.strip():
+            raise GPUError("LEGACY_DESIGN_ATTACK_EXTRACTION_INVALID", "project, design, and evidence_summary are required")
+        assumptions = [
+            item for item in self.store.objects_list(project_id, "DesignAssumption", limit=None)
+            if str(item["data"].get("scientific_design_id")) == str(scientific_design_id)
+        ]
+        known = {str(item["id"]) for item in assumptions}
+        considered = {str(item) for item in considered_assumption_ids if str(item)}
+        if not considered or not considered.issubset(known):
+            raise GPUError("LEGACY_DESIGN_ATTACK_ASSUMPTION_COVERAGE_INVALID", "considered assumptions must belong to the design")
+        supplied_challenges = challenges or []
+        now = self._now()
+        key = self._hash({"project_id": str(project_id), "source_review_id": str(source_review_id), "design_id": str(scientific_design_id)})
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"v366-legacy-design-attack:{key}",))
+            cur.execute("SELECT kind FROM research_objects WHERE id=%s AND project_id=%s", (source_review_id, project_id))
+            source = cur.fetchone()
+            source_kind = str(source["kind"]) if source else None
+            if not source:
+                cur.execute("SELECT kind FROM lab_work_items WHERE id=%s AND project_id=%s", (source_review_id, project_id))
+                source = cur.fetchone()
+                source_kind = str(source["kind"]) if source else None
+            if not source:
+                raise GPUError("LEGACY_DESIGN_ATTACK_SOURCE_NOT_FOUND", str(source_review_id))
+            cur.execute(
+                "SELECT id FROM research_objects WHERE project_id=%s AND kind='ScientificDesignAttack' "
+                "AND data->>'legacy_extraction_key'=%s FOR UPDATE",
+                (project_id, key),
+            )
+            existing = cur.fetchone()
+            if existing:
+                return self.store.object_get(str(existing["id"]))
+            attack_id = uuid.uuid4()
+            challenge_ids: list[str] = []
+            for challenge in supplied_challenges:
+                ctype = self._normal(challenge.get("challenge_type"))
+                statement = str(challenge.get("statement") or "").strip()
+                assumption_id = str(challenge.get("target_assumption_id") or "")
+                if ctype not in CHALLENGE_TYPES or not statement or (assumption_id and assumption_id not in considered):
+                    raise GPUError("LEGACY_DESIGN_CHALLENGE_INVALID", ctype or "missing type/statement/assumption")
+                challenge_id = uuid.uuid4()
+                payload = {
+                    "implementation_version": VERSION, "design_attack_id": str(attack_id),
+                    "target_assumption_id": assumption_id or None, "challenge_type": ctype,
+                    "statement": statement[:12000], "competing_explanation": challenge.get("competing_explanation"),
+                    "why_current_controls_fail": challenge.get("why_current_controls_fail"),
+                    "distinguishing_prediction": challenge.get("distinguishing_prediction"),
+                    "proposed_discriminating_test": challenge.get("proposed_discriminating_test"),
+                    "severity": self._normal(challenge.get("severity", "MEDIUM")),
+                    "verification_status": "UNRESOLVED", "resolution": None,
+                    "legacy_extracted_from": str(source_review_id),
+                    "does_not_claim_new_independent_discovery": True,
+                }
+                cur.execute(
+                    "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                    "VALUES(%s,%s,'DesignChallenge','OPEN',%s,%s)",
+                    (challenge_id, project_id, self._json(payload), now),
+                )
+                challenge_ids.append(str(challenge_id))
+            data = {
+                "implementation_version": VERSION, "legacy_extraction_key": key,
+                "target_design_id": str(scientific_design_id),
+                "target_design_version": design["data"]["semantic_hash"],
+                "target_assumption_ids": sorted(considered), "considered_assumption_ids": sorted(considered),
+                "source_review_id": str(source_review_id), "source_kind": source_kind,
+                "historical_evidence_summary": evidence_summary.strip()[:12000],
+                "challenge_ids": challenge_ids, "challenges": supplied_challenges,
+                "verdict": "INSUFFICIENT_ATTACK_COVERAGE", "peer_exposure_state": "HISTORICAL_BACKFILL",
+                "frozen_context_version": design["data"]["semantic_hash"],
+                "independence": {
+                    "historical_extraction": True, "attacker_identity": "UNATTRIBUTED_OR_PRESERVED_IN_SOURCE",
+                    "does_not_count_toward_live_independent_batch_quorum": True,
+                    "does_not_claim_peer_isolation": True,
+                },
+            }
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'ScientificDesignAttack','FROZEN',%s,%s)",
+                (attack_id, project_id, self._json(data), now),
+            )
+            self.store._event(cur, project_id, "LEGACY_DESIGN_ATTACK_EXTRACTED", attack_id, {
+                "source_review_id": str(source_review_id), "source_kind": source_kind,
+                "design_id": str(scientific_design_id), "challenge_count": len(challenge_ids),
+                "does_not_claim_independence": True,
+            })
+        return self.store.object_get(str(attack_id))
+
     def _materialize_transition_work(
         self, cur, batch: dict, design: dict, synthesis_id: str, status: str,
     ) -> tuple[dict[str, Any], bool]:
