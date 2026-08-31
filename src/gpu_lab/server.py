@@ -3016,12 +3016,20 @@ async def policy_export(policy_id: str, provider: str | None = None):
 
 
 @mcp.tool()
-async def research_policy_context_get(project_id: str, provider: str = "CHATGPT"):
-    """Return the active compiled policy context; dynamic research state remains in Research OS tools."""
+async def research_policy_context_get(
+    project_id: str, provider: str = "CHATGPT",
+    correction_mode: Literal["GENERAL", "DESIGN_ATTACK", "IMPLEMENTATION_FIDELITY", "RESULT_INTERPRETATION", "DETERMINISTIC_ENGINEERING"] = "GENERAL",
+):
+    """Return active policy with a correction-layer-specific runtime overlay.
+
+    Dynamic state and the actual assigned correction layer still come from
+    CanonicalWorkerContext; the overlay only keeps the durable prompt's focus
+    aligned with the WorkItem rather than presenting a generic review prompt.
+    """
     policy = await call(policy_lab().ensure_production_policy, project_id)
     if isinstance(policy, dict) and "error" in policy:
         return policy
-    return await call(policy_lab().compile_policy, str(policy["id"]), provider)
+    return await call(policy_lab().compile_policy, str(policy["id"]), provider, correction_mode)
 
 
 @mcp.tool()
