@@ -49,6 +49,10 @@ INTERPRETATION_VERDICTS = {
     "SURVIVES_CURRENT_ATTACK", "MECHANISM_NONSPECIFIC", "NARROW_CLAIM",
     "IMPLEMENTATION_VALIDITY_REQUIRED", "INSUFFICIENT_EVIDENCE", "INCONCLUSIVE",
 }
+INTERPRETATION_OPERATORS = {
+    "STRONGEST_NULL", "CAUSAL_IDENTIFIABILITY", "INTERVENTION_VALIDITY",
+    "GENERALIZATION_SCOPE", "FAILURE_CLASSIFICATION", "MEASUREMENT_VALIDITY",
+}
 
 
 class ScientificSelfCorrectionService:
@@ -449,13 +453,65 @@ class ScientificSelfCorrectionService:
         return self.store.object_create(str(design["project_id"]), "ImplementationFidelityCheck", data, "IMPLEMENTATION_FIDELITY_CONFIRMED" if status == "FIDELITY_CONFIRMED" else "IMPLEMENTATION_FIDELITY_RECORDED", status)
 
     def interpretation_attack_record(self, project_id: str, result_id: str, *, claim: str, verdict: str,
-                                     strongest_alternative: str, rationale: str) -> dict:
+                                     strongest_alternative: str, rationale: str,
+                                     attack_operator: str = "STRONGEST_NULL",
+                                     reviewer_worker_id: str | None = None,
+                                     reviewer_session_id: str | None = None) -> dict:
+        """Persist one scoped challenge to an inspected result's inference.
+
+        This never changes the result, admits evidence, or reviews code.  The
+        same result/claim/operator is idempotent, while high-consequence work
+        can still receive independent attacks under distinct operators.
+        """
         result = self.store.object_get(str(result_id))
         verdict = self._normal(verdict)
-        if str(result["project_id"]) != str(project_id) or verdict not in INTERPRETATION_VERDICTS or not claim.strip() or not rationale.strip():
+        operator = self._normal(attack_operator)
+        if str(result["project_id"]) != str(project_id) or verdict not in INTERPRETATION_VERDICTS or operator not in INTERPRETATION_OPERATORS or not claim.strip() or not strongest_alternative.strip() or not rationale.strip():
             raise GPUError("RESULT_INTERPRETATION_ATTACK_INVALID", verdict)
-        data = {"implementation_version": VERSION, "result_id": str(result_id), "claim": claim[:12000], "verdict": verdict, "strongest_alternative": strongest_alternative[:12000], "rationale": rationale[:12000], "does_not_admit_evidence": True}
-        return self.store.object_create(project_id, "ResultInterpretationAttack", data, "RESULT_INTERPRETATION_ATTACK_COMMITTED", "COMPLETED")
+        if bool(reviewer_worker_id) != bool(reviewer_session_id):
+            raise GPUError("RESULT_INTERPRETATION_REVIEWER_IDENTITY_REQUIRED", "worker_id and session_id must be supplied together")
+        key = self._hash({
+            "result_id": str(result_id), "claim": claim.strip().casefold(), "operator": operator,
+        })
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"result-interpretation:{project_id}:{key}",))
+            if reviewer_worker_id and reviewer_session_id:
+                self._session(cur, project_id, str(reviewer_worker_id), str(reviewer_session_id))
+            cur.execute(
+                "SELECT id FROM research_objects WHERE project_id=%s AND kind='ResultInterpretationAttack' "
+                "AND data->>'dedupe_key'=%s ORDER BY created_at LIMIT 1",
+                (project_id, key),
+            )
+            existing = cur.fetchone()
+            if existing:
+                return self.store.object_get(str(existing["id"]))
+            data = {
+                "implementation_version": VERSION, "result_id": str(result_id),
+                "claim": claim[:12000], "verdict": verdict,
+                "strongest_alternative": strongest_alternative[:12000],
+                "rationale": rationale[:12000], "attack_operator": operator,
+                "dedupe_key": key,
+                "reviewer_worker_id": str(reviewer_worker_id) if reviewer_worker_id else None,
+                "reviewer_session_id": str(reviewer_session_id) if reviewer_session_id else None,
+                "reviewer_identity_status": "VERIFIED" if reviewer_worker_id else "UNATTRIBUTED_LEGACY_COMPATIBILITY",
+                "target_layer": "SCIENTIFIC_INTERPRETATION",
+                "implementation_validity_is_held_separate": True,
+                "does_not_admit_evidence": True,
+            }
+            self.store._event(cur, project_id, "RESULT_INTERPRETATION_ATTACK_STARTED", str(result_id), {
+                "operator": operator, "dedupe_key": key,
+            })
+            attack_id, now = uuid.uuid4(), self._now()
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'ResultInterpretationAttack','COMPLETED',%s,%s)",
+                (attack_id, project_id, self._json(data), now),
+            )
+            self.store._event(cur, project_id, "RESULT_INTERPRETATION_ATTACK_COMMITTED", attack_id, data)
+        return {
+            "id": str(attack_id), "project_id": str(project_id),
+            "kind": "ResultInterpretationAttack", "status": "COMPLETED", "data": data,
+        }
 
     def challenge_hindsight_record(self, design_challenge_id: str, *, outcome: str,
                                    notes: str, evidence_refs: list[str] | None = None) -> dict:

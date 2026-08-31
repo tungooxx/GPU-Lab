@@ -1888,11 +1888,14 @@ async def result_interpretation_attack_record(
     project_id: str, result_id: str, claim: str,
     verdict: Literal["SURVIVES_CURRENT_ATTACK", "MECHANISM_NONSPECIFIC", "NARROW_CLAIM", "IMPLEMENTATION_VALIDITY_REQUIRED", "INSUFFICIENT_EVIDENCE", "INCONCLUSIVE"],
     strongest_alternative: str, rationale: str,
+    attack_operator: Literal["STRONGEST_NULL", "CAUSAL_IDENTIFIABILITY", "INTERVENTION_VALIDITY", "GENERALIZATION_SCOPE", "FAILURE_CLASSIFICATION", "MEASUREMENT_VALIDITY"] = "STRONGEST_NULL",
+    reviewer_worker_id: str | None = None, reviewer_session_id: str | None = None,
 ):
-    """Record a post-result causal-inference attack; this never admits evidence or changes a claim."""
+    """Record one deduplicated scientific-inference attack; it never reviews code or admits evidence."""
     return await call(scientific_correction().interpretation_attack_record, project_id, result_id,
                       claim=claim, verdict=verdict, strongest_alternative=strongest_alternative,
-                      rationale=rationale)
+                      rationale=rationale, attack_operator=attack_operator,
+                      reviewer_worker_id=reviewer_worker_id, reviewer_session_id=reviewer_session_id)
 
 
 @mcp.tool()

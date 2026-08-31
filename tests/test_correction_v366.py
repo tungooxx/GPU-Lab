@@ -86,12 +86,33 @@ def test_v366_fidelity_pass_never_completes_idea_attack_and_peer_isolation_holds
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_v366_result_interpretation_is_separate_from_evidence_admission():
     store = ResearchStore(TEST_DATABASE_URL)
-    correction = ScientificSelfCorrectionService(store)
+    lab, correction = LabController(store), ScientificSelfCorrectionService(store)
     project_id = store.project_create(f"v366-result-{time.time_ns()}", "result correction") ["project_id"]
+    reviewer = lab.join(None, f"v366-result-reviewer-{time.time_ns()}", "CODEX", project_id)
     result = store.object_create(project_id, "ExperimentRun", {"metric": 0.9}, "RUN_RECORDED", "RESULT_INSPECTED")
-    attack = correction.interpretation_attack_record(project_id, result["id"], claim="Mechanism improves planning.", verdict="MECHANISM_NONSPECIFIC", strongest_alternative="Strongest null improves equally.", rationale="The result does not distinguish mechanisms.")
+    attack = correction.interpretation_attack_record(
+        project_id, result["id"], claim="Mechanism improves planning.", verdict="MECHANISM_NONSPECIFIC",
+        strongest_alternative="Strongest null improves equally.", rationale="The result does not distinguish mechanisms.",
+        attack_operator="STRONGEST_NULL", reviewer_worker_id=reviewer["worker"]["id"],
+        reviewer_session_id=reviewer["session_id"],
+    )
     assert attack["kind"] == "ResultInterpretationAttack"
     assert attack["data"]["does_not_admit_evidence"] is True
+    assert attack["data"]["target_layer"] == "SCIENTIFIC_INTERPRETATION"
+    assert attack["data"]["reviewer_identity_status"] == "VERIFIED"
+    repeat = correction.interpretation_attack_record(
+        project_id, result["id"], claim="Mechanism improves planning.", verdict="MECHANISM_NONSPECIFIC",
+        strongest_alternative="Same strongest null.", rationale="Same inference question.",
+        attack_operator="STRONGEST_NULL", reviewer_worker_id=reviewer["worker"]["id"],
+        reviewer_session_id=reviewer["session_id"],
+    )
+    assert str(repeat["id"]) == str(attack["id"])
+    with pytest.raises(GPUError) as exc:
+        correction.interpretation_attack_record(
+            project_id, result["id"], claim="A second claim", verdict="MECHANISM_NONSPECIFIC",
+            strongest_alternative="", rationale="An attack needs an explicit competing explanation.",
+        )
+    assert exc.value.error_type == "RESULT_INTERPRETATION_ATTACK_INVALID"
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
