@@ -1043,6 +1043,12 @@ def scientific_correction() -> ScientificSelfCorrectionService:
     return scientific_correction_service
 
 
+def require_v366_feature(setting_name: str) -> None:
+    """Enforce a v3.6.6 rollout flag at the public mutation boundary."""
+    if not bool(getattr(settings, setting_name)):
+        raise GPUError("V366_FEATURE_DISABLED", f"Set {setting_name.upper()}=true")
+
+
 def research_operators() -> ResearchOperatorService:
     global research_operator_service
     if settings.gpu_lab_research_operator_provider != "literature-http":
@@ -1794,6 +1800,7 @@ async def scientific_design_create(
     engineering_risk: Literal["DETERMINISTIC", "SCIENCE_CRITICAL", "HIGH_AMBIGUITY"] = "DETERMINISTIC",
 ):
     """Freeze an attackable scientific idea. This does not create code or authorize execution."""
+    require_v366_feature("scientific_design_attack_v366")
     return await call(scientific_correction().create_design, project_id, name, specification,
                       source_object_id=source_object_id, scientific_risk=scientific_risk,
                       engineering_risk=engineering_risk)
@@ -1807,6 +1814,7 @@ async def design_assumption_create(
     falsifiable_prediction: str | None = None, provenance: dict[str, Any] | None = None,
 ):
     """Persist one explicit, falsifiable scientific-design assumption."""
+    require_v366_feature("design_assumptions_v366")
     return await call(scientific_correction().assumption_create, scientific_design_id, statement,
                       assumption_type, centrality=centrality,
                       falsifiable_prediction=falsifiable_prediction, provenance=provenance)
@@ -1815,6 +1823,7 @@ async def design_assumption_create(
 @mcp.tool()
 async def design_attack_batch_create(scientific_design_id: str, assumption_ids: list[str] | None = None):
     """Open a peer-isolated independent scientific-design attack batch."""
+    require_v366_feature("scientific_design_attack_v366")
     return await call(scientific_correction().attack_batch_create, scientific_design_id, assumption_ids)
 
 
@@ -1827,12 +1836,14 @@ async def design_attack_batch_get(design_attack_batch_id: str, requester_session
 @mcp.tool()
 async def scientific_design_attack_join(design_attack_batch_id: str, worker_id: str, session_id: str, attack_operator: str):
     """Join one independent idea-attack slot. It is not an implementation review."""
+    require_v366_feature("scientific_design_attack_v366")
     return await call(scientific_correction().attack_join, design_attack_batch_id, worker_id, session_id, attack_operator)
 
 
 @mcp.tool()
 async def scientific_design_attack_submit(design_attack_batch_id: str, worker_id: str, session_id: str, submission: DesignAttackSubmissionInput):
     """Submit the caller's isolated scientific attack with first-class alternatives and discriminators."""
+    require_v366_feature("scientific_design_attack_v366")
     return await call(scientific_correction().attack_submit, design_attack_batch_id, worker_id, session_id,
                       **submission.model_dump())
 
@@ -1840,6 +1851,7 @@ async def scientific_design_attack_submit(design_attack_batch_id: str, worker_id
 @mcp.tool()
 async def scientific_design_attack_freeze(design_attack_batch_id: str, worker_id: str, session_id: str):
     """Freeze one attack; peers become visible only after every joined attack freezes."""
+    require_v366_feature("scientific_design_attack_v366")
     return await call(scientific_correction().attack_freeze, design_attack_batch_id, worker_id, session_id)
 
 
@@ -1850,6 +1862,7 @@ async def design_attack_synthesize(
     rationale: str,
 ):
     """Synthesize frozen attacks and atomically open the bounded next design task."""
+    require_v366_feature("design_attack_synthesis_v366")
     result = await call(scientific_correction().synthesize, design_attack_batch_id, synthesis_verdict, rationale)
     transition = result.get("transition_work_item") if isinstance(result, dict) else None
     if transition and transition.get("status") == "READY":
@@ -1878,6 +1891,7 @@ async def implementation_fidelity_record(
     rationale: str,
 ):
     """Record a narrow exact-byte science-to-code fidelity check, not an idea verdict."""
+    require_v366_feature("targeted_fidelity_v366")
     return await call(scientific_correction().fidelity_record, scientific_design_id,
                       implementation_ref=implementation_ref, science_to_code_map=science_to_code_map,
                       deterministic_checks=deterministic_checks, verdict=verdict, rationale=rationale)
@@ -1892,6 +1906,7 @@ async def result_interpretation_attack_record(
     reviewer_worker_id: str | None = None, reviewer_session_id: str | None = None,
 ):
     """Record one deduplicated scientific-inference attack; it never reviews code or admits evidence."""
+    require_v366_feature("result_interpretation_attack_v366")
     return await call(scientific_correction().interpretation_attack_record, project_id, result_id,
                       claim=claim, verdict=verdict, strongest_alternative=strongest_alternative,
                       rationale=rationale, attack_operator=attack_operator,
@@ -1914,6 +1929,7 @@ async def deterministic_regression_proposal_create(
     project_id: str, source_id: str, test_reference: str, invariant: str, rationale: str,
 ):
     """Convert a repeatable implementation finding into a deterministic-test proposal."""
+    require_v366_feature("review_to_regression_test_v366")
     return await call(scientific_correction().regression_proposal_create, project_id, source_id,
                       test_reference=test_reference, invariant=invariant, rationale=rationale)
 
@@ -1927,6 +1943,7 @@ async def review_target_classifier_v366(project_id: str, target_id: str):
 @mcp.tool()
 async def review_target_classification_backfill_v366(project_id: str, target_id: str):
     """Persist one inferred migration label without changing the historical review or WorkItem."""
+    require_v366_feature("review_target_classifier_v366")
     return await call(scientific_correction().review_target_classification_persist, project_id, target_id)
 
 

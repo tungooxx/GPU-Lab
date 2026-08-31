@@ -91,14 +91,14 @@ class Settings(BaseSettings):
     semantic_consistency_auditor_v365: bool = False
     # v3.6.6 is additive and initially operates as a typed correction layer;
     # rollout can enable each authority-facing path independently.
-    scientific_design_attack_v366: bool = False
-    design_assumptions_v366: bool = False
-    design_attack_synthesis_v366: bool = False
-    lean_engineering_review_v366: bool = False
-    targeted_fidelity_v366: bool = False
-    review_target_classifier_v366: bool = False
-    result_interpretation_attack_v366: bool = False
-    review_to_regression_test_v366: bool = False
+    scientific_design_attack_v366: bool = True
+    design_assumptions_v366: bool = True
+    design_attack_synthesis_v366: bool = True
+    lean_engineering_review_v366: bool = True
+    targeted_fidelity_v366: bool = True
+    review_target_classifier_v366: bool = True
+    result_interpretation_attack_v366: bool = True
+    review_to_regression_test_v366: bool = True
     gpu_lab_dashboard_monitor_enabled: bool = True
     gpu_lab_cockpit_password: str | None = None
     gpu_lab_cockpit_session_secret: str | None = None
