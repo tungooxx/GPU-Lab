@@ -761,7 +761,29 @@ class DistributedDiscoveryService:
         for member in self._members(round_id):
             if member["status"] != "JOINED":
                 continue
-            item = controller.create_work(
+            equivalence_key = f"dde-v33:{round_id}:{member['worker_session_id']}"
+            # This endpoint is intentionally incremental: a later worker may
+            # join after an earlier call has already materialized its peer
+            # lane.  Reuse that immutable lane and continue with the missing
+            # membership instead of treating the existing peer as a conflict.
+            existing = next(
+                (
+                    work for work in controller.work_list(str(round_["project_id"]), limit=500)
+                    if work.get("equivalence_key") == equivalence_key
+                ),
+                None,
+            )
+            if existing:
+                refs = existing.get("related_refs") or {}
+                if (
+                    str(refs.get("discovery_round_id")) != str(round_id)
+                    or str(refs.get("candidate_batch_id")) != str(member["candidate_batch_id"])
+                ):
+                    raise GPUError("DISCOVERY_WORK_ITEM_BINDING_CONFLICT", equivalence_key)
+                items.append(existing)
+                continue
+            try:
+                item = controller.create_work(
                 str(round_["project_id"]), "DISCOVERY_GENERATION",
                 f"Independent discovery: {member['generation_operator']}",
                 "Generate a bounded candidate batch from frozen state. Current-round peer ideas are unavailable.",
@@ -769,14 +791,28 @@ class DistributedDiscoveryService:
                     "discovery_round_id": str(round_id), "candidate_batch_id": member["candidate_batch_id"],
                     "generation_operator": member["generation_operator"], "requested_distance": member["requested_distance"],
                     "peer_visibility": "HIDDEN",
-                }, equivalence_key=f"dde-v33:{round_id}:{member['worker_session_id']}",
+                }, equivalence_key=equivalence_key,
                 created_session_id=member["worker_session_id"], subject_id=str(round_id),
                 recovery_policy={
                     "reassign_same_work_item": True,
                     "fallback_live_work_item": False,
                     "discovery_batch_recovery": "FRESH_INDEPENDENT_REPLACEMENT",
                 },
-            )
+                )
+            except GPUError as exc:
+                if exc.error_type != "LAB_EQUIVALENT_WORK_ACTIVE":
+                    raise
+                # Concurrent materializers may race between the lookup and
+                # insert.  Read the winner and retain idempotency.
+                item = next(
+                    (
+                        work for work in controller.work_list(str(round_["project_id"]), limit=500)
+                        if work.get("equivalence_key") == equivalence_key
+                    ),
+                    None,
+                )
+                if not item:
+                    raise
             items.append(item)
         return items
 

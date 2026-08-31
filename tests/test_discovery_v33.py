@@ -572,6 +572,36 @@ def test_expired_independent_generation_work_claim_creates_fresh_batch_lane():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_incremental_discovery_work_materialization_reuses_existing_peer_lane():
+    """An existing lane must not prevent a later joined peer from materializing."""
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab, dde = LabController(store), DistributedDiscoveryService(store)
+    project_id = store.project_create(
+        f"dde-incremental-work-{time.time_ns()}", "Incremental discovery work"
+    )["project_id"]
+    first = lab.join(None, f"dde-incremental-first-{time.time_ns()}", "CODEX", project_id)
+    second = lab.join(None, f"dde-incremental-second-{time.time_ns()}", "CHATGPT_WEB", project_id)
+    round_ = dde.create_round(
+        project_id, None, "MECHANISM_SEARCH", baseline_signature={"causal_object": "baseline"}
+    )
+    first_batch = dde.join_round(
+        round_["id"], first["worker"]["id"], first["session_id"], "CAUSAL_INVERSION", "FAR"
+    )
+    initial = dde.lab_work_items(round_["id"])
+    assert len(initial) == 1
+
+    second_batch = dde.join_round(
+        round_["id"], second["worker"]["id"], second["session_id"], "REPRESENTATION_RESET", "MID"
+    )
+    materialized = dde.lab_work_items(round_["id"])
+    assert len(materialized) == 2
+    by_batch = {item["related_refs"]["candidate_batch_id"]: item for item in materialized}
+    assert by_batch[str(first_batch["id"])]["id"] == initial[0]["id"]
+    assert by_batch[str(second_batch["id"])]["related_refs"]["generation_operator"] == "REPRESENTATION_RESET"
+    assert [item["id"] for item in dde.lab_work_items(round_["id"])] == [item["id"] for item in materialized]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_allocator_claims_ready_discovery_lane_after_stale_worker_projection():
     """A fresh independent lane must not be hidden by SUPPORTING classification.
 

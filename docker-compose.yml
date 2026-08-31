@@ -39,6 +39,9 @@ services:
       GPU_LAB_EXECUTABLE_PAPER_WORKER_URL: http://paper2agent-relay:8020
       GPU_LAB_EXECUTABLE_PAPER_WORKER_TOKEN: ${GPU_LAB_EXECUTABLE_PAPER_WORKER_TOKEN:-}
       GPU_LAB_APPROVAL_SECRET: ${GPU_LAB_APPROVAL_SECRET:-}
+      # Assignment only claims already-authorized READY work.  It does not
+      # materialize scientific work, and can still be disabled explicitly.
+      BRANCH_AWARE_ASSIGNMENT: ${BRANCH_AWARE_ASSIGNMENT:-true}
       # Override env_file inheritance: task-scoped literature credentials stay in the worker.
       OPENAI_API_KEY: ""
       ANTHROPIC_API_KEY: ""
