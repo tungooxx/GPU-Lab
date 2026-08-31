@@ -701,6 +701,25 @@ class ScientificSelfCorrectionService:
             "mutated": False,
         }
 
+    def interpretation_attack_work_preview(self, project_id: str) -> dict:
+        """Preview one bounded inference-attack card per inspected result."""
+        attacked = {
+            str(item["data"].get("result_id"))
+            for item in self.store.objects_list(project_id, "ResultInterpretationAttack", limit=None)
+        }
+        proposals = []
+        for run in self.store.objects_list(project_id, "ExperimentRun", limit=None):
+            if run["status"] != "RESULT_INSPECTED" or str(run["id"]) in attacked:
+                continue
+            proposals.append({
+                "kind": "RESULT_INTERPRETATION_ATTACK", "scientific_role": "RESULT_INTERPRETATION_ATTACK",
+                "title": f"Interpretation attack: inspected result {run['id']}",
+                "equivalence_key": f"v366-interpretation-attack:{run['id']}",
+                "related_refs": {"correction_layer": "INTERPRETATION", "result_id": str(run["id"]), "no_execution_authority": True},
+                "materialization_requires": "authorized planner/work-proposal transition",
+            })
+        return {"read_only": True, "implementation_version": VERSION, "bounded_work_proposals": proposals, "mutated": False}
+
     def production_audit(self, project_id: str) -> dict:
         """Read-only v3.6.6 audit; historical records are never rewritten."""
         kinds = ("EngineeringTask", "EngineeringResult", "ScientificDesignAttack",

@@ -1960,6 +1960,12 @@ async def v5_missing_design_attack_preview_v366(project_id: str):
 
 
 @mcp.tool()
+async def result_interpretation_attack_preview_v366(project_id: str):
+    """Preview bounded interpretation-attack proposals for inspected results; creates nothing."""
+    return await call(scientific_correction().interpretation_attack_work_preview, project_id)
+
+
+@mcp.tool()
 async def lab_workers_list(project_id: str):
     """List active workers for this project only."""
     return await call(lab()._active_workers, project_id)
