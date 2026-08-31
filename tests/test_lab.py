@@ -29,15 +29,15 @@ def test_rejoin_refreshes_durable_worker_capabilities_without_replacing_identity
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)
     project_id = store.project_create(f"capability-refresh-{time.time_ns()}", "capability refresh")["project_id"]
-    original = lab.join(None, f"capability-refresh-a4-{uuid.uuid4().hex}", "CHATGPT_WEB", project_id, {"BRAIN_V32": True})
+    original = lab.join(None, f"capability-refresh-a4-{uuid.uuid4().hex}", "CHATGPT_WEB", project_id, {"brain_v32": True})
     refreshed = lab.join(
         original["worker"]["id"], None, "CHATGPT_WEB", project_id,
-        {"SCIENTIFIC_REVIEW": True}, session_id=original["session_id"],
+        {"scientific_review": True}, session_id=original["session_id"],
     )
 
     assert refreshed["worker"]["id"] == original["worker"]["id"]
     assert refreshed["session_id"] == original["session_id"]
-    assert refreshed["worker"]["capabilities"] == {"BRAIN_V32": True, "SCIENTIFIC_REVIEW": True}
+    assert refreshed["worker"]["capabilities"] == {"brain_v32": True, "scientific_review": True}
     work = lab.create_work(
         project_id, "INDEPENDENT_REVIEW", "Fresh independent review", "Bounded scientific review.",
         "SCIENTIFIC_REVIEW", created_by=original["worker"]["id"], created_session_id=original["session_id"],
@@ -45,6 +45,28 @@ def test_rejoin_refreshes_durable_worker_capabilities_without_replacing_identity
     )
     claimed = lab.claim_work(work["id"], refreshed["worker"]["id"], refreshed["session_id"])
     assert claimed["id"] == work["id"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_scheduler_skips_unversioned_review_when_bound_successor_exists():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store, feature_flags={"BRANCH_AWARE_ASSIGNMENT": True})
+    project_id = store.project_create(f"review-version-priority-{time.time_ns()}", "review version priority")["project_id"]
+    joined = lab.join(None, f"review-version-worker-{uuid.uuid4().hex}", "CHATGPT_WEB", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    legacy = lab.create_work(
+        project_id, "ADVERSARIAL_REVIEW", "Legacy review", "Old unversioned review.", "REVIEWER", worker_id,
+        created_session_id=session_id, subject_id="hypothesis-1", priority=3690, resource_class="REVIEW",
+    )
+    current = lab.create_work(
+        project_id, "SCIENTIFIC_REVIEW", "Current review", "Version-bound review.", "REVIEWER", worker_id,
+        created_session_id=session_id, subject_id="hypothesis-1", canonical_subject_version="v5", priority=10_000, resource_class="REVIEW",
+    )
+
+    assert lab._scheduler_actionable_work(lab.work_get(legacy["id"])) is False
+    assigned = lab.portfolio_assign_existing(project_id, worker_id, session_id)
+    assert assigned["work_item"]["id"] == current["id"]
+    assert lab.work_get(legacy["id"])["status"] == "READY"
 
 
 def test_completed_review_work_cannot_satisfy_a_nonpass_verdict_dependency():

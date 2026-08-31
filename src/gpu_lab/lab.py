@@ -727,7 +727,7 @@ class LabController:
         if not isinstance(capabilities, dict):
             return set()
         return {
-            str(name) for name, enabled in capabilities.items()
+            name.strip().upper() for name, enabled in capabilities.items()
             if isinstance(name, str) and name.strip() and enabled is True
         }
 
@@ -737,7 +737,7 @@ class LabController:
         raw = refs.get("required_capabilities", []) if isinstance(refs, dict) else []
         if not isinstance(raw, list) or any(not isinstance(value, str) or not value.strip() for value in raw):
             raise GPUError("LAB_WORK_REQUIRED_CAPABILITIES_INVALID", "related_refs.required_capabilities must be a list of strings")
-        return {value.strip() for value in raw}
+        return {value.strip().upper() for value in raw}
 
     @classmethod
     def _worker_can_claim_item(cls, worker: dict, item: dict) -> bool:
@@ -2247,6 +2247,23 @@ class LabController:
             return phase == "INDEPENDENT_GENERATION"
         return phase in {"GENERATION_FROZEN", "COVERAGE_CONTINUED"}
 
+    def _unversioned_review_has_bound_successor(self, item: dict) -> bool:
+        """Keep a legacy review from pre-empting a bound current review."""
+        if (
+            item.get("resource_class") != "REVIEW"
+            or item.get("canonical_subject_version")
+            or not item.get("subject_id")
+        ):
+            return False
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM lab_work_items WHERE project_id=%s AND subject_id=%s "
+                "AND id<>%s AND status=ANY(%s) AND canonical_subject_version IS NOT NULL "
+                "AND superseded_by IS NULL AND invalidated_at IS NULL LIMIT 1",
+                (item["project_id"], item["subject_id"], item["id"], list(ACTIVE_WORK_STATUSES)),
+            )
+            return bool(cur.fetchone())
+
     def _scheduler_actionable_work(self, item: dict) -> bool:
         """Return whether a READY item is safe for portfolio assignment.
 
@@ -2259,6 +2276,8 @@ class LabController:
         if item.get("status") != "READY" or item.get("superseded_by") or item.get("invalidated_at"):
             return False
         if not self._discovery_work_round_is_current(item):
+            return False
+        if self._unversioned_review_has_bound_successor(item):
             return False
         if item.get("authority_status") == "AUTHORITATIVE":
             return True
