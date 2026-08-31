@@ -75,6 +75,12 @@ class ScientificSelfCorrectionService:
     def _normal(value: str) -> str:
         return str(value or "").strip().upper()
 
+    @staticmethod
+    def _record(row: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not row:
+            return None
+        return {key: str(value) if isinstance(value, uuid.UUID) else value for key, value in row.items()}
+
     def _migrate(self) -> None:
         with self.store._connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT pg_advisory_xact_lock(hashtext('gpu_lab_correction_v366_migration'))")
@@ -308,6 +314,67 @@ class ScientificSelfCorrectionService:
                 self.store._event(cur, member["project_id"], "DESIGN_ATTACK_COMMITTED", member["design_id"], {"batch_id": str(batch_id)})
         return self.store.object_get(str(member["attack_id"]))
 
+    def _materialize_transition_work(
+        self, cur, batch: dict, design: dict, synthesis_id: str, status: str,
+    ) -> tuple[dict[str, Any], bool]:
+        """Create exactly one bounded follow-up for an attack synthesis.
+
+        A synthesis has a deterministic operational consequence, but critics
+        must not invent arbitrary adjacent science.  The resulting card is
+        therefore keyed by the immutable synthesis identity and contains only
+        the frozen design/synthesis references.  It is supporting reasoning,
+        never execution authority.
+        """
+        accepted = status == "ACCEPTED_FOR_TEST"
+        kind = "PRE_SCIENCE_DESIGN_FINALIZATION" if accepted else "SCIENTIFIC_DESIGN_REPAIR"
+        role = "DESIGN_FINALIZER" if accepted else "SCIENTIFIC_DESIGN_REPAIR"
+        action = "Finalize the accepted pre-science design binding" if accepted else "Repair the scientific design before any test"
+        key = f"v366-design-transition:{synthesis_id}:{kind}"
+        cur.execute(
+            "SELECT * FROM lab_work_items WHERE project_id=%s AND equivalence_key=%s "
+            "AND status=ANY(%s) FOR UPDATE",
+            (
+                batch["project_id"], key,
+                ["DORMANT", "READY", "CLAIMED", "RUNNING", "RUNNING_DETACHED", "RESULT_READY", "WAITING_DEPENDENCY", "BLOCKED"],
+            ),
+        )
+        existing = cur.fetchone()
+        if existing:
+            return self._record(existing), True
+        now, work_id = self._now(), uuid.uuid4()
+        refs = {
+            "correction_layer": "DESIGN",
+            "scientific_design_id": str(batch["design_id"]),
+            "design_attack_batch_id": str(batch["id"]),
+            "design_attack_synthesis_id": str(synthesis_id),
+            "design_version": batch["design_snapshot_hash"],
+            "deterministic_successor": True,
+            "no_execution_authority": True,
+            "transition": "DESIGN_ACCEPTED_FOR_TEST" if accepted else "DESIGN_REPAIR_REQUIRED",
+        }
+        cur.execute(
+            "INSERT INTO lab_work_items("
+            "id,project_id,kind,title,description,scientific_role,status,related_refs,equivalence_key,"
+            "authority_status,subject_id,recovery_policy,speculation_class,speculation_condition,resource_class,"
+            "dependency_scope,authority_class,promotion_state,created_at,updated_at"
+            ") VALUES(%s,%s,%s,%s,%s,%s,'READY',%s,%s,'SUPPORTING',%s,'{}'::jsonb,"
+            "'NON_SPECULATIVE','{}'::jsonb,'REASONING','WORKITEM_LOCAL','SUPPORTING','NOT_APPLICABLE',%s,%s) "
+            "RETURNING *",
+            (
+                work_id, batch["project_id"], kind,
+                f"{action}: {design['data'].get('name', 'Scientific design')}",
+                "Deterministic successor of a frozen v3.6.6 design-attack synthesis. "
+                "It may bind or repair the design, but cannot itself authorize execution.",
+                role, self._json(refs), key, str(batch["design_id"]), now, now,
+            ),
+        )
+        work = self._record(cur.fetchone())
+        self.store._event(cur, batch["project_id"], "WORK_ITEM_SUCCESSOR_MATERIALIZED", str(work_id), {
+            "source": "DESIGN_ATTACK_SYNTHESIS", "synthesis_id": str(synthesis_id),
+            "design_id": str(batch["design_id"]), "transition": refs["transition"],
+        })
+        return work, False
+
     def synthesize(self, batch_id: str, synthesis_verdict: str, rationale: str) -> dict:
         verdict = self._normal(synthesis_verdict)
         if verdict not in SYNTHESIS_VERDICTS or not rationale.strip():
@@ -357,10 +424,18 @@ class ScientificSelfCorrectionService:
             status = "ACCEPTED_FOR_TEST" if verdict in {"RETAIN_FOR_TEST", "RETAIN_WITH_NARROWER_CLAIM"} else "REPAIR_REQUIRED"
             synthesis = self.store.object_create(str(batch["project_id"]), "DesignAttackSynthesis", data, "DESIGN_ATTACK_SYNTHESIZED", status)
             design = self._object(str(batch["design_id"]), "ScientificDesign")
-            design_data = {**design["data"], "design_self_correction_status": "COMPLETE" if status == "ACCEPTED_FOR_TEST" else "REPAIR_REQUIRED", "design_status": status, "design_attack_synthesis_id": synthesis["id"]}
+            transition_work, transition_reused = self._materialize_transition_work(
+                cur, batch, design, synthesis["id"], status,
+            )
+            data["transition_work_item_id"] = str(transition_work["id"])
+            data["transition_work_reused"] = transition_reused
+            cur.execute("UPDATE research_objects SET data=%s WHERE id=%s", (self._json(data), synthesis["id"]))
+            synthesis["data"] = data
+            design_data = {**design["data"], "design_self_correction_status": "COMPLETE" if status == "ACCEPTED_FOR_TEST" else "REPAIR_REQUIRED", "design_status": status, "authority": "PASS_FOR_TEST" if status == "ACCEPTED_FOR_TEST" else "REPAIR_REQUIRED", "design_attack_synthesis_id": synthesis["id"], "transition_work_item_id": str(transition_work["id"])}
             cur.execute("UPDATE research_objects SET status=%s,data=%s WHERE id=%s", (status, self._json(design_data), batch["design_id"]))
             cur.execute("INSERT INTO design_attack_syntheses(batch_id,synthesis_id,created_at) VALUES(%s,%s,%s)", (batch_id, synthesis["id"], self._now()))
-            self.store._event(cur, batch["project_id"], "DESIGN_ACCEPTED_FOR_TEST" if status == "ACCEPTED_FOR_TEST" else "DESIGN_REPAIR_REQUIRED", batch["design_id"], {"synthesis_id": synthesis["id"], "verdict": verdict})
+            self.store._event(cur, batch["project_id"], "DESIGN_ACCEPTED_FOR_TEST" if status == "ACCEPTED_FOR_TEST" else "DESIGN_REPAIR_REQUIRED", batch["design_id"], {"synthesis_id": synthesis["id"], "verdict": verdict, "transition_work_item_id": str(transition_work["id"]), "transition_work_reused": transition_reused})
+            synthesis["transition_work_item"] = transition_work
         return synthesis
 
     def fidelity_record(self, design_id: str, *, implementation_ref: str, science_to_code_map: dict[str, Any],

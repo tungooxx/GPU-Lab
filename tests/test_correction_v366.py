@@ -67,6 +67,8 @@ def test_v366_fidelity_pass_never_completes_idea_attack_and_peer_isolation_holds
     synthesis = correction.synthesize(batch["id"], "DISCRIMINATING_EXPERIMENT_REQUIRED", "The static-binding alternative is material.")
     assert synthesis["data"]["majority_vote_used"] is False
     assert synthesis["data"]["discriminating_experiment_ids"]
+    assert synthesis["transition_work_item"]["kind"] == "SCIENTIFIC_DESIGN_REPAIR"
+    assert synthesis["transition_work_item"]["related_refs"]["no_execution_authority"] is True
     assert store.object_get(design["id"])["status"] == "REPAIR_REQUIRED"
     hindsight = correction.challenge_hindsight_record(
         synthesis["data"]["unique_challenge_ids"][0], outcome="STILL_UNRESOLVED",
@@ -164,3 +166,39 @@ def test_v366_read_only_audit_classifies_review_like_lab_workitems():
     assert audit["read_only"] is True
     assert audit["review_like_work_item_count"] == 1
     assert f"work:{work['id']}" in audit["review_like_work_by_type"]["IMPLEMENTATION_FIDELITY"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v366_synthesis_atomically_materializes_only_its_bounded_transition_work():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab, correction = LabController(store), ScientificSelfCorrectionService(store)
+    project_id = store.project_create(f"v366-transition-{time.time_ns()}", "transition") ["project_id"]
+    worker = lab.join(None, f"v366-transition-worker-{time.time_ns()}", "CODEX", project_id)
+    design = correction.create_design(
+        project_id, "bounded transition", {"mechanism": "frozen testable mechanism"}, scientific_risk="LOW"
+    )
+    assumption = correction.assumption_create(
+        design["id"], "The mechanism has a prospective falsifier.", "NECESSITY"
+    )
+    batch = correction.attack_batch_create(design["id"], [assumption["id"]])
+    correction.attack_join(batch["id"], worker["worker"]["id"], worker["session_id"], "NECESSITY_ATTACKER")
+    correction.attack_submit(
+        batch["id"], worker["worker"]["id"], worker["session_id"],
+        verdict="SURVIVES_CURRENT_ATTACK", challenges=[],
+    )
+    correction.attack_freeze(batch["id"], worker["worker"]["id"], worker["session_id"])
+
+    synthesis = correction.synthesize(batch["id"], "RETAIN_FOR_TEST", "The required assumption was independently attacked.")
+    transition = synthesis["transition_work_item"]
+    assert transition["kind"] == "PRE_SCIENCE_DESIGN_FINALIZATION"
+    assert transition["status"] == "READY"
+    assert transition["related_refs"]["scientific_design_id"] == design["id"]
+    assert transition["related_refs"]["design_attack_synthesis_id"] == synthesis["id"]
+    assert transition["related_refs"]["no_execution_authority"] is True
+    assert store.object_get(design["id"])["data"]["authority"] == "PASS_FOR_TEST"
+
+    # The same frozen synthesis is idempotent and cannot multiply successor work.
+    repeat = correction.synthesize(batch["id"], "RETAIN_FOR_TEST", "same request")
+    assert str(repeat["id"]) == str(synthesis["id"])
+    work = lab.work_get(transition["id"])
+    assert work["equivalence_key"].startswith(f"v366-design-transition:{synthesis['id']}")

@@ -1849,8 +1849,19 @@ async def design_attack_synthesize(
     synthesis_verdict: Literal["RETAIN_FOR_TEST", "RETAIN_WITH_NARROWER_CLAIM", "REVISE_BEFORE_TEST", "DISCRIMINATING_EXPERIMENT_REQUIRED", "SUPERSEDE", "INSUFFICIENT_CORRECTION"],
     rationale: str,
 ):
-    """Synthesize frozen attacks by challenge materiality, never majority vote."""
-    return await call(scientific_correction().synthesize, design_attack_batch_id, synthesis_verdict, rationale)
+    """Synthesize frozen attacks and atomically open the bounded next design task."""
+    result = await call(scientific_correction().synthesize, design_attack_batch_id, synthesis_verdict, rationale)
+    transition = result.get("transition_work_item") if isinstance(result, dict) else None
+    if transition and transition.get("status") == "READY":
+        # Wake is best-effort operational delivery. The transition WorkItem was
+        # already committed atomically with the synthesis and remains durable
+        # when no eligible browser runtime is attached.
+        result["wake"] = await call(
+            cockpit().wake_ready_work,
+            transition["project_id"],
+            [transition["id"]],
+        )
+    return result
 
 
 @mcp.tool()
