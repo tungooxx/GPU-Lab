@@ -306,6 +306,36 @@ class CockpitController:
             ]
             cur.execute(
                 "SELECT id,status,data,created_at FROM research_objects WHERE project_id=%s "
+                "AND kind='ImplementationFidelityCheck' ORDER BY created_at DESC LIMIT 24",
+                (project_id,),
+            )
+            implementation_fidelity_checks = [
+                {
+                    "id": str(row["id"]), "status": row["status"],
+                    "design_id": row["data"].get("scientific_design_id"),
+                    "verdict": row["data"].get("verdict"),
+                    "implementation_ref": row["data"].get("implementation_ref"),
+                    "created_at": row["created_at"],
+                }
+                for row in cur.fetchall()
+            ]
+            cur.execute(
+                "SELECT id,status,data,created_at FROM research_objects WHERE project_id=%s "
+                "AND kind='ResultInterpretationAttack' ORDER BY created_at DESC LIMIT 24",
+                (project_id,),
+            )
+            result_interpretation_attacks = [
+                {
+                    "id": str(row["id"]), "status": row["status"],
+                    "result_id": row["data"].get("result_id"),
+                    "verdict": row["data"].get("verdict"),
+                    "attack_operator": row["data"].get("attack_operator"),
+                    "created_at": row["created_at"],
+                }
+                for row in cur.fetchall()
+            ]
+            cur.execute(
+                "SELECT id,status,data,created_at FROM research_objects WHERE project_id=%s "
                 "AND kind='StrategyTransferCandidate' ORDER BY created_at DESC LIMIT 12",
                 (project_id,),
             )
@@ -339,6 +369,8 @@ class CockpitController:
             "discovery_archives": discovery_archives,
             "correction_cases": correction_cases,
             "scientific_designs": scientific_designs,
+            "implementation_fidelity_checks": implementation_fidelity_checks,
+            "result_interpretation_attacks": result_interpretation_attacks,
             "strategy_transfers": strategy_transfers,
             "portfolio_scheduler": portfolio,
         }

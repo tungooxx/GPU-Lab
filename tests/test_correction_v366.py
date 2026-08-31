@@ -6,6 +6,7 @@ import time
 import pytest
 
 from gpu_lab.correction_v366 import ScientificSelfCorrectionService
+from gpu_lab.cockpit import CockpitController
 from gpu_lab.errors import GPUError
 from gpu_lab.lab import LabController
 from gpu_lab.research import RESEARCH_OBJECT_KINDS, RESEARCH_OBJECT_STATUSES, ResearchStore
@@ -222,6 +223,27 @@ def test_v366_attack_batch_freezes_current_lineage_without_counting_technical_fa
     assert batch["frozen_lineage_context"]["technical_only_negative_result_ids"] == [technical["id"]]
     attack = correction.attack_join(batch["id"], worker["worker"]["id"], worker["session_id"], "NECESSITY_ATTACKER")
     assert attack["data"]["frozen_lineage_context"] == batch["frozen_lineage_context"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v366_cockpit_projects_design_fidelity_and_interpretation_separately():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab, correction = LabController(store), ScientificSelfCorrectionService(store)
+    project_id = store.project_create(f"v366-cockpit-{time.time_ns()}", "cockpit") ["project_id"]
+    design = correction.create_design(project_id, "visible design", {"mechanism": "test"})
+    fidelity = correction.fidelity_record(
+        design["id"], implementation_ref="commit:fixture", science_to_code_map={"m": "model.py"},
+        deterministic_checks=["test_model"], verdict="FIDELITY_CONFIRMED", rationale="Exact mapping checked.",
+    )
+    result = store.object_create(project_id, "ExperimentRun", {"metric": 1.0}, "RUN_RECORDED", "RESULT_INSPECTED")
+    interpretation = correction.interpretation_attack_record(
+        project_id, result["id"], claim="The mechanism worked.", verdict="MECHANISM_NONSPECIFIC",
+        strongest_alternative="A strongest null matches the result.", rationale="The result does not discriminate.",
+    )
+    state = CockpitController(store, lab).state_get(project_id)
+    assert state["scientific_designs"][0]["id"] == design["id"]
+    assert state["implementation_fidelity_checks"][0]["id"] == fidelity["id"]
+    assert state["result_interpretation_attacks"][0]["id"] == interpretation["id"]
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
