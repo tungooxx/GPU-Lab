@@ -637,6 +637,28 @@ def test_allocator_claims_ready_discovery_lane_after_stale_worker_projection():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_scheduler_excludes_discovery_work_for_a_stale_round():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store, feature_flags={"BRANCH_AWARE_ASSIGNMENT": True})
+    dde = DistributedDiscoveryService(store)
+    project_id = store.project_create(
+        f"dde-scheduler-stale-{time.time_ns()}", "Stale discovery scheduling"
+    )["project_id"]
+    worker = lab.join(None, f"dde-stale-scheduler-{time.time_ns()}", "CODEX", project_id)
+    round_ = dde.create_round(
+        project_id, None, "MECHANISM_SEARCH", baseline_signature={"causal_object": "baseline"}
+    )
+    dde.join_round(round_["id"], worker["worker"]["id"], worker["session_id"], "CAUSAL_INVERSION", "FAR")
+    work = dde.lab_work_items(round_["id"])[0]
+    store.object_update(round_["id"], {"stale": True}, "ACTIVE", "DISCOVERY_ROUND_MARKED_STALE")
+
+    assert lab._scheduler_actionable_work(lab.work_get(work["id"])) is False
+    assigned = lab.portfolio_assign_existing(project_id, worker["worker"]["id"], worker["session_id"])
+    assert assigned["status"] == "IDLE"
+    assert lab.work_get(work["id"])["status"] == "READY"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_stale_transition_and_candidate_submission_leave_no_joined_active_batch():
     store = ResearchStore(TEST_DATABASE_URL)
     lab, dde = LabController(store), DistributedDiscoveryService(store)

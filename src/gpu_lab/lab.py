@@ -2222,8 +2222,32 @@ class LabController:
             cur.execute(sql, args)
             return [self._record(row) for row in cur.fetchall()]
 
-    @staticmethod
-    def _scheduler_actionable_work(item: dict) -> bool:
+    def _discovery_work_round_is_current(self, item: dict) -> bool:
+        """Discovery work is schedulable only while its frozen round is live."""
+        if item.get("kind") not in {"DISCOVERY_GENERATION", "DISCOVERY_SYNTHESIS"}:
+            return True
+        refs = item.get("related_refs") or {}
+        round_id = str(refs.get("discovery_round_id") or "")
+        if not round_id:
+            return False
+        try:
+            round_ = self.store.object_get(round_id)
+        except GPUError:
+            return False
+        data = round_.get("data") or {}
+        if (
+            str(round_.get("project_id")) != str(item.get("project_id"))
+            or round_.get("kind") != "DiscoveryRound"
+            or round_.get("status") != "ACTIVE"
+            or bool(data.get("stale"))
+        ):
+            return False
+        phase = data.get("phase")
+        if item.get("kind") == "DISCOVERY_GENERATION":
+            return phase == "INDEPENDENT_GENERATION"
+        return phase in {"GENERATION_FROZEN", "COVERAGE_CONTINUED"}
+
+    def _scheduler_actionable_work(self, item: dict) -> bool:
         """Return whether a READY item is safe for portfolio assignment.
 
         ``AUTHORITATIVE`` remains mandatory for execution authority. It is not
@@ -2233,6 +2257,8 @@ class LabController:
         lookup but impossible for the scheduler to assign.
         """
         if item.get("status") != "READY" or item.get("superseded_by") or item.get("invalidated_at"):
+            return False
+        if not self._discovery_work_round_is_current(item):
             return False
         if item.get("authority_status") == "AUTHORITATIVE":
             return True
@@ -3328,7 +3354,13 @@ class LabController:
         if not round_:
             raise GPUError("DISCOVERY_ROUND_NOT_FOUND", round_id)
         round_data = dict(round_["data"] or {})
-        if round_["status"] != "ACTIVE" or round_data.get("phase") != "INDEPENDENT_GENERATION":
+        if (
+            round_["status"] != "ACTIVE"
+            or round_data.get("phase") != "INDEPENDENT_GENERATION"
+            or bool(round_data.get("stale"))
+        ):
+            if bool(round_data.get("stale")):
+                raise GPUError("DISCOVERY_ROUND_STALE", "Cannot reassign a generation lane from a stale round.")
             raise GPUError("DISCOVERY_ROUND_NOT_GENERATING", "Cannot replace a generation lane outside independent generation.")
         cur.execute(
             "SELECT * FROM discovery_round_memberships WHERE discovery_round_id=%s AND candidate_batch_id=%s FOR UPDATE",
@@ -4523,7 +4555,7 @@ class LabController:
             except GPUError as error:
                 if error.error_type not in {
                     "LAB_WORK_NOT_CLAIMABLE", "LAB_WORK_DEPENDENCY_UNSATISFIED",
-                    "LAB_WORK_DEPENDENCY_INVALIDATED",
+                    "LAB_WORK_DEPENDENCY_INVALIDATED", "DISCOVERY_ROUND_STALE",
                 }:
                     raise
 

@@ -59,6 +59,20 @@ def test_causal_edge_status_requires_finite_agenda_scores():
     assert error.value.error_type == "INVALID_AGENDA_SCORE"
 
 
+def test_stale_active_discovery_round_does_not_block_brain_ranking():
+    stale = {
+        "id": "stale-round", "status": "ACTIVE",
+        "data": {"phase": "INDEPENDENT_GENERATION", "stale": True},
+    }
+    live = {
+        "id": "live-round", "status": "ACTIVE",
+        "data": {"phase": "INDEPENDENT_GENERATION", "stale": False},
+    }
+
+    assert ResearchBrain._live_incomplete_discovery_rounds([stale]) == []
+    assert ResearchBrain._live_incomplete_discovery_rounds([stale, live]) == [live]
+
+
 def test_state_snapshot_keeps_object_identity_without_copying_large_payloads():
     state = {
         "canonical_state": {

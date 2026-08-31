@@ -648,6 +648,25 @@ class ResearchBrain:
         }
         return candidates, portfolio, frontier, {**stagnation, "search_regime": regime, "portfolio_critic": critique}
 
+    @staticmethod
+    def _live_incomplete_discovery_rounds(rounds: list[dict]) -> list[dict]:
+        """Return only live, current-snapshot discovery that may block ranking.
+
+        A stale round is historical control-plane provenance.  It must never
+        be synthesized or treated as a live discovery prerequisite; the next
+        valid action is a fresh round from the current snapshot.
+        """
+        incomplete_phases = {
+            "INDEPENDENT_GENERATION", "GENERATION_FROZEN", "CHARACTERIZATION",
+            "DEAD_MEMORY_SCREEN", "QD_ARCHIVE", "LITERATURE_PASS", "SYNTHESIS",
+        }
+        return [
+            item for item in rounds
+            if item.get("status") == "ACTIVE"
+            and not bool((item.get("data") or {}).get("stale"))
+            and (item.get("data") or {}).get("phase") in incomplete_phases
+        ]
+
     def brain_step(
         self, project_id: str, as_of: str | None = None, persist: bool = True
     ) -> dict:
@@ -697,10 +716,7 @@ class ResearchBrain:
             data_filters={"agenda_item_id": str(agenda_item["id"])},
             **temporal,
         )
-        generating_rounds = [
-            item for item in discovery_rounds
-            if item["data"].get("phase") in {"INDEPENDENT_GENERATION", "GENERATION_FROZEN", "CHARACTERIZATION", "DEAD_MEMORY_SCREEN", "QD_ARCHIVE", "LITERATURE_PASS", "SYNTHESIS"}
-        ]
+        generating_rounds = self._live_incomplete_discovery_rounds(discovery_rounds)
         if generating_rounds:
             raise GPUError(
                 "DISCOVERY_ROUND_INCOMPLETE",
