@@ -2242,6 +2242,18 @@ class LabController:
             or bool(data.get("stale"))
         ):
             return False
+        # ``data.stale`` is a cached retirement marker, not the source of
+        # truth.  Legacy/live rounds may predate that marker while their
+        # frozen snapshot already differs from current scientific state.
+        # Scheduler eligibility must retire those rounds before they can be
+        # selected as apparently READY work.
+        from .discovery_v33 import DistributedDiscoveryService
+
+        staleness = DistributedDiscoveryService(self.store, migrate=False).stale_check(
+            round_id, mark_stale=True
+        )
+        if staleness["stale"]:
+            return False
         phase = data.get("phase")
         if item.get("kind") == "DISCOVERY_GENERATION":
             return phase == "INDEPENDENT_GENERATION"

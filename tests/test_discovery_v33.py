@@ -650,12 +650,15 @@ def test_scheduler_excludes_discovery_work_for_a_stale_round():
     )
     dde.join_round(round_["id"], worker["worker"]["id"], worker["session_id"], "CAUSAL_INVERSION", "FAR")
     work = dde.lab_work_items(round_["id"])[0]
-    store.object_update(round_["id"], {"stale": True}, "ACTIVE", "DISCOVERY_ROUND_MARKED_STALE")
+    # Do not pre-set the cached marker: the scheduler must derive staleness
+    # from the frozen/current snapshots and retire the round itself.
+    store.object_create(project_id, "Claim", {"statement": "state changed", "scope": "test"}, "CLAIM_CREATED")
 
     assert lab._scheduler_actionable_work(lab.work_get(work["id"])) is False
     assigned = lab.portfolio_assign_existing(project_id, worker["worker"]["id"], worker["session_id"])
     assert assigned["status"] == "IDLE"
     assert lab.work_get(work["id"])["status"] == "READY"
+    assert store.object_get(round_["id"])["status"] == "STALE"
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")

@@ -716,7 +716,17 @@ class ResearchBrain:
             data_filters={"agenda_item_id": str(agenda_item["id"])},
             **temporal,
         )
-        generating_rounds = self._live_incomplete_discovery_rounds(discovery_rounds)
+        from .discovery_v33 import DistributedDiscoveryService
+
+        discovery_service = DistributedDiscoveryService(self.store, migrate=False)
+        generating_rounds = [
+            item for item in self._live_incomplete_discovery_rounds(discovery_rounds)
+            # A preview remains read-only, but must still ignore a round whose
+            # frozen snapshot has already drifted. A persisted Brain step also
+            # retires it atomically, so a fresh current-snapshot round can be
+            # created instead of being asked to synthesize stale work.
+            if not discovery_service.stale_check(str(item["id"]), mark_stale=persist)["stale"]
+        ]
         if generating_rounds:
             raise GPUError(
                 "DISCOVERY_ROUND_INCOMPLETE",
@@ -736,9 +746,7 @@ class ResearchBrain:
             # discovery archive predates current scientific state. Already-gated
             # frozen execution uses a separate exact authority path and must not
             # weaken this ranking guard.
-            from .discovery_v33 import DistributedDiscoveryService
-
-            staleness = DistributedDiscoveryService(self.store, migrate=False).stale_check(
+            staleness = discovery_service.stale_check(
                 str(latest_discovery_round["id"]), mark_stale=persist,
             )
             if staleness["stale"]:
