@@ -653,6 +653,54 @@ class ScientificSelfCorrectionService:
             self.store._event(cur, project_id, "REVIEW_TARGET_CLASSIFICATION_BACKFILLED", ident, data)
         return {"id": str(ident), "project_id": str(project_id), "kind": "ReviewTargetClassification", "status": "COMPLETED", "data": data}
 
+    @staticmethod
+    def _is_v5_design(design: dict) -> bool:
+        data = design.get("data") or {}
+        text = " ".join((
+            str(data.get("name", "")), str(data.get("specification", "")),
+            str(data.get("source_object_id", "")),
+        )).casefold()
+        return "v5" in text or "gru-256" in text or "learned g" in text
+
+    def v5_missing_attack_work_preview(self, project_id: str) -> dict:
+        """Return, but never create, the one bounded V5 attack successor."""
+        focus = [
+            "recurrence necessity", "256D rationale", "predictive-state identifiability",
+            "learned G causal role", "static plus binding alternative",
+            "transition-memory alternative", "short-history alternative",
+            "time-permutation validity",
+        ]
+        designs = [
+            design for design in self.store.objects_list(project_id, "ScientificDesign", limit=None)
+            if self._is_v5_design(design)
+            and design["status"] not in {"SUPERSEDED", "INVALID", "CANCELLED", "FAILED"}
+        ]
+        proposals = []
+        for design in designs:
+            coverage = self.design_coverage(str(design["id"]))
+            if not coverage["missing_assumption_ids"]:
+                continue
+            version = str(design["data"].get("semantic_hash") or "unknown")
+            proposals.append({
+                "kind": "V5_SCIENTIFIC_DESIGN_ATTACK",
+                "title": f"V5 bounded scientific design attack: {design['data'].get('name', 'V5')}",
+                "scientific_role": "SCIENTIFIC_DESIGN_ATTACKER",
+                "description": "One bounded attack lane covering all currently missing V5 design assumptions; not a code review or execution authorization.",
+                "equivalence_key": f"v366-v5-design-attack:{design['id']}:{version}",
+                "related_refs": {
+                    "correction_layer": "DESIGN", "scientific_design_id": str(design["id"]),
+                    "design_version": version, "required_focus": focus,
+                    "no_execution_authority": True,
+                },
+                "missing_assumption_ids": coverage["missing_assumption_ids"],
+                "materialization_requires": "authorized planner/work-proposal transition",
+            })
+        return {
+            "read_only": True, "implementation_version": VERSION,
+            "v5_design_count": len(designs), "bounded_work_proposals": proposals,
+            "mutated": False,
+        }
+
     def production_audit(self, project_id: str) -> dict:
         """Read-only v3.6.6 audit; historical records are never rewritten."""
         kinds = ("EngineeringTask", "EngineeringResult", "ScientificDesignAttack",
@@ -682,13 +730,44 @@ class ScientificSelfCorrectionService:
             classifications.setdefault(label, []).append(f"work:{item['id']}")
         designs = self.store.objects_list(project_id, "ScientificDesign", limit=None)
         persisted = self.store.objects_list(project_id, "ReviewTargetClassification", limit=None)
+        assumptions = self.store.objects_list(project_id, "DesignAssumption", limit=None)
+        runs = self.store.objects_list(project_id, "ExperimentRun", limit=None)
+        interpretation_attacks = self.store.objects_list(project_id, "ResultInterpretationAttack", limit=None)
+        regression_proposals = self.store.objects_list(project_id, "DeterministicRegressionProposal", limit=None)
         coverage = [self.design_coverage(str(design["id"])) for design in designs]
         incomplete = [entry["design_id"] for entry in coverage if entry["missing_assumption_ids"] or not entry["synthesis"]]
+        design_ids_with_assumptions = {str(item["data"].get("scientific_design_id")) for item in assumptions}
+        designs_without_assumption_maps = [str(item["id"]) for item in designs if str(item["id"]) not in design_ids_with_assumptions]
+        v5_ids = {str(item["id"]) for item in designs if self._is_v5_design(item)}
+        v5_coverage = [entry for entry in coverage if entry["design_id"] in v5_ids]
+        fidelity_ids = {
+            str(item["data"].get("scientific_design_id"))
+            for item in self.store.objects_list(project_id, "ImplementationFidelityCheck", limit=None)
+        }
+        fidelity_not_correction = [
+            entry["design_id"] for entry in coverage
+            if entry["design_id"] in fidelity_ids and (entry["missing_assumption_ids"] or not entry["synthesis"])
+        ]
+        interpretation_result_ids = {str(item["data"].get("result_id")) for item in interpretation_attacks}
+        inspected_runs = [str(item["id"]) for item in runs if item["status"] == "RESULT_INSPECTED"]
+        regression_sources = {str(item["data"].get("source_id")) for item in regression_proposals}
+        engineering_results = self.store.objects_list(project_id, "EngineeringResult", limit=None)
+        regression_opportunities = [str(item["id"]) for item in engineering_results if str(item["id"]) not in regression_sources]
         return {
             "read_only": True, "implementation_version": VERSION,
             "review_like_work_by_type": classifications,
             "review_like_work_item_count": len(work_items),
             "major_designs_lacking_explicit_self_correction": incomplete,
+            "major_designs_lacking_assumption_maps": designs_without_assumption_maps,
+            "implementation_reviews_not_counted_as_design_correction": fidelity_not_correction,
+            "current_v5_correction_coverage": v5_coverage,
+            "v5_missing_attack_preview": self.v5_missing_attack_work_preview(project_id),
+            "result_interpretation_correction_coverage": {
+                "inspected_result_ids": inspected_runs,
+                "attacked_result_ids": sorted(interpretation_result_ids),
+                "unattacked_inspected_result_ids": sorted(set(inspected_runs) - interpretation_result_ids),
+            },
+            "engineering_review_to_test_conversion_opportunity_ids": regression_opportunities,
             "design_coverage": coverage,
             "generic_code_review_frequency": len(classifications["UNKNOWN"]),
             "historical_classification_persisted": bool(persisted),

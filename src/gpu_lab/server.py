@@ -1937,6 +1937,12 @@ async def scientific_self_correction_audit_v366(project_id: str):
 
 
 @mcp.tool()
+async def v5_missing_design_attack_preview_v366(project_id: str):
+    """Preview one bounded V5 design-attack WorkProposal; it never creates scientific work."""
+    return await call(scientific_correction().v5_missing_attack_work_preview, project_id)
+
+
+@mcp.tool()
 async def lab_workers_list(project_id: str):
     """List active workers for this project only."""
     return await call(lab()._active_workers, project_id)

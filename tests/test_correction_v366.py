@@ -170,6 +170,14 @@ def test_v5_regression_fidelity_is_not_full_scientific_design_self_correction():
     assert coverage["assumption_count"] == 7
     assert set(coverage["missing_assumption_ids"]) == set(ids)
     assert coverage["synthesis"] is None
+    preview = correction.v5_missing_attack_work_preview(project_id)
+    assert preview["read_only"] is True
+    assert preview["mutated"] is False
+    assert len(preview["bounded_work_proposals"]) == 1
+    proposal = preview["bounded_work_proposals"][0]
+    assert proposal["kind"] == "V5_SCIENTIFIC_DESIGN_ATTACK"
+    assert proposal["missing_assumption_ids"] == coverage["missing_assumption_ids"]
+    assert len(proposal["related_refs"]["required_focus"]) == 8
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
@@ -188,6 +196,8 @@ def test_v366_read_only_audit_classifies_review_like_lab_workitems():
     assert audit["review_like_work_item_count"] == 1
     assert f"work:{work['id']}" in audit["review_like_work_by_type"]["IMPLEMENTATION_FIDELITY"]
     assert audit["historical_classification_persisted"] is False
+    assert audit["major_designs_lacking_assumption_maps"] == []
+    assert audit["result_interpretation_correction_coverage"]["inspected_result_ids"] == []
     backfill = correction.review_target_classification_persist(project_id, work["id"])
     assert backfill["kind"] == "ReviewTargetClassification"
     assert backfill["data"]["target_type"] == "WORK_ITEM"
