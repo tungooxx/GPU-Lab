@@ -25,6 +25,27 @@ CORE_EPISTEMIC_INVARIANTS = (
     "unexecuted_counterfactual_is_unknown",
 )
 PROVIDERS = {"GENERIC", "CHATGPT", "CLAUDE", "CODEX", "OPENAI_API", "CLAUDE_API"}
+CORRECTION_RUNTIME_MODES = {
+    "DESIGN_ATTACK": (
+        "Your correction layer is DESIGN. Attack the frozen idea, its explicit assumptions, "
+        "strongest competing explanations, degeneracies, and discriminating controls. Do not "
+        "substitute a code review for an idea attack."
+    ),
+    "IMPLEMENTATION_FIDELITY": (
+        "Your correction layer is IMPLEMENTATION. Verify only the named science-to-code mapping, "
+        "the exact executable boundary, and deterministic checks. Do not adjudicate whether the "
+        "scientific idea is correct."
+    ),
+    "RESULT_INTERPRETATION": (
+        "Your correction layer is INTERPRETATION. Test whether the inspected result supports its "
+        "claim against strongest alternatives. Do not admit evidence, inspect confirmation, or "
+        "treat performance as proof of mechanism."
+    ),
+    "DETERMINISTIC_ENGINEERING": (
+        "Your correction layer is DETERMINISTIC_ENGINEERING. Prefer bounded reproducible checks, "
+        "hashes, manifests, and regression tests. Do not create a generic code-review chain."
+    ),
+}
 
 
 class PromptCompiler:
@@ -60,6 +81,8 @@ class PromptCompiler:
                 "correction_policy",
             )
         }
+        runtime_key = str(target_runtime or "default").strip().upper().replace("-", "_")
+        correction_mode = runtime_key if runtime_key in CORRECTION_RUNTIME_MODES else "GENERAL"
         lines = [
             "# GENERATED FILE — DO NOT EDIT MANUALLY",
             f"# Source: ResearchPolicy v{data.get('version', 'unknown')}",
@@ -77,6 +100,8 @@ class PromptCompiler:
             "- IMPLEMENTATION: verify the exact science-to-code mapping and deterministic checks; fidelity never certifies the idea itself.",
             "- INTERPRETATION: after a result, attack whether it supports the claim; performance never by itself establishes mechanism.",
             "- Do not create generic code-review chains when deterministic engineering validation or a bounded fidelity check answers the actual question.",
+            "Correction runtime mode:",
+            f"- {CORRECTION_RUNTIME_MODES.get(correction_mode, 'GENERAL: retrieve the assigned correction layer from CanonicalWorkerContext and keep design, implementation, and interpretation distinct.')}",
             "Operating policy:",
             *[f"- {name}: {json.dumps(value, sort_keys=True)}" for name, value in sections.items() if value],
             f"Provider adaptation: {self._provider_note(provider)}",
@@ -85,7 +110,7 @@ class PromptCompiler:
         content = "\n".join(lines) + "\n"
         return {
             "policy_id": str(policy.get("id", "")), "policy_version": data.get("version"),
-            "target_provider": provider, "target_runtime": target_runtime,
+            "target_provider": provider, "target_runtime": target_runtime, "correction_runtime_mode": correction_mode,
             "provenance": data.get("provenance", {}), "semantic_sections": sections,
             "provider_adapter": adapter,
             "generated_at": datetime.now(UTC).isoformat(), "content": content,

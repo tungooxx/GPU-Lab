@@ -498,3 +498,19 @@ def test_provider_compilation_includes_only_the_selected_adapter_data():
 
     assert compiled["provider_adapter"] == {"format": "structured"}
     assert 'Provider adapter data: {"format": "structured"}' in compiled["content"]
+
+
+def test_prompt_compiler_uses_a_correction_layer_specific_runtime_mode():
+    compiler = PromptCompiler()
+    policy = {"id": "policy", "data": {"version": 1, "core_epistemic_invariants": list(CORE_EPISTEMIC_INVARIANTS)}}
+
+    design = compiler.compile(policy, "CODEX", "design_attack")
+    fidelity = compiler.compile(policy, "CODEX", "implementation-fidelity")
+    interpretation = compiler.compile(policy, "CODEX", "result_interpretation")
+
+    assert design["correction_runtime_mode"] == "DESIGN_ATTACK"
+    assert "Attack the frozen idea" in design["content"]
+    assert fidelity["correction_runtime_mode"] == "IMPLEMENTATION_FIDELITY"
+    assert "science-to-code mapping" in fidelity["content"]
+    assert interpretation["correction_runtime_mode"] == "RESULT_INTERPRETATION"
+    assert "strongest alternatives" in interpretation["content"]
