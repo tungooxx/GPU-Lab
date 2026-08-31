@@ -22,8 +22,9 @@ provenance without rewriting the historical artifact.
 
 Verification on 2026-08-31:
 
-- Windows suite: `398 passed, 102 skipped`.
-- Fresh PostgreSQL v3.6.6 integration: `7 passed`.
+- Windows suite: `399 passed, 107 skipped`.
+- Fresh PostgreSQL v3.6.6 integration: targeted correction checks passed,
+  including current-lineage and legacy-backfill regressions.
 - Covered invariants: peer isolation, fidelity != design correction, one
   material challenge overrides apparent majority, independent duplicate
   challenge origins collapse only during synthesis, discriminator creation,
@@ -31,7 +32,10 @@ Verification on 2026-08-31:
   G assumption map remaining incomplete after an implementation-fidelity pass,
   bounded V5 missing-attack preview, persistent inferred classification,
   atomic design finalization/repair successor materialization, and
-  interpretation-attack deduplication/provenance.
+  interpretation-attack deduplication/provenance, high-risk independent-worker
+  and operator coverage, partial assumption coverage, current-lineage freezing
+  with technical-failure separation, and provenance-preserving legacy design
+  attack extraction.
 
 All v3.6.6 rollout flags default enabled for this release and are enforced at
 their public mutation boundaries; operators can selectively disable a feature
