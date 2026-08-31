@@ -502,7 +502,10 @@ def test_stale_transition_expires_open_batches_and_makes_them_visibly_non_writea
     assert view["effective_status"] == "EXPIRED"
     assert view["writeable"] is False
     assert view["recovery_action"] == "CREATE_FRESH_ROUND"
-    assert next(member for member in dde._members(round_["id"]) if member["candidate_batch_id"] == batch["id"])["status"] == "EXPIRED"
+    assert next(
+        member for member in dde._members(round_["id"])
+        if str(member["candidate_batch_id"]) == str(batch["id"])
+    )["status"] == "EXPIRED"
 
     with pytest.raises(GPUError) as exc:
         dde.submit_candidate(round_["id"], batch["id"], worker["worker"]["id"], worker["session_id"], _candidate("late", {"causal_object": "late"}))
@@ -524,8 +527,8 @@ def test_expired_independent_generation_work_claim_creates_fresh_batch_lane():
     store = ResearchStore(TEST_DATABASE_URL)
     lab, dde = LabController(store, lease_seconds=30), DistributedDiscoveryService(store)
     project_id = store.project_create(f"dde-reassigned-lane-{time.time_ns()}", "Fresh replacement lane")['project_id']
-    original = lab.join(None, "dde-original-generator", "CODEX", project_id)
-    replacement = lab.join(None, "dde-replacement-generator", "LOCAL_AGENT", project_id)
+    original = lab.join(None, f"dde-original-generator-{time.time_ns()}", "CODEX", project_id)
+    replacement = lab.join(None, f"dde-replacement-generator-{time.time_ns()}", "LOCAL_AGENT", project_id)
     round_ = dde.create_round(
         project_id, None, "MECHANISM_SEARCH",
         baseline_signature={"causal_object": "baseline"},
@@ -566,6 +569,41 @@ def test_expired_independent_generation_work_claim_creates_fresh_batch_lane():
             _candidate("expired lane", {"causal_object": "expired"}),
         )
     assert exc.value.error_type == "DISCOVERY_BATCH_NOT_WRITABLE"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_allocator_claims_ready_discovery_lane_after_stale_worker_projection():
+    """A fresh independent lane must not be hidden by SUPPORTING classification.
+
+    This is the production path used by ``portfolio_assign_existing`` after a
+    previous generator expires.  A stale EXECUTING worker projection must also
+    be reconciled before the allocator rejects an otherwise free worker.
+    """
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store, feature_flags={"BRANCH_AWARE_ASSIGNMENT": True})
+    dde = DistributedDiscoveryService(store)
+    project_id = store.project_create(
+        f"dde-allocator-lane-{time.time_ns()}", "Allocator claims discovery lane"
+    )["project_id"]
+    worker = lab.join(None, f"dde-allocator-generator-{time.time_ns()}", "CODEX", project_id)
+    round_ = dde.create_round(
+        project_id, None, "MECHANISM_SEARCH", baseline_signature={"causal_object": "baseline"}
+    )
+    batch = dde.join_round(
+        round_["id"], worker["worker"]["id"], worker["session_id"], "ONTOLOGY_CHALLENGE", "ORTHOGONAL"
+    )
+    work = dde.lab_work_items(round_["id"])[0]
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE research_workers SET availability_state='EXECUTING' WHERE id=%s",
+            (worker["worker"]["id"],),
+        )
+
+    assigned = lab.portfolio_assign_existing(project_id, worker["worker"]["id"], worker["session_id"])
+    assert assigned["status"] == "ASSIGNED"
+    assert assigned["work_item"]["id"] == work["id"]
+    assert assigned["work_item"]["related_refs"]["candidate_batch_id"] == str(batch["id"])
+    assert lab.work_get(work["id"])["status"] == "CLAIMED"
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")

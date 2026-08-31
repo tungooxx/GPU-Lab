@@ -779,6 +779,36 @@ class LabController:
         )
         return [str(row["id"]) for row in cur.fetchall()]
 
+    def _reconcile_worker_availability(self, cur, worker_id: str, now: datetime) -> dict:
+        """Repair availability projection before allocator admission.
+
+        A worker can remain EXECUTING after its lease expired or was released,
+        even when no session owns work. Availability is a projection, not the
+        authority source, so correct it only when no current session has a
+        live unreleased lease. Detached execution does not reserve its worker.
+        """
+        self._clear_stale_session_ownership(cur, worker_id, now)
+        cur.execute(
+            "SELECT EXISTS("
+            "SELECT 1 FROM research_worker_sessions s "
+            "JOIN lab_work_items wi ON wi.id=s.current_work_item_id "
+            "JOIN lab_work_leases l ON l.id=wi.lease_id "
+            "WHERE s.worker_id=%s AND s.status IN ('ACTIVE','BUSY','WAITING') "
+            "AND wi.status IN ('CLAIMED','RUNNING') "
+            "AND wi.assigned_worker_id=s.worker_id AND wi.assigned_session_id=s.id "
+            "AND l.worker_id=s.worker_id AND l.worker_session_id=s.id "
+            "AND l.released_at IS NULL AND l.expires_at >= %s"
+            ") AS owns_live_work",
+            (worker_id, now),
+        )
+        if not bool(cur.fetchone()["owns_live_work"]):
+            cur.execute(
+                "UPDATE research_workers SET availability_state='AVAILABLE',availability_updated_at=%s,"
+                "idle_reason=NULL,idle_since=NULL WHERE id=%s",
+                (now, worker_id),
+            )
+        return self._worker(cur, worker_id)
+
     def budget_set(self, project_id: str, worker_id: str, session_id: str,
                    limits: dict[str, Any]) -> dict:
         allowed = {
@@ -2179,9 +2209,17 @@ class LabController:
             return False
         if item.get("authority_status") == "AUTHORITATIVE":
             return True
+        if item.get("authority_status") != "SUPPORTING":
+            return False
+        # Supporting work is normally restricted to outcome-independent
+        # reasoning/review. Independent discovery generation is also
+        # outcome-independent: it is bound to a frozen DiscoveryRound and
+        # claim_work re-validates/rebinds its batch atomically. Hiding this
+        # kind leaves a valid fresh lane stranded after an expired claimant.
+        if item.get("kind") == "DISCOVERY_GENERATION":
+            return item.get("resource_class") == "REASONING"
         return (
-            item.get("authority_status") == "SUPPORTING"
-            and item.get("resource_class") in {"REASONING", "REVIEW"}
+            item.get("resource_class") in {"REASONING", "REVIEW"}
             and item.get("kind") not in {"RUN_EXPERIMENT", "TRAINING_RUN"}
         )
 
@@ -4408,6 +4446,7 @@ class LabController:
         with self.store._connect() as conn, conn.cursor() as cur:
             worker = self._worker(cur, worker_id)
             self._session(cur, session_id, worker_id, project_id)
+            worker = self._reconcile_worker_availability(cur, worker_id, self._now())
             if worker.get("availability_state") not in {"AVAILABLE", "IDLE"}:
                 raise GPUError("LAB_WORKER_NOT_AVAILABLE", str(worker.get("availability_state")))
 
