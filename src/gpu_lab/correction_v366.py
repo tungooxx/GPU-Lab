@@ -94,8 +94,11 @@ class ScientificSelfCorrectionService:
                     design_id UUID NOT NULL REFERENCES research_objects(id),
                     design_snapshot_hash TEXT NOT NULL, status TEXT NOT NULL,
                     peer_visibility TEXT NOT NULL, required_assumption_ids JSONB NOT NULL,
+                    frozen_lineage_context JSONB NOT NULL DEFAULT '{}'::jsonb,
                     created_at TIMESTAMPTZ NOT NULL, frozen_at TIMESTAMPTZ
                 );
+                ALTER TABLE design_attack_batches
+                    ADD COLUMN IF NOT EXISTS frozen_lineage_context JSONB NOT NULL DEFAULT '{}'::jsonb;
                 CREATE TABLE IF NOT EXISTS design_attack_memberships (
                     batch_id UUID NOT NULL REFERENCES design_attack_batches(id),
                     worker_id UUID NOT NULL, worker_session_id UUID NOT NULL,
@@ -141,6 +144,33 @@ class ScientificSelfCorrectionService:
         if not cur.fetchone():
             raise GPUError("DESIGN_ATTACK_WORKER_SESSION_INVALID", str(session_id))
 
+    def _frozen_lineage_context(self, project_id: str, source_object_id: str | None = None) -> dict[str, Any]:
+        """Capture current design-relevant history without treating technical failure as science.
+
+        The context is an immutable list of durable references, not a verdict
+        on the design.  It makes post-design NegativeResults visible to the
+        critics while explicitly separating records that identify themselves
+        as technical-only or not scientifically assessed.
+        """
+        scientific_negative_result_ids: list[str] = []
+        technical_only_negative_result_ids: list[str] = []
+        for item in self.store.objects_list(project_id, "NegativeResult", limit=None):
+            data = item.get("data") or {}
+            marker = " ".join(str(data.get(key) or "") for key in (
+                "scientific_result", "classification", "failure_class", "result_type", "validity",
+            )).upper()
+            if any(token in marker for token in ("TECHNICAL", "NOT_ASSESSED", "INVALID_EXECUTION")):
+                technical_only_negative_result_ids.append(str(item["id"]))
+            else:
+                scientific_negative_result_ids.append(str(item["id"]))
+        return {
+            "captured_at": self._now().isoformat(),
+            "source_object_id": str(source_object_id) if source_object_id else None,
+            "scientific_negative_result_ids": sorted(scientific_negative_result_ids),
+            "technical_only_negative_result_ids": sorted(technical_only_negative_result_ids),
+            "technical_failures_are_not_scientific_design_evidence": True,
+        }
+
     def create_design(self, project_id: str, name: str, specification: dict[str, Any], *,
                       source_object_id: str | None = None, scientific_risk: str = "MODERATE",
                       engineering_risk: str = "DETERMINISTIC") -> dict:
@@ -163,6 +193,7 @@ class ScientificSelfCorrectionService:
             "scientific_design_risk": scientific_risk, "engineering_verification_risk": engineering_risk,
             "semantic_hash": self._hash(frozen), "design_status": "FROZEN", "authority": "NOT_ACCEPTED_FOR_TEST",
             "design_self_correction_status": "INCOMPLETE", "created_at": self._now().isoformat(),
+            "original_lineage_context": self._frozen_lineage_context(project_id, source_object_id),
         }
         return self.store.object_create(project_id, "ScientificDesign", data, "SCIENTIFIC_DESIGN_FROZEN", "FROZEN")
 
@@ -198,15 +229,16 @@ class ScientificSelfCorrectionService:
         intensity = self._attack_intensity(risk)
         now, batch_id = self._now(), uuid.uuid4()
         snapshot_hash = design["data"]["semantic_hash"]
+        lineage_context = self._frozen_lineage_context(str(design["project_id"]), design["data"].get("source_object_id"))
         with self.store._connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT id FROM design_attack_batches WHERE design_id=%s AND design_snapshot_hash=%s AND status='GENERATING' FOR UPDATE", (design_id, snapshot_hash))
             existing = cur.fetchone()
             if existing:
                 return self.attack_batch_get(str(existing["id"]))
-            cur.execute("INSERT INTO design_attack_batches(id,project_id,design_id,design_snapshot_hash,status,peer_visibility,required_assumption_ids,created_at) VALUES(%s,%s,%s,%s,'GENERATING','HIDDEN',%s,%s)", (batch_id, design["project_id"], design_id, snapshot_hash, self._json(required), now))
+            cur.execute("INSERT INTO design_attack_batches(id,project_id,design_id,design_snapshot_hash,status,peer_visibility,required_assumption_ids,frozen_lineage_context,created_at) VALUES(%s,%s,%s,%s,'GENERATING','HIDDEN',%s,%s,%s)", (batch_id, design["project_id"], design_id, snapshot_hash, self._json(required), self._json(lineage_context), now))
             self.store._event(cur, design["project_id"], "DESIGN_ATTACK_INTENSITY_SELECTED", design_id, {"scientific_design_risk": risk, **intensity})
             cur.execute("UPDATE research_objects SET status='UNDER_ATTACK',data=%s WHERE id=%s", (self._json({**design["data"], "design_status": "UNDER_ATTACK"}), design_id))
-            self.store._event(cur, design["project_id"], "DESIGN_ATTACK_STARTED", design_id, {"batch_id": str(batch_id), "required_assumption_ids": required})
+            self.store._event(cur, design["project_id"], "DESIGN_ATTACK_STARTED", design_id, {"batch_id": str(batch_id), "required_assumption_ids": required, "scientific_negative_result_count": len(lineage_context["scientific_negative_result_ids"]), "technical_negative_result_count": len(lineage_context["technical_only_negative_result_ids"])})
         result = self.attack_batch_get(str(batch_id))
         result["scientific_design_risk"] = risk
         result["recommended_attack_intensity"] = intensity
@@ -263,6 +295,7 @@ class ScientificSelfCorrectionService:
                 "target_assumption_ids": list(batch["required_assumption_ids"]), "attacker_worker_id": str(worker_id),
                 "attacker_session_id": str(session_id), "attack_operator": operator, "peer_exposure_state": "HIDDEN",
                 "frozen_context_version": batch["design_snapshot_hash"], "design_snapshot": design["data"],
+                "frozen_lineage_context": batch["frozen_lineage_context"],
                 "challenges": [], "competing_explanations": [], "degenerate_explanations": [], "discriminating_tests": [],
                 "verdict": None, "independence": {"peer_attack_visible_before_submission": False, "shared_message_visible": False},
             }

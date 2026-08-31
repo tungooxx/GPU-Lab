@@ -207,6 +207,24 @@ def test_v366_coverage_uses_assumptions_actually_considered_not_batch_membership
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v366_attack_batch_freezes_current_lineage_without_counting_technical_failures():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab, correction = LabController(store), ScientificSelfCorrectionService(store)
+    project_id = store.project_create(f"v366-lineage-{time.time_ns()}", "lineage") ["project_id"]
+    worker = lab.join(None, "lineage-attacker", "CODEX", project_id)
+    design = correction.create_design(project_id, "current lineage design", {"mechanism": "test"}, scientific_risk="LOW")
+    assumption = correction.assumption_create(design["id"], "The mechanism is falsifiable.", "NECESSITY")
+    scientific = store.object_create(project_id, "NegativeResult", {"classification": "SCIENTIFIC_VALID"}, "NEGATIVE_RESULT_RECORDED", "COMPLETED")
+    technical = store.object_create(project_id, "NegativeResult", {"scientific_result": "TECHNICAL_ONLY"}, "NEGATIVE_RESULT_RECORDED", "COMPLETED")
+
+    batch = correction.attack_batch_create(design["id"], [assumption["id"]])
+    assert batch["frozen_lineage_context"]["scientific_negative_result_ids"] == [scientific["id"]]
+    assert batch["frozen_lineage_context"]["technical_only_negative_result_ids"] == [technical["id"]]
+    attack = correction.attack_join(batch["id"], worker["worker"]["id"], worker["session_id"], "NECESSITY_ATTACKER")
+    assert attack["data"]["frozen_lineage_context"] == batch["frozen_lineage_context"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_v5_regression_fidelity_is_not_full_scientific_design_self_correction():
     store = ResearchStore(TEST_DATABASE_URL)
     correction = ScientificSelfCorrectionService(store)
