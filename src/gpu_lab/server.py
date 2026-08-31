@@ -1925,6 +1925,12 @@ async def review_target_classifier_v366(project_id: str, target_id: str):
 
 
 @mcp.tool()
+async def review_target_classification_backfill_v366(project_id: str, target_id: str):
+    """Persist one inferred migration label without changing the historical review or WorkItem."""
+    return await call(scientific_correction().review_target_classification_persist, project_id, target_id)
+
+
+@mcp.tool()
 async def scientific_self_correction_audit_v366(project_id: str):
     """Read-only v3.6.6 audit of review-like records and missing design correction."""
     return await call(scientific_correction().production_audit, project_id)

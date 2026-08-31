@@ -187,6 +187,17 @@ def test_v366_read_only_audit_classifies_review_like_lab_workitems():
     assert audit["read_only"] is True
     assert audit["review_like_work_item_count"] == 1
     assert f"work:{work['id']}" in audit["review_like_work_by_type"]["IMPLEMENTATION_FIDELITY"]
+    assert audit["historical_classification_persisted"] is False
+    backfill = correction.review_target_classification_persist(project_id, work["id"])
+    assert backfill["kind"] == "ReviewTargetClassification"
+    assert backfill["data"]["target_type"] == "WORK_ITEM"
+    assert backfill["data"]["inferred_classification"] == "IMPLEMENTATION"
+    assert backfill["data"]["provenance"] == "BACKFILL_INFERRED_CLASSIFICATION"
+    assert backfill["data"]["preserves_original_artifact"] is True
+    assert str(correction.review_target_classification_persist(project_id, work["id"])["id"]) == backfill["id"]
+    persisted_audit = correction.production_audit(project_id)
+    assert persisted_audit["historical_classification_persisted"] is True
+    assert persisted_audit["persisted_review_classification_count"] == 1
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")

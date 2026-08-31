@@ -585,6 +585,74 @@ class ScientificSelfCorrectionService:
         label = self._classify_review_target(target["kind"], target["data"])
         return {"read_only": True, "implementation_version": VERSION, "target_id": str(target_id), "classification": label, "canonical_history_mutated": False}
 
+    @staticmethod
+    def _migration_label(classification: str) -> str:
+        return {
+            "DESIGN_ATTACK": "DESIGN",
+            "IMPLEMENTATION_FIDELITY": "IMPLEMENTATION",
+            "RESULT_INTERPRETATION": "INTERPRETATION",
+            "DETERMINISTIC_ENGINEERING": "MECHANICAL",
+        }.get(classification, "UNKNOWN")
+
+    def review_target_classification_persist(self, project_id: str, target_id: str) -> dict:
+        """Persist an inferred migration label without rewriting the source record.
+
+        The original object or WorkItem remains untouched. This produces one
+        durable BACKFILL record per target so dashboards can distinguish a
+        historical inference from a contemporaneous independent review.
+        """
+        with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id,kind,data FROM research_objects WHERE id=%s AND project_id=%s", (target_id, project_id))
+            object_row = cur.fetchone()
+            target_type = "RESEARCH_OBJECT"
+            if object_row:
+                kind, payload = str(object_row["kind"]), dict(object_row["data"] or {})
+            else:
+                cur.execute(
+                    "SELECT id,kind,title,description,scientific_role,related_refs FROM lab_work_items "
+                    "WHERE id=%s AND project_id=%s",
+                    (target_id, project_id),
+                )
+                work_row = cur.fetchone()
+                if not work_row:
+                    raise GPUError("REVIEW_TARGET_NOT_FOUND", str(target_id))
+                target_type, kind = "WORK_ITEM", str(work_row["kind"])
+                payload = {
+                    "title": work_row["title"], "description": work_row["description"],
+                    "scientific_role": work_row["scientific_role"], **(work_row["related_refs"] or {}),
+                }
+            raw = self._classify_review_target(kind, payload)
+            migration_label = self._migration_label(raw)
+            confidence = "MEDIUM" if raw != "UNKNOWN" else "LOW"
+            key = self._hash({"project_id": str(project_id), "target_type": target_type, "target_id": str(target_id)})
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"v366-review-classification:{key}",))
+            cur.execute(
+                "SELECT id FROM research_objects WHERE project_id=%s AND kind='ReviewTargetClassification' "
+                "AND data->>'classification_key'=%s ORDER BY created_at LIMIT 1",
+                (project_id, key),
+            )
+            existing = cur.fetchone()
+            if existing:
+                return self.store.object_get(str(existing["id"]))
+            ident, now = uuid.uuid4(), self._now()
+            data = {
+                "implementation_version": VERSION, "classification_key": key,
+                "target_id": str(target_id), "target_type": target_type,
+                "source_kind": kind, "inferred_classification": migration_label,
+                "classifier_label": raw, "confidence": confidence,
+                "provenance": "BACKFILL_INFERRED_CLASSIFICATION",
+                "preserves_original_artifact": True,
+                "does_not_claim_independent_worker_separation": True,
+                "classified_at": now.isoformat(),
+            }
+            cur.execute(
+                "INSERT INTO research_objects(id,project_id,kind,status,data,created_at) "
+                "VALUES(%s,%s,'ReviewTargetClassification','COMPLETED',%s,%s)",
+                (ident, project_id, self._json(data), now),
+            )
+            self.store._event(cur, project_id, "REVIEW_TARGET_CLASSIFICATION_BACKFILLED", ident, data)
+        return {"id": str(ident), "project_id": str(project_id), "kind": "ReviewTargetClassification", "status": "COMPLETED", "data": data}
+
     def production_audit(self, project_id: str) -> dict:
         """Read-only v3.6.6 audit; historical records are never rewritten."""
         kinds = ("EngineeringTask", "EngineeringResult", "ScientificDesignAttack",
@@ -613,6 +681,7 @@ class ScientificSelfCorrectionService:
             label = self._classify_review_target(str(item["kind"]), payload)
             classifications.setdefault(label, []).append(f"work:{item['id']}")
         designs = self.store.objects_list(project_id, "ScientificDesign", limit=None)
+        persisted = self.store.objects_list(project_id, "ReviewTargetClassification", limit=None)
         coverage = [self.design_coverage(str(design["id"])) for design in designs]
         incomplete = [entry["design_id"] for entry in coverage if entry["missing_assumption_ids"] or not entry["synthesis"]]
         return {
@@ -622,6 +691,7 @@ class ScientificSelfCorrectionService:
             "major_designs_lacking_explicit_self_correction": incomplete,
             "design_coverage": coverage,
             "generic_code_review_frequency": len(classifications["UNKNOWN"]),
-            "historical_classification_persisted": False,
+            "historical_classification_persisted": bool(persisted),
+            "persisted_review_classification_count": len(persisted),
             "confirmation_integrity": "UNCHANGED_BY_V366_AUDIT",
         }
