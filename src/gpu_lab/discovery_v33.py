@@ -32,11 +32,32 @@ GENERATION_OPERATORS = {
     "STRONG_NULL_CONSTRUCTION", "ASSUMPTION_REMOVAL", "ASSUMPTION_INVERSION",
     "BOTTLENECK_FIRST_DESIGN", "BREAKTHROUGH_EXTRACTION", "FRONTIER_BACKWARD_DESIGN",
 }
-MEMBER_STATUSES = {"JOINED", "FROZEN", "ABSTAINED", "FAILED"}
+MEMBER_STATUSES = {"JOINED", "FROZEN", "ABSTAINED", "FAILED", "EXPIRED"}
 DISCOVERY_KINDS = {
     "DiscoveryRound", "CandidateBatch", "DiscoveryCandidate", "MechanisticNiche",
     "CrossWorkerQDArchive", "DiscoveryCandidateOutcome", "DiscoveryCoverageAtDecision",
 }
+CONTROL_PLANE_KINDS = {
+    # Brain-step materialization records describe selection/provenance.  They
+    # are not new observations, hypotheses, claims, or negative evidence.
+    "HypothesisPortfolio", "ResearchSituation", "CandidatePortfolio",
+    "ResearchActionCandidate", "ResearchDecision", "ResearchDecisionOutcome",
+    "ResearchStrategyPattern", "StrategyOutcome",
+}
+
+
+def _snapshot_relevant_kind(kind: str) -> bool:
+    """Return whether an object can change the scientific discovery context.
+
+    Engineering implementation bookkeeping can be frequent while a discovery
+    round is generating.  It is operational provenance, not a scientific
+    state transition, and must never stale an independent generation round.
+    """
+    return (
+        kind not in DISCOVERY_KINDS
+        and kind not in CONTROL_PLANE_KINDS
+        and not kind.startswith("Engineering")
+    )
 
 
 class DistributedDiscoveryService:
@@ -91,7 +112,25 @@ class DistributedDiscoveryService:
 
     def _scientific_snapshot(self, project_id: str, *, legacy_full_data: bool = False) -> dict[str, Any]:
         state = self.store.state_get(project_id)
-        records = [
+        selected_niche_baselines = sorted(
+            [
+                {
+                    "id": str(item["id"]),
+                    "active_best_hypothesis_id": str(item["data"]["active_best_hypothesis_id"]),
+                    "diversity_signature": self._signature(
+                        {"diversity_signature": item["data"].get("diversity_signature")}
+                    ),
+                    "data_hash": self._hash(item["data"]),
+                }
+                for item in state["objects"]
+                if item["kind"] == "HypothesisNiche"
+                and item["status"] == "ACTIVE"
+                and item["data"].get("active_best_hypothesis_id")
+                and item["data"].get("diversity_signature")
+            ],
+            key=lambda item: item["id"],
+        )
+        records = sorted([
             # A frozen discovery snapshot needs an immutable identity and
             # content hash, not a second copy of every historical document.
             # This keeps future rounds bounded even for long-lived projects.
@@ -100,8 +139,8 @@ class DistributedDiscoveryService:
                 if legacy_full_data else
                 {"id": str(item["id"]), "kind": item["kind"], "status": item["status"], "data_hash": self._hash(item["data"])}
             )
-            for item in state["objects"] if item["kind"] not in DISCOVERY_KINDS
-        ]
+            for item in state["objects"] if _snapshot_relevant_kind(item["kind"])
+        ], key=lambda item: item["id"])
         return {
             "research_state_version": state["state_freshness"]["research_state_version"],
             "world_model_version": state["state_freshness"].get("world_model_version"),
@@ -113,6 +152,32 @@ class DistributedDiscoveryService:
             "stagnation_ids": [item["id"] for item in records if item["kind"] == "StagnationState"],
             "architecture_lineage_ids": [item["id"] for item in records if item["kind"] == "ArchitectureLineage"],
             "breakthrough_signal_ids": [item["id"] for item in records if item["kind"] == "BreakthroughSignal"],
+            # This is the narrow structural baseline needed to classify a
+            # discovery round. It is frozen alongside the scientific records,
+            # rather than being read from mutable project state at submission.
+            "selected_niche_baselines": selected_niche_baselines,
+        }
+
+    @staticmethod
+    def _baseline_from_snapshot(snapshot: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        candidates = list(snapshot.get("selected_niche_baselines", []))
+        if not candidates:
+            raise GPUError(
+                "DISCOVERY_BASELINE_REQUIRED",
+                "Provide baseline_signature, a triggering decision with a signature, or select an active HypothesisNiche.",
+            )
+        if len(candidates) > 1:
+            raise GPUError(
+                "DISCOVERY_BASELINE_AMBIGUOUS",
+                "Multiple active selected HypothesisNiches exist; provide baseline_signature explicitly.",
+                details={"selected_niche_ids": [item["id"] for item in candidates]},
+            )
+        niche = candidates[0]
+        return dict(niche["diversity_signature"]), {
+            "kind": "HypothesisNiche",
+            "id": niche["id"],
+            "active_best_hypothesis_id": niche["active_best_hypothesis_id"],
+            "data_hash": niche["data_hash"],
         }
 
     @staticmethod
@@ -132,6 +197,7 @@ class DistributedDiscoveryService:
         self, project_id: str, agenda_item_id: str | None, search_regime: str,
         *, triggering_decision_id: str | None = None, generation_budget: dict[str, int] | None = None,
         policy_version: str | None = None, brain_policy_version: str | None = None,
+        baseline_signature: dict[str, Any] | None = None,
     ) -> dict:
         snapshot = self._scientific_snapshot(project_id)
         budget = {"max_workers": 4, "max_candidates_per_batch": 3, "max_generation_waves": 2, "max_literature_calls": 1, "max_synthesis_rounds": 1, **(generation_budget or {})}
@@ -141,9 +207,47 @@ class DistributedDiscoveryService:
             agenda = self.store.object_get(agenda_item_id)
             if agenda["kind"] != "AgendaItem" or str(agenda["project_id"]) != str(project_id):
                 raise GPUError("DISCOVERY_AGENDA_ITEM_INVALID", agenda_item_id)
+        resolved_baseline_signature: dict[str, Any] | None = None
+        baseline_signature_source: dict[str, Any] | None = None
+        if baseline_signature is not None:
+            try:
+                resolved_baseline_signature = self._signature(
+                    {"diversity_signature": baseline_signature}
+                )
+            except GPUError as exc:
+                if exc.error_type in {
+                    "DISCOVERY_DIVERSITY_SIGNATURE_REQUIRED",
+                    "DISCOVERY_DIVERSITY_SIGNATURE_INVALID",
+                }:
+                    raise GPUError("DISCOVERY_BASELINE_SIGNATURE_INVALID", exc.message) from exc
+                raise
+            baseline_signature_source = {"kind": "EXPLICIT_ROUND_BASELINE"}
+        if triggering_decision_id:
+            decision = self.store.object_get(triggering_decision_id)
+            if decision["kind"] != "ResearchDecision" or str(decision["project_id"]) != str(project_id):
+                raise GPUError("DISCOVERY_TRIGGERING_DECISION_INVALID", str(triggering_decision_id))
+            selected = decision.get("data", {}).get("selected_action", {})
+            try:
+                resolved_baseline_signature = self._signature(selected)
+            except GPUError as exc:
+                if exc.error_type != "DISCOVERY_DIVERSITY_SIGNATURE_REQUIRED":
+                    raise
+            if resolved_baseline_signature:
+                baseline_signature_source = {
+                    "kind": "ResearchDecision",
+                    "id": str(triggering_decision_id),
+                    "selected_action_id": selected.get("id"),
+                }
+        if not resolved_baseline_signature:
+            resolved_baseline_signature, baseline_signature_source = self._baseline_from_snapshot(
+                snapshot
+            )
         data = {
             "implementation_version": DDE_VERSION, "agenda_item_id": agenda_item_id,
             "triggering_decision_id": triggering_decision_id, "search_regime": search_regime.upper(),
+            "baseline_signature": resolved_baseline_signature,
+            "baseline_signature_source": baseline_signature_source,
+            "baseline_status": "READY",
             "phase": "INDEPENDENT_GENERATION", "peer_visibility": "HIDDEN",
             "independent_generation": True, "required_distance_coverage": self.reservations(search_regime),
             "generation_budget": budget, "frozen_state": snapshot,
@@ -167,22 +271,90 @@ class DistributedDiscoveryService:
         """Detect external scientific-state changes without mixing generations across state versions."""
         round_ = self._round(round_id)
         frozen_records = round_["data"].get("frozen_state", {}).get("records", [])
+        # Older rounds stored engineering records before the snapshot-scope
+        # correction. Filter both sides so the corrected semantics are also
+        # safe for an already-active legacy round.
+        scientific_frozen_records = sorted([
+            item for item in frozen_records if _snapshot_relevant_kind(str(item.get("kind", "")))
+        ], key=lambda item: str(item["id"]))
         current = self._scientific_snapshot(
             str(round_["project_id"]),
             legacy_full_data=bool(frozen_records and "data" in frozen_records[0]),
         )
-        stale = self._hash(current["records"]) != round_["data"].get("scientific_snapshot_hash")
+        current_hash = self._hash(current["records"])
+        frozen_hash = self._hash(scientific_frozen_records)
+        stale = current_hash != frozen_hash
+        frozen_by_id = {str(item["id"]): item for item in scientific_frozen_records}
+        current_by_id = {str(item["id"]): item for item in current["records"]}
+        changed_ids = sorted(
+            object_id for object_id in frozen_by_id.keys() | current_by_id.keys()
+            if frozen_by_id.get(object_id) != current_by_id.get(object_id)
+        )
         result = {
             "discovery_round_id": str(round_id), "stale": stale,
-            "frozen_scientific_snapshot_hash": round_["data"].get("scientific_snapshot_hash"),
-            "current_scientific_snapshot_hash": self._hash(current["records"]),
+            "frozen_scientific_snapshot_hash": frozen_hash,
+            "current_scientific_snapshot_hash": current_hash,
+            "changed_scientific_record_ids": changed_ids[:50],
+            "changed_scientific_record_count": len(changed_ids),
         }
-        if stale and mark_stale and round_["status"] == "ACTIVE":
-            updated = self.store.object_update(
-                str(round_id), {"phase": "STALE", "stale_detected_at": self._now().isoformat(), **result},
-                "STALE", "DISCOVERY_ROUND_STALE",
-            )
-            result["round"] = updated
+        if stale and mark_stale:
+            now = self._now()
+            with self.store._connect() as conn, conn.cursor() as cur:
+                # Serialise every generation-state transition on the parent.
+                # Candidate submission takes the same lock before creating a
+                # proposal, so a stale transition cannot leave a JOINED batch
+                # apparently writable under a non-generating parent.
+                cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"dde-round:{round_id}",))
+                cur.execute("SELECT * FROM research_objects WHERE id=%s AND kind='DiscoveryRound' FOR UPDATE", (round_id,))
+                locked_round = self._record(cur.fetchone())
+                if not locked_round:
+                    raise GPUError("DISCOVERY_ROUND_NOT_FOUND", str(round_id))
+                # Also reconcile legacy stale rounds created before open child
+                # batches were expired atomically.
+                if locked_round["status"] in {"ACTIVE", "STALE"}:
+                    cur.execute(
+                        "SELECT * FROM discovery_round_memberships WHERE discovery_round_id=%s AND status='JOINED' FOR UPDATE",
+                        (round_id,),
+                    )
+                    open_members = cur.fetchall()
+                    expired_batch_ids: list[str] = []
+                    for member in open_members:
+                        batch_id = str(member["candidate_batch_id"])
+                        cur.execute("SELECT data FROM research_objects WHERE id=%s AND kind='CandidateBatch' FOR UPDATE", (batch_id,))
+                        batch = cur.fetchone()
+                        if batch:
+                            batch_data = {
+                                **batch["data"],
+                                "status": "EXPIRED",
+                                "writeable": False,
+                                "expired_at": now.isoformat(),
+                                "expiration_reason": "ROUND_STALE",
+                            }
+                            cur.execute("UPDATE research_objects SET status='EXPIRED',data=%s WHERE id=%s", (self._json(batch_data), batch_id))
+                            expired_batch_ids.append(batch_id)
+                        cur.execute(
+                            "UPDATE discovery_round_memberships SET status='EXPIRED',frozen_at=%s,failure_reason='ROUND_STALE' "
+                            "WHERE discovery_round_id=%s AND candidate_batch_id=%s",
+                            (now, round_id, batch_id),
+                        )
+                    round_data = {
+                        **locked_round["data"],
+                        "phase": "STALE",
+                        "stale_detected_at": now.isoformat(),
+                        "recovery_action": "CREATE_FRESH_ROUND",
+                        **result,
+                    }
+                    cur.execute("UPDATE research_objects SET status='STALE',data=%s WHERE id=%s", (self._json(round_data), round_id))
+                    for batch_id in expired_batch_ids:
+                        self.store._event(cur, str(locked_round["project_id"]), "DISCOVERY_BATCH_EXPIRED", batch_id, {"round_id": str(round_id), "reason": "ROUND_STALE"})
+                    self.store._event(
+                        cur,
+                        str(locked_round["project_id"]),
+                        "DISCOVERY_ROUND_STALE" if locked_round["status"] == "ACTIVE" else "DISCOVERY_STALE_ROUND_RECONCILED",
+                        str(round_id),
+                        {**result, "expired_batch_ids": expired_batch_ids},
+                    )
+            result["round"] = self._round(str(round_id))
         return result
 
     def shadow_preview(self, project_id: str, candidates: list[dict[str, Any]], search_regime: str) -> dict:
@@ -190,6 +362,7 @@ class DistributedDiscoveryService:
         snapshot = self._scientific_snapshot(project_id)
         reservations = self.reservations(search_regime)
         characterized = []
+        baseline_signature: dict[str, Any] | None = None
         for index, raw in enumerate(candidates):
             try:
                 signature = self._signature(raw)
@@ -197,8 +370,15 @@ class DistributedDiscoveryService:
                 if exc.error_type != "DISCOVERY_DIVERSITY_SIGNATURE_REQUIRED":
                     raise
                 signature = {}
+            if signature and baseline_signature is None:
+                # Match Brain._discovery_portfolio semantics: the first serious
+                # candidate is the read-only comparison baseline.  Comparing to
+                # an empty signature makes every explicit causal_object look
+                # ORTHOGONAL and collapses NEAR/MID/FAR coverage.
+                baseline_signature = dict(signature)
             distance = classify_scientific_distance(
-                {"payload": {"scientific_dimensions": signature}}, {"payload": {"scientific_dimensions": {}}},
+                {"payload": {"scientific_dimensions": signature}},
+                {"payload": {"scientific_dimensions": baseline_signature or {}}},
             ) if signature else {"scientific_distance": "UNCHARACTERIZED", "reason": "Existing candidate lacks a structured DiversitySignature"}
             characterized.append({
                 "index": index, "title": raw.get("title") or raw.get("action_type", f"candidate-{index}"),
@@ -215,6 +395,7 @@ class DistributedDiscoveryService:
             "read_only": True, "implementation_version": DDE_VERSION,
             "frozen_scientific_snapshot_hash": self._hash(snapshot["records"]),
             "search_regime": search_regime.upper(), "required_distance_coverage": reservations,
+            "baseline_signature": baseline_signature or {},
             "candidates": characterized, "effective_niche_count": len(niches),
             "niche_distribution": dict(niches), "scientific_distance_distribution": dict(coverage),
             "unfilled_distance_slots": [key for key, amount in reservations.items() if amount and not coverage[key]],
@@ -238,9 +419,18 @@ class DistributedDiscoveryService:
             raise GPUError("DISCOVERY_ROUND_NOT_FOUND", round_id)
         return round_
 
-    def _assert_independent_phase(self, round_: dict) -> None:
+    def _assert_independent_phase(self, round_: dict, batch_effective_status: str | None = None) -> None:
         if round_["status"] != "ACTIVE" or round_["data"].get("phase") != "INDEPENDENT_GENERATION":
-            raise GPUError("DISCOVERY_ROUND_NOT_GENERATING", str(round_["id"]))
+            raise GPUError(
+                "DISCOVERY_ROUND_NOT_GENERATING",
+                "Discovery round is not accepting candidate submissions.",
+                details={
+                    "actual_round_phase": round_["data"].get("phase"),
+                    "stale": round_["status"] == "STALE" or round_["data"].get("phase") == "STALE",
+                    "batch_effective_status": batch_effective_status,
+                    "recovery_action": round_["data"].get("recovery_action"),
+                },
+            )
 
     def join_round(
         self, round_id: str, worker_id: str, session_id: str, generation_operator: str,
@@ -362,22 +552,30 @@ class DistributedDiscoveryService:
     @staticmethod
     def _validate_candidate(candidate: dict[str, Any]) -> None:
         if not isinstance(candidate.get("mechanism"), str) or not candidate["mechanism"].strip():
-            raise GPUError("DISCOVERY_CANDIDATE_MECHANISM_REQUIRED", "A serious candidate needs a mechanism")
+            raise GPUError("DISCOVERY_CANDIDATE_MECHANISM_REQUIRED", "candidate.mechanism must be a non-empty string")
         predictions = candidate.get("predictions")
         if not isinstance(predictions, list) or not any(isinstance(item, str) and item.strip() for item in predictions):
-            raise GPUError("DISCOVERY_CANDIDATE_PREDICTION_REQUIRED", "A serious candidate needs a discriminating prediction")
+            raise GPUError(
+                "DISCOVERY_CANDIDATE_PREDICTION_REQUIRED",
+                "candidate.predictions must be a non-empty array containing at least one non-empty string; "
+                "candidate.discriminating_prediction is not a supported field",
+            )
         if not isinstance(candidate.get("falsifier"), str) or not candidate["falsifier"].strip():
-            raise GPUError("DISCOVERY_CANDIDATE_FALSIFIER_REQUIRED", "A serious candidate needs a falsifier")
+            raise GPUError("DISCOVERY_CANDIDATE_FALSIFIER_REQUIRED", "candidate.falsifier must be a non-empty string")
 
     def submit_candidate(self, round_id: str, batch_id: str, worker_id: str, session_id: str, candidate: dict[str, Any]) -> dict:
-        round_ = self._round(round_id)
-        self._assert_independent_phase(round_)
         self._validate_candidate(candidate)
         signature = self._signature(candidate)
         now = self._now()
         with self.store._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"dde-round:{round_id}",))
+            cur.execute("SELECT * FROM research_objects WHERE id=%s AND kind='DiscoveryRound' FOR UPDATE", (round_id,))
+            round_ = self._record(cur.fetchone())
+            if not round_:
+                raise GPUError("DISCOVERY_ROUND_NOT_FOUND", str(round_id))
             cur.execute("SELECT * FROM discovery_round_memberships WHERE discovery_round_id=%s AND candidate_batch_id=%s AND worker_id=%s AND worker_session_id=%s FOR UPDATE", (round_id, batch_id, worker_id, session_id))
             member = cur.fetchone()
+            self._assert_independent_phase(round_, member["status"] if member else None)
             if not member or member["status"] != "JOINED":
                 raise GPUError("DISCOVERY_BATCH_NOT_WRITABLE", batch_id)
             cur.execute("SELECT data FROM research_objects WHERE id=%s AND kind='CandidateBatch' FOR UPDATE", (batch_id,))
@@ -387,7 +585,16 @@ class DistributedDiscoveryService:
             candidate_ids = batch["data"].get("candidate_ids", [])
             if len(candidate_ids) >= round_["data"]["generation_budget"]["max_candidates_per_batch"]:
                 raise GPUError("DISCOVERY_BATCH_CANDIDATE_BUDGET_EXHAUSTED", batch_id)
-            distance = classify_scientific_distance({"payload": {"scientific_dimensions": signature}}, {"payload": {"scientific_dimensions": round_["data"].get("baseline_signature", {})}})
+            baseline = round_["data"].get("baseline_signature")
+            if not baseline:
+                raise GPUError(
+                    "DISCOVERY_BASELINE_REQUIRED",
+                    "This legacy round has no frozen canonical baseline; create a fresh round.",
+                )
+            distance = classify_scientific_distance(
+                {"payload": {"scientific_dimensions": signature}},
+                {"payload": {"scientific_dimensions": baseline}},
+            )
             requested = member["requested_distance"]
             data = {
                 "implementation_version": DDE_VERSION, "discovery_round_id": round_id, "candidate_batch_id": batch_id,
@@ -404,6 +611,9 @@ class DistributedDiscoveryService:
                 "genealogy_relation": candidate.get("genealogy_relation", "INDEPENDENT_GENERATION"),
                 "quality_components": dict(candidate.get("quality_components") or {}),
                 "expected_failure_modes": list(candidate.get("expected_failure_modes") or []),
+                "enabling_method": candidate.get("enabling_method"),
+                "mechanistic_hypothesis": candidate.get("mechanistic_hypothesis"),
+                "lineage_audit": dict(candidate.get("lineage_audit") or {}),
                 "novelty_status": "NOVELTY_UNVERIFIED", "dead_memory_status": "NOT_SCREENED",
                 "proposal_state_hash": round_["data"]["frozen_state_hash"], "proposed_at": now.isoformat(),
                 "independent_generation": bool(member["independent_generation"]), "selected_for_portfolio": False,
@@ -490,7 +700,21 @@ class DistributedDiscoveryService:
             if not requester or requester["independent_generation"]:
                 raise GPUError("DISCOVERY_PEER_ISOLATION_ACTIVE", "Peer candidate batches are hidden until generation freezes")
         candidate_ids = batch["data"].get("candidate_ids", [])
-        return {**batch, "candidates": [self.store.object_get(candidate_id) for candidate_id in candidate_ids]}
+        member = next((item for item in self._members(round_id) if item["candidate_batch_id"] == str(batch_id)), None)
+        effective_status = member["status"] if member else batch["status"]
+        writeable = (
+            round_["status"] == "ACTIVE"
+            and round_["data"].get("phase") == "INDEPENDENT_GENERATION"
+            and effective_status == "JOINED"
+            and batch["status"] == "ACTIVE"
+        )
+        return {
+            **batch,
+            "candidates": [self.store.object_get(candidate_id) for candidate_id in candidate_ids],
+            "effective_status": effective_status,
+            "writeable": writeable,
+            "recovery_action": round_["data"].get("recovery_action"),
+        }
 
     def peer_isolation_override(
         self, round_id: str, batch_id: str, worker_id: str, session_id: str, rationale: str

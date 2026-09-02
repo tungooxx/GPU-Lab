@@ -122,7 +122,10 @@ class PolicyLabService:
             version=1,
             provenance={"source_type": "V2_5_BOOTSTRAP", "created_at": datetime.now(UTC).isoformat()},
             scientific_policy={"closed_cycle_required": True, "learning_namespace": "PRODUCTION_SCIENCE"},
-            decision_policy={"falsification_first": True, "reproduction_gate": True},
+            decision_policy={
+                "falsification_first": True,
+                "reproduction_gate_scopes": ["BASELINE_COMPARISON", "PUBLICATION"],
+            },
             critic_policy={"null_reasoning": True},
             strategy_policy={"eligibility": "v2.2 fail-closed"},
             evidence_policy={"independence_required": True},

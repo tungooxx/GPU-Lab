@@ -34,10 +34,11 @@ def test_resolved_compose_keeps_sentinel_worker_credentials_out_of_gateway():
         ["docker", "compose", "--profile", "literature", "config", "--format", "json"],
         cwd=Path(__file__).parents[1],
         env=environment,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
     gateway = json.loads(result.stdout)["services"]["gpu-lab"]["environment"]
 
     assert {name: gateway[name] for name in (

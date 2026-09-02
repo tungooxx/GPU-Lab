@@ -76,6 +76,29 @@ class LocalRunner:
             raise GPUError("INVALID_ENV_NAME", "Environment must be inside the environment root")
         return candidate
 
+    def _environment_from_python(self, value: str) -> Path:
+        """Resolve either a persistent environment name or its absolute Python path."""
+        if not Path(value).is_absolute():
+            return self._environment_path(value)
+        executable = Path(value).resolve()
+        root = self.settings.gpu_lab_local_env_root.resolve()
+        if not executable.is_relative_to(root):
+            raise GPUError(
+                "INVALID_PYTHON_ENV_PATH",
+                "Absolute environment paths must be inside the environment root",
+            )
+        # local_status exposes the canonical environment directory, while some
+        # reviewed manifests persist its bin/python path.  Both identify the
+        # same persistent environment and must be executable inputs.
+        if executable.is_dir():
+            return executable
+        if executable.name in {"python", "python3"} and executable.parent.name == "bin":
+            return executable.parent.parent
+        raise GPUError(
+            "INVALID_PYTHON_ENV_PATH",
+            "Absolute environment paths must be an environment directory or its bin/python executable",
+        )
+
     def _requirements_path(self, value: str) -> Path:
         candidate = (self.workspace / value).resolve()
         if not candidate.is_relative_to(self.workspace):
@@ -218,7 +241,7 @@ class LocalRunner:
         ).hexdigest()
         run_env = self._job_environment(env)
         if python_env:
-            venv = self._environment_path(python_env)
+            venv = self._environment_from_python(python_env)
             if not venv.is_dir():
                 raise GPUError("LOCAL_ENV_NOT_FOUND", f"No persistent environment named {python_env}")
             run_env["PATH"] = f"{venv / 'bin'}:{run_env.get('PATH', '')}"
@@ -359,6 +382,17 @@ class LocalRunner:
                 job.remote_pid = int(pid_file.read_text().strip())
             except ValueError:
                 pass
+        # A successful cancellation is terminal even when SIGTERM/SIGKILL
+        # prevented the child from writing its normal exit-code file.
+        if job.status == "cancelled":
+            result = {"job_id": job_id, "status": "cancelled", "exit_code": job.exit_code}
+            if include_logs:
+                logs = ""
+                for file in (jobdir / "stdout.log", jobdir / "stderr.log"):
+                    if file.exists():
+                        logs += file.read_text(errors="replace")[-65536:]
+                result["logs_tail"] = logs
+            return result
         if code_file.is_file():
             try:
                 job.exit_code = int(code_file.read_text().strip())
@@ -370,22 +404,41 @@ class LocalRunner:
             # ``queued`` is the durable pre-spawn claim. A status reader must
             # not invalidate a live claimant and make the ID reclaimable while
             # its subprocess creation is still in flight.
-            owner_pid = job.metadata.get("submission_owner_pid")
-            owner_identity = job.metadata.get("submission_owner_identity")
-            same_owner = job.metadata.get("submission_owner_id") == self.submission_owner_id
-            owner_alive = (
-                job.metadata.get("runner_instance_id") == self.runner_instance_id
-                and isinstance(owner_pid, int)
-                and bool(owner_identity)
-                and self._process_identity(owner_pid) == owner_identity
+            # A client/gateway may disconnect after the child is spawned but
+            # before this coroutine can persist ``running``.  The detached
+            # wrapper writes process.pid before executing user code, so recover
+            # that durable launch proof instead of turning a real job unknown.
+            process_identity = (
+                self._process_identity(job.remote_pid)
+                if job.remote_pid and job.remote_pid > 0
+                else None
             )
-            try:
-                claimed_at = datetime.fromisoformat(job.metadata["submission_claimed_at"])
-                fresh_claim = (datetime.now(UTC) - claimed_at).total_seconds() < 60
-            except (KeyError, TypeError, ValueError):
-                fresh_claim = False
-            if not (same_owner or owner_alive or fresh_claim):
-                job.status = "unknown"
+            if process_identity:
+                job.status = "running"
+                job.metadata.update(
+                    {
+                        "process_identity": process_identity,
+                        "runner_instance_id": self.runner_instance_id,
+                        "recovered_from_durable_pid": True,
+                    }
+                )
+            else:
+                owner_pid = job.metadata.get("submission_owner_pid")
+                owner_identity = job.metadata.get("submission_owner_identity")
+                same_owner = job.metadata.get("submission_owner_id") == self.submission_owner_id
+                owner_alive = (
+                    job.metadata.get("runner_instance_id") == self.runner_instance_id
+                    and isinstance(owner_pid, int)
+                    and bool(owner_identity)
+                    and self._process_identity(owner_pid) == owner_identity
+                )
+                try:
+                    claimed_at = datetime.fromisoformat(job.metadata["submission_claimed_at"])
+                    fresh_claim = (datetime.now(UTC) - claimed_at).total_seconds() < 60
+                except (KeyError, TypeError, ValueError):
+                    fresh_claim = False
+                if not (same_owner or owner_alive or fresh_claim):
+                    job.status = "unknown"
         else:
             launched_by_current_runner = (
                 job.metadata.get("runner_instance_id") == self.runner_instance_id
@@ -436,10 +489,32 @@ class LocalRunner:
             raise GPUError("JOB_NOT_FOUND", f"No local job named {job_id}")
         if not job.remote_pid or job.remote_pid <= 0:
             raise GPUError("JOB_PID_UNKNOWN", f"No valid process ID for {job_id}")
+        def group_alive() -> bool:
+            try:
+                os.kill(-job.remote_pid, 0)
+                return True
+            except (PermissionError, ProcessLookupError):
+                return False
         try:
             os.killpg(job.remote_pid, signal.SIGTERM)
         except (PermissionError, ProcessLookupError):
             pass
+        for _ in range(5):
+            if not group_alive():
+                break
+            __import__("time").sleep(1)
+        if group_alive():
+            try:
+                os.killpg(job.remote_pid, signal.SIGKILL)
+            except (PermissionError, ProcessLookupError):
+                pass
+            __import__("time").sleep(1)
+        if group_alive():
+            job.metadata.update({"cancellation_requested_at": datetime.now(UTC).isoformat(), "cancellation_incomplete": True})
+            self.repo.save_job(job)
+            return {"job_id": job_id, "status": "cancellation_incomplete", "terminated": False, "process_group_alive": True, "recovery_action": "CANCEL_PROCESS_GROUP"}
         job.status, job.completed_at = "cancelled", datetime.now(UTC)
+        job.metadata.pop("cancellation_requested_at", None)
+        job.metadata.pop("cancellation_incomplete", None)
         self.repo.save_job(job)
-        return {"job_id": job_id, "status": "cancelled"}
+        return {"job_id": job_id, "status": "cancelled", "terminated": True, "process_group_alive": False}

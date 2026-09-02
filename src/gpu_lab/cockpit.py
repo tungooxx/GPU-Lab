@@ -288,6 +288,29 @@ class CockpitController:
                 }
                 for row in cur.fetchall()
             ]
+            cur.execute(
+                "SELECT id,status,data,created_at FROM research_objects WHERE project_id=%s "
+                "AND kind='StrategyTransferCandidate' ORDER BY created_at DESC LIMIT 12",
+                (project_id,),
+            )
+            strategy_transfers = [
+                {
+                    "id": str(row["id"]), "status": row["status"],
+                    "strategy_id": row["data"].get("strategy_id"),
+                    "source_project_id": row["data"].get("source_project_id"),
+                    "predicted_benefit": row["data"].get("predicted_benefit"),
+                    "applicability": (row["data"].get("applicability_assessment") or {}).get("state"),
+                    "created_at": row["created_at"],
+                }
+                for row in cur.fetchall()
+            ]
+        # v3.6 is operational data: expose coverage and worker availability
+        # separately so a waiting WorkItem is never rendered as a blocked worker.
+        portfolio = {
+            "branch_coverage": self.lab.branch_coverage_get(project_id),
+            "agenda_coverage": self.lab.agenda_coverage_get(project_id),
+            "production_audit": self.lab.portfolio_production_audit(project_id),
+        }
         return {
             "lab_state": lab_state,
             "live_workers_by_project": self.live_workers_by_project(),
@@ -299,6 +322,8 @@ class CockpitController:
             "discovery_rounds": discovery_rounds,
             "discovery_archives": discovery_archives,
             "correction_cases": correction_cases,
+            "strategy_transfers": strategy_transfers,
+            "portfolio_scheduler": portfolio,
         }
 
     def live_workers_by_project(self) -> list[dict[str, Any]]:

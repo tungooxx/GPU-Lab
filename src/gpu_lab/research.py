@@ -9,6 +9,7 @@ from typing import Any
 import psycopg
 from psycopg.rows import dict_row
 
+from .discovery import BRAIN_POLICY_VERSION
 from .errors import GPUError
 from .execution_validity import normalize_execution_attestation
 
@@ -68,7 +69,18 @@ RESEARCH_OBJECT_KINDS = (
     "ResearchSituation",
     "ResearchDecisionOutcome",
     "ResearchStrategyPattern",
+    # Typed v3.5 patterns live beside the legacy v2 observational patterns.
+    # Keeping a distinct kind avoids silently reinterpreting historical data.
+    "StrategyPatternV35",
     "StrategyOutcome",
+    # v3.5 Cross-Project Strategy Learning Engine.  These are meta-scientific
+    # records: they can transfer a method, never scientific evidence or truth.
+    "StrategyTransferCandidate",
+    "StrategyTransferHypothesis",
+    "StrategyTransferOutcome",
+    "StrategyRetrievalEvent",
+    "StrategyPromotionDecision",
+    "StrategyTransferHindsight",
     "EngineeringTask",
     "EngineeringResult",
     "ResearchPolicy",
@@ -126,6 +138,7 @@ RESEARCH_OBJECT_STATUSES = {
     "COMPLETED",
     "DEFERRED",
     "FAILED",
+    "EXPIRED",
     "IMPLEMENTED_UNVERIFIED",
     "INCONCLUSIVE",
     "OPEN",
@@ -185,6 +198,17 @@ RESEARCH_OBJECT_STATUSES = {
     "RESOLVED_REVISE",
     "RESOLVED_REJECT",
     "RESOLVED_NARROW_SCOPE",
+    "SCREENED_OUT",
+    "ELIGIBLE",
+    "APPLIED",
+    "NOT_APPLIED",
+    "INVALID_TRANSFER",
+    "NEGATIVE_TRANSFER",
+    "NEUTRAL_TRANSFER",
+    "POSITIVE_TRANSFER",
+    "PROSPECTIVE_TESTING",
+    "CROSS_PROJECT_SUPPORTED",
+    "CROSS_DOMAIN_SUPPORTED",
 }
 
 # Orthogonal epistemic classifications. These are metadata about the role and
@@ -3556,6 +3580,125 @@ class ResearchStore:
             "decision": {"id": decision_id, "status": "COMPLETED", "data": decision_data},
         }
 
+    def canonical_assessment_inspection_reconcile(
+        self,
+        run_id: str,
+        decision_id: str,
+        canonical_assessment_record_ids: list[str],
+        rationale: str,
+    ) -> dict:
+        """Close a legacy inspection gap without reapplying scientific assessment.
+
+        This migration is deliberately narrower than ``result_assessment_apply``:
+        it may only point an already terminal ExperimentRun at pre-existing
+        canonical records. It never creates or changes evidence, negative
+        results, hypotheses, agenda items, decisions, or causal edges.
+        """
+        if not isinstance(canonical_assessment_record_ids, list) or not canonical_assessment_record_ids:
+            raise GPUError(
+                "CANONICAL_ASSESSMENT_RECORDS_REQUIRED",
+                "Provide at least one existing canonical assessment record ID.",
+            )
+        if not isinstance(rationale, str) or not rationale.strip():
+            raise GPUError("CANONICAL_ASSESSMENT_RECONCILIATION_RATIONALE_REQUIRED", run_id)
+        try:
+            run_id = str(uuid.UUID(run_id))
+            decision_id = str(uuid.UUID(decision_id))
+            record_ids = [str(uuid.UUID(item)) for item in canonical_assessment_record_ids]
+        except (ValueError, AttributeError) as exc:
+            raise GPUError("INVALID_RESEARCH_OBJECT_ID", str(exc)) from exc
+        if len(set(record_ids)) != len(record_ids):
+            raise GPUError("CANONICAL_ASSESSMENT_RECORDS_DUPLICATE", run_id)
+        now = datetime.now(UTC)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,project_id,kind,status,data FROM research_objects "
+                "WHERE id=ANY(%s::uuid[]) FOR UPDATE",
+                ([run_id, decision_id, *record_ids],),
+            )
+            rows = {str(row["id"]): row for row in cur.fetchall()}
+            if len(rows) != len({run_id, decision_id, *record_ids}):
+                missing = next(
+                    item for item in [run_id, decision_id, *record_ids] if item not in rows
+                )
+                raise GPUError("RESEARCH_OBJECT_NOT_FOUND", missing)
+            run, decision = rows[run_id], rows[decision_id]
+            if run["kind"] != "ExperimentRun":
+                raise GPUError("EXPERIMENT_RUN_NOT_FOUND", run_id)
+            if decision["kind"] != "ResearchDecision":
+                raise GPUError("NOT_A_RESEARCHDECISION", decision_id)
+            project_id = str(run["project_id"])
+            if any(str(rows[item]["project_id"]) != project_id for item in [decision_id, *record_ids]):
+                raise GPUError("RESEARCH_PROJECT_MISMATCH", "Assessment records differ")
+            if str(run["data"].get("decision_id")) != decision_id:
+                raise GPUError("RESEARCH_DECISION_MISMATCH", "Run was not authorized by this decision")
+            prior = run["data"].get("inspection")
+            if run["status"] == "RESULT_INSPECTED":
+                if (
+                    isinstance(prior, dict)
+                    and prior.get("inspection_kind") == "CANONICAL_ASSESSMENT_RECONCILIATION"
+                    and prior.get("decision_id") == decision_id
+                    and prior.get("canonical_assessment_record_ids") == record_ids
+                ):
+                    return {
+                        "run": {"id": run_id, "status": run["status"], "data": run["data"]},
+                        "idempotent_replay": True,
+                        "scientific_records_created": 0,
+                    }
+                raise GPUError("EXPERIMENT_RESULT_ALREADY_INSPECTED", run_id)
+            if run["status"] not in {"completed", "RESULT_NOT_INSPECTED"}:
+                raise GPUError("EXPERIMENT_RESULT_NOT_READY", run["status"])
+            experiment_id = str(run["data"].get("experiment_id") or "")
+            linked_ids: list[str] = []
+            for record_id in record_ids:
+                record = rows[record_id]
+                data = record["data"]
+                linked = (
+                    record["kind"] == "EvidenceUnit"
+                    and str(data.get("run_id")) == run_id
+                ) or (
+                    record["kind"] == "NegativeResult"
+                    and experiment_id
+                    and str(data.get("experiment_id")) == experiment_id
+                ) or (
+                    record["kind"] == "ResearchDecisionOutcome"
+                    and str(data.get("decision_id")) == decision_id
+                    and run_id in {str(item) for item in data.get("experiment_run_ids", [])}
+                )
+                if not linked:
+                    raise GPUError(
+                        "CANONICAL_ASSESSMENT_RECORD_NOT_LINKED",
+                        record_id,
+                        details={"run_id": run_id, "experiment_id": experiment_id},
+                    )
+                linked_ids.append(record_id)
+            inspection = {
+                "inspection_kind": "CANONICAL_ASSESSMENT_RECONCILIATION",
+                "decision_id": decision_id,
+                "canonical_assessment_record_ids": linked_ids,
+                "reconciled_at": now.isoformat(),
+                "rationale": rationale.strip()[:4000],
+                "scientific_records_created": 0,
+                "scientific_result": "ALREADY_CANONICALLY_ASSESSED",
+            }
+            run_data = {**run["data"], "inspection": inspection}
+            cur.execute(
+                "UPDATE research_objects SET status='RESULT_INSPECTED',data=%s WHERE id=%s",
+                (json.dumps(run_data), run_id),
+            )
+            self._event(
+                cur,
+                project_id,
+                "EXPERIMENT_RUN_CANONICAL_ASSESSMENT_RECONCILED",
+                run_id,
+                inspection,
+            )
+        return {
+            "run": {"id": run_id, "status": "RESULT_INSPECTED", "data": run_data},
+            "idempotent_replay": False,
+            "scientific_records_created": 0,
+        }
+
     @staticmethod
     def _object_row(cur, object_id: str) -> dict:
         cur.execute(
@@ -3866,7 +4009,11 @@ class ResearchStore:
             "research_state_version": int(object_freshness["object_count"] or 0),
             "world_model_version": str(world_model["id"]) if world_model else None,
             "research_policy_version": policy["version"] if policy else None,
+            # Persisted decision provenance intentionally remains historical;
+            # expose runtime policy separately so callers do not mistake one
+            # for the other after a code deployment.
             "brain_policy_version": decision["version"] if decision else None,
+            "runtime_brain_policy_version": BRAIN_POLICY_VERSION,
             "state_updated_at": object_freshness["latest_object_at"].isoformat() if object_freshness["latest_object_at"] else None,
             "latest_scientific_event_at": event_freshness["latest_scientific_event_at"].isoformat() if event_freshness["latest_scientific_event_at"] else None,
             "scientific_event_count": int(event_freshness["event_count"] or 0),
@@ -4115,6 +4262,7 @@ class ResearchStore:
         job_id: str,
         request_fingerprint: str,
         execution: dict[str, Any],
+        one_shot: bool = False,
     ) -> dict:
         """Atomically reserve canonical run/job identity before process submission."""
         if not idempotency_key or len(idempotency_key) > 200:
@@ -4130,6 +4278,19 @@ class ResearchStore:
                 raise GPUError("RESEARCH_OBJECT_NOT_FOUND", experiment_id)
             if experiment["kind"] != "Experiment" or not experiment["data"].get("frozen"):
                 raise GPUError("EXPERIMENT_NOT_PREREGISTERED", experiment_id)
+            if one_shot:
+                cur.execute(
+                    "SELECT run_id,job_id,idempotency_key,request_fingerprint,status "
+                    "FROM research_execution_attempts WHERE experiment_id=%s ORDER BY created_at,run_id",
+                    (experiment_id,),
+                )
+                prior_attempts = cur.fetchall()
+                conflicting = [row for row in prior_attempts if str(row["idempotency_key"]) != str(idempotency_key)]
+                if conflicting or len(prior_attempts) > 1:
+                    raise GPUError(
+                        "EXPERIMENT_ONE_SHOT_ALREADY_RESERVED",
+                        "A one-shot Experiment already has a different canonical execution attempt",
+                    )
             cur.execute(
                 "SELECT run_id,job_id,request_fingerprint,status FROM research_execution_attempts "
                 "WHERE experiment_id=%s AND idempotency_key=%s",
@@ -4138,6 +4299,45 @@ class ResearchStore:
             existing = cur.fetchone()
             if existing:
                 if existing["request_fingerprint"] != request_fingerprint:
+                    # v3.5.1 routing repair: old gateways treated the string
+                    # ``instance_id=local`` as a Vast target.  An untouched
+                    # reserved attempt may be safely retried as local using
+                    # its original UUID.  This is intentionally narrow: a
+                    # submitted/terminal run, a real instance, or any other
+                    # request difference remains an idempotency violation.
+                    cur.execute(
+                        "SELECT project_id,status,data FROM research_objects WHERE id=%s FOR UPDATE",
+                        (existing["run_id"],),
+                    )
+                    prior_run = cur.fetchone()
+                    prior_data = prior_run["data"] if prior_run else {}
+                    safe_local_route_repair = (
+                        prior_run is not None
+                        and existing["status"] == "RESERVED"
+                        and prior_run["status"] == "RESERVED"
+                        and prior_data.get("executor") == "vast"
+                        and str(prior_data.get("instance_id", "")).strip().lower() in {"local", "local_runner"}
+                        and execution.get("executor") == "local"
+                        and execution.get("instance_id") is None
+                        and not prior_data.get("submission_status")
+                    )
+                    if safe_local_route_repair:
+                        repaired_data = {**prior_data, **execution, "request_fingerprint": request_fingerprint, "routing_repaired_at": now.isoformat(), "routing_repair_reason": "LOCAL_INSTANCE_ID_NORMALIZED"}
+                        cur.execute(
+                            "UPDATE research_objects SET data=%s WHERE id=%s",
+                            (json.dumps(repaired_data), existing["run_id"]),
+                        )
+                        cur.execute(
+                            "UPDATE research_execution_attempts SET request_fingerprint=%s,updated_at=%s WHERE run_id=%s",
+                            (request_fingerprint, now, existing["run_id"]),
+                        )
+                        self._event(
+                            cur, prior_run["project_id"], "EXPERIMENT_EXECUTION_ROUTING_REPAIRED",
+                            existing["run_id"], {"from_executor": "vast", "from_instance_id": prior_data.get("instance_id"), "to_executor": "local"},
+                        )
+                        return self._execution_mapping(
+                            cur, existing["run_id"], existing["job_id"], idempotency_key, True
+                        )
                     raise GPUError(
                         "IDEMPOTENCY_KEY_REUSED",
                         "The execution key is already bound to a different request",
@@ -4278,6 +4478,10 @@ class ResearchStore:
             "run_id": str(run["id"]),
             "job_id": job_id,
             "idempotency_key": idempotency_key,
+            # Public canonical retry token.  Keep idempotency_key for older
+            # clients, but callers should never have to infer it from a
+            # reservation response.
+            "execution_attempt_uuid": idempotency_key,
             "status": run["status"],
             "run": run,
             "idempotent_replay": idempotent_replay,

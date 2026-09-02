@@ -1,4 +1,5 @@
 import pytest
+import shlex
 
 from gpu_lab.config import Settings
 from gpu_lab.db import Repository
@@ -11,6 +12,30 @@ from gpu_lab.ssh import q
 
 def test_quote_is_shell_safe():
     assert q("a; rm -rf /") == "'a; rm -rf /'"
+
+
+@pytest.mark.asyncio
+async def test_repo_checkout_resolves_fetch_head_to_one_detached_commit(tmp_path):
+    service = GPUService(Settings(gpu_lab_database_url=f"sqlite:///{tmp_path / 'db.sqlite'}"))
+    service.repo.save_instance(Instance(id="vast_test", provider_instance_id="test"))
+    captured = {}
+
+    async def fake_run(instance, command, timeout):
+        captured["command"] = command
+        return "a" * 40 + "\n", "", 0
+
+    service.ssh.run = fake_run
+    result = await service.repo_checkout(
+        "vast_test", "git@github.com:example/repo.git", commit="a" * 40
+    )
+
+    command = captured["command"]
+    assert "git clone --depth 1 --no-checkout" in command
+    assert "git fetch --depth 1 origin " + "a" * 40 in command
+    assert "git rev-parse --verify FETCH_HEAD^{commit}" in command
+    assert 'git checkout --detach "$resolved_ref"' in command
+    assert "git checkout --detach FETCH_HEAD" not in command
+    assert result["commit"] == "a" * 40
 
 
 def test_provider_normalizes_connection_metadata():
@@ -41,6 +66,25 @@ def test_provider_prefers_direct_public_ssh_mapping():
     )
     assert item.hostname == "191.223.212.127"
     assert item.ssh_port == 31708
+
+
+@pytest.mark.asyncio
+async def test_gpu_list_marks_provider_missing_instances_without_deleting_history(tmp_path):
+    service = GPUService(Settings(gpu_lab_database_url=f"sqlite:///{tmp_path / 'db.sqlite'}"))
+    stale = Instance(id="vast_old", provider_instance_id="old", status="running")
+    current = Instance(id="vast_current", provider_instance_id="current", status="running")
+    service.repo.save_instance(stale)
+
+    class Provider:
+        async def list_instances(self):
+            return [current]
+
+    service.provider = Provider()
+    items = await service.gpu_list()
+
+    assert {item["id"] for item in items} == {"vast_old", "vast_current"}
+    assert next(item for item in items if item["id"] == "vast_old")["status"] == "provider_missing"
+    assert service.repo.get_instance("vast_old").metadata["provider_visible"] is False
 
 
 @pytest.mark.asyncio
@@ -115,6 +159,28 @@ async def test_vast_creation_requests_direct_ssh(monkeypatch):
     assert captured["payload"]["runtype"] == "ssh_direct"
 
 
+@pytest.mark.asyncio
+async def test_vast_start_requests_running_state_and_refreshes_instance(monkeypatch):
+    provider = VastProvider("not-a-real-key")
+    captured = {}
+
+    async def fake_request(method, path, **kwargs):
+        captured.update(method=method, path=path, payload=kwargs["json"])
+        return {"success": True}
+
+    async def fake_get_instance(instance_id):
+        assert instance_id == "123"
+        return Instance(id="vast_123", provider_instance_id="123", status="scheduling")
+
+    monkeypatch.setattr(provider, "_request", fake_request)
+    monkeypatch.setattr(provider, "get_instance", fake_get_instance)
+    item = await provider.start_instance("vast_123")
+    await provider.client.aclose()
+
+    assert captured == {"method": "PUT", "path": "/instances/123", "payload": {"state": "running"}}
+    assert item.status == "scheduling"
+
+
 def test_database_persists_models(tmp_path):
     db = Repository(tmp_path / "state.db")
     db.save_instance(Instance(id="vast_1", provider_instance_id="1"))
@@ -134,6 +200,28 @@ async def test_destroy_requires_confirmation(tmp_path):
     service = GPUService(Settings(gpu_lab_database_url=f"sqlite:///{tmp_path / 'db.sqlite'}"))
     with pytest.raises(GPUError, match="DESTROY"):
         await service.gpu_destroy("vast_1", "no")
+
+
+@pytest.mark.asyncio
+async def test_destroy_treats_provider_404_as_already_deleted_and_keeps_history(tmp_path):
+    service = GPUService(Settings(gpu_lab_database_url=f"sqlite:///{tmp_path / 'db.sqlite'}"))
+    service.repo.save_instance(Instance(id="vast_deleted", provider_instance_id="deleted", status="running"))
+
+    class Provider:
+        async def destroy_instance(self, _instance_id):
+            raise GPUError("PROVIDER_NOT_FOUND", "Vast returned 404", details={"status_code": 404})
+
+    service.provider = Provider()
+    result = await service.gpu_destroy("vast_deleted", "DESTROY")
+
+    assert result == {
+        "instance_id": "vast_deleted",
+        "status": "ALREADY_DELETED",
+        "historical_record_retained": True,
+    }
+    saved = service.repo.get_instance("vast_deleted")
+    assert saved.status == "destroyed"
+    assert saved.metadata["provider_already_deleted"] is True
 
 
 @pytest.mark.asyncio
@@ -161,3 +249,123 @@ async def test_remote_exec_is_disabled(tmp_path):
     )
     with pytest.raises(GPUError, match="REMOTE_EXEC"):
         await service.remote_exec("vast_1", "id")
+
+
+@pytest.mark.asyncio
+async def test_remote_experiment_submission_quotes_the_tmux_pane_once(tmp_path):
+    service = GPUService(Settings(gpu_lab_database_url=f"sqlite:///{tmp_path / 'db.sqlite'}"))
+    instance = Instance(id="vast_1", provider_instance_id="1", gpu_model="RTX")
+    service.repo.save_instance(instance)
+    captured = {}
+
+    class SSH:
+        async def run(self, _instance, command, _timeout):
+            captured["command"] = command
+            return "12345\n", "", 0
+
+    service.ssh = SSH()
+    await service.experiment_submit(
+        "vast_1",
+        f"{service.settings.gpu_lab_remote_root}/repos/repo",
+        "python run.py --label 'causal development'",
+        env={"MODE": "causal development"},
+        job_id="exp_quote_regression",
+    )
+
+    tmux_command = captured["command"].split(" && tmux display-message", 1)[0].rsplit(" && ", 1)[1]
+    tokens = shlex.split(tmux_command)
+    assert tokens[:5] == ["tmux", "new-session", "-d", "-s", "exp_quote_regression"]
+    pane_command = tokens[5]
+    assert pane_command.startswith("setsid sh -c ")
+    assert "process_group.pid" in pane_command
+    assert "exit $code" in pane_command
+    assert "stdout.log" in pane_command and "stderr.log" in pane_command
+
+
+@pytest.mark.asyncio
+async def test_remote_experiment_submission_enforces_wall_time_limit(tmp_path):
+    service = GPUService(Settings(gpu_lab_database_url=f"sqlite:///{tmp_path / 'db.sqlite'}"))
+    service.repo.save_instance(Instance(id="vast_1", provider_instance_id="1", gpu_model="RTX"))
+    captured = {}
+
+    class SSH:
+        async def run(self, _instance, command, _timeout):
+            captured["command"] = command
+            return "12345\n", "", 0
+
+    service.ssh = SSH()
+    await service.experiment_submit("vast_1", "/workspace/GPU-Lab/repos/repo", "python run.py", timeout_seconds=120, job_id="exp_wall_limit")
+    assert "timeout --foreground --signal=TERM --kill-after=30s 120s sh -c" in captured["command"]
+    assert "python run.py" in captured["command"]
+    assert "MAX_WALL_SECONDS" in captured["command"]
+
+
+@pytest.mark.asyncio
+async def test_remote_cancel_requires_process_group_termination(tmp_path):
+    service = GPUService(Settings(gpu_lab_database_url=f"sqlite:///{tmp_path / 'db.sqlite'}"))
+    service.repo.save_instance(Instance(id="vast_1", provider_instance_id="1", gpu_model="RTX"))
+    service.repo.save_job(Job(job_id="exp_cancel_group", instance_id="vast_1", repo_path="/workspace/repo", command="python run.py", remote_pid=12345, status="running"))
+    captured = {}
+
+    class SSH:
+        async def run(self, _instance, command, _timeout):
+            captured["command"] = command
+            return "process_group_alive\n", "", 0
+
+    service.ssh = SSH()
+    result = await service.experiment_cancel("exp_cancel_group")
+
+    assert result["status"] == "cancellation_incomplete"
+    assert result["terminated"] is False
+    assert "kill -TERM -- -$pgid" in captured["command"]
+    assert "kill -KILL -- -$pgid" in captured["command"]
+
+
+@pytest.mark.asyncio
+async def test_remote_cancel_reports_terminated_only_after_group_check(tmp_path):
+    service = GPUService(Settings(gpu_lab_database_url=f"sqlite:///{tmp_path / 'db.sqlite'}"))
+    service.repo.save_instance(Instance(id="vast_1", provider_instance_id="1", gpu_model="RTX"))
+    service.repo.save_job(Job(job_id="exp_cancel_done", instance_id="vast_1", repo_path="/workspace/repo", command="python run.py", remote_pid=12345, status="running"))
+
+    class SSH:
+        async def run(self, *_args):
+            return "terminated_verified\n", "", 0
+
+    service.ssh = SSH()
+    result = await service.experiment_cancel("exp_cancel_done")
+
+    assert result == {"job_id": "exp_cancel_done", "status": "cancelled", "terminated": True, "process_group_alive": False}
+
+
+@pytest.mark.asyncio
+async def test_remote_cancel_keeps_unverified_termination_pending(tmp_path):
+    service = GPUService(Settings(gpu_lab_database_url=f"sqlite:///{tmp_path / 'db.sqlite'}"))
+    service.repo.save_instance(Instance(id="vast_1", provider_instance_id="1", gpu_model="RTX"))
+    service.repo.save_job(Job(job_id="exp_cancel_unverified", instance_id="vast_1", repo_path="/workspace/repo", command="python run.py", status="running"))
+
+    class SSH:
+        async def run(self, *_args):
+            return "pid_unverified\n", "", 0
+
+    service.ssh = SSH()
+    result = await service.experiment_cancel("exp_cancel_unverified")
+
+    assert result["status"] == "cancellation_pending_verification"
+    assert result["terminated"] is False
+    assert result["recovery_action"] == "VERIFY_PROCESS_GROUP"
+
+
+@pytest.mark.asyncio
+async def test_remote_status_does_not_turn_verified_cancellation_unknown(tmp_path):
+    service = GPUService(Settings(gpu_lab_database_url=f"sqlite:///{tmp_path / 'db.sqlite'}"))
+    service.repo.save_instance(Instance(id="vast_1", provider_instance_id="1", gpu_model="RTX"))
+    service.repo.save_job(Job(job_id="exp_cancelled", instance_id="vast_1", repo_path="/workspace/repo", command="python run.py", remote_pid=12345, status="cancelled"))
+
+    async def no_artifacts(_job_id):
+        return []
+
+    service.artifact_list = no_artifacts
+    result = await service.experiment_status("exp_cancelled")
+
+    assert result["status"] == "cancelled"
+    assert result["cancellation_verified"] is True

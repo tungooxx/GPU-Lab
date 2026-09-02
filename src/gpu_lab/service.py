@@ -42,8 +42,24 @@ class GPUService:
 
     async def gpu_list(self) -> list[dict]:
         if self.provider:
-            for item in await self.provider.list_instances():
+            visible = await self.provider.list_instances()
+            visible_ids = {item.id for item in visible}
+            for item in visible:
                 self.repo.save_instance(item)
+            # Preserve historical instance/job references, but never present an
+            # instance missing from Vast as live.  A later provider refresh can
+            # revive the record if it reappears (for example after scheduling).
+            for item in self.repo.list_instances():
+                if item.provider == "vast" and item.id not in visible_ids:
+                    if item.status == "destroyed":
+                        continue
+                    item.status = "provider_missing"
+                    item.metadata = {
+                        **item.metadata,
+                        "provider_visible": False,
+                        "provider_missing_at": datetime.now(UTC).isoformat(),
+                    }
+                    self.repo.save_instance(item)
         return [x.model_dump(mode="json", exclude={"metadata"}) for x in self.repo.list_instances()]
 
     async def gpu_status(self, instance_id: str) -> dict:
@@ -125,6 +141,15 @@ class GPUService:
             "reason": "explicit offer selected by caller",
         }
 
+    async def gpu_start(self, instance_id: str) -> dict:
+        item = await self._provider().start_instance(instance_id)
+        self.repo.save_instance(item)
+        return {
+            "instance": item.model_dump(mode="json", exclude={"metadata"}),
+            "requested_state": "running",
+            "note": "Vast may report scheduling until host resources are available.",
+        }
+
     async def gpu_stop(self, instance_id: str) -> dict:
         await self._provider().stop_instance(instance_id)
         item = self._instance(instance_id)
@@ -137,11 +162,28 @@ class GPUService:
             raise GPUError(
                 "CONFIRMATION_REQUIRED", "Pass confirmation='DESTROY' to destroy an instance"
             )
-        await self._provider().destroy_instance(instance_id)
         item = self._instance(instance_id)
+        already_deleted = False
+        try:
+            await self._provider().destroy_instance(instance_id)
+        except GPUError as exc:
+            if exc.error_type != "PROVIDER_NOT_FOUND":
+                raise
+            already_deleted = True
         item.status = "destroyed"
+        item.metadata = {
+            **item.metadata,
+            "provider_visible": False,
+            "provider_deleted_at": datetime.now(UTC).isoformat(),
+            "provider_deletion_confirmed": not already_deleted,
+            "provider_already_deleted": already_deleted,
+        }
         self.repo.save_instance(item)
-        return {"instance_id": instance_id, "status": "destroyed"}
+        return {
+            "instance_id": instance_id,
+            "status": "ALREADY_DELETED" if already_deleted else "destroyed",
+            "historical_record_retained": True,
+        }
 
     async def repo_checkout(
         self,
@@ -156,16 +198,15 @@ class GPUService:
         if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
             raise GPUError("INVALID_REPOSITORY_NAME", "Repository name contains unsafe characters")
         path = self._remote_path(f"{self.settings.gpu_lab_remote_root}/repos/{name}")
-        clone_branch = f" --branch {q(branch)}" if branch else ""
         fetch_ref = q(commit or branch or "HEAD")
-        checkout_ref = "FETCH_HEAD" if commit else "HEAD"
         command = (
             f'mkdir -p {q(self.settings.gpu_lab_remote_root + "/repos")} && '
             f'if [ -d {q(path + "/.git")} ]; then '
             f'cd {q(path)} && test -z "$(git status --porcelain)" || exit 42; '
-            f'git fetch --depth 1 origin {fetch_ref}; '
-            f'else git clone --depth 1 --single-branch{clone_branch} {q(repo_url)} {q(path)}; fi && '
-            f'cd {q(path)} && git checkout --detach {checkout_ref} && git rev-parse HEAD'
+            f'else git clone --depth 1 --no-checkout {q(repo_url)} {q(path)}; fi && '
+            f'cd {q(path)} && git fetch --depth 1 origin {fetch_ref} && '
+            f'resolved_ref=$(git rev-parse --verify FETCH_HEAD^{{commit}}) && '
+            f'git checkout --detach "$resolved_ref" && git rev-parse HEAD'
         )
         out, err, code = await self.ssh.run(item, command, 300)
         if code == 42:
@@ -209,10 +250,33 @@ class GPUService:
         timeout_seconds: int | None = None,
         artifact_patterns: list[str] | None = None,
         metadata: dict | None = None,
+        job_id: str | None = None,
     ) -> dict:
         item = self._instance(instance_id)
         repo_path = self._remote_path(repo_path)
-        job_id = "exp_" + uuid.uuid4().hex[:16]
+        # The canonical Research OS executor reserves this identity before a
+        # process is launched.  Keeping it here makes remote submission
+        # idempotent at the same boundary as local submission.
+        job_id = job_id or "exp_" + uuid.uuid4().hex[:16]
+        if not re.fullmatch(r"(?:exp|remote)_[A-Za-z0-9_-]{8,80}", job_id):
+            raise GPUError("INVALID_REMOTE_JOB_ID", "Remote job ID is invalid")
+        if timeout_seconds is not None and not 1 <= timeout_seconds <= 604800:
+            raise GPUError("INVALID_WALL_TIME_LIMIT", "timeout_seconds must be between 1 and 604800")
+        existing = self.repo.get_job(job_id)
+        if existing:
+            if (
+                existing.instance_id != instance_id
+                or existing.repo_path != repo_path
+                or existing.command != command
+            ):
+                raise GPUError("REMOTE_JOB_ID_REUSED", "Job ID is bound to a different remote command")
+            return {
+                "job_id": job_id,
+                "status": existing.status,
+                "experiment": existing.name,
+                "instance": {"id": instance_id, "gpu": item.gpu_model},
+                "idempotent_replay": True,
+            }
         jobdir = f"{self.settings.gpu_lab_remote_root}/jobs/{job_id}"
         safe_env = " ".join(
             f"{k}={q(v)}"
@@ -227,9 +291,39 @@ class GPUService:
             command=command,
             remote_session=job_id,
             started_at=datetime.now(UTC),
-            metadata={**(metadata or {}), "artifact_patterns": artifact_patterns or []},
+            metadata={
+                **(metadata or {}),
+                "artifact_patterns": artifact_patterns or [],
+                "max_wall_seconds": timeout_seconds,
+            },
         )
-        bootstrap = f"mkdir -p {q(jobdir)}/{{metrics,plots,checkpoints,artifacts}}; printf '%s\\n' {q(command)} > {q(jobdir + '/command.sh')}; printf '%s' {q(job.model_dump_json())} > {q(jobdir + '/metadata.json')}; cd {q(repo_path)} && tmux new-session -d -s {q(job_id)} 'setsid sh -c {q((safe_env + ' ' if safe_env else '') + command + '; code=$?; echo $code > ' + jobdir + '/exit_code; exit $code')} > {q(jobdir + '/stdout.log')} 2> {q(jobdir + '/stderr.log')}' && tmux display-message -p -t {q(job_id)} '#{{pane_pid}}'"
+        # Quote the pane command once as the final tmux argument.  Do not wrap
+        # it in literal single quotes: ``q(inner)`` may itself contain quotes.
+        guarded_command = (
+            f"timeout --foreground --signal=TERM --kill-after=30s {int(timeout_seconds)}s sh -c {q(command)}"
+            if timeout_seconds is not None
+            else command
+        )
+        inner = (
+            f"echo $$ > {q(jobdir + '/process_group.pid')}; "
+            + (safe_env + " " if safe_env else "")
+            + guarded_command
+            + f"; code=$?; echo $code > {q(jobdir + '/exit_code')}; "
+            + (f"if [ $code -eq 124 ]; then echo MAX_WALL_SECONDS > {q(jobdir + '/termination_reason')}; fi; " if timeout_seconds is not None else "")
+            + "exit $code"
+        )
+        pane_command = (
+            f"setsid sh -c {q(inner)} "
+            f"> {q(jobdir + '/stdout.log')} "
+            f"2> {q(jobdir + '/stderr.log')}"
+        )
+        bootstrap = (
+            f"mkdir -p {q(jobdir)}/{{metrics,plots,checkpoints,artifacts}}; "
+            f"printf '%s\\n' {q(command)} > {q(jobdir + '/command.sh')}; "
+            f"printf '%s' {q(job.model_dump_json())} > {q(jobdir + '/metadata.json')}; "
+            f"cd {q(repo_path)} && tmux new-session -d -s {q(job_id)} {q(pane_command)} "
+            f"&& tmux display-message -p -t {q(job_id)} '#{{pane_pid}}'"
+        )
         out, err, code = await self.ssh.run(item, bootstrap, 60)
         if code:
             raise GPUError("JOB_SUBMIT_FAILED", err.strip() or out.strip())
@@ -250,15 +344,33 @@ class GPUService:
         job = self.repo.get_job(job_id)
         if not job:
             raise GPUError("JOB_NOT_FOUND", f"No job named {job_id}")
+        # ``experiment_cancel`` records this state only after its process-group
+        # probe confirms termination.  Never turn that durable terminal fact
+        # back into ``unknown`` merely because a cancelled job has no user exit
+        # code file (SIGTERM/SIGKILL normally prevents it from being written).
+        if job.status == "cancelled":
+            return {
+                "job_id": job_id,
+                "status": "cancelled",
+                "cancellation_verified": True,
+                "cancellation_incomplete": False,
+                "process_group_alive": False,
+                "pid": job.remote_pid,
+                "exit_code": job.exit_code,
+                "start_time": job.started_at,
+                "end_time": job.completed_at,
+                "logs_tail": [],
+                "artifact_count": len(await self.artifact_list(job_id)),
+            }
         item = self._instance(job.instance_id)
         jd = f"{self.settings.gpu_lab_remote_root}/jobs/{job_id}"
         out, _, _ = await self.ssh.run(
             item,
-            f"if tmux has-session -t {q(job_id)} 2>/dev/null; then echo running; elif [ -f {q(jd + '/exit_code')} ]; then echo exit:$(cat {q(jd + '/exit_code')}); else echo unknown; fi; tail -n 50 {q(jd + '/stdout.log')} {q(jd + '/stderr.log')} 2>/dev/null",
+            f"pgid=''; [ -f {q(jd + '/process_group.pid')} ] && pgid=$(cat {q(jd + '/process_group.pid')} 2>/dev/null || true); case \"$pgid\" in ''|*[!0-9]*) group_alive=false;; *) kill -0 -- -$pgid 2>/dev/null && group_alive=true || group_alive=false;; esac; if [ \"$group_alive\" = true ]; then echo process_running; elif tmux has-session -t {q(job_id)} 2>/dev/null; then echo running; elif [ -f {q(jd + '/exit_code')} ]; then echo exit:$(cat {q(jd + '/exit_code')}); else echo unknown; fi; tail -n 50 {q(jd + '/stdout.log')} {q(jd + '/stderr.log')} 2>/dev/null",
             30,
         )
         first, *logs = out.splitlines()
-        if first == "running":
+        if first in {"running", "process_running"}:
             job.status = "running"
         elif first.startswith("exit:"):
             job.exit_code = int(first.split(":", 1)[1])
@@ -266,10 +378,22 @@ class GPUService:
             job.completed_at = datetime.now(UTC)
         else:
             job.status = "unknown"
+        cancellation_requested = bool(job.metadata.get("cancellation_requested_at"))
+        cancellation_incomplete = bool(first == "process_running" and cancellation_requested)
+        cancellation_pending_verification = bool(first == "unknown" and cancellation_requested)
         self.repo.save_job(job)
         return {
             "job_id": job_id,
-            "status": job.status,
+            "status": (
+                "cancellation_incomplete"
+                if cancellation_incomplete
+                else "cancellation_pending_verification"
+                if cancellation_pending_verification
+                else job.status
+            ),
+            "cancellation_incomplete": cancellation_incomplete,
+            "cancellation_pending_verification": cancellation_pending_verification,
+            "process_group_alive": first == "process_running",
             "pid": job.remote_pid,
             "exit_code": job.exit_code,
             "start_time": job.started_at,
@@ -306,18 +430,51 @@ class GPUService:
         if not job:
             raise GPUError("JOB_NOT_FOUND", f"No job named {job_id}")
         item = self._instance(job.instance_id)
+        jobdir = f"{self.settings.gpu_lab_remote_root}/jobs/{job_id}"
+        # The job command is launched by ``setsid`` and writes its session / process
+        # group leader.  Killing tmux alone only removes the wrapper pane and can
+        # orphan CUDA children.  TERM first, then KILL only if the group survives.
+        cancel_command = (
+            f"pgfile={q(jobdir + '/process_group.pid')}; "
+            "pgid=''; [ -f \"$pgfile\" ] && pgid=$(cat \"$pgfile\" 2>/dev/null || true); "
+            f"case \"$pgid\" in ''|*[!0-9]*) pgid={int(job.remote_pid or 0)};; esac; "
+            "case \"$pgid\" in ''|*[!0-9]*) pid_verified=false;; *) pid_verified=true;; esac; "
+            "if [ \"$pgid\" -gt 0 ] 2>/dev/null; then "
+            "kill -TERM -- -$pgid 2>/dev/null || true; "
+            "for n in 1 2 3 4 5; do kill -0 -- -$pgid 2>/dev/null || break; sleep 1; done; "
+            "if kill -0 -- -$pgid 2>/dev/null; then kill -KILL -- -$pgid 2>/dev/null || true; sleep 1; fi; "
+            "fi; "
+            f"tmux kill-session -t {q(job_id)} 2>/dev/null || true; "
+            "if [ \"$pid_verified\" != true ]; then echo pid_unverified; "
+            "elif kill -0 -- -$pgid 2>/dev/null; then echo process_group_alive; "
+            f"elif tmux has-session -t {q(job_id)} 2>/dev/null; then echo tmux_alive; else echo terminated_verified; fi"
+        )
         out, _, _ = await self.ssh.run(
             item,
-            f"tmux kill-session -t {q(job_id)} 2>/dev/null || true; sleep 1; tmux has-session -t {q(job_id)} 2>/dev/null && echo alive || echo terminated",
+            cancel_command,
             30,
         )
-        if "terminated" not in out:
-            raise GPUError("JOB_CANCEL_FAILED", "Process session is still running", True)
+        if "terminated_verified" not in out:
+            job.metadata["cancellation_requested_at"] = datetime.now(UTC).isoformat()
+            job.metadata["cancellation_incomplete"] = "process_group_alive" in out
+            self.repo.save_job(job)
+            pending = "process_group_alive" not in out
+            return {
+                "job_id": job_id,
+                "status": "cancellation_pending_verification" if pending else "cancellation_incomplete",
+                "terminated": False,
+                "process_group_alive": "process_group_alive" in out,
+                "cancellation_pending_verification": pending,
+                "retry_safe": False,
+                "recovery_action": "VERIFY_PROCESS_GROUP" if pending else "CANCEL_PROCESS_GROUP",
+            }
         job.status = "cancelled"
         job.completed_at = datetime.now(UTC)
+        job.metadata.pop("cancellation_requested_at", None)
+        job.metadata.pop("cancellation_incomplete", None)
         self.repo.save_job(job)
-        self.repo.event(job_id, "cancelled", "tmux session terminated")
-        return {"job_id": job_id, "status": "cancelled", "terminated": True}
+        self.repo.event(job_id, "cancelled", "tmux session and process group terminated")
+        return {"job_id": job_id, "status": "cancelled", "terminated": True, "process_group_alive": False}
 
     async def artifact_list(self, job_id: str) -> list[dict]:
         job = self.repo.get_job(job_id)

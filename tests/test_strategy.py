@@ -4,9 +4,26 @@ import time
 import pytest
 
 from gpu_lab.research import ResearchStore
+from gpu_lab.errors import GPUError
 from gpu_lab.strategy import ResearchStrategyService
 
 TEST_DATABASE_URL = os.getenv("GPU_LAB_TEST_DATABASE_URL")
+
+
+def test_invalid_decision_outcome_assessment_is_a_typed_error():
+    with pytest.raises(GPUError) as exc_info:
+        ResearchStrategyService(None).decision_outcome_assess("decision", {})
+
+    assert exc_info.value.error_type == "INVALID_DECISION_OUTCOME_ASSESSMENT"
+    assert exc_info.value.details["validation_errors"]
+
+
+def test_invalid_null_model_is_a_typed_error():
+    with pytest.raises(GPUError) as exc_info:
+        ResearchStrategyService(None).null_model_create("project", {"name": "incomplete"})
+
+    assert exc_info.value.error_type == "INVALID_NULL_MODEL"
+    assert exc_info.value.details["validation_errors"]
 
 
 class StrategyStore:

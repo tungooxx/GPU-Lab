@@ -8,6 +8,7 @@ from gpu_lab.research_operators import (
     HttpResearchOperatorProvider,
     ResearchOperatorService,
 )
+from gpu_lab.server import deterministic_null_model_critique
 
 
 class OperatorStore:
@@ -171,6 +172,16 @@ async def test_null_and_design_critics_return_versioned_typed_advice():
     assert null["provenance"]["prompt_version"] == "brain-v2-operators-1"
     assert design["findings"][0]["code"] == "CHEAP_NULL_UNTESTED"
     assert design["provenance"]["operator_name"] == "ExperimentalDesignCritic"
+
+
+def test_offline_null_critique_is_advisory_and_does_not_need_a_provider():
+    result = deterministic_null_model_critique(
+        "project-1", "Anchor substitution proves semantic transport", {"metric": "CD"}
+    )
+
+    assert len(result["alternative_explanations"]) == 5
+    assert result["provenance"]["provider"] == "builtin-deterministic"
+    assert "cannot promote scientific truth" in result["warning"]
 
 
 @pytest.mark.asyncio

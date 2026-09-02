@@ -13,6 +13,13 @@ class FakeResearch:
     def run_resolve(self, _identifier):
         return self.mapping
 
+    def object_get(self, experiment_id):
+        return {
+            "id": experiment_id,
+            "project_id": "project-id",
+            "data": {"plan": {}},
+        }
+
     def run_update(self, run_id, result):
         self.updates.append((run_id, result))
         return {"id": run_id, "status": result["status"], "data": result}
@@ -76,6 +83,50 @@ class UnprovenLocal:
         return {"job_id": "local_reserved_job", "status": self.status}
 
 
+class CapturingLocal(UnprovenLocal):
+    def __init__(self, status):
+        super().__init__(status)
+        self.submit_args = None
+
+    async def submit(self, *args):
+        self.submit_args = args
+        return await super().submit(*args)
+
+
+class RemoteRunner:
+    def __init__(self):
+        self.submit_args = None
+        self.repo = type("AuditRepo", (), {"audit": staticmethod(lambda *_args, **_kwargs: None)})()
+
+    async def experiment_submit(self, *args):
+        self.submit_args = args
+        return {"job_id": args[-1], "status": "running", "instance": {"id": args[0]}}
+
+    async def experiment_status(self, job_id):
+        return {"job_id": job_id, "status": "completed", "exit_code": 0, "logs_tail": ["ok"]}
+
+    async def artifact_list(self, _job_id):
+        return []
+
+    async def gpu_status(self, instance_id):
+        return {"instance_id": instance_id}
+
+
+class CancellationIncompleteRemote(RemoteRunner):
+    async def experiment_status(self, job_id):
+        return {"job_id": job_id, "status": "cancellation_incomplete", "cancellation_incomplete": True, "process_group_alive": True, "exit_code": None, "logs_tail": []}
+
+
+class CancellationPendingRemote(RemoteRunner):
+    async def experiment_status(self, job_id):
+        return {"job_id": job_id, "status": "cancellation_pending_verification", "cancellation_pending_verification": True, "process_group_alive": False, "exit_code": None, "logs_tail": []}
+
+
+class TerminalLab:
+    def experiment_run_terminal(self, *_args):
+        return {"status": "ok"}
+
+
 class AuthorizingBrain:
     def authorize_execution(self, *_args):
         return {"authorized": True}
@@ -91,9 +142,9 @@ class BindingBrain:
 
 
 class DecisionCreatingBrain(BindingBrain):
-    def brain_step(self, _project_id):
+    def experiment_execution_decision_create(self, _project_id, _experiment_id):
         return {
-            "decision_id": "decision-id",
+            "decision": {"id": "decision-id"},
             "large_durable_trace": "x" * 100_000,
         }
 
@@ -193,6 +244,10 @@ async def test_execution_decision_bind_exposes_exact_request_fingerprint(monkeyp
 async def test_decision_create_returns_compact_execution_handoff(monkeypatch):
     brain = DecisionCreatingBrain()
     monkeypatch.setattr(server, "brain", lambda: brain)
+    # This is a dependency-light handoff unit test.  It intentionally exercises
+    # the legacy no-Lab-authority path, rather than resolving the Docker-only
+    # canonical Lab database from the Windows test process.
+    monkeypatch.setattr(server.settings, "gpu_lab_research_database_url", "")
 
     result = await server.research_decision_create(
         "project-id", "experiment-id", "python run.py", "/workspace", {"MODE": "test"}, "torch-env"
@@ -253,6 +308,98 @@ async def test_execute_does_not_mark_queued_replay_as_started(monkeypatch):
     assert result["runner_status"] == "queued"
     assert result["recovery_action"] == "RETRY_EXECUTION"
     assert research.promotions == 0
+
+
+@pytest.mark.asyncio
+async def test_execute_normalizes_local_instance_label_before_reservation(monkeypatch):
+    research = FakeResearch(_mapping("RESERVED"))
+    captured_reservation = {}
+    def reserve(*args):
+        captured_reservation["execution"] = args[-1]
+        return research.mapping
+    research.run_reserve = reserve
+    runner = CapturingLocal("queued")
+    monkeypatch.setattr(server.settings, "gpu_lab_enable_local_runner", True)
+    monkeypatch.setattr(server, "research", lambda: research)
+    monkeypatch.setattr(server, "brain", lambda: AuthorizingBrain())
+    monkeypatch.setattr(server, "local", runner)
+
+    result = await server.research_experiment_execute(
+        "experiment-id", "decision-id", "echo ok", execution_attempt_uuid="attempt-id", instance_id="local"
+    )
+
+    assert result["status"] == "RESERVED"
+    assert captured_reservation["execution"]["executor"] == "local"
+    assert captured_reservation["execution"]["instance_id"] is None
+    assert captured_reservation["execution"]["requested_instance_id"] == "local"
+    assert runner.submit_args is not None
+
+
+@pytest.mark.asyncio
+async def test_execute_uses_canonical_remote_submission_and_absolute_python(monkeypatch):
+    research = FakeResearch(_mapping("RESERVED"))
+    research.run_reserve = lambda *_args: research.mapping
+    runner = RemoteRunner()
+    monkeypatch.setattr(server, "research", lambda: research)
+    monkeypatch.setattr(server, "brain", lambda: AuthorizingBrain())
+    monkeypatch.setattr(server, "svc", lambda: runner)
+
+    result = await server.research_experiment_execute(
+        "experiment-id", "decision-id", "python train.py", "/workspace/repos/plancarry",
+        python_env="/workspace/repos/plancarry/.venv/bin/python",
+        execution_attempt_uuid="attempt-id", instance_id="vast_1",
+    )
+
+    assert result["execution_attempt_uuid"] == "attempt-id"
+    assert runner.submit_args[0] == "vast_1"
+    assert runner.submit_args[-1] == "local_reserved_job"
+    assert "VIRTUAL_ENV=" in runner.submit_args[2]
+
+
+@pytest.mark.asyncio
+async def test_sync_uses_remote_status_artifacts_and_runtime(monkeypatch):
+    mapping = _mapping("running")
+    mapping["run"]["data"].update({"executor": "vast", "instance_id": "vast_1"})
+    research = FakeResearch(mapping)
+    runner = RemoteRunner()
+    monkeypatch.setattr(server, "research", lambda: research)
+    monkeypatch.setattr(server, "svc", lambda: runner)
+    monkeypatch.setattr(server, "lab", lambda: TerminalLab())
+
+    result = await server.research_experiment_sync(run_id="run-id")
+
+    assert result["status"] == "completed"
+    assert research.updates[0][1]["runtime"] == {"instance_id": "vast_1"}
+
+
+@pytest.mark.asyncio
+async def test_sync_reports_incomplete_cancellation_without_marking_unknown(monkeypatch):
+    mapping = _mapping("running")
+    mapping["run"]["data"].update({"executor": "vast", "instance_id": "vast_1"})
+    research = FakeResearch(mapping)
+    monkeypatch.setattr(server, "research", lambda: research)
+    monkeypatch.setattr(server, "svc", lambda: CancellationIncompleteRemote())
+
+    result = await server.research_experiment_sync(run_id="run-id")
+
+    assert result["status"] == "CANCELLATION_INCOMPLETE"
+    assert result["recovery_action"] == "CANCEL_PROCESS_GROUP"
+    assert research.updates == []
+
+
+@pytest.mark.asyncio
+async def test_sync_reports_pending_cancellation_without_marking_unknown(monkeypatch):
+    mapping = _mapping("running")
+    mapping["run"]["data"].update({"executor": "vast", "instance_id": "vast_1"})
+    research = FakeResearch(mapping)
+    monkeypatch.setattr(server, "research", lambda: research)
+    monkeypatch.setattr(server, "svc", lambda: CancellationPendingRemote())
+
+    result = await server.research_experiment_sync(run_id="run-id")
+
+    assert result["status"] == "CANCELLATION_PENDING_VERIFICATION"
+    assert result["recovery_action"] == "VERIFY_PROCESS_GROUP"
+    assert research.updates == []
 
 
 @pytest.mark.asyncio

@@ -1,3 +1,4 @@
+from pathlib import Path
 import os
 import threading
 import time
@@ -38,6 +39,469 @@ def test_two_workers_claim_distinct_work_and_messages_are_not_evidence():
     lab.message_send(project_id, first_worker, first["session_id"], "SHARE_FINDING", "Opinion", "H1 is definitely correct")
     assert lab.message_list(project_id, second_worker)
     assert store.objects_list(project_id, "Hypothesis", limit=None) == []
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_dependency_requires_explicit_status_or_exists_only_marker():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project = store.project_create(f"lab-dependency-status-{time.time_ns()}", "Dependency validation")
+    worker = lab.join(None, "dependency-status-worker", "CODEX", project["project_id"])
+    with pytest.raises(GPUError) as exc_info:
+        lab.create_work(
+            project["project_id"], "VALIDATION", "Missing status", "Must not become ready.",
+            "VALIDATOR", worker["worker"]["id"], created_session_id=worker["session_id"],
+            dependencies=[{"target_type": "RESEARCH_OBJECT", "target_id": str(uuid.uuid4())}],
+        )
+    assert exc_info.value.error_type == "LAB_DEPENDENCY_REQUIRED_STATUS_REQUIRED"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_dependency_target_type_is_never_inferred_from_a_uuid():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project = store.project_create(f"lab-dependency-type-{time.time_ns()}", "Typed dependency")
+    joined = lab.join(None, "typed-dependency-worker", "CODEX", project["project_id"])
+    with pytest.raises(GPUError, match="LAB_DEPENDENCY_TARGET_TYPE_REQUIRED"):
+        lab.create_work(project["project_id"], "REVIEW", "Type required", "No inference", "REVIEWER", joined["worker"]["id"], created_session_id=joined["session_id"], dependencies=[{"target_id": str(uuid.uuid4()), "required_statuses": ["COMPLETED"]}])
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v355_objective_is_versioned_and_proposals_merge_into_existing_work():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-v355-proposal-{time.time_ns()}", "v3.5.5 proposal arbitration")["project_id"]
+    joined = lab.join(None, "v355-worker", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    objective = lab.canonical_objective_create(
+        project_id, "SCIENTIFIC", "Inspect E201", "Does E201 satisfy the frozen metric contract?",
+    )
+    assert objective["version"] == 1
+    assert lab.canonical_objective_create(
+        project_id, "SCIENTIFIC", "Inspect E201", "Does E201 satisfy the frozen metric contract?",
+    )["id"] == objective["id"]
+    with pytest.raises(GPUError, match="CANONICAL_OBJECTIVE_VERSION_TRANSITION_REQUIRED"):
+        lab.canonical_objective_create(project_id, "SCIENTIFIC", "Inspect E201", "A different question")
+
+    authority = lab.authority_key(project_id, "E201", "v4", "RESULT_INSPECTION")
+    canonical = lab.create_work(
+        project_id, "REVIEW", "Inspect E201", "Canonical review", "RESULT_INSPECTOR", worker_id,
+        created_session_id=session_id, authority_key=authority, authority_status="AUTHORITATIVE",
+        canonical_subject_version="v4", subject_id="E201", canonical_objective_id=objective["id"],
+    )
+    proposal = lab.work_propose(
+        project_id, worker_id, session_id, "RESULT_INSPECTION", "RESULT_INSPECTOR", "same inspection",
+        canonical_objective_id=objective["id"], target_id="E201", authority_key_hint=authority,
+    )
+    assert proposal["status"] == "MERGED_INTO_EXISTING"
+    assert proposal["canonical_work_item_id"] == canonical["id"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_branch_identity_is_structured_for_work_and_proposals():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-v36-branch-link-{time.time_ns()}", "v3.6 branch linkage")["project_id"]
+    joined = lab.join(None, "v36-branch-worker", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    objective = lab.canonical_objective_create(
+        project_id, "SCIENTIFIC", "Residual mechanism", "Which mechanism explains residual instability?",
+    )
+    branch = lab.hypothesis_branch_create(
+        project_id, objective["id"], question_id="Q-residual", hypothesis_ids=["H-anchor"],
+        mechanistic_niche_id="anchor-state", scientific_distance="NEAR",
+    )
+    work = lab.create_work(
+        project_id, "ANALYSIS", "Inspect anchor state", "Bounded branch analysis", "RESULT_INSPECTOR",
+        worker_id, created_session_id=session_id, canonical_objective_id=objective["id"], branch_id=branch["id"],
+    )
+    proposal = lab.work_propose(
+        project_id, worker_id, session_id, "ANALYSIS", "RESULT_INSPECTOR", "Independent branch follow-up",
+        hypothesis_branch_id=branch["id"],
+    )
+    assert work["branch_id"] == branch["id"]
+    assert proposal["hypothesis_branch_id"] == branch["id"]
+    assert proposal["canonical_objective_id"] == objective["id"]
+    coverage = lab.branch_coverage_get(project_id)
+    assert coverage[0]["branch_id"] == branch["id"]
+    assert coverage[0]["active_work_item_ids"] == [work["id"]]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_branch_cannot_cross_objective_boundary():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-v36-branch-scope-{time.time_ns()}", "v3.6 branch scope")["project_id"]
+    joined = lab.join(None, "v36-scope-worker", "CODEX", project_id)
+    first = lab.canonical_objective_create(project_id, "SCIENTIFIC", "First", "First question")
+    second = lab.canonical_objective_create(project_id, "SCIENTIFIC", "Second", "Second question")
+    branch = lab.hypothesis_branch_create(project_id, first["id"])
+    with pytest.raises(GPUError, match="HYPOTHESIS_BRANCH_OBJECTIVE_MISMATCH"):
+        lab.create_work(
+            project_id, "ANALYSIS", "Wrong branch", "Must not cross objectives", "RESULT_INSPECTOR",
+            joined["worker"]["id"], created_session_id=joined["session_id"],
+            canonical_objective_id=second["id"], branch_id=branch["id"],
+        )
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_refuting_branch_releases_live_lease_and_worker_ownership():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-v36-branch-retire-{time.time_ns()}", "v3.6 branch retirement")["project_id"]
+    joined = lab.join(None, "v36-branch-retire-worker", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    objective = lab.canonical_objective_create(project_id, "SCIENTIFIC", "Refutation", "Which branch survives?")
+    branch = lab.hypothesis_branch_create(project_id, objective["id"])
+    portfolio = lab.hypothesis_portfolio_ensure(project_id, objective["id"])
+    assert portfolio["active_branch_ids"] == [branch["id"]]
+    work = lab.create_work(
+        project_id, "ANALYSIS", "Live branch analysis", "Must be released when branch is refuted.",
+        "RESULT_INSPECTOR", worker_id, created_session_id=session_id,
+        canonical_objective_id=objective["id"], branch_id=branch["id"],
+    )
+    claimed = lab.claim_work(work["id"], worker_id, session_id)
+    assert lab.start_work(work["id"], worker_id, session_id)["status"] == "RUNNING"
+
+    transitioned = lab.hypothesis_branch_transition(
+        branch["id"], worker_id, session_id, "REFUTED", "The discriminating prediction failed.",
+    )
+
+    assert transitioned["retired_descendants"] == 1
+    retired = lab.work_get(work["id"])
+    assert retired["status"] == "INVALIDATED"
+    assert retired["lease_id"] is None
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT released_at,release_reason FROM lab_work_leases WHERE id=%s", (claimed["lease_id"],))
+        lease = cur.fetchone()
+        cur.execute("SELECT current_work_item_id,status FROM research_worker_sessions WHERE id=%s", (session_id,))
+        session = cur.fetchone()
+        cur.execute("SELECT availability_state FROM research_workers WHERE id=%s", (worker_id,))
+        worker = cur.fetchone()
+    assert lease["released_at"] is not None
+    assert lease["release_reason"] == "BRANCH_RETIRED"
+    assert session["current_work_item_id"] is None
+    assert session["status"] == "ACTIVE"
+    assert worker["availability_state"] == "AVAILABLE"
+    refreshed_portfolio = lab.hypothesis_portfolio_ensure(project_id, objective["id"])
+    assert refreshed_portfolio["active_branch_ids"] == []
+    assert refreshed_portfolio["status"] == "RESOLVED"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v355_gate_supersession_releases_live_lease_and_worker_ownership():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-v355-gate-retire-{time.time_ns()}", "gate retirement")["project_id"]
+    joined = lab.join(None, "v355-gate-retire-worker", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    old_gate = lab.gate_ensure(project_id, "RESULT_INSPECTION", "E-gate-retire", "v1", worker_id, session_id)
+    successor_gate = lab.gate_ensure(project_id, "RESULT_INSPECTION", "E-gate-retire", "v2", worker_id, session_id)
+    work = lab.gate_work_ensure(old_gate["id"], "REVIEW", "Inspect v1", "Old reviewed contract", "RESULT_INSPECTOR", worker_id, session_id)
+    claimed = lab.claim_work(work["id"], worker_id, session_id)
+    lab.start_work(work["id"], worker_id, session_id)
+
+    result = lab.supersede_gate_version(old_gate["id"], successor_gate["id"], worker_id, session_id, "A new reviewed version supersedes v1.")
+
+    assert result["status"] == "SUPERSEDED"
+    retired = lab.work_get(work["id"])
+    assert retired["status"] == "SUPERSEDED"
+    assert retired["lease_id"] is None
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT released_at,release_reason FROM lab_work_leases WHERE id=%s", (claimed["lease_id"],))
+        lease = cur.fetchone()
+        cur.execute("SELECT current_work_item_id,status FROM research_worker_sessions WHERE id=%s", (session_id,))
+        session = cur.fetchone()
+        cur.execute("SELECT availability_state FROM research_workers WHERE id=%s", (worker_id,))
+        worker = cur.fetchone()
+    assert lease["released_at"] is not None
+    assert lease["release_reason"] == "GATE_SUPERSEDED"
+    assert session["current_work_item_id"] is None
+    assert session["status"] == "ACTIVE"
+    assert worker["availability_state"] == "AVAILABLE"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_feature_gated_scheduler_claims_existing_work_or_records_healthy_idle():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store, feature_flags={"BRANCH_AWARE_ASSIGNMENT": True})
+    project_id = store.project_create(f"lab-v36-assign-{time.time_ns()}", "v3.6 assignment")["project_id"]
+    planner = lab.join(None, "v36-assignment-planner", "CODEX", project_id)
+    worker = lab.join(None, "v36-assignment-worker", "CHATGPT_WEB", project_id)
+    objective = lab.canonical_objective_create(project_id, "SCIENTIFIC", "Causal branch", "Which causal branch is active?")
+    branch = lab.hypothesis_branch_create(project_id, objective["id"], scientific_distance="FAR")
+    lab.hypothesis_portfolio_ensure(project_id, objective["id"])
+    gate = lab.gate_ensure(project_id, "RESULT_INSPECTION", "E-v36", "v1", planner["worker"]["id"], planner["session_id"])
+    work = lab.gate_work_ensure(
+        gate["id"], "REVIEW", "Inspect E-v36", "Canonical existing work", "RESULT_INSPECTOR",
+        planner["worker"]["id"], planner["session_id"], branch_id=branch["id"],
+    )
+
+    assigned = lab.portfolio_assign_existing(project_id, worker["worker"]["id"], worker["session_id"])
+    assert assigned["status"] == "ASSIGNED"
+    assert assigned["work_item"]["id"] == work["id"]
+    assert assigned["work_item"]["branch_id"] == branch["id"]
+    assert assigned["plan"]["version"] == 1
+
+    idle = lab.portfolio_assign_existing(project_id, planner["worker"]["id"], planner["session_id"])
+    assert idle["status"] == "IDLE"
+    assert idle["idle_reason"] == "NO_EXISTING_ACTIONABLE_CANONICAL_WORK"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_planner_on_idle_requests_central_evaluation_without_creating_work():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store, feature_flags={"BRANCH_AWARE_ASSIGNMENT": True, "PLANNER_ON_IDLE": True})
+    project_id = store.project_create(f"lab-v36-planner-idle-{time.time_ns()}", "v3.6 planner on idle")["project_id"]
+    joined = lab.join(None, f"v36-planner-idle-worker-{time.time_ns()}", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    objective = lab.canonical_objective_create(project_id, "SCIENTIFIC", "Planner", "Is missing work scientifically justified?")
+    branch = lab.hypothesis_branch_create(project_id, objective["id"])
+    lab.hypothesis_portfolio_ensure(project_id, objective["id"])
+    before = lab.work_list(project_id, None, 100)
+
+    result = lab.portfolio_assign_existing(project_id, worker_id, session_id)
+
+    assert result["status"] == "IDLE"
+    assert result["idle_reason"] == "PLANNER_EVALUATION_REQUIRED"
+    assert result["planner_action"] == "REQUEST_CENTRAL_PLANNER_EVALUATION"
+    assert result["planner_candidates"]["planner_action"] == "CONSIDER_PROPOSAL"
+    assert result["planner_candidates"]["undercovered_branches"][0]["branch_id"] == branch["id"]
+    assert result["plan"]["rationale"]["new_work_created"] is False
+    assert lab.work_list(project_id, None, 100) == before
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_objective_global_dependency_blocks_assignment_but_branch_local_wait_does_not():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store, feature_flags={"BRANCH_AWARE_ASSIGNMENT": True})
+    project_id = store.project_create(f"lab-v36-global-scope-{time.time_ns()}", "v3.6 dependency scope")["project_id"]
+    worker = lab.join(None, f"v36-global-worker-{time.time_ns()}", "CODEX", project_id)
+    worker_id, session_id = worker["worker"]["id"], worker["session_id"]
+    objective = lab.canonical_objective_create(project_id, "SCIENTIFIC", "Scope", "Which dependency scope is blocking?")
+    first_branch = lab.hypothesis_branch_create(project_id, objective["id"])
+    second_branch = lab.hypothesis_branch_create(project_id, objective["id"])
+    lab.hypothesis_portfolio_ensure(project_id, objective["id"])
+    gate = lab.gate_ensure(project_id, "RESULT_INSPECTION", "global-ready", "v1", worker_id, session_id)
+    ready = lab.gate_work_ensure(gate["id"], "REVIEW", "Independent", "Should run absent global block.", "RESULT_INSPECTOR", worker_id, session_id, branch_id=second_branch["id"])
+    local_pending = store.object_create(project_id, "ExperimentRun", {"label": "local"}, "EXPERIMENT_STARTED", "running")
+    local_wait = lab.create_work(
+        project_id, "VALIDATION", "Local prerequisite", "Must not block an independent branch.", "VALIDATOR", worker_id,
+        created_session_id=session_id, canonical_objective_id=objective["id"], branch_id=first_branch["id"],
+        dependency_scope="BRANCH", dependencies=[{"target_type": "EXPERIMENT_RUN", "target_id": local_pending["id"], "required_statuses": ["completed"]}],
+    )
+    pending = store.object_create(project_id, "ExperimentRun", {"label": "global"}, "EXPERIMENT_STARTED", "running")
+    global_wait = lab.create_work(
+        project_id, "VALIDATION", "Global prerequisite", "Blocks this objective only.", "VALIDATOR", worker_id,
+        created_session_id=session_id, canonical_objective_id=objective["id"], branch_id=first_branch["id"],
+        dependency_scope="OBJECTIVE_GLOBAL", dependencies=[{"target_type": "EXPERIMENT_RUN", "target_id": pending["id"], "required_statuses": ["completed"]}],
+    )
+    assert global_wait["status"] == "WAITING_DEPENDENCY"
+    blocked = lab.portfolio_assign_existing(project_id, worker_id, session_id)
+    assert blocked["status"] == "IDLE"
+    assert blocked["idle_reason"] == "OBJECTIVE_GLOBAL_DEPENDENCY_BLOCK"
+    assert blocked["global_blocks"][0]["id"] == global_wait["id"]
+    assert lab.work_planner_candidates(project_id)["planner_action"] == "IDLE_OBJECTIVE_GLOBAL_BLOCK"
+    store.object_update(pending["id"], {}, "completed", "EXPERIMENT_COMPLETED")
+    assert lab.resolve_dependencies(project_id)["ready"] == 1
+    assert lab.work_get(local_wait["id"])["status"] == "WAITING_DEPENDENCY"
+    assert lab.portfolio_assign_existing(project_id, worker_id, session_id)["work_item"]["id"] == ready["id"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_worker_affinity_prefers_context_without_becoming_exclusive():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store, feature_flags={"BRANCH_AWARE_ASSIGNMENT": True})
+    project_id = store.project_create(f"lab-v36-affinity-{time.time_ns()}", "v3.6 affinity")["project_id"]
+    first = lab.join(None, f"v36-affinity-first-{time.time_ns()}", "CODEX", project_id)
+    preferred = lab.join(None, f"v36-affinity-preferred-{time.time_ns()}", "CODEX", project_id)
+    first_id, first_session = first["worker"]["id"], first["session_id"]
+    preferred_id, preferred_session = preferred["worker"]["id"], preferred["session_id"]
+    objective = lab.canonical_objective_create(project_id, "SCIENTIFIC", "Affinity", "Who can inspect this output?")
+    preferred_branch = lab.hypothesis_branch_create(project_id, objective["id"])
+    other_branch = lab.hypothesis_branch_create(project_id, objective["id"])
+    lab.hypothesis_portfolio_ensure(project_id, objective["id"])
+    preferred_gate = lab.gate_ensure(project_id, "RESULT_INSPECTION", "affinity-preferred", "v1", first_id, first_session)
+    other_gate = lab.gate_ensure(project_id, "RESULT_INSPECTION", "affinity-other", "v1", first_id, first_session)
+    preferred_work = lab.create_work(
+        project_id, "REVIEW", "Preferred", "Prior context exists.", "RESULT_INSPECTOR", first_id,
+        created_session_id=first_session, gate_id=preferred_gate["id"], authority_key=preferred_gate["authority_key"],
+        canonical_subject_version="v1", authority_status="AUTHORITATIVE", subject_id="affinity-preferred",
+        branch_id=preferred_branch["id"], preferred_worker_id=preferred_id, affinity_reason="Prior execution context.",
+    )
+    other_work = lab.create_work(
+        project_id, "REVIEW", "Other", "Independent work.", "RESULT_INSPECTOR", first_id,
+        created_session_id=first_session, gate_id=other_gate["id"], authority_key=other_gate["authority_key"],
+        canonical_subject_version="v1", authority_status="AUTHORITATIVE", subject_id="affinity-other", branch_id=other_branch["id"],
+    )
+    assert lab.portfolio_assign_existing(project_id, preferred_id, preferred_session)["work_item"]["id"] == preferred_work["id"]
+    assert lab.portfolio_assign_existing(project_id, first_id, first_session)["work_item"]["id"] == other_work["id"]
+    lab.start_work(other_work["id"], first_id, first_session)
+    lab.complete_work(other_work["id"], first_id, first_session, "Done")
+    fallback_gate = lab.gate_ensure(project_id, "RESULT_INSPECTION", "affinity-fallback", "v1", first_id, first_session)
+    fallback_work = lab.create_work(
+        project_id, "REVIEW", "Fallback", "Context preferred but not required.", "RESULT_INSPECTOR", first_id,
+        created_session_id=first_session, gate_id=fallback_gate["id"], authority_key=fallback_gate["authority_key"],
+        canonical_subject_version="v1", authority_status="AUTHORITATIVE", subject_id="affinity-fallback",
+        branch_id=other_branch["id"], preferred_worker_id=preferred_id, affinity_reason="Preferred worker is busy.",
+    )
+    assert lab.portfolio_assign_existing(project_id, first_id, first_session)["work_item"]["id"] == fallback_work["id"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_speculation_classes_and_expensive_budget_are_enforced():
+    store = ResearchStore(TEST_DATABASE_URL)
+    disabled = LabController(store)
+    project_id = store.project_create(f"lab-v36-speculation-{time.time_ns()}", "v3.6 speculation")["project_id"]
+    joined = disabled.join(None, "v36-speculation-worker", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    objective = disabled.canonical_objective_create(project_id, "SCIENTIFIC", "Speculation", "Which bounded preparation is justified?")
+    branch = disabled.hypothesis_branch_create(project_id, objective["id"])
+    safe = disabled.create_work(
+        project_id, "ANALYSIS", "Safe metric audit", "Outcome-independent inspection", "RESULT_INSPECTOR",
+        worker_id, created_session_id=session_id, canonical_objective_id=objective["id"], branch_id=branch["id"],
+        speculation_class="SAFE_SPECULATIVE",
+    )
+    assert safe["speculation_class"] == "SAFE_SPECULATIVE"
+    with pytest.raises(GPUError, match="LAB_WORK_SPECULATION_CONDITION_REQUIRED"):
+        disabled.create_work(
+            project_id, "ANALYSIS", "Bad conditional", "No trigger", "RESULT_INSPECTOR",
+            worker_id, created_session_id=session_id, canonical_objective_id=objective["id"], branch_id=branch["id"],
+            speculation_class="CONDITIONAL_SPECULATIVE",
+        )
+    with pytest.raises(GPUError, match="LAB_SPECULATIVE_WORK_POLICY_DISABLED"):
+        disabled.create_work(
+            project_id, "RUN_EXPERIMENT", "Gated expensive run", "Not approved", "EXPERIMENT_OWNER",
+            worker_id, created_session_id=session_id, canonical_objective_id=objective["id"], branch_id=branch["id"],
+            speculation_class="EXPENSIVE_SPECULATIVE", related_refs={"brain_approval": "B1"}, expected_value=1,
+        )
+
+    enabled = LabController(store, feature_flags={"SPECULATIVE_WORK_POLICY": True})
+    enabled.budget_set(project_id, worker_id, session_id, {"max_concurrent_expensive_speculative_runs": 1})
+    first = enabled.create_work(
+        project_id, "RUN_EXPERIMENT", "Approved expensive run", "Bounded approved run", "EXPERIMENT_OWNER",
+        worker_id, created_session_id=session_id, canonical_objective_id=objective["id"], branch_id=branch["id"],
+        speculation_class="EXPENSIVE_SPECULATIVE", related_refs={"brain_approval": "B1"}, expected_value=1,
+    )
+    enabled.claim_work(first["id"], worker_id, session_id)
+    second = enabled.create_work(
+        project_id, "RUN_EXPERIMENT", "Second approved run", "Must wait for budget", "EXPERIMENT_OWNER",
+        worker_id, created_session_id=session_id, canonical_objective_id=objective["id"], branch_id=branch["id"],
+        speculation_class="EXPENSIVE_SPECULATIVE", related_refs={"brain_approval": "B2"}, expected_value=1,
+    )
+    with pytest.raises(GPUError, match="LAB_SPECULATIVE_BUDGET_EXCEEDED"):
+        enabled.claim_work(second["id"], worker_id, session_id)
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_production_audit_and_cockpit_portfolio_are_read_only():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    cockpit = CockpitController(store, lab)
+    project_id = store.project_create(f"lab-v36-audit-{time.time_ns()}", "v3.6 audit")["project_id"]
+    joined = lab.join(None, f"v36-audit-worker-{time.time_ns()}", "CODEX", project_id)
+    objective = lab.canonical_objective_create(project_id, "SCIENTIFIC", "Audit", "What coordination capacity is useful?")
+    branch = lab.hypothesis_branch_create(project_id, objective["id"], mechanistic_niche_id="strong-null")
+    work = lab.create_work(
+        project_id, "ANALYSIS", "Ready branch analysis", "Existing canonical work", "RESULT_INSPECTOR",
+        joined["worker"]["id"], created_session_id=joined["session_id"],
+        canonical_objective_id=objective["id"], branch_id=branch["id"],
+    )
+    before = lab.work_get(work["id"])
+    audit = lab.portfolio_production_audit(project_id)
+    state = cockpit.state_get(project_id)
+    assert audit["mutated"] is False
+    assert audit["existing_ready_canonical_work"] == []  # supporting work is never scheduler authority
+    assert state["portfolio_scheduler"]["branch_coverage"][0]["branch_id"] == branch["id"]
+    assert lab.work_get(work["id"])["work_version"] == before["work_version"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_shadow_and_audit_only_expose_workers_joined_to_the_project():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    first_project = store.project_create(f"lab-v36-worker-scope-a-{time.time_ns()}", "first scope")["project_id"]
+    second_project = store.project_create(f"lab-v36-worker-scope-b-{time.time_ns()}", "second scope")["project_id"]
+    first = lab.join(None, f"v36-scope-first-{time.time_ns()}", "CODEX", first_project)
+    second = lab.join(None, f"v36-scope-second-{time.time_ns()}", "CODEX", second_project)
+    shadow = lab.portfolio_scheduler_shadow(first_project)
+    audit = lab.portfolio_production_audit(first_project)
+    assert [entry["worker_id"] for entry in shadow["assignments"]] == [first["worker"]["id"]]
+    assert [entry["id"] for entry in audit["workers"]["all"]] == [first["worker"]["id"]]
+    assert second["worker"]["id"] not in [entry["id"] for entry in audit["workers"]["all"]]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_agenda_coverage_exposes_unbranched_active_agenda_item():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-v36-agenda-uncovered-{time.time_ns()}", "v3.6 agenda coverage")["project_id"]
+    agenda_item = store.object_create(
+        project_id, "AgendaItem", {"question": "Which independent mechanism remains untested?"},
+        "AGENDA_ITEM_CREATED", "OPEN",
+    )
+    coverage = lab.agenda_coverage_get(project_id)
+    entry = next(item for item in coverage if item.get("agenda_item_id") == agenda_item["id"])
+    assert entry["coverage_state"] == "UNCOVERED_ACTIONABLE"
+    assert entry["planner_action"] == "CONSIDER_BRANCH_PROPOSAL"
+    assert entry["branches"] == []
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_planner_on_idle_receives_unbranched_agenda_item_without_creating_work():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store, feature_flags={"BRANCH_AWARE_ASSIGNMENT": True, "PLANNER_ON_IDLE": True})
+    project_id = store.project_create(f"lab-v36-agenda-planner-{time.time_ns()}", "v3.6 agenda planner")["project_id"]
+    joined = lab.join(None, f"v36-agenda-planner-worker-{time.time_ns()}", "CODEX", project_id)
+    agenda_item = store.object_create(project_id, "AgendaItem", {"question": "Which strong null remains untested?"}, "AGENDA_ITEM_CREATED", "OPEN")
+    result = lab.portfolio_assign_existing(project_id, joined["worker"]["id"], joined["session_id"])
+    assert result["idle_reason"] == "PLANNER_EVALUATION_REQUIRED"
+    assert result["planner_candidates"]["unbranched_agenda_items"][0]["agenda_item_id"] == agenda_item["id"]
+    assert result["plan"]["rationale"]["unbranched_agenda_item_ids"] == [agenda_item["id"]]
+    assert lab.work_list(project_id, None, 100) == []
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_historical_replay_is_read_only_and_never_claims_counterfactual_science():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-v36-replay-{time.time_ns()}", "v3.6 replay")["project_id"]
+    joined = lab.join(None, f"v36-replay-worker-{time.time_ns()}", "CODEX", project_id)
+    objective = lab.canonical_objective_create(project_id, "SCIENTIFIC", "Replay", "Which work was actionable?")
+    branch = lab.hypothesis_branch_create(project_id, objective["id"])
+    before_events = len(store.events(project_id, 500))
+    replay = lab.portfolio_historical_replay(project_id)
+    after_events = len(store.events(project_id, 500))
+    assert replay["mutated"] is False
+    assert replay["events_examined"] >= before_events
+    assert replay["limitations"]["counterfactual_claim"].startswith("No suggested assignment")
+    assert after_events == before_events
+    assert replay["summary"]["observed_available_workers_at_end"] == [joined["worker"]["id"]]
+    assert branch["id"] in {point.get("branch_id") for point in replay["schedule_points"]}
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_historical_replay_detects_waiting_release_with_existing_independent_work():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-v36-replay-release-{time.time_ns()}", "v3.6 replay release")["project_id"]
+    joined = lab.join(None, f"v36-replay-release-{time.time_ns()}", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    objective = lab.canonical_objective_create(project_id, "SCIENTIFIC", "Replay release", "Which branch remains actionable?")
+    waiting_branch = lab.hypothesis_branch_create(project_id, objective["id"])
+    independent_branch = lab.hypothesis_branch_create(project_id, objective["id"])
+    waiting_gate = lab.gate_ensure(project_id, "RESULT_INSPECTION", "replay-wait", "v1", worker_id, session_id)
+    ready_gate = lab.gate_ensure(project_id, "RESULT_INSPECTION", "replay-ready", "v1", worker_id, session_id)
+    waiting_work = lab.gate_work_ensure(waiting_gate["id"], "REVIEW", "Wait", "Waiting branch", "RESULT_INSPECTOR", worker_id, session_id, branch_id=waiting_branch["id"])
+    ready_work = lab.gate_work_ensure(ready_gate["id"], "REVIEW", "Ready", "Independent branch", "RESULT_INSPECTOR", worker_id, session_id, branch_id=independent_branch["id"])
+    prerequisite = store.object_create(project_id, "ExperimentRun", {"label": "pending"}, "EXPERIMENT_STARTED", "running")
+    lab.claim_work(waiting_work["id"], worker_id, session_id)
+    lab.block_work(waiting_work["id"], worker_id, session_id, [{"target_type": "EXPERIMENT_RUN", "target_id": prerequisite["id"], "required_statuses": ["completed"]}])
+
+    replay = lab.portfolio_historical_replay(project_id)
+    released = [point for point in replay["schedule_points"] if point["kind"] == "WORK_RELEASED"]
+    assert replay["summary"]["waiting_releases_with_independent_ready_opportunity"] == 1
+    assert ready_work["id"] in released[-1]["independent_ready_work_item_ids"]
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
@@ -130,6 +594,214 @@ def test_atomic_claim_and_dependency_reactivation_survive_store_restart():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_concurrent_schedulers_cannot_assign_two_work_items_to_one_session():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-v36-session-race-{time.time_ns()}", "Session assignment race")["project_id"]
+    joined = lab.join(None, f"v36-session-race-worker-{time.time_ns()}", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    first = lab.create_work(project_id, "REVIEW", "First", "First canonical work", "RESULT_INSPECTOR", worker_id, created_session_id=session_id)
+    second = lab.create_work(project_id, "REVIEW", "Second", "Second canonical work", "RESULT_INSPECTOR", worker_id, created_session_id=session_id)
+    barrier = threading.Barrier(2)
+
+    def claim(work_id):
+        barrier.wait()
+        controller = LabController(ResearchStore(TEST_DATABASE_URL))
+        try:
+            return controller.claim_work(work_id, worker_id, session_id)["id"]
+        except GPUError as error:
+            return error.error_type
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(claim, (first["id"], second["id"])))
+    assert sum(outcome in {first["id"], second["id"]} for outcome in outcomes) == 1
+    assert outcomes.count("LAB_WORKER_ALREADY_ASSIGNED") == 1
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT current_work_item_id FROM research_worker_sessions WHERE id=%s", (session_id,))
+        session = cur.fetchone()
+    assert str(session["current_work_item_id"]) in {first["id"], second["id"]}
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_worker_identity_cannot_be_assigned_through_two_project_sessions():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    first_project = store.project_create(f"lab-v36-worker-identity-a-{time.time_ns()}", "first identity scope")["project_id"]
+    second_project = store.project_create(f"lab-v36-worker-identity-b-{time.time_ns()}", "second identity scope")["project_id"]
+    first = lab.join(None, f"v36-identity-worker-{time.time_ns()}", "CODEX", first_project)
+    second = lab.join(first["worker"]["id"], None, "CODEX", second_project)
+    first_work = lab.create_work(first_project, "REVIEW", "First", "First project work", "RESULT_INSPECTOR", first["worker"]["id"], created_session_id=first["session_id"])
+    second_work = lab.create_work(second_project, "REVIEW", "Second", "Second project work", "RESULT_INSPECTOR", second["worker"]["id"], created_session_id=second["session_id"])
+    lab.claim_work(first_work["id"], first["worker"]["id"], first["session_id"])
+    with pytest.raises(GPUError) as exc_info:
+        lab.claim_work(second_work["id"], second["worker"]["id"], second["session_id"])
+    assert exc_info.value.error_type == "LAB_WORKER_ALREADY_ASSIGNED"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_stale_completed_session_pointer_is_cleared_before_a_new_claim_after_restart():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-stale-completed-{time.time_ns()}", "stale completed ownership")['project_id']
+    joined = lab.join(None, f"stale-completed-{time.time_ns()}", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    completed = lab.create_work(project_id, "REVIEW", "Complete old", "terminal old work", "RESULT_INSPECTOR", worker_id, created_session_id=session_id)
+    lab.claim_work(completed["id"], worker_id, session_id)
+    lab.complete_work(completed["id"], worker_id, session_id)
+    replacement = lab.create_work(project_id, "REVIEW", "Claim new", "new ready work", "RESULT_INSPECTOR", worker_id, created_session_id=session_id)
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE research_worker_sessions SET current_work_item_id=%s,status='BUSY' WHERE id=%s", (completed["id"], session_id))
+
+    claimed = LabController(ResearchStore(TEST_DATABASE_URL)).claim_work(replacement["id"], worker_id, session_id)
+    assert claimed["id"] == replacement["id"]
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT current_work_item_id FROM research_worker_sessions WHERE id=%s", (session_id,))
+        assert str(cur.fetchone()["current_work_item_id"]) == replacement["id"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_missing_session_work_pointer_cannot_block_a_ready_claim():
+    """A deleted/nonexistent WorkItem pointer is never a hidden reservation."""
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-missing-pointer-{time.time_ns()}", "missing ownership pointer")['project_id']
+    joined = lab.join(None, f"missing-pointer-worker-{time.time_ns()}", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    ready = lab.create_work(project_id, "REVIEW", "Ready work", "must remain claimable", "RESULT_INSPECTOR", worker_id, created_session_id=session_id)
+    missing_work_id = str(uuid.uuid4())
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE research_worker_sessions SET current_work_item_id=%s,status='BUSY' WHERE id=%s",
+            (missing_work_id, session_id),
+        )
+
+    claimed = LabController(ResearchStore(TEST_DATABASE_URL)).claim_work(ready["id"], worker_id, session_id)
+    assert claimed["id"] == ready["id"]
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT current_work_item_id FROM research_worker_sessions WHERE id=%s", (session_id,))
+        assert str(cur.fetchone()["current_work_item_id"]) == ready["id"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_released_orphaned_session_pointer_cannot_block_a_fresh_session_for_same_worker():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-orphaned-session-{time.time_ns()}", "orphaned session ownership")['project_id']
+    old = lab.join(None, f"orphaned-worker-{time.time_ns()}", "CODEX", project_id)
+    fresh = lab.join(old["worker"]["id"], None, "CODEX", project_id)
+    worker_id = old["worker"]["id"]
+    old_work = lab.create_work(project_id, "REVIEW", "Old lease", "orphaned old lease", "RESULT_INSPECTOR", worker_id, created_session_id=old["session_id"])
+    lab.claim_work(old_work["id"], worker_id, old["session_id"])
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE lab_work_leases SET released_at=NOW(),release_reason='ORPHANED_SESSION' WHERE work_item_id=%s", (old_work["id"],))
+        cur.execute("UPDATE research_worker_sessions SET current_work_item_id=%s,status='BUSY' WHERE id=%s", (old_work["id"], old["session_id"]))
+    new_work = lab.create_work(project_id, "REVIEW", "Fresh lease", "fresh ready work", "RESULT_INSPECTOR", worker_id, created_session_id=fresh["session_id"])
+
+    assert lab.claim_work(new_work["id"], worker_id, fresh["session_id"])["id"] == new_work["id"]
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT current_work_item_id FROM research_worker_sessions WHERE id=%s", (old["session_id"],))
+        assert cur.fetchone()["current_work_item_id"] is None
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_sync_cleans_lost_terminal_ownership_projection():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-sync-stale-{time.time_ns()}", "sync stale ownership")['project_id']
+    joined = lab.join(None, f"sync-stale-{time.time_ns()}", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    old_work = lab.create_work(project_id, "REVIEW", "Complete sync old", "terminal sync work", "RESULT_INSPECTOR", worker_id, created_session_id=session_id)
+    lab.claim_work(old_work["id"], worker_id, session_id)
+    lab.complete_work(old_work["id"], worker_id, session_id)
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE research_worker_sessions SET current_work_item_id=%s,status='BUSY' WHERE id=%s", (old_work["id"], session_id))
+
+    synced = lab.sync(session_id, project_id, current_work_item_id=old_work["id"])
+    assert synced["lease_state"] == "LEASE_LOST"
+    assert synced["sync_status"] == "WORK_COMPLETED_ELSEWHERE"
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT current_work_item_id FROM research_worker_sessions WHERE id=%s", (session_id,))
+        assert cur.fetchone()["current_work_item_id"] is None
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_live_lease_ownership_still_blocks_competing_session_claims():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-live-owner-{time.time_ns()}", "live owner remains exclusive")['project_id']
+    owner = lab.join(None, f"live-owner-{time.time_ns()}", "CODEX", project_id)
+    competitor = lab.join(owner["worker"]["id"], None, "CODEX", project_id)
+    worker_id = owner["worker"]["id"]
+    owned = lab.create_work(project_id, "REVIEW", "Live owned", "must retain ownership", "RESULT_INSPECTOR", worker_id, created_session_id=owner["session_id"])
+    contender = lab.create_work(project_id, "REVIEW", "Competing", "must not claim", "RESULT_INSPECTOR", worker_id, created_session_id=competitor["session_id"])
+    lab.claim_work(owned["id"], worker_id, owner["session_id"])
+
+    with pytest.raises(GPUError) as exc_info:
+        lab.claim_work(contender["id"], worker_id, competitor["session_id"])
+    assert exc_info.value.error_type == "LAB_WORKER_ALREADY_ASSIGNED"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_branch_coverage_respects_persisted_branch_dependencies():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-branch-dependency-{time.time_ns()}", "branch dependency coverage")["project_id"]
+    joined = lab.join(None, f"branch-dependency-{time.time_ns()}", "CODEX", project_id)
+    objective = lab.canonical_objective_create(project_id, "SCIENTIFIC", "Sleeve", "Does sleeve input validate?")
+    input_run = store.object_create(project_id, "ExperimentRun", {"label": "validated sleeve input"}, "EXPERIMENT_STARTED", "running")
+    branch = lab.hypothesis_branch_create(
+        project_id, objective["id"], question_id="VALIDATED_SLEEVE_INPUT",
+        branch_dependencies=[{"target_type": "EXPERIMENT_RUN", "target_id": input_run["id"], "required_statuses": ["completed"]}],
+    )
+    coverage = next(item for item in lab.branch_coverage_get(project_id) if item["branch_id"] == branch["id"])
+    assert coverage["next_actionability"] == "WAITING_BRANCH_DEPENDENCY"
+    assert coverage["waiting_dependency"] is True
+    assert coverage["unresolved_branch_dependencies"][0]["dependency"]["target_id"] == input_run["id"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_branch_coverage_accepts_legacy_type_status_dependencies():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store)
+    project_id = store.project_create(f"lab-legacy-branch-dependency-{time.time_ns()}", "legacy branch dependency coverage")["project_id"]
+    objective = lab.canonical_objective_create(project_id, "SCIENTIFIC", "Sleeve", "Does sleeve input validate?")
+    branch = lab.hypothesis_branch_create(
+        project_id, objective["id"], question_id="VALIDATED_SLEEVE_INPUT",
+        branch_dependencies=[{"type": "VALIDATED_SLEEVE_INPUT", "status": "BLOCKED", "detail": "No validated sleeve."}],
+    )
+    coverage = next(item for item in lab.branch_coverage_get(project_id) if item["branch_id"] == branch["id"])
+    assert coverage["next_actionability"] == "WAITING_BRANCH_DEPENDENCY"
+    assert coverage["unresolved_branch_dependencies"][0]["reason"].endswith("BLOCKED")
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_controller_restart_reconstructs_waiting_branch_and_reclaims_after_dependency():
+    store = ResearchStore(TEST_DATABASE_URL)
+    flags = {"WAITING_WORK_RELEASE": True, "BRANCH_AWARE_ASSIGNMENT": True}
+    lab = LabController(store, feature_flags=flags)
+    project_id = store.project_create(f"lab-v36-restart-{time.time_ns()}", "v3.6 restart durability")["project_id"]
+    joined = lab.join(None, f"v36-restart-worker-{time.time_ns()}", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    objective = lab.canonical_objective_create(project_id, "SCIENTIFIC", "Restart", "Does waiting work survive restart?")
+    branch = lab.hypothesis_branch_create(project_id, objective["id"])
+    lab.hypothesis_portfolio_ensure(project_id, objective["id"])
+    gate = lab.gate_ensure(project_id, "RESULT_INSPECTION", "restart-run", "v1", worker_id, session_id)
+    work = lab.gate_work_ensure(gate["id"], "REVIEW", "Inspect after restart", "Wait for canonical run.", "RESULT_INSPECTOR", worker_id, session_id, branch_id=branch["id"])
+    run = store.object_create(project_id, "ExperimentRun", {"label": "pending"}, "EXPERIMENT_STARTED", "running")
+    lab.claim_work(work["id"], worker_id, session_id)
+    lab.block_work(work["id"], worker_id, session_id, [{"target_type": "EXPERIMENT_RUN", "target_id": run["id"], "required_statuses": ["completed"]}])
+
+    restarted = LabController(ResearchStore(TEST_DATABASE_URL), feature_flags=flags)
+    coverage = restarted.branch_coverage_get(project_id)
+    assert coverage[0]["waiting_work_item_ids"] == [work["id"]]
+    assert coverage[0]["active_worker_count"] == 0
+    store.object_update(run["id"], {}, "completed", "EXPERIMENT_COMPLETED")
+    assert restarted.resolve_dependencies(project_id)["ready"] == 1
+    assigned = restarted.portfolio_assign_existing(project_id, worker_id, session_id)
+    assert assigned["work_item"]["id"] == work["id"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_unsatisfied_dependency_demotes_ready_work_and_blocks_claim():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)
@@ -159,7 +831,7 @@ def test_unsatisfied_dependency_demotes_ready_work_and_blocks_claim():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
-def test_dependency_reconciliation_supersedes_duplicate_equivalent_dormant_work():
+def test_dormant_equivalence_is_reserved_before_it_can_wake():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)
     project_id = store.project_create(f"lab-equivalence-reconcile-{time.time_ns()}", "Equivalent work") ["project_id"]
@@ -174,20 +846,16 @@ def test_dependency_reconciliation_supersedes_duplicate_equivalent_dormant_work(
         worker["worker"]["id"], created_session_id=worker["session_id"], dependencies=dependency,
         equivalence_key="same-review", dormant_until_dependencies=True,
     )
-    duplicate = lab.create_work(
-        project_id, "REVIEW", "Duplicate review", "Same review", "ADVERSARIAL_REVIEWER",
-        worker["worker"]["id"], created_session_id=worker["session_id"], dependencies=dependency,
-        equivalence_key="same-review", dormant_until_dependencies=True,
-    )
+    with pytest.raises(GPUError, match="LAB_EQUIVALENT_WORK_ACTIVE"):
+        lab.create_work(
+            project_id, "REVIEW", "Duplicate review", "Same review", "ADVERSARIAL_REVIEWER",
+            worker["worker"]["id"], created_session_id=worker["session_id"], dependencies=dependency,
+            equivalence_key="same-review", dormant_until_dependencies=True,
+        )
     claimed = lab.claim_work(prerequisite["id"], worker["worker"]["id"], worker["session_id"])
     lab.complete_work(claimed["id"], worker["worker"]["id"], worker["session_id"], summary="Implemented")
-    # complete_work invokes dependency reconciliation itself; the explicit
-    # second pass must be idempotent rather than recreating either work item.
     assert lab.resolve_dependencies(project_id) == {"ready": 0, "waiting": 0, "invalidated": 0}
     assert lab.work_get(first["id"])["status"] == "READY"
-    reconciled = lab.work_get(duplicate["id"])
-    assert reconciled["status"] == "SUPERSEDED"
-    assert reconciled["superseded_by"] == first["id"]
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
@@ -250,6 +918,36 @@ def test_orphaned_running_work_without_a_lease_is_recovered():
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_live_lease_is_never_orphan_reclaimed_for_an_active_session():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store, lease_seconds=30)
+    project_id = store.project_create(f"lab-live-lease-{time.time_ns()}", "Lease authority") ["project_id"]
+    joined = lab.join(None, "live-lease-worker", "CODEX", project_id)
+    work = lab.create_work(
+        project_id, "REVIEW", "Keep ownership", "Live lease is authoritative", "REVIEWER",
+        joined["worker"]["id"], created_session_id=joined["session_id"],
+    )
+    claimed = lab.claim_work(work["id"], joined["worker"]["id"], joined["session_id"])
+    lab.start_work(claimed["id"], joined["worker"]["id"], joined["session_id"])
+    # Reproduce the formerly unsafe projection: session remains ACTIVE but its
+    # heartbeat looks stale.  Its unexpired lease must still win.
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE research_worker_sessions SET status='ACTIVE',last_heartbeat_at="
+            "NOW() - INTERVAL '1 hour' WHERE id=%s",
+            (joined["session_id"],),
+        )
+
+    recovered = lab.recover_stale_leases(project_id)
+
+    assert recovered["recovered"] == 0
+    current = lab.work_get(work["id"])
+    assert current["status"] == "RUNNING"
+    assert current["assigned_session_id"] == joined["session_id"]
+    assert current["lease_id"] == claimed["lease_id"]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
 def test_start_work_explains_an_unknown_work_item_id():
     store = ResearchStore(TEST_DATABASE_URL)
     lab = LabController(store)
@@ -277,11 +975,38 @@ def test_attached_execution_cannot_return_to_ready_after_worker_disconnect():
     attached = lab.attach_experiment_run(work["id"], worker_id, session_id, run["id"])
     assert attached["status"] == "RUNNING_DETACHED"
     assert attached["related_refs"]["experiment_run_id"] == run["id"]
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT availability_state FROM research_workers WHERE id=%s", (worker_id,))
+        worker = cur.fetchone()
+    assert worker["availability_state"] == "AVAILABLE"
     assert lab.work_list(project_id, ["READY"]) == []
 
     assert lab.experiment_run_terminal(run["id"], "completed") == {"result_ready": 1}
     assert lab.work_get(work["id"])["status"] == "RESULT_READY"
     assert lab.work_list(project_id, ["READY"]) == []
+    store.object_update(run["id"], {"inspection": {"mode": "fixture"}}, "RESULT_INSPECTED")
+    assert lab.experiment_run_inspected(run["id"]) == {"completed": 1}
+    assert lab.work_get(work["id"])["status"] == "COMPLETED"
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_v36_detached_gpu_run_releases_worker_for_existing_independent_work():
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store, feature_flags={"BRANCH_AWARE_ASSIGNMENT": True})
+    project_id = store.project_create(f"lab-v36-detach-reassign-{time.time_ns()}", "v3.6 GPU detach")["project_id"]
+    joined = lab.join(None, f"v36-detach-worker-{time.time_ns()}", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    objective = lab.canonical_objective_create(project_id, "SCIENTIFIC", "Detach", "Can long execution release reasoning capacity?")
+    run_branch = lab.hypothesis_branch_create(project_id, objective["id"])
+    inspect_branch = lab.hypothesis_branch_create(project_id, objective["id"])
+    lab.hypothesis_portfolio_ensure(project_id, objective["id"])
+    run_work = lab.create_work(project_id, "TRAINING_RUN", "Launch", "Canonical long run.", "EXECUTION", worker_id, created_session_id=session_id, canonical_objective_id=objective["id"], branch_id=run_branch["id"])
+    gate = lab.gate_ensure(project_id, "RESULT_INSPECTION", "detach-independent", "v1", worker_id, session_id)
+    ready_work = lab.gate_work_ensure(gate["id"], "REVIEW", "Inspect", "Existing independent review.", "RESULT_INSPECTOR", worker_id, session_id, branch_id=inspect_branch["id"])
+    run = store.object_create(project_id, "ExperimentRun", {"label": "long"}, "EXPERIMENT_STARTED", "running")
+    lab.claim_work(run_work["id"], worker_id, session_id)
+    assert lab.attach_experiment_run(run_work["id"], worker_id, session_id, run["id"])["status"] == "RUNNING_DETACHED"
+    assert lab.portfolio_assign_existing(project_id, worker_id, session_id)["work_item"]["id"] == ready_work["id"]
 
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
@@ -378,3 +1103,255 @@ def test_project_scope_and_message_acknowledgement_require_active_session():
     assert lab.message_list(one, recipient["worker"]["id"], unread_only=True) == []
     with pytest.raises(GPUError, match="LAB_MESSAGE_RECIPIENT_NOT_IN_PROJECT"):
         lab.message_send(one, sender["worker"]["id"], sender["session_id"], "REQUEST_REVIEW", "Bad", "No cross-project recipient", to_worker_id=outsider["worker"]["id"])
+
+
+def _execution_authority_records():
+    project, experiment_id, work, worker, session = "p", "e", "w", "u", "s"
+    item = {
+        "id": work, "project_id": project, "status": "RUNNING", "assigned_worker_id": worker,
+        "assigned_session_id": session, "authority_status": "AUTHORITATIVE", "subject_id": experiment_id,
+        "gate_id": "g", "canonical_subject_version": "sv", "authority_key": "ak",
+        "recovery_policy": {"one_shot": True}, "superseded_by": None, "invalidated_at": None,
+    }
+    gate = {
+        "id": "g", "project_id": project, "status": "PASS", "scientific_object_id": experiment_id,
+        "authoritative_work_item_id": work, "canonical_subject_version": "sv",
+        "superseded_by": None, "invalidation_reason": None,
+    }
+    experiment = {
+        "id": experiment_id, "project_id": project, "kind": "Experiment", "status": "ACTIVE",
+        "data": {"frozen": True, "hypothesis_id": "h"},
+    }
+    hypothesis = {"id": "h", "project_id": project, "kind": "Hypothesis", "status": "ACTIVE", "data": {}}
+    return project, experiment_id, work, worker, session, item, gate, experiment, hypothesis
+
+
+def test_frozen_execution_authority_records_require_exact_current_owner_and_gate():
+    args = _execution_authority_records()
+    result = LabController._validate_frozen_execution_authority_records(
+        *args[:5], *args[5:], [(True, False, "ok")], True, [], None
+    )
+    assert result["validated"] is True
+    assert result["one_shot"] is True
+    assert result["gate_id"] == "g"
+
+
+@pytest.mark.parametrize("mutation,error_type", [
+    (("item", "status", "WAITING_DEPENDENCY"), "LAB_EXECUTION_WORK_NOT_OWNED"),
+    (("item", "assigned_worker_id", "other"), "LAB_WORK_OWNERSHIP_MISMATCH"),
+    (("item", "authority_status", "SUPPORTING"), "LAB_EXECUTION_AUTHORITY_INVALID"),
+    (("gate", "status", "FAIL"), "SCIENTIFIC_GATE_NOT_EXECUTABLE"),
+    (("gate", "authoritative_work_item_id", "other"), "SCIENTIFIC_GATE_AUTHORITY_MISMATCH"),
+    (("experiment", "status", "COMPLETED"), "EXPERIMENT_NOT_EXECUTABLE"),
+])
+def test_frozen_execution_authority_records_fail_closed(mutation, error_type):
+    project, experiment_id, work, worker, session, item, gate, experiment, hypothesis = _execution_authority_records()
+    target = {"item": item, "gate": gate, "experiment": experiment}[mutation[0]]
+    target[mutation[1]] = mutation[2]
+    with pytest.raises(GPUError) as error:
+        LabController._validate_frozen_execution_authority_records(
+            project, experiment_id, work, worker, session, item, gate, experiment, hypothesis,
+            [(True, False, "ok")], True, [], None,
+        )
+    assert error.value.error_type == error_type
+
+
+def test_one_shot_authority_allows_only_exact_retry_attempt_uuid():
+    args = _execution_authority_records()
+    attempt = [{"idempotency_key": "attempt-1", "run_id": "r", "status": "RESERVED"}]
+    with pytest.raises(GPUError) as error:
+        LabController._validate_frozen_execution_authority_records(
+            *args[:5], *args[5:], [(True, False, "ok")], True, attempt, "attempt-2"
+        )
+    assert error.value.error_type == "EXPERIMENT_ONE_SHOT_ALREADY_RESERVED"
+    replay = LabController._validate_frozen_execution_authority_records(
+        *args[:5], *args[5:], [(True, False, "ok")], True, attempt, "attempt-1"
+    )
+    assert replay["execution_attempt_uuid"] == "attempt-1"
+
+
+def _detached_execution_authority_records():
+    project, experiment_id, work, worker, session, item, gate, experiment, hypothesis = _execution_authority_records()
+    item.update({
+        "status": "RUNNING_DETACHED",
+        "assigned_worker_id": None,
+        "assigned_session_id": None,
+        "lease_id": None,
+        "related_refs": {
+            "experiment_run_id": "r",
+            "execution_owner_worker_id": worker,
+            "execution_owner_session_id": session,
+            "execution_attempt_uuid": "attempt-1",
+            "execution_request_fingerprint": "fp-1",
+        },
+    })
+    attempt = [{"idempotency_key": "attempt-1", "run_id": "r", "request_fingerprint": "fp-1", "status": "RESERVED"}]
+    return project, experiment_id, work, worker, session, item, gate, experiment, hypothesis, attempt
+
+
+def test_detached_exact_retry_preserves_same_owner_same_reserved_attempt_only():
+    *records, attempt = _detached_execution_authority_records()
+    result = LabController._validate_frozen_execution_authority_records(
+        *records, [(True, False, "ok")], False, attempt, "attempt-1", True
+    )
+    assert result["validated"] is True
+    assert result["detached_retry"] is True
+    assert result["execution_attempt_uuid"] == "attempt-1"
+
+
+@pytest.mark.parametrize("field,value,error_type", [
+    ("uuid", "attempt-2", "EXPERIMENT_ONE_SHOT_ALREADY_RESERVED"),
+    ("worker", "other", "LAB_WORK_OWNERSHIP_MISMATCH"),
+    ("session", "other", "LAB_WORK_OWNERSHIP_MISMATCH"),
+    ("run", "other-run", "EXPERIMENT_DETACHED_RETRY_NOT_RESERVED"),
+    ("fingerprint", "other-fp", "EXPERIMENT_DETACHED_RETRY_NOT_RESERVED"),
+    ("status", "SUBMITTED", "EXPERIMENT_DETACHED_RETRY_NOT_RESERVED"),
+])
+def test_detached_retry_fails_closed_on_identity_or_attempt_drift(field, value, error_type):
+    project, experiment_id, work, worker, session, item, gate, experiment, hypothesis, attempt = _detached_execution_authority_records()
+    execution_uuid = "attempt-1"
+    if field == "uuid":
+        execution_uuid = value
+    elif field == "worker":
+        worker = value
+    elif field == "session":
+        session = value
+    elif field == "run":
+        attempt[0]["run_id"] = value
+    elif field == "fingerprint":
+        attempt[0]["request_fingerprint"] = value
+    elif field == "status":
+        attempt[0]["status"] = value
+    with pytest.raises(GPUError) as error:
+        LabController._validate_frozen_execution_authority_records(
+            project, experiment_id, work, worker, session, item, gate, experiment, hypothesis,
+            [(True, False, "ok")], False, attempt, execution_uuid, True,
+        )
+    assert error.value.error_type == error_type
+
+
+def _db_frozen_execution_fixture(label: str):
+    store = ResearchStore(TEST_DATABASE_URL)
+    lab = LabController(store, lease_seconds=60)
+    project_id = store.project_create(f"tr6-frozen-authority-{label}-{time.time_ns()}", "Frozen authority DB canary")["project_id"]
+    joined = lab.join(None, f"tr6-authority-{label}-{time.time_ns()}", "CODEX", project_id)
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    hypothesis = store.object_create(
+        project_id, "Hypothesis", {"label": label}, "HYPOTHESIS_CREATED", "ACTIVE"
+    )
+    experiment = store.object_create(
+        project_id, "Experiment",
+        {"frozen": True, "hypothesis_id": hypothesis["id"], "plan": {"label": label}},
+        "EXPERIMENT_PREREGISTERED", "ACTIVE",
+    )
+    subject_version = f"experiment:{experiment['id']}|fixture:{label}"
+    gate = lab.gate_ensure(
+        project_id, "ONE_SHOT_EXECUTION", experiment["id"], subject_version,
+        worker_id, session_id, semantic_review_required=False,
+    )
+    work = lab.gate_work_ensure(
+        gate["id"], "MECHANISM_TEST", "Execute frozen DB canary", "One-shot exact authority canary",
+        "EXPERIMENT_OWNER", worker_id, session_id,
+        recovery_policy={"one_shot": True, "requires_no_existing_run": True},
+    )
+    lab.preflight_run(gate["id"], worker_id, session_id, {"fixture_ready": True})
+    lab.gate_resolve(gate["id"], worker_id, session_id, "PASS", rationale="DB canary only")
+    lab.claim_work(work["id"], worker_id, session_id)
+    lab.start_work(work["id"], worker_id, session_id)
+    return store, lab, project_id, joined, experiment, work
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_frozen_authority_detached_exact_reserved_retry_is_db_safe():
+    store, lab, project_id, joined, experiment, work = _db_frozen_execution_fixture("detached-retry")
+    worker_id, session_id = joined["worker"]["id"], joined["session_id"]
+    attempt_uuid, fingerprint = "attempt-exact-1", "fingerprint-exact-1"
+
+    authority = lab.frozen_execution_authority_validate(
+        project_id, experiment["id"], work["id"], worker_id, session_id, attempt_uuid
+    )
+    reserved = store.run_reserve(
+        experiment["id"], attempt_uuid, "local_retryfixture01", fingerprint,
+        {"executor": "local", "decision_id": "fixture-decision"}, True,
+    )
+    attached = lab.attach_experiment_run(
+        work["id"], worker_id, session_id, reserved["run_id"], authority
+    )
+    assert attached["status"] == "RUNNING_DETACHED"
+    assert attached["related_refs"]["execution_owner_worker_id"] == worker_id
+    assert attached["related_refs"]["execution_owner_session_id"] == session_id
+    assert attached["related_refs"]["execution_attempt_uuid"] == attempt_uuid
+    assert attached["related_refs"]["execution_request_fingerprint"] == fingerprint
+
+    # Exercise a real LocalRunner pre-process submission failure after the WorkItem
+    # has detached.  No process/job directory may be created, and exact retry
+    # authority must remain recoverable for the canonical RESERVED attempt.
+    import asyncio as _asyncio
+    from gpu_lab.config import Settings as _Settings
+    from gpu_lab.local_runner import LocalRunner as _LocalRunner
+    runner = _LocalRunner(
+        _Settings(gpu_lab_enable_local_runner=True, gpu_lab_local_workspace="/workspace/local-vlm"), None
+    )
+    with pytest.raises(GPUError) as submit_error:
+        _asyncio.run(
+            runner.submit(
+                "printf should-not-run", "__tr6_missing_workdir__", "retry-fixture",
+                job_id=reserved["job_id"],
+            )
+        )
+    assert submit_error.value.error_type == "INVALID_LOCAL_PATH"
+    assert not (Path("/workspace/local-vlm/.gpu-lab/jobs") / reserved["job_id"]).exists()
+
+    retry_authority = lab.frozen_execution_authority_validate(
+        project_id, experiment["id"], work["id"], worker_id, session_id, attempt_uuid
+    )
+    assert retry_authority["detached_retry"] is True
+    same = store.run_reserve(
+        experiment["id"], attempt_uuid, "local_retryfixture01", fingerprint,
+        {"executor": "local", "decision_id": "fixture-decision"}, True,
+    )
+    assert same["run_id"] == reserved["run_id"]
+
+    with pytest.raises(GPUError) as fresh_error:
+        lab.frozen_execution_authority_validate(
+            project_id, experiment["id"], work["id"], worker_id, session_id, "attempt-fresh-2"
+        )
+    assert fresh_error.value.error_type == "EXPERIMENT_ONE_SHOT_ALREADY_RESERVED"
+
+    outsider = lab.join(None, f"tr6-outsider-{time.time_ns()}", "CODEX", project_id)
+    with pytest.raises(GPUError) as owner_error:
+        lab.frozen_execution_authority_validate(
+            project_id, experiment["id"], work["id"], outsider["worker"]["id"], outsider["session_id"], attempt_uuid
+        )
+    assert owner_error.value.error_type == "LAB_WORK_OWNERSHIP_MISMATCH"
+
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT count(*) AS n FROM research_execution_attempts WHERE experiment_id=%s", (experiment["id"],))
+        assert cur.fetchone()["n"] == 1
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="GPU_LAB_TEST_DATABASE_URL is not configured")
+def test_one_shot_run_reserve_racing_fresh_uuids_creates_one_canonical_attempt():
+    store, _, _, _, experiment, _ = _db_frozen_execution_fixture("uuid-race")
+    barrier = threading.Barrier(2)
+
+    def reserve(attempt_uuid: str):
+        barrier.wait()
+        contender = ResearchStore(TEST_DATABASE_URL)
+        try:
+            result = contender.run_reserve(
+                experiment["id"], attempt_uuid, f"job-{attempt_uuid}", f"fp-{attempt_uuid}",
+                {"executor": "local", "decision_id": "fixture-decision"}, True,
+            )
+            return ("OK", result["run_id"], result["idempotency_key"])
+        except GPUError as error:
+            return (error.error_type, None, attempt_uuid)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(reserve, ("race-a", "race-b")))
+
+    assert sum(result[0] == "OK" for result in results) == 1
+    assert sum(result[0] == "EXPERIMENT_ONE_SHOT_ALREADY_RESERVED" for result in results) == 1
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT count(*) AS n FROM research_execution_attempts WHERE experiment_id=%s", (experiment["id"],))
+        assert cur.fetchone()["n"] == 1

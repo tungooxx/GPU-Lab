@@ -12,6 +12,7 @@ class GPUProvider(Protocol):
     async def create_instance(self, offer_id: str, **options: Any) -> Instance: ...
     async def get_instance(self, instance_id: str) -> Instance: ...
     async def list_instances(self) -> list[Instance]: ...
+    async def start_instance(self, instance_id: str) -> Instance: ...
     async def stop_instance(self, instance_id: str) -> None: ...
     async def destroy_instance(self, instance_id: str) -> None: ...
 
@@ -32,6 +33,14 @@ class VastProvider:
             response = await self.client.request(method, f"{self.base_url}{path}", **kwargs)
             response.raise_for_status()
             data = response.json()
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+            raise GPUError(
+                "PROVIDER_NOT_FOUND" if status_code == 404 else "PROVIDER_API_ERROR",
+                str(exc),
+                status_code >= 500,
+                {"status_code": status_code},
+            ) from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise GPUError(
                 "PROVIDER_API_ERROR", str(exc), isinstance(exc, httpx.TimeoutException)
@@ -47,6 +56,14 @@ class VastProvider:
             response = await self.client.request(method, f"{self.v1_base_url}{path}", **kwargs)
             response.raise_for_status()
             return response.json()
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+            raise GPUError(
+                "PROVIDER_NOT_FOUND" if status_code == 404 else "PROVIDER_API_ERROR",
+                str(exc),
+                status_code >= 500,
+                {"status_code": status_code},
+            ) from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise GPUError(
                 "PROVIDER_API_ERROR", str(exc), isinstance(exc, httpx.TimeoutException)
@@ -131,6 +148,14 @@ class VastProvider:
         return [
             self.normalize(i) for i in data.get("instances", data if isinstance(data, list) else [])
         ]
+
+    async def start_instance(self, instance_id: str) -> Instance:
+        ident = instance_id.removeprefix("vast_")
+        # Vast manages both stop and start through its documented instance
+        # lifecycle endpoint; the subsequent read returns fresh connection
+        # metadata if the provider has already assigned it.
+        await self._request("PUT", f"/instances/{ident}", json={"state": "running"})
+        return await self.get_instance(ident)
 
     async def stop_instance(self, instance_id: str) -> None:
         await self._request(

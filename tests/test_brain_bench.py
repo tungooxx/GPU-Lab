@@ -213,6 +213,12 @@ def test_aggregate_keeps_every_metric_separate():
     assert not hasattr(aggregate, "total_score")
 
 
+def test_brain_bench_exposes_v35_strategy_transfer_contract_cases():
+    cases = ResearchBrainBench(BENCH_ROOT).strategy_transfer_v35_cases()
+    assert cases["case_count"] == 12
+    assert cases["cases"][0]["id"] == "A_SCIENTIFIC_RESULT_LEAKAGE"
+
+
 @pytest.mark.asyncio
 async def test_mcp_benchmark_tools_do_not_expose_hidden_state(monkeypatch):
     from gpu_lab import server
@@ -237,3 +243,5 @@ async def test_mcp_benchmark_tools_do_not_expose_hidden_state(monkeypatch):
     assert "expected_information_gain" not in json.dumps(visible)
     assert baseline["selected_action_id"] == "derive-competing-mechanisms"
     assert "metrics" not in baseline
+    v35 = await server.research_benchmark_v35_strategy_transfer_cases()
+    assert v35["case_count"] == 12

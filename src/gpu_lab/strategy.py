@@ -4,7 +4,7 @@ import math
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from .errors import GPUError
 from .research import ResearchStore
@@ -225,7 +225,12 @@ class ResearchStrategyService:
         )
         if uninspected:
             research_stage = "RESULT_INSPECTION"
-        elif reproductions and not baseline_reproduced:
+        elif (
+            str(agenda_item["data"].get("reproduction_gate_scope") or "").upper()
+            in {"BASELINE_COMPARISON", "PUBLICATION"}
+            and reproductions
+            and not baseline_reproduced
+        ):
             research_stage = "REPRODUCTION"
         elif not hypotheses:
             research_stage = "HYPOTHESIS_GENERATION"
@@ -555,10 +560,17 @@ class ResearchStrategyService:
     def decision_outcome_assess(
         self,
         decision_id: str,
-        assessment: dict[str, Any],
+        assessment: DecisionOutcomeAssessment | dict[str, Any],
         domain: str | None = None,
     ) -> dict[str, Any]:
-        parsed = DecisionOutcomeAssessment.model_validate(assessment)
+        try:
+            parsed = DecisionOutcomeAssessment.model_validate(assessment)
+        except ValidationError as exc:
+            raise GPUError(
+                "INVALID_DECISION_OUTCOME_ASSESSMENT",
+                "Assessment is missing required fields or contains invalid values.",
+                details={"validation_errors": exc.errors(include_url=False)},
+            ) from exc
         decision = self.store.object_get(decision_id)
         if decision["kind"] != "ResearchDecision":
             raise GPUError("NOT_A_RESEARCHDECISION", decision_id)
@@ -644,8 +656,17 @@ class ResearchStrategyService:
         }
         return self.store.decision_outcome_apply(decision_id, outcome_data, after)
 
-    def null_model_create(self, project_id: str, data: dict[str, Any]) -> dict[str, Any]:
-        draft = NullModelDraft.model_validate(data)
+    def null_model_create(
+        self, project_id: str, data: NullModelDraft | dict[str, Any]
+    ) -> dict[str, Any]:
+        try:
+            draft = NullModelDraft.model_validate(data)
+        except ValidationError as exc:
+            raise GPUError(
+                "INVALID_NULL_MODEL",
+                "Null model is missing required fields or contains invalid values.",
+                details={"validation_errors": exc.errors(include_url=False)},
+            ) from exc
         target = self.store.object_get(draft.target_entity_id)
         if str(target["project_id"]) != project_id or target["kind"] not in {
             "Claim",

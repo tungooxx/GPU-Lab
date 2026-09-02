@@ -8,6 +8,8 @@ from gpu_lab.server import (
     _compact_research_state,
     _prioritise_monitor_jobs,
     _safe_request_id,
+    EngineeringBaselineInput,
+    EngineeringInspectionInput,
     mcp,
 )
 
@@ -17,6 +19,14 @@ def test_vast_status_tool_has_provider_specific_name():
 
     assert "vast_gpu_status" in names
     assert "gpu_status" not in names
+
+
+def test_vast_start_tool_is_exposed_as_a_mutating_provider_operation():
+    tool = mcp._tool_manager._tools["gpu_start"]
+
+    assert tool.annotations.readOnlyHint is False
+    assert tool.annotations.destructiveHint is False
+    assert tool.annotations.openWorldHint is True
 
 
 @pytest.mark.asyncio
@@ -80,6 +90,98 @@ def test_research_decision_creation_is_explicitly_discoverable():
     assert "research_experiment_execute" in tool.description
 
 
+def test_discovery_candidate_contract_exposes_prediction_shape():
+    schema = mcp._tool_manager._tools["discovery_candidate_submit"].fn_metadata.arg_model.model_json_schema()
+    candidate = schema["$defs"]["DiscoveryCandidateInput"]
+
+    assert candidate["properties"]["predictions"] == {
+        "description": "One or more non-empty, discriminating prediction statements.",
+        "items": {"type": "string"},
+        "minItems": 1,
+        "title": "Predictions",
+        "type": "array",
+    }
+    assert {"mechanism", "predictions", "falsifier"} <= set(candidate["required"])
+    assert "discriminating_prediction" not in candidate["properties"]
+
+
+def test_hypothesis_qd_screen_exposes_the_backend_hypothesis_draft_contract():
+    schema = mcp._tool_manager._tools["hypothesis_qd_screen"].fn_metadata.arg_model.model_json_schema()
+    draft = schema["$defs"]["HypothesisDraft"]
+
+    assert {"mechanism", "prediction", "kill_condition", "niche_id", "scope"} <= set(draft["required"])
+    assert draft["properties"]["mechanism"]["minLength"] == 10
+    embedding = draft["properties"]["embedding"]
+    assert any(
+        item.get("type") == "array" and item.get("items") == {"type": "number"}
+        for item in embedding["anyOf"]
+    )
+
+
+def test_operational_tool_contracts_expose_backend_enums_and_required_objects():
+    message = mcp._tool_manager._tools["lab_message_send"].fn_metadata.arg_model.model_json_schema()
+    task = mcp._tool_manager._tools["engineering_task_create"].fn_metadata.arg_model.model_json_schema()
+    work = mcp._tool_manager._tools["lab_work_create"].fn_metadata.arg_model.model_json_schema()
+    review = mcp._tool_manager._tools["engineering_diff_review"].fn_metadata.arg_model.model_json_schema()
+    preflight = mcp._tool_manager._tools["deterministic_preflight_run"].fn_metadata.arg_model.model_json_schema()
+
+    assert "ENGINEERING_HANDOFF" in message["properties"]["message_type"]["enum"]
+    assert "HANDOFF" in message["properties"]["message_type"]["enum"]
+    assert "BUG_FIX" in task["properties"]["task_type"]["enum"]
+    assert {"created_by", "created_session_id"} <= set(work["required"])
+    typed_review = review["$defs"]["EngineeringDiffReviewInput"]
+    assert {"files_changed", "diff_summary", "unrelated_changes", "scientific_variable_drift"} <= set(typed_review["required"])
+    checks = preflight["properties"]["checks"]["additionalProperties"]["anyOf"]
+    assert any(item.get("$ref", "").endswith("/DeterministicPreflightCheck") for item in checks)
+
+
+def test_research_state_update_exposes_its_bounded_cache_fields():
+    schema = mcp._tool_manager._tools["research_state_update"].fn_metadata.arg_model.model_json_schema()
+    update = schema["$defs"]["ResearchStateUpdateInput"]
+
+    assert set(update["properties"]) == {
+        "established_facts",
+        "current_best_explanation",
+        "highest_value_unknown",
+        "next_discriminating_experiments",
+    }
+    assert "current_focus" not in update["properties"]
+    assert "evidence_refs" not in update["properties"]
+
+
+def test_correction_challenge_contract_exposes_issue_type_enum():
+    schema = mcp._tool_manager._tools["correction_challenge_submit"].fn_metadata.arg_model.model_json_schema()
+    challenge = schema["$defs"]["CorrectionChallengeInput"]
+
+    assert "CAUSAL_OVERREACH" in challenge["properties"]["issue_type"]["enum"]
+    assert "OTHER_STRUCTURED" in challenge["properties"]["issue_type"]["enum"]
+    assert challenge["additionalProperties"] is False
+
+
+def test_engineering_task_start_exposes_inspection_and_baseline_contracts():
+    schema = mcp._tool_manager._tools["engineering_task_start"].fn_metadata.arg_model.model_json_schema()
+    inspection = schema["$defs"]["EngineeringInspectionInput"]
+    baseline = schema["$defs"]["EngineeringBaselineInput"]
+    inspected_file = schema["$defs"]["EngineeringInspectedFile"]
+
+    assert inspection["properties"]["files_read"]["minItems"] == 1
+    assert baseline["properties"]["commands_run"]["minItems"] == 1
+    assert "passed" in baseline["required"]
+    assert {"path", "sha256"} <= set(inspected_file["properties"])
+
+
+def test_engineering_task_start_accepts_compatible_file_and_command_aliases():
+    inspection = EngineeringInspectionInput.model_validate(
+        {"files": [{"path": "src/model.py", "hash": "a" * 64}]}
+    )
+    baseline = EngineeringBaselineInput.model_validate(
+        {"commands": ["pytest -q"], "passed": True}
+    )
+
+    assert inspection.files_read[0].sha256 == "a" * 64
+    assert baseline.commands_run == ["pytest -q"]
+
+
 def test_every_mcp_tool_has_chatgpt_metadata():
     for tool in mcp._tool_manager._tools.values():
         assert tool.title
@@ -107,6 +209,7 @@ def test_strategy_writes_are_not_advertised_as_read_only():
         "research_null_model_create",
         "research_null_model_test",
         "research_decision_outcome_assess",
+        "research_canonical_assessment_reconcile",
     ):
         annotations = mcp._tool_manager._tools[name].annotations
         assert annotations.readOnlyHint is False

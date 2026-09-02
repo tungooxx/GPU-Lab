@@ -166,7 +166,11 @@ class DistributedCorrectionService:
         issue_type = str(challenge.get("issue_type", "")).upper()
         statement = str(challenge.get("issue_statement", "")).strip()
         if issue_type not in ISSUE_TYPES:
-            raise GPUError("CORRECTION_ISSUE_TYPE_INVALID", issue_type)
+            raise GPUError(
+                "CORRECTION_ISSUE_TYPE_INVALID",
+                issue_type,
+                details={"allowed_issue_types": sorted(ISSUE_TYPES)},
+            )
         if not statement:
             raise GPUError("CORRECTION_ISSUE_STATEMENT_REQUIRED", str(case_id))
         evidence_refs = [str(item) for item in challenge.get("evidence_refs", []) if str(item)]
